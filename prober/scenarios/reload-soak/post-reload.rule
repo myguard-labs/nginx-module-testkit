@@ -1,0 +1,19 @@
+# The post-reload coherence case, run by the driver AFTER the whole reload
+# series has been absorbed. It proves the final cycle is a WORKING one: the
+# reloaded worker serves a correct 200, leaks no descriptor within the case, and
+# logs nothing on the error path around the request.
+#
+# The pid oracle is STRICT (no pid_may_change) and that is correct: every reload
+# happened outside this prober invocation, so both of the case's probe snapshots
+# see the same worker. pid_may_change would be a vacuous no-op here (confirmed by
+# the same reasoning as backend-reload-inflight/post-reload.rule); the
+# reload-spanning assertions this scenario exists to make are the driver's, which
+# compare probe snapshots taken on either side of each signal.
+
+name    the final reloaded worker serves cleanly
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+no_error_log  \[error\]
