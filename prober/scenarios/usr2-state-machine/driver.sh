@@ -85,34 +85,47 @@ read_pidfile() {   # $1 = pidfile path; echoes a live pid or nothing
     [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "$p"
 }
 
-# The inode behind the master's FIRST listening socket fd. nginx names its
-# listening sockets `socket:[INODE]` under /proc/<pid>/fd; the inherited socket
-# keeps its inode across the USR2 exec, a re-bind would not. Returns nothing when
-# /proc is unreadable (caller treats that as a visible SKIP) or when no listening
-# socket fd is found.
+# The inode behind the master's listening socket fd for OUR 127.0.0.1:$PORT.
+# nginx names its listening sockets `socket:[INODE]` under /proc/<pid>/fd; the
+# inherited socket keeps its inode across the USR2 exec, a re-bind would not.
+# The inode is pinned to the listener by cross-checking it against a LISTEN
+# state bound to our exact address:port in /proc/net/tcp -- never an arbitrary
+# socket fd (the master also holds channel/signal socketpairs, inherited the
+# same way, which would pass the oracle without proving listen-socket survival).
+# Returns nothing when /proc is unreadable or no matching listener fd is found;
+# the caller treats an empty result as a visible SKIP.
+# The /proc/net/tcp local_address hex for 127.0.0.1:$PORT -- IP little-endian
+# (0100007F), port big-endian uppercase 4-hex. Used to pin the inode to OUR
+# listener specifically, never to a channel/signal socketpair the master also
+# holds (which is inherited across USR2 just the same and would pass the oracle
+# without validating listen-socket survival at all). Empty if PORT is unset.
+LISTEN_HEX=""
+if [ -n "${PORT:-}" ]; then
+    LISTEN_HEX="$(printf '0100007F:%04X' "$PORT")"
+fi
+
 listen_inode() {   # $1 = master pid
-    local d="/proc/$1/fd" fd tgt first=""
+    local d="/proc/$1/fd" fd tgt ino
     [ -r "$d" ] || return 0
+    # No exact listener match is possible without /proc/net/tcp and the port
+    # hex: return nothing so the caller SKIPs visibly, rather than falling back
+    # to an arbitrary socket fd that is not proven to be the listener.
+    [ -r /proc/net/tcp ] && [ -n "$LISTEN_HEX" ] || return 0
     for fd in "$d"/*; do
         tgt="$(readlink "$fd" 2>/dev/null)" || continue
         case "$tgt" in
             socket:\[*\])
-                # Match it to a LISTENING socket by cross-checking the inode
-                # against a listen state in /proc/net/tcp; if that is unreadable,
-                # fall back to the first socket fd (the master holds only the
-                # listener plus signal/channel pipes, no data sockets while idle).
-                local ino="${tgt#socket:[}"; ino="${ino%]}"
-                if [ -r /proc/net/tcp ] && \
-                   awk -v i="$ino" 'NR>1 && $10==i && $4=="0A"{f=1} END{exit !f}' \
+                ino="${tgt#socket:[}"; ino="${ino%]}"
+                # Accept only a socket whose inode is a LISTEN state ($4==0A)
+                # bound to OUR address:port ($2==LISTEN_HEX) in /proc/net/tcp.
+                if awk -v i="$ino" -v a="$LISTEN_HEX" \
+                       'NR>1 && $10==i && $4=="0A" && $2==a{f=1} END{exit !f}' \
                        /proc/net/tcp 2>/dev/null; then
                     echo "$ino"; return 0
                 fi
-                # remember the first socket as a fallback
-                [ -n "$first" ] || first="$ino"
                 ;;
         esac
     done
-    [ -n "$first" ] && echo "$first"
     return 0
 }
 
