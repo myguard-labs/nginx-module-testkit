@@ -1,0 +1,23 @@
+# The post-reload coherence case, run by the driver AFTER prober_signal_wait
+# has confirmed a new worker is answering. It proves the server came back
+# HEALTHY: the reloaded worker serves a correct 200, leaks no descriptor, and
+# logs nothing on the error path in the window around this request.
+#
+# The pid oracle is STRICT (no pid_may_change), and that is correct: by the
+# time this file runs, a single post-reload worker is serving, so both of the
+# case's probe snapshots see the SAME worker and "same worker pid" is the
+# stronger, true assertion. pid_may_change relaxes the oracle only for a case
+# whose OWN before/after window straddles a reload -- there is no such window
+# here (the reload happened outside this prober invocation entirely), so the
+# directive would be a vacuous no-op and is deliberately omitted. The
+# reload-survival assertions that DO straddle the signal (the idle keepalive
+# conn getting closed by the draining worker) are the driver's, not this
+# file's.
+
+name    the reloaded worker serves cleanly after the idle-keepalive reload
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+no_error_log  \[error\]
