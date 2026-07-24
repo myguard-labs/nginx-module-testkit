@@ -83,7 +83,13 @@ read_pidfile() {   # $1 = pidfile path; echoes a live pid or nothing
     [ -s "$1" ] || return 0
     local p
     p="$(tr -d '[:space:]' < "$1" 2>/dev/null)"
+    # MUST return 0 even with no live pid: absence is a normal outcome (missing
+    # .oldbin, an already-retired master, or a pidfile caught mid-rewrite during
+    # the two-master overlap). Callers detect it via empty stdout; a non-zero
+    # status would abort the driver under `set -e` at the bare assignments in
+    # the new-master poll (L221) and the .oldbin/retire legs (L317, L350).
     [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "$p"
+    return 0
 }
 
 # The inode behind the master's listening socket fd for OUR 127.0.0.1:$PORT.
@@ -245,8 +251,9 @@ elif [ -z "$NEW_MASTER" ]; then
     echo "# nginx.pid still holds the old master $OLD_MASTER after 5 s;"
     echo "# under daemon off; USR2 is dropped -- check PROBER_DAEMON_MODE=on took effect"
     grep -n 'changing binary signal is ignored' "$ELOG" | sed 's/^/# /' || true
-    # Still adopt the new master if one somehow exists, so teardown is correct.
-    [ -n "$NEW_MASTER" ] && { PROBER_SERVER_PID="$NEW_MASTER"; export PROBER_SERVER_PID; }
+    # No adoption here: this branch proved NEW_MASTER is empty, so no new master
+    # exists. The old master still owns nginx.pid, so PROBER_SERVER_PID is
+    # already the correct teardown target.
     FAILED=$((FAILED + 1))
 else
     echo "not ok 3 - the in-flight reply had already completed when the USR2 was delivered (no transfer spanned the exec; ok 4 would be vacuous)"
@@ -286,7 +293,11 @@ if grep -q '^HTTP/1.1 200' "$INFLIGHT" \
     echo "ok 4 - the in-flight streaming response completed intact across the USR2"
 else
     echo "not ok 4 - the in-flight response was dropped or truncated by the USR2"
-    sed 's/^/# /' "$INFLIGHT" | head -20
+    # head FIRST, then sed: under `pipefail` a `sed ... | head -20` pipeline
+    # returns 141 when sed is SIGPIPEd (INFLIGHT >20 lines), which `set -e`
+    # turns into an abort before the FAILED bump below -- on the very failure
+    # path this diagnostic exists for.
+    head -20 "$INFLIGHT" | sed 's/^/# /' || true
     FAILED=$((FAILED + 1))
 fi
 
