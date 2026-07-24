@@ -29,7 +29,9 @@
 # new worker answering, prober_signal_wait), and only then joins the upload to
 # check it survived.
 #
-# ON THE ORDERING ORACLE (assertion 1) AND WHY IT IS WEAKER HERE:
+# ON THE ORDERING ORACLE (assertion 2, the mid-flight liveness gate; assertion
+# 1 is its in-scenario negative control -- a fast upload that must fail it)
+# AND WHY IT IS WEAKER HERE:
 # backend-reload-inflight proves "in flight" with a backend JOURNAL -- a
 # {"ev":"send"} record the fake backend flushes the instant it starts writing
 # the reply, which is a genuine per-byte server-side event. This scenario has
@@ -45,7 +47,7 @@
 # itself), only that the client has not yet finished WRITING it.
 #
 # The actual load-bearing proof that the upload SPANNED the reload is not
-# assertion 1 at all -- it is the conjunction of: UPLOAD_PID is re-checked
+# assertion 2 at all -- it is the conjunction of: UPLOAD_PID is re-checked
 # alive immediately before prober_signal_wait is called (a hard gate, not a
 # soft assertion: if it already exited, the run aborts assertion 2 as a
 # mistimed `not ok` rather than certifying a false span), and the total body
@@ -76,49 +78,95 @@ export PROBER_ERROR_LOG="$ELOG"
 # if FAILED > 0 OR the prober leg went red.
 FAILED=0
 
-# TAP plan: (1) the upload was provably mid-flight before the reload (the
-# ordering precondition, honestly weaker here -- see comment above), (2) the
-# reload was absorbed while the upload was in flight, (3) the upload completed
-# intact across the reload, (4) no worker died by signal, (5) the post-reload
-# prober leg folded in as diagnostics.
-echo "1..5"
+# TAP plan: (1) NEGATIVE CONTROL -- a fast upload that finishes before the
+# settle window MUST fail the mid-flight liveness gate (proves assertion 2's
+# gate actually discriminates; without this the gate can pass an
+# already-completed upload and certify a span that never happened), (2) the
+# real slow upload was provably mid-flight before the reload (the ordering
+# precondition, honestly weaker here -- see comment above), (3) the reload was
+# absorbed while the upload was in flight, (4) the upload completed intact
+# across the reload, (5) no worker died by signal, (6) the post-reload prober
+# leg folded in as diagnostics.
+echo "1..6"
 
-# --- fire the slow upload ---------------------------------------------------
-# A raw HTTP/1.1 POST over /dev/tcp, body dripped a few bytes at a time. The
-# Content-Length is FIXED and the total bytes written MUST exactly equal it --
-# a short body would leave nginx waiting forever for the rest and hang this
-# driver, not just the request.
+# --- upload subshell factory ------------------------------------------------
+# Fires a raw HTTP/1.1 POST over /dev/tcp to /upload, dripping the body a few
+# bytes at a time with $1 seconds between writes ($1=0 means send the whole
+# body in one shot, i.e. finish fast). The Content-Length is FIXED and the
+# total bytes written MUST exactly equal it -- a short body would leave nginx
+# waiting forever for the rest and hang this driver, not just the request.
+# Echoes the background PID; output lands in the file named by $2.
 BODY="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX"   # 60 bytes
 BODY_LEN=${#BODY}
 CHUNK=4          # bytes per write
+
+start_upload() {
+    local step_sleep=$1 out=$2
+    (
+        exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
+        printf 'POST /upload HTTP/1.1\r\nHost: prober\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' \
+            "$BODY_LEN" >&3
+
+        off=0
+        while [ "$off" -lt "$BODY_LEN" ]; do
+            len=$CHUNK
+            remaining=$((BODY_LEN - off))
+            [ "$len" -gt "$remaining" ] && len=$remaining
+            printf '%s' "${BODY:$off:$len}" >&3
+            off=$((off + len))
+            # $step_sleep=0 -> no inter-chunk delay, the whole body streams out
+            # in one pass and the request finishes well inside the settle loop.
+            if [ "$off" -lt "$BODY_LEN" ] && [ "$step_sleep" != 0 ]; then
+                sleep "$step_sleep"
+            fi
+        done
+
+        # Ignore cat's exit status: a Connection: close response commonly ends
+        # in an RST once the server has sent everything, and cat then exits
+        # non-zero having already delivered a complete body (documented in
+        # prober_probe_pid).
+        cat <&3 2>/dev/null || true
+    ) >"$out" 2>/dev/null &
+    echo $!
+}
+
+# --- assertion 1: NEGATIVE CONTROL -- a fast upload must NOT pass the gate ----
+# The whole scenario's span-proof rests on the liveness gate (assertion 2)
+# distinguishing "still uploading" from "already finished". If that gate would
+# also pass an upload that has already completed, it proves nothing. So before
+# the real run, fire a fast upload (no inter-chunk drip) that finishes inside
+# the same settle window, and assert it is NOT alive afterwards -- i.e. the
+# gate reds for it. This is the in-scenario control the manual mutation used to
+# stand in for; baking it in makes the scenario self-falsifying.
+NEG_OUT="$PROBER_PREFIX/upload-fast.out"
+NEG_PID=$(start_upload 0 "$NEG_OUT")
+neg_alive=0
+for ((i = 0; i < 20; i++)); do   # same 20 * 50 ms = 1 s settle as the real gate
+    if kill -0 "$NEG_PID" 2>/dev/null; then
+        neg_alive=1
+    else
+        neg_alive=0
+        break
+    fi
+    sleep 0.05
+done
+# Reap it either way so it cannot linger into the real run.
+wait "$NEG_PID" 2>/dev/null || true
+if [ "$neg_alive" -eq 0 ]; then
+    echo "ok 1 - a fast upload finished before the settle window (liveness gate discriminates)"
+else
+    echo "not ok 1 - a fast upload was still 'alive' after the settle window (gate cannot tell finished from in-flight)"
+    FAILED=$((FAILED + 1))
+fi
+
+# --- fire the slow upload ---------------------------------------------------
 STEP_SLEEP=0.3   # seconds between writes -> ~(60/4)*0.3 = 4.5s total drip,
                  # many times a reload's absorb time.
 
 UPLOAD_OUT="$PROBER_PREFIX/upload.out"
-(
-    exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
-    printf 'POST /upload HTTP/1.1\r\nHost: prober\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' \
-        "$BODY_LEN" >&3
+UPLOAD_PID=$(start_upload "$STEP_SLEEP" "$UPLOAD_OUT")
 
-    off=0
-    while [ "$off" -lt "$BODY_LEN" ]; do
-        len=$CHUNK
-        remaining=$((BODY_LEN - off))
-        [ "$len" -gt "$remaining" ] && len=$remaining
-        printf '%s' "${BODY:$off:$len}" >&3
-        off=$((off + len))
-        [ "$off" -lt "$BODY_LEN" ] && sleep "$STEP_SLEEP"
-    done
-
-    # Ignore cat's exit status: a Connection: close response commonly ends in
-    # an RST once the server has sent everything, and cat then exits non-zero
-    # having already delivered a complete body (documented in
-    # prober_probe_pid).
-    cat <&3 2>/dev/null || true
-) >"$UPLOAD_OUT" 2>/dev/null &
-UPLOAD_PID=$!
-
-# --- ordering oracle (assertion 1, honestly weaker -- see header) ----------
+# --- ordering oracle (assertion 2, honestly weaker -- see header) ----------
 # Fixed-step counted iterations, never a wall-clock diff (same discipline as
 # prober_signal_wait / prober_wait_listen): a loaded runner performs the same
 # number of attempts. This only proves the subshell is alive and a bounded
@@ -143,16 +191,16 @@ done
 # vacuous "in flight" that never was. Re-check liveness immediately before
 # printing the verdict / sending the signal, not just after the settle loop.
 if [ "$ALIVE_SEEN" -eq 1 ] && kill -0 "$UPLOAD_PID" 2>/dev/null; then
-    echo "ok 1 - the upload was still sending (alive, mid-drip) before the reload"
+    echo "ok 2 - the upload was still sending (alive, mid-drip) before the reload"
 else
-    echo "not ok 1 - the upload subshell was not alive through the settle window (mistimed or finished early)"
+    echo "not ok 2 - the upload subshell was not alive through the settle window (mistimed or finished early)"
     FAILED=$((FAILED + 1))
 fi
 
 if prober_signal_wait HUP "$PROBER_SERVER_PID" "$HOST" "$PORT" 5000; then
-    echo "ok 2 - the reload was absorbed while the upload was in flight"
+    echo "ok 3 - the reload was absorbed while the upload was in flight"
 else
-    echo "not ok 2 - the reload never landed (no new worker answered)"
+    echo "not ok 3 - the reload never landed (no new worker answered)"
     FAILED=$((FAILED + 1))
 fi
 
@@ -186,9 +234,9 @@ wait "$UPLOAD_PID" 2>/dev/null || true
 # response, a 4xx/5xx, or an empty file -- each of which fails this check.
 if grep -q '^HTTP/1.1 200' "$UPLOAD_OUT" \
    && grep -q 'UPLOADED' "$UPLOAD_OUT"; then
-    echo "ok 3 - the upload completed intact across the reload"
+    echo "ok 4 - the upload completed intact across the reload"
 else
-    echo "not ok 3 - the upload was dropped or truncated by the reload"
+    echo "not ok 4 - the upload was dropped or truncated by the reload"
     sed 's/^/# /' "$UPLOAD_OUT" | head -20
     FAILED=$((FAILED + 1))
 fi
@@ -199,11 +247,11 @@ fi
 # is asserted separately here: a clean reload logs the old worker leaving via
 # "gracefully shutting down" / "exiting", never a signal-death line.
 if grep -qE 'worker process .* exited on signal|SIGSEGV|SIGABRT|SIGBUS' "$ELOG"; then
-    echo "not ok 4 - a worker died by signal during the reload"
+    echo "not ok 5 - a worker died by signal during the reload"
     grep -nE 'exited on signal|SIGSEGV|SIGABRT|SIGBUS' "$ELOG" | sed 's/^/# /'
     FAILED=$((FAILED + 1))
 else
-    echo "ok 4 - no worker died by signal across the reload"
+    echo "ok 5 - no worker died by signal across the reload"
 fi
 
 # --- post-reload coherence (prober, folded in as diagnostics) ---------------
@@ -212,7 +260,7 @@ fi
 # in the window around the request. The pid oracle in post-reload.rule is
 # STRICT on purpose -- see that file's header for why pid_may_change would be a
 # no-op here. The reload-survival claims this scenario exists to make are the
-# driver's ok 1-3 above, which hold the upload open across the signal.
+# driver's ok 2-4 above, which hold the upload open across the signal.
 STATUS=0
 # PIPESTATUS, not $?: a bare `./prober | sed` would report sed's exit, which is
 # always 0, silently discarding a red prober leg -- the exact vacuous shape
