@@ -4,9 +4,14 @@
 # the whole scenario. Exempt exactly that line -- and ONLY that line.
 #
 # The regex is deliberately pinned to "exited on signal 9": a FAULT signal
-# (SIGSEGV=11, SIGABRT=6, SIGBUS=7) or a second, unexpected kill still carries
-# an [alert] that this pattern does NOT match, so it stays un-exempted and reds
-# the log scrape. That log scrape is the backstop to the driver's oracle 3 (no
-# OTHER signal death): a cascade fault reds here even if the driver's grep logic
-# were ever wrong. Blanket-allowing all alerts would throw that backstop away.
+# (SIGSEGV=11, SIGABRT=6, SIGBUS=7) carries an [alert] this pattern does NOT
+# match, so it stays un-exempted and reds the log scrape. That is the backstop
+# to the driver's oracle 3 (no OTHER signal death): a cascade fault reds here
+# even if the driver's grep logic were ever wrong. Blanket-allowing all alerts
+# would throw that backstop away.
+#
+# A SECOND signal-9 exit is NOT caught by this pattern -- "[0-9]+" matches every
+# worker pid, so an extra "exited on signal 9" line is exempted here too. The
+# protection against an unexpected additional SIGKILL is the driver's oracle 3
+# count check (N_SIG9 > 1 reds), NOT this log exemption.
 PROBER_ALLOW_LOG='worker process [0-9]+ exited on signal 9'

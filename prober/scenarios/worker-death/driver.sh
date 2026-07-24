@@ -186,7 +186,14 @@ fi
 DRC=0
 prober_drain_wait "$MASTER" "$WORKERS" 10000 || DRC=$?
 if [ "$DRC" -ne 0 ] && [ "$DRC" -ne 2 ]; then
-    echo "# the replacement worker had not settled to $WORKERS child after 10 s"
+    # A drain timeout is a real failure: the replacement never settled to the
+    # required $WORKERS-child steady state, so the oracles below (cycle-pool,
+    # master fd, ppid) would measure an unsettled cycle. Not one of the seven
+    # planned oracles, so it stays a diagnostic line -- but it MUST fail the
+    # scenario, or a never-settling replacement passes silently. rc 2 = "no
+    # pgrep on this host" is a visible skip, not a red.
+    echo "# FAIL: the replacement worker had not settled to $WORKERS child after 10 s"
+    FAILED=$((FAILED + 1))
 fi
 
 warm
@@ -221,10 +228,16 @@ else
 fi
 
 # --- 4: cycle-pool footprint identical across the death --------------------
+# This post-death snapshot also refreshes SNAP_PPID for oracle 6. If it fails,
+# SNAP_PPID still holds the PRE-KILL baseline value (snapshot() leaves it
+# untouched on an early return), which equals BASE_PPID and would let oracle 6
+# pass without ever reading the replacement -- so gate oracle 6 on SNAP_OK.
+SNAP_OK=0
 if ! snapshot; then
     echo "not ok 4 - the probe did not answer after the replacement settled"
     FAILED=$((FAILED + 1))
 else
+    SNAP_OK=1
     DRIFT=""
     [ "$SNAP_USED"   = "$USED_REF"   ] || DRIFT="$DRIFT cycle_used=$SNAP_USED/want-$USED_REF"
     [ "$SNAP_BLOCKS" = "$BLOCKS_REF" ] || DRIFT="$DRIFT cycle_blocks=$SNAP_BLOCKS/want-$BLOCKS_REF"
@@ -252,6 +265,11 @@ fi
 # --- 6: the replacement is a child of the original master ------------------
 if [ -z "$BASE_PPID" ]; then
     echo "ok 6 - master parentage # SKIP this module .so emits no \"ppid\" field"
+elif [ "$SNAP_OK" -ne 1 ]; then
+    # oracle 4's post-death snapshot failed -- SNAP_PPID is the stale pre-kill
+    # baseline, not the replacement's. Cannot validate parentage; fail loud.
+    echo "not ok 6 - no post-death snapshot; cannot read the replacement's master"
+    FAILED=$((FAILED + 1))
 elif [ -n "${SNAP_PPID:-}" ] && [ "$SNAP_PPID" = "$BASE_PPID" ]; then
     echo "ok 6 - the replacement worker is a child of the original master ($BASE_PPID)"
 else
