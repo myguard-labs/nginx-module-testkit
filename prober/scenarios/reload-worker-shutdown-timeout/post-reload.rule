@@ -1,0 +1,28 @@
+# The post-reload coherence case, run by the driver AFTER prober_signal_wait
+# has confirmed a new worker is answering AND the stalled connection under
+# test has been force-closed. It proves the server came back HEALTHY: the
+# reloaded worker serves a correct 200, leaks no descriptor, and logs nothing
+# on the error path in the window around THIS request.
+#
+# The pid oracle is STRICT (no pid_may_change), and that is correct for the
+# same reason as reload-mid-upload/post-reload.rule: by the time this file
+# runs, a single post-reload worker is serving, so both of the case's probe
+# snapshots see the SAME worker -- "same worker pid" is the stronger, true
+# assertion. The reload-survival / force-close claims this scenario exists to
+# make are the driver's own numbered assertions (the stalled conn stays open
+# until worker_shutdown_timeout, then is force-closed), not this leg.
+#
+# no_error_log here is scoped to \[error\] on THIS case's own before/after
+# log window (prober_scrape_log/no_error_log only look at log growth around
+# this one case). The worker_shutdown_timeout force-close emits NO
+# [error]/[warn]/[alert] line of its own (empirically verified -- it is a
+# plain graceful-exit fd close), so there is nothing for this leg to trip on
+# either way; the window scoping is belt-and-suspenders.
+
+name    the reloaded worker serves cleanly after the stalled-upload force-close
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+no_error_log  \[error\]
