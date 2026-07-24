@@ -95,13 +95,22 @@ echo "1..6"
 # body in one shot, i.e. finish fast). The Content-Length is FIXED and the
 # total bytes written MUST exactly equal it -- a short body would leave nginx
 # waiting forever for the rest and hang this driver, not just the request.
-# Echoes the background PID; output lands in the file named by $2.
+# Output lands in the file named by $2; the background PID is written back into
+# the caller's variable named by $3 (an out-param, NOT command substitution).
+#
+# WHY NOT `pid=$(start_upload ...)`: command substitution runs the function body
+# in a subshell, so the `( ... ) &` job would be a child of THAT subshell, not of
+# this driver. Bash `wait` only reaps direct children, so a later
+# `wait "$UPLOAD_PID"` would be waiting on a non-child (undefined/"not a child of
+# this shell") and could leave the upload running past the intended cleanup
+# boundary. Backgrounding in the driver's own shell (out-param via `printf -v`)
+# keeps the job a true child, so wait/kill/kill -0 all address it correctly.
 BODY="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX"   # 60 bytes
 BODY_LEN=${#BODY}
 CHUNK=4          # bytes per write
 
 start_upload() {
-    local step_sleep=$1 out=$2
+    local step_sleep=$1 out=$2 pidvar=$3
     (
         exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
         printf 'POST /upload HTTP/1.1\r\nHost: prober\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' \
@@ -127,7 +136,10 @@ start_upload() {
         # prober_probe_pid).
         cat <&3 2>/dev/null || true
     ) >"$out" 2>/dev/null &
-    echo $!
+    # The `&` above runs in THIS shell (start_upload is called directly, not in a
+    # command substitution), so $! is a real child of the driver. Hand it back
+    # through the caller-named variable.
+    printf -v "$pidvar" '%s' "$!"
 }
 
 # --- assertion 1: NEGATIVE CONTROL -- a fast upload must NOT pass the gate ----
@@ -139,7 +151,7 @@ start_upload() {
 # gate reds for it. This is the in-scenario control the manual mutation used to
 # stand in for; baking it in makes the scenario self-falsifying.
 NEG_OUT="$PROBER_PREFIX/upload-fast.out"
-NEG_PID=$(start_upload 0 "$NEG_OUT")
+start_upload 0 "$NEG_OUT" NEG_PID
 neg_alive=0
 for ((i = 0; i < 20; i++)); do   # same 20 * 50 ms = 1 s settle as the real gate
     if kill -0 "$NEG_PID" 2>/dev/null; then
@@ -164,7 +176,7 @@ STEP_SLEEP=0.3   # seconds between writes -> ~(60/4)*0.3 = 4.5s total drip,
                  # many times a reload's absorb time.
 
 UPLOAD_OUT="$PROBER_PREFIX/upload.out"
-UPLOAD_PID=$(start_upload "$STEP_SLEEP" "$UPLOAD_OUT")
+start_upload "$STEP_SLEEP" "$UPLOAD_OUT" UPLOAD_PID
 
 # --- ordering oracle (assertion 2, honestly weaker -- see header) ----------
 # Fixed-step counted iterations, never a wall-clock diff (same discipline as
