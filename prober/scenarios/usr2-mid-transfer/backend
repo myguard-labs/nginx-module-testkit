@@ -1,0 +1,13 @@
+# The upstream serves a CORRECT reply, but DRIPS it: 4 bytes every 300 ms.
+# The value below is 40 bytes, so a full reply takes ~3 s to leave fakesrv --
+# long enough that a USR2 sent after the request is on the wire lands while
+# the response is still in flight, which is the entire point of the scenario.
+#
+# Gated by backend-smoke: an adversarially-timed reply proves nothing unless
+# the same fake is first proven correct when told to behave normally.
+proto   memcached
+seed    slow    0123456789abcdefghijklmnopqrstuvwxyzABCD
+
+# on=get:1 so ONLY the in-flight request drips; the pre-USR2 baseline is
+# served at full speed and is not itself what spans the signal.
+fault   on=get:1    action=drip    bytes=4    ms=300
