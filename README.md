@@ -1115,6 +1115,32 @@ instead — the reason the scenario asserts all three pool counters), and a
 descriptor opened per config load reds the worker `fds` comparison and the
 master descriptor count together.
 
+### `reload-soak` — 100 reloads under concurrent traffic
+
+`reload-cycle` reloads an idle server 8 times; `reload-soak` reloads it **100
+times while a background load loop keeps requests in flight across every
+signal**. The higher count turns a per-cycle leak from a handful of ambiguous
+steps into an unmistakable climb, and the concurrent traffic exercises paths an
+idle reload never touches — request cleanup on the retiring worker, and the
+listen-socket handover while it is being `accept()`ed on.
+
+The leak oracles are `reload-cycle`'s: the worker `cycle_used`/`cycle_blocks`/
+`cycle_large` counters are **exact-equal** across the whole series (taken after
+`prober_drain_wait` confirms each old cycle's worker has exited), and the master
+descriptor count is flat before vs after. The one deliberate difference is that
+the worker **fd count is not** in the exact-equal set here: under load a
+background connection can be mid-flight on the freshly-drained worker at snapshot
+time (10 vs 11 fds on a few of the 100 reloads), so an exact fd assertion would
+flake on one in-flight request rather than a leak — a leaked descriptor still
+climbs the *master* fd count instead, which is the oracle that catches it. The
+scenario adds one oracle of its own: the background stream must record **no
+failed request** (and a non-empty stream), which is what gives "under load" its
+teeth — a reload that dropped a connection or refused `accept()` during the
+handover shows up there. The `cycle_used`/master-fd leak controls are inherited
+from `reload-cycle` (same fields, same config-load site); the load and count are
+proven here by driver mutation (force every request `bad` → the load oracle reds;
+corrupt the pool-counter reference → the exact-equal oracle reds).
+
 ### `reload-config-version` — is the server running the config you just loaded?
 
 `reload-cycle` above answers "did a new cycle appear, and did the old one go
