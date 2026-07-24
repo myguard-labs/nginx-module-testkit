@@ -187,6 +187,7 @@ M_FDS_BASE="$(master_fds || true)"
 
 # --- the soak series -------------------------------------------------------
 ABSORBED=0
+SNAPSHOTS=0            # post-reload snapshots actually taken (must reach RELOADS)
 PPID_STABLE=1
 FIRST_SET=0
 USED_REF=; BLOCKS_REF=; LARGE_REF=
@@ -197,6 +198,8 @@ for ((r = 1; r <= RELOADS; r++)); do
         ABSORBED=$((ABSORBED + 1))
     else
         echo "# reload $r was not absorbed within 5 s (no new worker answered)"
+        DRIFT="$DRIFT
+reload $r: no-new-worker"
         continue
     fi
 
@@ -218,6 +221,7 @@ reload $r: drain-timeout"
 reload $r: no-snapshot"
         continue
     fi
+    SNAPSHOTS=$((SNAPSHOTS + 1))
 
     if [ -n "$BASE_PPID" ] && [ "$SNAP_PPID" != "$BASE_PPID" ]; then
         PPID_STABLE=0
@@ -258,15 +262,19 @@ else
 fi
 
 # --- 2: comparable snapshots exist -----------------------------------------
-if [ "$FIRST_SET" -eq 1 ]; then
-    echo "ok 2 - post-reload snapshots were collected for comparison"
+# Require a snapshot from EVERY reload, not merely one: a partial series (some
+# reloads unabsorbed or unsnapshotted) must not be reported as a comparable set.
+# A shortfall already reddens oracle 1, but oracle 3 below would otherwise print
+# "identical across all $RELOADS reloads" having compared only a subset.
+if [ "$SNAPSHOTS" -eq "$RELOADS" ]; then
+    echo "ok 2 - post-reload snapshots were collected for all $RELOADS reloads"
 else
-    echo "not ok 2 - no post-reload snapshot could be taken; the comparisons below prove nothing"
+    echo "not ok 2 - only $SNAPSHOTS of $RELOADS post-reload snapshots taken; the comparisons below cover a subset"
     FAILED=$((FAILED + 1))
 fi
 
 # --- 3: worker cycle-pool counters flat across the series -----------------
-if [ -z "$DRIFT" ] && [ "$FIRST_SET" -eq 1 ]; then
+if [ -z "$DRIFT" ] && [ "$SNAPSHOTS" -eq "$RELOADS" ]; then
     echo "ok 3 - worker cycle-pool counters identical across all $RELOADS reloads"
     echo "# cycle_used=$USED_REF cycle_blocks=$BLOCKS_REF cycle_large=$LARGE_REF"
 else
