@@ -101,7 +101,7 @@ echo "1..6"
 # documented at length in reload-mid-upload/driver.sh lines ~99-142; the
 # reasoning is identical here, just applied to a read instead of a write.
 open_keepalive_conn() {
-    local marker=$1 pidvar=$2
+    local marker=$1 pidvar=$2 closedmarker=$3
     (
         exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
         printf 'GET / HTTP/1.1\r\nHost: prober\r\nConnection: keep-alive\r\n\r\n' >&3
@@ -136,13 +136,24 @@ open_keepalive_conn() {
         : >"$marker"
 
         # Block reading further. Nothing else is ever sent on this
-        # connection, so this call can only return by EOF -- i.e. the
-        # peer closed its end -- at which point this subshell exits.
-        # Ignore cat's exit status: an EOF-terminated read commonly
-        # reports non-zero despite delivering exactly what was expected
-        # (zero further bytes), same as the upload/download drivers'
-        # `cat <&3 2>/dev/null || true`.
-        cat <&3 >/dev/null 2>/dev/null || true
+        # connection, so this read can only return when the peer closes its
+        # end, at which point this subshell exits.
+        #
+        # PRESERVE the reader's exit status rather than swallowing it with
+        # `|| true`: a graceful nginx keepalive close on worker shutdown is a
+        # FIN, so `cat` sees a clean end-of-file and exits 0. A socket-read
+        # FAILURE (e.g. an RST, or the fd going bad for another reason) makes
+        # `cat` exit nonzero. We must not let those two look alike, or
+        # assertion 4 would print `ok` for a reader that failed rather than
+        # for the intended close/EOF path. So drop the `|| true` (this is the
+        # exit-status-swallowing pitfall the up/download drivers accept only
+        # because their oracle is liveness, not close-classification) and, on
+        # a clean EOF only, drop a CLOSED marker the caller can gate `ok 4`
+        # on. If `cat` exits nonzero, no marker is written and the subshell's
+        # own nonzero status is preserved.
+        if cat <&3 >/dev/null 2>/dev/null; then
+            : >"$closedmarker"
+        fi
     ) &
     printf -v "$pidvar" '%s' "$!"
 }
@@ -163,18 +174,42 @@ SETTLE_ITERS=100     # 100 * 50 ms = 5 s
 # assertion 4 would not discriminate a reload-caused close from ambient
 # noise, and this scenario would prove nothing.
 CONTROL_MARKER="$PROBER_PREFIX/control.ready"
-open_keepalive_conn "$CONTROL_MARKER" CONTROL_PID
+CONTROL_CLOSED="$PROBER_PREFIX/control.closed"
+open_keepalive_conn "$CONTROL_MARKER" CONTROL_PID "$CONTROL_CLOSED"
 
-control_alive=0
+# Wait for the control conn to become IDLE (its one response fully read, ready
+# marker dropped) BEFORE starting the liveness window. Without this gate the
+# window could elapse while the child is still connecting or reading the first
+# response -- then "stayed alive" would say nothing about an *idle* keepalive
+# socket, and the discrimination claim (an idle conn does not close on its own)
+# would be unproven. Fixed-step counted iterations, never a sleep. The child
+# must still be alive when the marker appears; if it died before ever reaching
+# the marker, readiness failed.
+control_ready=0
 for ((i = 0; i < SETTLE_ITERS; i++)); do
-    if kill -0 "$CONTROL_PID" 2>/dev/null; then
-        control_alive=1
-    else
-        control_alive=0
+    if [ -e "$CONTROL_MARKER" ]; then
+        control_ready=1
+        break
+    fi
+    if ! kill -0 "$CONTROL_PID" 2>/dev/null; then
         break
     fi
     sleep 0.05
 done
+
+control_alive=0
+if [ "$control_ready" -eq 1 ] && kill -0 "$CONTROL_PID" 2>/dev/null; then
+    # Now, and only now, time the idle socket across the full settle window.
+    for ((i = 0; i < SETTLE_ITERS; i++)); do
+        if kill -0 "$CONTROL_PID" 2>/dev/null; then
+            control_alive=1
+        else
+            control_alive=0
+            break
+        fi
+        sleep 0.05
+    done
+fi
 
 # Reap the control connection's subtree so it cannot linger into the real
 # run -- job control is off in a script (no process group to signal), so the
@@ -184,7 +219,10 @@ pkill -P "$CONTROL_PID" 2>/dev/null || true
 kill "$CONTROL_PID" 2>/dev/null || true
 wait "$CONTROL_PID" 2>/dev/null || true
 
-if [ "$control_alive" -eq 1 ]; then
+if [ "$control_ready" -eq 0 ]; then
+    echo "not ok 1 - the control idle keepalive conn was never established/idle in time"
+    FAILED=$((FAILED + 1))
+elif [ "$control_alive" -eq 1 ]; then
     echo "ok 1 - an idle keepalive conn stayed open on its own (close oracle discriminates)"
 else
     echo "not ok 1 - the idle keepalive conn closed itself with no reload (close oracle cannot discriminate)"
@@ -193,7 +231,8 @@ fi
 
 # --- open the REAL idle keepalive connection --------------------------------
 REAL_MARKER="$PROBER_PREFIX/real.ready"
-open_keepalive_conn "$REAL_MARKER" REAL_PID
+REAL_CLOSED="$PROBER_PREFIX/real.closed"
+open_keepalive_conn "$REAL_MARKER" REAL_PID "$REAL_CLOSED"
 
 # --- assertion 2: established and idle BEFORE signalling -------------------
 # Poll for the ready marker with fixed-step counted iterations, never a
@@ -215,13 +254,29 @@ for ((i = 0; i < SETTLE_ITERS; i++)); do
     sleep 0.05
 done
 
+READY_OK=0
 if [ "$marker_seen" -eq 1 ] && kill -0 "$REAL_PID" 2>/dev/null; then
+    READY_OK=1
     echo "ok 2 - the real idle keepalive conn is established and idle before the reload"
 else
     echo "not ok 2 - the real idle keepalive conn was never established/idle in time"
     FAILED=$((FAILED + 1))
 fi
 
+# READINESS IS A HARD GATE. If assertion 2 failed, the idle conn was never
+# established -- so sending the reload and then watching the (already-dead or
+# never-idle) subshell "exit" would let assertion 4 print `ok` for a close
+# that has nothing to do with the reload. Reap the child and mark the
+# dependent assertions 3+4 as failures rather than running them against an
+# unestablished conn. FAILED is already bumped for the not-ok-2 above.
+if [ "$READY_OK" -eq 0 ]; then
+    pkill -P "$REAL_PID" 2>/dev/null || true
+    kill "$REAL_PID" 2>/dev/null || true
+    wait "$REAL_PID" 2>/dev/null || true
+    echo "not ok 3 - skipped: the idle conn was never established (see not ok 2)"
+    echo "not ok 4 - skipped: the idle conn was never established (see not ok 2)"
+    FAILED=$((FAILED + 2))
+else
 # --- assertion 3: the reload is absorbed ------------------------------------
 # prober_signal_wait probes via /__probe on its OWN fresh connections --
 # independent of our idle conn -- and blocks until a different worker pid
@@ -240,6 +295,12 @@ fi
 # generous 100 * 50 ms = 5 s ceiling) for the real subshell to exit. It
 # should close near-immediately once graceful shutdown starts, well inside
 # the ceiling; the ceiling only exists to bound a genuine failure.
+#
+# The subshell writes REAL_CLOSED only on a CLEAN EOF (`cat` exit 0 -- a FIN
+# from a graceful worker shutdown). Gating `ok 4` on that marker, not merely
+# on the subshell being gone, means a subshell that exited because its read
+# FAILED (a nonzero `cat`, e.g. an RST or a bad fd) does NOT certify the
+# close/EOF path this oracle exists to prove.
 closed=0
 for ((i = 0; i < SETTLE_ITERS; i++)); do
     if ! kill -0 "$REAL_PID" 2>/dev/null; then
@@ -248,10 +309,13 @@ for ((i = 0; i < SETTLE_ITERS; i++)); do
     fi
     sleep 0.05
 done
+wait "$REAL_PID" 2>/dev/null || true
 
-if [ "$closed" -eq 1 ]; then
-    echo "ok 4 - the draining old worker closed the idle client keepalive conn"
-    wait "$REAL_PID" 2>/dev/null || true
+if [ "$closed" -eq 1 ] && [ -e "$REAL_CLOSED" ]; then
+    echo "ok 4 - the draining old worker closed the idle client keepalive conn (clean EOF)"
+elif [ "$closed" -eq 1 ]; then
+    echo "not ok 4 - the idle conn's reader exited without a clean EOF (read error, not a graceful close)"
+    FAILED=$((FAILED + 1))
 else
     echo "not ok 4 - the idle client keepalive conn was still open $((SETTLE_ITERS * 50))ms after the reload"
     # Kill the subtree so nothing lingers past this driver's exit.
@@ -260,6 +324,7 @@ else
     wait "$REAL_PID" 2>/dev/null || true
     FAILED=$((FAILED + 1))
 fi
+fi   # end READY_OK gate (assertions 3+4)
 
 # --- assertion 5: no worker died by signal ----------------------------------
 # prober_signal_wait's relaxed oracle cannot tell a reload from a crash (a
