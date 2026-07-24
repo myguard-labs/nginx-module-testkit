@@ -1,0 +1,26 @@
+# The post-death coherence case, run by the driver AFTER the killed worker has
+# been replaced and drained in. It proves the replacement is a WORKING worker:
+# it serves a correct 200, leaks no descriptor within the case, and logs nothing
+# on the error path around the request.
+#
+# The pid oracle is STRICT (no pid_may_change) and that is correct: the kill and
+# the respawn both happened OUTSIDE this prober invocation, so both of the case's
+# probe snapshots see the one settled replacement worker. pid_may_change would be
+# a vacuous no-op here; the death-spanning assertions this scenario exists to
+# make are the driver's, which compare probe snapshots taken on either side of
+# the kill. This case only certifies that whatever worker remains works.
+#
+# Note it does NOT assert on the error log's KILL line: the log legitimately
+# carries "worker process NNNN exited on signal 9" from the driver's kill, which
+# is the whole point of the scenario. no_error_log here is scoped to \[error\]
+# on THIS request's path -- the signal-9 notice is an nginx-level info/alert
+# line, not a per-request error, and the driver's oracle 2 is what asserts it
+# positively.
+
+name    the replacement worker serves cleanly
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+no_error_log  \[error\]

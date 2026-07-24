@@ -1141,6 +1141,36 @@ from `reload-cycle` (same fields, same config-load site); the load and count are
 proven here by driver mutation (force every request `bad` → the load oracle reds;
 corrupt the pool-counter reference → the exact-equal oracle reds).
 
+### `worker-death` — a killed worker's blast radius
+
+Every reload scenario above sends `SIGHUP` and asserts that **no** worker died
+by signal. `worker-death` is the mirror image: it `SIGKILL`s the single worker
+while it is the one serving the probe, lets the master respawn it, and asserts
+that the death was **contained**.
+
+The load-bearing oracle is the non-vacuity control. A crash-respawned worker
+keeps its master's pid — *measured*, not assumed — so "a different pid answers"
+and "still a child of the same master" are both satisfied by a respawn and
+cannot tell a crash from a reload. Without a **positive** assertion that a
+worker exited on signal 9, every other oracle passes on a server that was never
+killed at all. That assertion reads the `exited on signal 9` line out of the
+error log, separately from any pid oracle, because the process-identity oracles
+are blind to it. A companion oracle then requires **no other** signal death (no
+`SIGSEGV`/`SIGABRT`/`SIGBUS`, no second signal-9) — a contained kill leaves
+exactly the one line we caused.
+
+The remaining oracles prove the master rode it out: the replacement's
+`cycle_used`/`cycle_blocks`/`cycle_large` must **equal** the killed worker's (a
+fresh fork of the same master parsing the same already-loaded config — no
+reparse, so identical), the master's descriptor count must be flat (it must
+close the dead worker's channel fd), the replacement's `ppid` must still be the
+original master (the master itself did not die), and a strict prober case proves
+the replacement serves a clean 200. The kill's `[alert]` log line is exempted
+via the scenario's `env` (`PROBER_ALLOW_LOG`), pinned to `signal 9` only so a
+fault signal still reds the log scrape as a backstop. Non-vacuity is proven by
+driver mutation (`kill -9` → `kill -0` kills nothing → the signal-9 oracle reds;
+corrupt the pool-counter reference → the footprint oracle reds).
+
 ### `reload-config-version` — is the server running the config you just loaded?
 
 `reload-cycle` above answers "did a new cycle appear, and did the old one go
