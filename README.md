@@ -1149,8 +1149,8 @@ field, so a gate built on it would be silently absent on every nginx leg. The
 harness keeps its own counter, which is a plain process global because the only
 writer is the master, during config load, strictly before it forks the workers
 that read it. It does not survive a binary upgrade (`execve` resets the image),
-which is correct for a `SIGHUP` gate and is why a USR2 state machine must use
-the pidfile/`.oldbin` observables instead.
+which is correct for a `SIGHUP` gate and is why the `usr2-state-machine` scenario
+below uses the pidfile/`.oldbin` observables instead.
 
 A counter that only asserts about itself would be the classic vacuous gate, so
 each reload **rewrites the rendered conf** (a `marker=<n>` in the `/` response
@@ -1159,6 +1159,34 @@ accepts the generation as meaningful. Negative control B neutralises that
 rewrite: the generation still advances — reloading an identical config is still
 a config load — so the generation oracle stays green and the marker oracle reds,
 proving the two are not restating each other.
+
+### `usr2-state-machine` — the binary-upgrade master-generation state machine
+
+A `SIGUSR2` binary upgrade execs a **new master** from the old master's inherited
+fd table, so the two generations coexist for a window: the old master renames its
+pidfile to `nginx.pid.oldbin` and the new master writes a fresh `nginx.pid`, both
+naming a distinct live process. This scenario observes that state machine directly
+— pidfile hand-off, `.oldbin` lifecycle, and the survival of the **inherited
+listen socket** — where `backend-usr2-keepalive` proves the orthogonal half (the
+new-exec worker reconnects an upstream keepalive pool it did not inherit). Split
+by subject so a failure names which half broke.
+
+The headline oracle is the listen socket. Because the new master execs from the
+inherited fd table, its listening socket is the *same kernel socket object*, not a
+fresh `bind()`. The driver reads the inode behind the master's listening fd from
+`/proc/<master>/fd` (cross-checked against a `LISTEN` state in `/proc/net/tcp`)
+and asserts it is **identical** on the old master, the new master, and the new
+master *after the old one is QUIT* — a re-bind would change the inode and would
+race a `bind()` against the still-held socket. The port must also keep answering
+across every transition (a surviving socket is meaningless with a refused window).
+Linux-only: skipped visibly where `/proc` fd links are unreadable.
+
+The `.oldbin` teardown oracle then retires the old master (`WINCH` to drain its
+workers, `QUIT` to stop it, targeting the pid from `nginx.pid.oldbin`) and requires
+`nginx.pid.oldbin` to **disappear** while `nginx.pid` still holds the new master —
+a lingering `.oldbin` is a stuck upgrade. Runs under `PROBER_DAEMON_MODE=on`: USR2
+is silently dropped under `daemon off` (see `check_conf` and the fake-upstream USR2
+notes), so the boot contract demands a daemonized master tracked by its pidfile.
 
 ### Running scenarios under valgrind (weekly)
 

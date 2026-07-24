@@ -1,0 +1,13 @@
+# PROBER_DAEMON_MODE=on is the boot-contract opt-in this scenario requires. A
+# USR2 binary upgrade cannot be delivered to a foregrounded (daemon off) master
+# -- ngx_signal_handler drops NGX_CHANGEBIN when getppid()==ngx_parent, which
+# always holds for a daemon-off master whose parent is prober_boot's `&`
+# launcher, so the master logs "the changing binary signal is ignored" and no
+# new master forks. The opt-in inverts prober_check_conf's daemon gate (it now
+# demands `daemon on;` plus a pidfile at $PROBER_PREFIX/nginx.pid) and switches
+# prober_boot/prober_stop from tracking the master by $! to tracking it by that
+# pidfile. See the backend-usr2-keepalive scenario's env for the same contract.
+#
+# Sourced per-scenario in a run-scenario.sh subprocess, so the opt-in cannot
+# leak into any other scenario's boot.
+PROBER_DAEMON_MODE=on
