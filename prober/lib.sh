@@ -611,6 +611,86 @@ prober_probe_field() {
     printf '%s\n' "$val"
 }
 
+# prober_probe_normalize BODY
+#
+# Echo a normalized rendering of a probe BODY for the nginx-vs-angie flavor
+# differential (scenarios/flavor-differential): every field that is legitimate
+# to differ across flavor, across a flavor's own release line, or across an
+# unrelated environment/run axis is replaced with a fixed placeholder token;
+# every FLAVOR-INVARIANT field is passed through untouched. Two documents that
+# agree on every invariant field become byte-identical after this, regardless
+# of which flavor or which run produced them -- which is exactly the property
+# a checked-in golden needs in order to be a real cross-flavor assertion
+# rather than a coin flip on unrelated noise.
+#
+# MASKED (replaced with a fixed token -- legitimately differs, not a bug):
+#   flavor             IS the axis under test: "nginx" vs "angie" by design.
+#                       Structural presence/shape is asserted by the caller
+#                       instead (a nonempty quoted string), never the literal
+#                       value, or the golden could only ever match one flavor.
+#   flavor_version     differs by construction between nginx 1.28.0/1.29.0 and
+#                       angie 1.12.0, and again on the next release of any of
+#                       them.
+#   pid, ppid          OS-assigned; a different value every boot on either
+#                       flavor.
+#   config_generation   a process-global counter (see ngx_test_probe.h): its
+#                       baseline depends on how many times THIS worker's
+#                       master has loaded config before the probe fired, a
+#                       run/harness artifact, not a flavor property.
+#   pool.cycle_used,    MEASURED to differ (3 runs each, both stable but
+#   pool.cycle_blocks,  disagreeing): nginx 1.29.0 and angie 1.12.0 allocate a
+#   pool.cycle_large    different amount from the cycle pool during their own
+#                       startup / module init on an otherwise-identical conf.
+#                       A genuine per-flavor startup difference, not a leak.
+#   fds,                ENVIRONMENT-fragile, not flavor-invariant. Locally both
+#   connections.free    flavors read fds=10 / free=13, but the CI matrix legs
+#                       (nginx 1.28.0/1.29.0/angie 1.12.0 + the ASan leg) all
+#                       disagreed with a golden pinning those absolutes: the
+#                       open-fd baseline at probe time depends on the runner's
+#                       inherited fds, the build's own descriptors (ASan opens
+#                       its own), and per-release listener/log fd handling --
+#                       none of it a cross-flavor property. connections.free is
+#                       total minus in-use, so it moves with the same fd noise.
+#                       (An earlier note called both "MEASURED identical"; that
+#                       was a single-host measurement mistaken for an invariant
+#                       -- the CI legs are the wider sample that refuted it.)
+#
+# INVARIANT (passed through untouched -- both flavors must produce the exact
+# same value on a freshly booted, request-free server, or the diff reds):
+#   page_size           ngx_pagesize; same host/libc/getconf(_SC_PAGESIZE) for
+#                       both binaries -- this is the "opposite" case the
+#                       driver's mutation proof checks (host-dependent, not
+#                       flavor-dependent; masking it would be wrong in the
+#                       other direction).
+#   connections.total   worker_connections from the shared conf template,
+#                       echoed back structurally -- both flavors render the
+#                       same template, so this must be identical or the
+#                       config layer itself diverged. Unlike free/fds this is
+#                       a pure config echo, not a runtime fd count.
+#   zone.present        no zone is configured in this scenario's conf, so both
+#                       flavors must report false.
+#
+# Deliberately no JSON parser: same discipline as prober_probe_field, and for
+# the same reason -- the document is flat enough that a handful of sed
+# substitutions is simpler and more auditable than linking a parser into
+# shell.
+prober_probe_normalize() {
+    local body="$1"
+
+    printf '%s' "$body" \
+        | sed -E \
+            -e 's/"flavor"[[:space:]]*:[[:space:]]*"[^"]*"/"flavor":"MASKED"/' \
+            -e 's/"flavor_version"[[:space:]]*:[[:space:]]*"[^"]*"/"flavor_version":"MASKED"/' \
+            -e 's/"pid"[[:space:]]*:[[:space:]]*[0-9]+/"pid":MASKED/' \
+            -e 's/"ppid"[[:space:]]*:[[:space:]]*[0-9]+/"ppid":MASKED/' \
+            -e 's/"config_generation"[[:space:]]*:[[:space:]]*[0-9]+/"config_generation":MASKED/' \
+            -e 's/"cycle_used"[[:space:]]*:[[:space:]]*[0-9]+/"cycle_used":MASKED/' \
+            -e 's/"cycle_blocks"[[:space:]]*:[[:space:]]*[0-9]+/"cycle_blocks":MASKED/' \
+            -e 's/"cycle_large"[[:space:]]*:[[:space:]]*[0-9]+/"cycle_large":MASKED/' \
+            -e 's/"free"[[:space:]]*:[[:space:]]*[0-9]+/"free":MASKED/' \
+            -e 's/"fds"[[:space:]]*:[[:space:]]*[0-9]+/"fds":MASKED/'
+}
+
 # prober_signal_wait SIG PID HOST PORT TIMEOUT_MS
 #
 # Send SIG to the master, then wait until the reload has actually been ABSORBED
