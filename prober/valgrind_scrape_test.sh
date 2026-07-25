@@ -96,8 +96,10 @@ cat > "$SCRATCH/clean.c" <<'EOF'
 int main(void) { return 0; }
 EOF
 
-"$CC" -O0 -g -o "$SCRATCH/leaky" "$SCRATCH/leaky.c"
-"$CC" -O0 -g -o "$SCRATCH/clean" "$SCRATCH/clean.c"
+# shellcheck disable=SC2086  # CC may carry flags (e.g. "gcc -m32"); word-split like build.sh
+$CC -O0 -g -o "$SCRATCH/leaky" "$SCRATCH/leaky.c"
+# shellcheck disable=SC2086
+$CC -O0 -g -o "$SCRATCH/clean" "$SCRATCH/clean.c"
 
 # --- 1/2: --error-exitcode DOES turn a real finding into a failing exit -----
 # `|| rc=$?` rather than a bare call: under `set -e` a plain nonzero-exit
