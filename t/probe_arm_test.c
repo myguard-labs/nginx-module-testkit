@@ -2,11 +2,13 @@
  * Copyright (C) 2026 Thijs Eilander
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * probe_arm_test.c -- TAP self-test for the fault_slab= query parser.
+ * probe_arm_test.c -- TAP self-test for the fault_*= query parser.
  *
  * ngx_test_probe_arm() is a parser of attacker-shaped text that arms a fault
- * injector, and it had no tests. Three things about it are easy to get subtly
- * wrong and impossible to notice from a rule file that passes:
+ * injector at one of several sibling sites (fault_slab=, fault_palloc=,
+ * fault_tempfile=, fault_accept=), and it had no tests. Four things about it
+ * are easy to get subtly wrong and impossible to notice from a rule file that
+ * passes:
  *
  *   1. The key must be a whole query argument. Matched as a substring,
  *      "not_fault_slab=1" arms the injector through a parameter nobody wrote --
@@ -21,6 +23,10 @@
  *      ngx_int_t -- undefined behaviour, and in practice an arbitrary,
  *      possibly negative fault index.
  *
+ *   4. The key must route to the right SITE. A parser that armed every query
+ *      as the slab site regardless of key would misroute fault_palloc= and
+ *      look correct to any value-only check.
+ *
  * The zone pointer is passed straight through to the hook and never
  * dereferenced, so a tagged dummy address is enough to prove it arrives intact.
  */
@@ -33,15 +39,16 @@
 
 /* Bumped by hand: a vanished test should show up as a plan mismatch rather
  * than as a smaller green run. */
-#define PLANNED  36
+#define PLANNED  53
 
 static int  tests_run = 0;
 static int  failures = 0;
 
 /* What the hook saw on the last call, and how many times it was called. */
-static ngx_shm_zone_t  *seen_zone;
-static ngx_int_t        seen_value;
-static int              calls;
+static ngx_shm_zone_t         *seen_zone;
+static ngx_int_t               seen_value;
+static ngx_test_probe_fault_e  seen_fault;
+static int                     calls;
 
 
 static void
@@ -58,10 +65,12 @@ ok(int cond, const char *name)
 
 
 static ngx_int_t
-recording_fault_set(ngx_shm_zone_t *zone, ngx_int_t nth)
+recording_fault_set(ngx_shm_zone_t *zone, ngx_test_probe_fault_e fault,
+    ngx_int_t nth)
 {
     calls++;
     seen_zone = zone;
+    seen_fault = fault;
     seen_value = nth;
 
     return NGX_OK;
@@ -95,6 +104,7 @@ arm(const char *query)
     calls = 0;
     seen_zone = NULL;
     seen_value = -12345;
+    seen_fault = (ngx_test_probe_fault_e) -1;
 
     return ngx_test_probe_arm(ZONE, &args);
 }
@@ -122,21 +132,38 @@ declines(const char *query, const char *name)
 }
 
 
-/* Accepted, and the hook received exactly this value and this zone. */
+/*
+ * Accepted, and the hook received exactly this value, this site and this zone.
+ *
+ * The site is load-bearing: it proves the key-to-enum mapping in the parser's
+ * table, not merely that some key matched. A parser that armed every query as
+ * SLAB regardless of the key would pass a value-only check while silently
+ * misrouting fault_palloc= to the slab site.
+ */
 static void
-arms_with(const char *query, ngx_int_t want, const char *name)
+arms_site(const char *query, ngx_test_probe_fault_e site, ngx_int_t want,
+    const char *name)
 {
     ngx_int_t rc = arm(query);
     int       good = (rc == NGX_OK && calls == 1 && seen_value == want
-                      && seen_zone == ZONE);
+                      && seen_fault == site && seen_zone == ZONE);
 
     if (!good) {
-        printf("# %s: rc=%ld calls=%d value=%ld (want %ld) zone=%s\n", name,
-               (long) rc, calls, (long) seen_value, (long) want,
+        printf("# %s: rc=%ld calls=%d value=%ld (want %ld) fault=%d (want %d) "
+               "zone=%s\n", name, (long) rc, calls, (long) seen_value,
+               (long) want, (int) seen_fault, (int) site,
                seen_zone == ZONE ? "ok" : "WRONG");
     }
 
     ok(good, name);
+}
+
+
+/* The slab site: the original tests all name it, so keep them terse. */
+static void
+arms_with(const char *query, ngx_int_t want, const char *name)
+{
+    arms_site(query, NGX_TEST_PROBE_FAULT_SLAB, want, name);
 }
 
 
@@ -246,6 +273,61 @@ main(void)
         ok(rc == NGX_DECLINED && calls == 0,
            "a query shorter than the key does not arm");
     }
+
+    /* ---- the sibling fault sites -------------------------------------- */
+
+    /*
+     * Each new site gets the same five checks as fault_slab plus a routing
+     * check: valid arm (routed to the right enum), disarm via a negative,
+     * whole-arg boundary reject, trailing-junk reject, digit-overflow reject.
+     * The routing assertion (arms_site's site check) is what proves the key
+     * table maps fault_palloc= to PALLOC and not to SLAB.
+     */
+
+    arms_site("fault_palloc=1", NGX_TEST_PROBE_FAULT_PALLOC, 1,
+              "fault_palloc arms and routes to the palloc site");
+    arms_site("fault_palloc=-1", NGX_TEST_PROBE_FAULT_PALLOC, -1,
+              "fault_palloc disarms with a negative value");
+    declines("not_fault_palloc=1",
+             "a suffix of fault_palloc does not arm");
+    declines("fault_palloc=1junk",
+             "fault_palloc with trailing junk does not arm");
+    declines("fault_palloc=99999",
+             "fault_palloc one digit past the bound does not arm");
+
+    arms_site("fault_tempfile=2", NGX_TEST_PROBE_FAULT_TEMPFILE, 2,
+              "fault_tempfile arms and routes to the tempfile site");
+    arms_site("fault_tempfile=-1", NGX_TEST_PROBE_FAULT_TEMPFILE, -1,
+              "fault_tempfile disarms with a negative value");
+    declines("not_fault_tempfile=1",
+             "a suffix of fault_tempfile does not arm");
+    declines("fault_tempfile=1junk",
+             "fault_tempfile with trailing junk does not arm");
+    declines("fault_tempfile=99999",
+             "fault_tempfile one digit past the bound does not arm");
+
+    arms_site("fault_accept=3", NGX_TEST_PROBE_FAULT_ACCEPT, 3,
+              "fault_accept arms and routes to the accept site");
+    arms_site("fault_accept=-1", NGX_TEST_PROBE_FAULT_ACCEPT, -1,
+              "fault_accept disarms with a negative value");
+    declines("not_fault_accept=1",
+             "a suffix of fault_accept does not arm");
+    declines("fault_accept=1junk",
+             "fault_accept with trailing junk does not arm");
+    declines("fault_accept=99999",
+             "fault_accept one digit past the bound does not arm");
+
+    /* A sibling key is found after an '&' just like fault_slab, and still
+     * routes to its own site -- the boundary logic is shared, the routing is
+     * not. */
+    arms_site("a=1&fault_accept=4", NGX_TEST_PROBE_FAULT_ACCEPT, 4,
+              "a sibling key after an & is found and routes correctly");
+
+    /* fault_palloc is not a prefix of any other key, but guard the reverse:
+     * fault_slab must not be matched by fault_palloc's presence, and vice
+     * versa -- each key stands alone. */
+    arms_site("fault_palloc=5&fault_slab=6", NGX_TEST_PROBE_FAULT_PALLOC, 5,
+              "the earliest sibling key wins over a later one");
 
     if (tests_run != PLANNED) {
         printf("# ran %d tests but the plan says %d\n", tests_run, PLANNED);

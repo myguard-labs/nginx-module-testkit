@@ -37,47 +37,50 @@ ngx_test_probe_register(const ngx_test_probe_hooks_t *hooks)
 }
 
 
-ngx_int_t
-ngx_test_probe_arm(ngx_shm_zone_t *zone, ngx_str_t *args)
+/*
+ * The sibling keys, one per fault site. Whole-query-arg matched, each with the
+ * identical boundary/digit-bound/malformed contract -- a query is compared
+ * against every key so that the SITE, not the parser, is what varies.
+ *
+ * The .fault field indexes ngx_test_probe_fault_e; the table order need not
+ * match the enum, but every enum value must appear exactly once. A missing key
+ * would make that site unreachable from a query; a duplicate would make the
+ * later one dead.
+ */
+typedef struct {
+    const char              *key;     /* includes the trailing '=' */
+    size_t                   keylen;  /* strlen(key) */
+    ngx_test_probe_fault_e   fault;
+} ngx_test_probe_fault_key_t;
+
+#define NGX_TEST_PROBE_FAULT_KEY(s, f)  { (s), sizeof(s) - 1, (f) }
+
+static const ngx_test_probe_fault_key_t  ngx_test_probe_fault_keys[] = {
+    NGX_TEST_PROBE_FAULT_KEY("fault_slab=",     NGX_TEST_PROBE_FAULT_SLAB),
+    NGX_TEST_PROBE_FAULT_KEY("fault_palloc=",   NGX_TEST_PROBE_FAULT_PALLOC),
+    NGX_TEST_PROBE_FAULT_KEY("fault_tempfile=", NGX_TEST_PROBE_FAULT_TEMPFILE),
+    NGX_TEST_PROBE_FAULT_KEY("fault_accept=",   NGX_TEST_PROBE_FAULT_ACCEPT)
+};
+
+#define NGX_TEST_PROBE_FAULT_KEY_N \
+    (sizeof(ngx_test_probe_fault_keys) / sizeof(ngx_test_probe_fault_keys[0]))
+
+
+/*
+ * Parse the value that begins at `v` and runs to `end` (the value part of one
+ * already-matched key). On a well-formed value -- optional '-', then one to
+ * NGX_TEST_PROBE_FAULT_MAX_DIGITS digits, then the arg boundary ('&' or end) --
+ * stores the signed result through *out and returns NGX_OK. Anything else
+ * (empty, lone minus, trailing junk, digit overflow) returns NGX_DECLINED so
+ * the contract for malformed input is a refusal, never a best guess.
+ */
+static ngx_int_t
+ngx_test_probe_parse_nth(u_char *v, u_char *end, ngx_int_t *out)
 {
-    static const u_char  key[] = "fault_slab=";
-    const size_t         keylen = sizeof(key) - 1;
+    int         negative;
+    ngx_uint_t  digits;
+    ngx_int_t   value;
 
-    int                  negative;
-    ngx_uint_t           digits;
-    u_char              *p, *end, *v;
-    ngx_int_t            value;
-
-    if (ngx_test_probe_hooks.fault_set == NULL) {
-        return NGX_DECLINED;
-    }
-
-    if (zone == NULL || args == NULL || args->len < keylen) {
-        return NGX_DECLINED;
-    }
-
-    end = args->data + args->len;
-
-    /*
-     * Match the key as a whole query argument, not as a substring: it must
-     * start the query or follow an '&', or "not_fault_slab=1" would arm the
-     * injector through a parameter nobody wrote.
-     */
-    for (p = args->data; (size_t) (end - p) >= keylen; p++) {
-        if (ngx_strncmp(p, key, keylen) != 0) {
-            continue;
-        }
-
-        if (p == args->data || p[-1] == '&') {
-            break;
-        }
-    }
-
-    if ((size_t) (end - p) < keylen) {
-        return NGX_DECLINED;
-    }
-
-    v = p + keylen;
     negative = 0;
 
     if (v < end && *v == '-') {
@@ -94,13 +97,13 @@ ngx_test_probe_arm(ngx_shm_zone_t *zone, ngx_str_t *args)
 
     while (v < end && *v >= '0' && *v <= '9') {
         /*
-         * Bounded before the multiply, not after. The nth-allocation counter
-         * this feeds is small by nature -- rules arm the 1st or 2nd slab
-         * allocation -- so nothing legitimate reaches even four digits, while
-         * an unbounded accumulate overflows ngx_int_t on a long enough digit
-         * run, which is undefined behaviour and would land as an arbitrary
-         * (possibly negative) fault index rather than as the refusal the
-         * caller expects for garbage.
+         * Bounded before the multiply, not after. The nth-event counter this
+         * feeds is small by nature -- rules arm the 1st or 2nd event -- so
+         * nothing legitimate reaches even four digits, while an unbounded
+         * accumulate overflows ngx_int_t on a long enough digit run, which is
+         * undefined behaviour and would land as an arbitrary (possibly
+         * negative) fault index rather than as the refusal the caller expects
+         * for garbage.
          */
         if (++digits > NGX_TEST_PROBE_FAULT_MAX_DIGITS) {
             return NGX_DECLINED;
@@ -117,11 +120,65 @@ ngx_test_probe_arm(ngx_shm_zone_t *zone, ngx_str_t *args)
         return NGX_DECLINED;
     }
 
-    if (negative) {
-        value = -value;
+    *out = negative ? -value : value;
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_test_probe_arm(ngx_shm_zone_t *zone, ngx_str_t *args)
+{
+    ngx_uint_t   i;
+    u_char      *p, *end;
+    ngx_int_t    value;
+
+    if (ngx_test_probe_hooks.fault_set == NULL) {
+        return NGX_DECLINED;
     }
 
-    return ngx_test_probe_hooks.fault_set(zone, value);
+    if (zone == NULL || args == NULL || args->len == 0) {
+        return NGX_DECLINED;
+    }
+
+    end = args->data + args->len;
+
+    /*
+     * Walk the query once. At each position that begins a query argument (the
+     * start, or just after an '&'), try every sibling key. Matching this way
+     * rather than substring-searching is the whole boundary contract: it must
+     * start the query or follow an '&', or "not_fault_slab=1" would arm the
+     * injector through a parameter nobody wrote. The first key that matches at
+     * the earliest argument wins.
+     */
+    for (p = args->data; p < end; p++) {
+
+        if (p != args->data && p[-1] != '&') {
+            continue;
+        }
+
+        for (i = 0; i < NGX_TEST_PROBE_FAULT_KEY_N; i++) {
+            const ngx_test_probe_fault_key_t  *k = &ngx_test_probe_fault_keys[i];
+
+            if ((size_t) (end - p) < k->keylen) {
+                continue;
+            }
+
+            if (ngx_strncmp(p, k->key, k->keylen) != 0) {
+                continue;
+            }
+
+            if (ngx_test_probe_parse_nth(p + k->keylen, end, &value)
+                != NGX_OK)
+            {
+                return NGX_DECLINED;
+            }
+
+            return ngx_test_probe_hooks.fault_set(zone, k->fault, value);
+        }
+    }
+
+    return NGX_DECLINED;
 }
 
 #else
