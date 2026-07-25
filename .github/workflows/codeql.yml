@@ -34,7 +34,7 @@ concurrency:
 
 jobs:
   analyze:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
 
     # Scoped to this job rather than the file: uploading a SARIF result is the
     # only reason any of this needs write anywhere, and ci.yml's top-level

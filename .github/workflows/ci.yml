@@ -17,7 +17,7 @@ jobs:
   # The harness's own parsers and assertion evaluators, as pure functions. No
   # server involved, so this is fast and is the gate that actually blocks.
   selftest:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     strategy:
       fail-fast: false
       matrix:
@@ -48,7 +48,7 @@ jobs:
   # sweep is well under a minute, and a coverage gap is cheapest to fix in the PR
   # that introduces it.
   mutation:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -70,7 +70,7 @@ jobs:
   # exits 0" is the canonical vacuous fuzz gate, and the standalone driver has no
   # reporting path at all -- only the process living or dying.
   fuzz-replay:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -97,7 +97,7 @@ jobs:
   # scenarios matrix) because Cachegrind must LAUNCH the process it measures and
   # cannot attach to a live nginx worker; it drives json_parse_n directly.
   cachegrind-scale:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -119,7 +119,7 @@ jobs:
   # ngx_* types, the slab pool layout and the ngx_slprintf format specifiers all
   # come from the server, and a mismatch there only shows up here.
   probe-compiles:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     strategy:
       fail-fast: false
       matrix:
@@ -493,7 +493,7 @@ jobs:
   # scenario, so splitting further would pay the nginx build cost repeatedly to
   # learn nothing extra.
   scenarios:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     strategy:
       fail-fast: false
       matrix:
@@ -714,7 +714,7 @@ jobs:
           cp /tmp/rule.orig "$RULE"
 
   header-self-sufficiency:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -751,7 +751,7 @@ jobs:
           fi
 
   shell:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -822,7 +822,7 @@ jobs:
   # are static in the sense that they assert on the repository itself rather
   # than on behaviour, so they belong together in one cheap job.
   hygiene:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -901,7 +901,7 @@ jobs:
   # SOURCE_DATE_EPOCH is exported for the same reason: it gives any timestamp a
   # build might reach for a fixed value instead of "now".
   reproducible-build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -971,7 +971,7 @@ jobs:
   # selections below are therefore load-bearing: each exclusion is a category
   # judged unactionable for THIS codebase, not a way to reach zero.
   analyzers:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -1095,7 +1095,7 @@ jobs:
   # analyzers job all compile under them too -- a flag that only CI passes is
   # a flag nobody develops against.
   build-flags-canary:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -1203,7 +1203,7 @@ jobs:
   # only passes with the strict flags loosened would be hiding exactly the
   # class of bug this leg exists to catch.
   build-32bit:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -1278,7 +1278,7 @@ jobs:
   # verifying the generated name is registered in `locale -a` avoids depending
   # on the runner image's default /etc/locale.gen contents.
   locale-hostility:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -1359,7 +1359,7 @@ jobs:
   # License-header gate: all .c and .h files must carry BSD-2-Clause SPDX
   # identifier (project policy for nginx modules).
   license-headers:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
