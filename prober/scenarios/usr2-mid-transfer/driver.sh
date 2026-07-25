@@ -82,7 +82,11 @@ serves_ok() {   # a fresh connection is accepted and answers 200
 read_pidfile() {   # $1 = pidfile path; echoes a live pid or nothing
     [ -s "$1" ] || return 0
     local p
-    p="$(tr -d '[:space:]' < "$1" 2>/dev/null)"
+    # Brace-group the input redirect so its OWN open failure is suppressed: `[ -s ]`
+    # and this read are not atomic, and `tr ... < "$1" 2>/dev/null` only silences
+    # tr's stderr, not the shell's redirect-open error (which leaks a stray "No such
+    # file or directory" when the master unlinks the pidfile between the two).
+    p="$( { tr -d '[:space:]' <"$1"; } 2>/dev/null )"
     # MUST return 0 even with no live pid: absence is a normal outcome (missing
     # .oldbin, an already-retired master, or a pidfile caught mid-rewrite during
     # the two-master overlap). Callers detect it via empty stdout; a non-zero
