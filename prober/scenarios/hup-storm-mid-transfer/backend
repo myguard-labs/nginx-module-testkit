@@ -1,0 +1,19 @@
+# The upstream serves a CORRECT reply, but DRIPS it slowly enough to outlast a
+# whole 10-SIGHUP storm, not just one reload. backend-reload-inflight's 40-byte
+# value @ 4 B/300 ms (~3 s total) is sized for ONE reload; this scenario fires
+# TEN, each costing a prober_signal_wait round trip that can itself cost real
+# wall-clock time on a loaded runner. Budget generously: a 120-byte value @
+# 2 B/300 ms drips for ~18 s -- comfortably longer than ten HUP round trips
+# even on a slow/loaded box (each HUP+probe-poll typically completes in well
+# under a second), while still finishing safely inside the driver's own
+# bounded join deadline.
+#
+# Gated by backend-smoke: an adversarially-timed reply proves nothing unless
+# the same fake is first proven correct when told to behave normally.
+proto   memcached
+seed    slow    AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMMNNNNOOOOPPPPQQQQRRRRSSSSTTTTUUUUVVVVWWWWXXXXYYYYZZZZ0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffffgggg
+
+# on=get:1 so ONLY the in-flight held request drips; the pre-storm baseline
+# ordering check and the post-storm coherence leg (get:2, get:3, ...) are
+# served at full speed and are not themselves what spans the storm.
+fault   on=get:1    action=drip    bytes=2    ms=300
