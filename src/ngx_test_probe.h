@@ -85,14 +85,45 @@
 
 
 /*
- * Digit limit for the fault_slab= value.
+ * Digit limit for a fault_*= value.
  *
- * The counter it feeds is an nth-allocation index -- rules arm the 1st or 2nd
+ * The counter it feeds is an nth-event index -- rules arm the 1st or 2nd
  * slab allocation -- so four digits is already far past anything meaningful,
  * while an unbounded accumulate overflows ngx_int_t and lands as an arbitrary
  * fault index instead of the refusal a caller expects for garbage.
  */
 #define NGX_TEST_PROBE_FAULT_MAX_DIGITS  4
+
+
+/*
+ * The fault sites the probe knows how to arm.
+ *
+ * Fault injection is CONSUMER-DRIVEN: the probe recognises WHICH site a query
+ * names and hands the parsed nth to the module's fault_set hook tagged with
+ * that site, but the module owns every actual injection point. A module arms
+ * only the sites it has wired up and returns NGX_DECLINED for the rest, so a
+ * query naming a site the module does not implement is refused, not silently
+ * dropped on the floor as if it took.
+ *
+ * WHY SIBLING KEYS (fault_slab=, fault_palloc=, ...) RATHER THAN ONE
+ * fault_site=NAME:nth. The arm parser is a parser of attacker-shaped text and
+ * its whole reason for existing is the boundary/digit-bound/malformed contract
+ * around a single whole-query-arg match. A sibling key reuses that exact match
+ * shape verbatim -- start-or-after-'&', value ends at the arg boundary -- so
+ * every site inherits the same proven contract and is independently unit
+ * testable against it. A single fault_site=NAME:nth would fold a second parser
+ * (the NAME:nth split, its own boundary and malformed cases) inside the first,
+ * multiplying the attacker-text surface the file was split out to keep small.
+ *
+ * The values are stable across builds only in that fault_slab stays first; a
+ * consumer switches on the enum, never on its integer value.
+ */
+typedef enum {
+    NGX_TEST_PROBE_FAULT_SLAB = 0,   /* ngx_slab_alloc failure          */
+    NGX_TEST_PROBE_FAULT_PALLOC,     /* ngx_palloc/ngx_pnalloc failure  */
+    NGX_TEST_PROBE_FAULT_TEMPFILE,   /* temp-file creation failure      */
+    NGX_TEST_PROBE_FAULT_ACCEPT      /* accept() EMFILE                 */
+} ngx_test_probe_fault_e;
 
 
 /*
@@ -129,17 +160,23 @@ typedef struct {
     u_char    *(*zone_render)(u_char *buf, u_char *last, ngx_shm_zone_t *zone);
 
     /*
-     * Arm or clear fault injection at nth (a negative value disarms).
+     * Arm or clear fault injection for `fault` at nth (a negative value
+     * disarms).
      *
-     * The probe parses and validates the query argument; the module only
-     * stores the result, because where that counter lives (shm vs process
+     * The probe parses and validates the query argument and identifies which
+     * fault site the query named; the module only stores the result for the
+     * site it was handed, because where that counter lives (shm vs process
      * global) is a module decision with correctness consequences -- a counter
      * in a process global is armed in one worker and tripped in another.
      *
-     * Returns NGX_OK if applied, NGX_DECLINED if this module has no fault site
-     * or the zone is not ready.
+     * A module implements only the sites it has fault points for and returns
+     * NGX_DECLINED for any other `fault` value: the same answer as "no fault
+     * site at all", so a query naming an unimplemented site is refused rather
+     * than reported applied. Returns NGX_OK if applied, NGX_DECLINED if this
+     * module has no such fault site or the zone is not ready.
      */
-    ngx_int_t  (*fault_set)(ngx_shm_zone_t *zone, ngx_int_t nth);
+    ngx_int_t  (*fault_set)(ngx_shm_zone_t *zone, ngx_test_probe_fault_e fault,
+        ngx_int_t nth);
 } ngx_test_probe_hooks_t;
 
 
@@ -210,17 +247,23 @@ u_char *ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone);
 /*
  * Arm or clear fault injection from a query string, e.g.
  *
- *     GET /__probe?fault_slab=1     fail the next slab allocation
- *     GET /__probe?fault_slab=-1    disarm
+ *     GET /__probe?fault_slab=1      fail the next slab allocation
+ *     GET /__probe?fault_slab=-1     disarm
+ *     GET /__probe?fault_palloc=1    fail the next ngx_palloc/ngx_pnalloc
+ *     GET /__probe?fault_tempfile=1  fail the next temp-file creation
+ *     GET /__probe?fault_accept=1    return EMFILE from the next accept()
  *
- * Returns NGX_OK if a fault directive was found and applied, NGX_DECLINED
- * otherwise -- including a malformed value, which is ignored rather than
- * guessed at, and including "no fault_set hook registered".
+ * Each site has its own sibling key (see ngx_test_probe_fault_e); the first
+ * one present in the query wins. Returns NGX_OK if a fault directive was found
+ * and applied, NGX_DECLINED otherwise -- including a malformed value, which is
+ * ignored rather than guessed at, and including "no fault_set hook registered"
+ * or "the module does not implement the named site".
  *
- * The key is matched as a whole query argument and the value must end at the
+ * Each key is matched as a whole query argument and the value must end at the
  * argument boundary, so neither "not_fault_slab=1" nor "fault_slab=1junk" arms
  * anything. Both of those armed the injector in an earlier version of this
- * code; the prober rule files pin them.
+ * code; the prober rule files pin them. The same contract holds for every
+ * sibling key.
  *
  * A side effect on GET is not REST-clean, and that is a deliberate trade: the
  * alternative is reading a request body inside the probe handler, which means

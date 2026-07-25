@@ -82,9 +82,12 @@ ngx_mymod_probe_zone_render(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
  * and set .fault_set = NULL in the hooks struct below.
  *
  * Contract: the harness has already parsed and validated the query
- * argument (e.g., "fault_slab=5"); this function only stores the result.
- * `nth` is negative to disarm, non-negative to arm. Return NGX_OK on success,
- * NGX_DECLINED if the zone/module is not ready to accept it.
+ * argument (e.g., "fault_slab=5") and identified which fault site it named,
+ * passed as `fault`; this function only stores the result for that site.
+ * `nth` is negative to disarm, non-negative to arm. Implement only the sites
+ * your module actually has injection points for and return NGX_DECLINED for
+ * the rest. Return NGX_OK on success, NGX_DECLINED if the zone/module is not
+ * ready to accept it or the named site is not one you implement.
  *
  * Counters MUST live in shared memory (not a process global) if the zone
  * can be accessed by multiple workers. The fault counter lives here, not in
@@ -102,12 +105,16 @@ ngx_mymod_probe_zone_render(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
  *   return NGX_OK;
  */
 static ngx_int_t
-ngx_mymod_probe_fault_set(ngx_shm_zone_t *zone, ngx_int_t nth)
+ngx_mymod_probe_fault_set(ngx_shm_zone_t *zone, ngx_test_probe_fault_e fault,
+    ngx_int_t nth)
 {
     (void) zone;
+    (void) fault;
     (void) nth;
 
-    /* Fault injection not supported by this module. */
+    /* Fault injection not supported by this module. Switch on `fault` here to
+     * arm only the sites (NGX_TEST_PROBE_FAULT_SLAB, ..._PALLOC, ...) your
+     * module actually implements, and return NGX_DECLINED for the others. */
     return NGX_DECLINED;
 }
 
