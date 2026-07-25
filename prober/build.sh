@@ -67,9 +67,33 @@ else
     LDFLAGS="$LDFLAGS -lssl -lcrypto -lz"
 fi
 
-# shellcheck disable=SC2086
-$CC $CFLAGS -o prober prober.c $LIB $LDFLAGS
+# Every $CC invocation below is independent -- each links a self-contained
+# binary from source, none reads another's output -- so they run concurrently
+# and are joined at the end. This is the load-bearing speedup for the mutation
+# job, which reinvokes this script once per mutant (89x): serialised, the ten
+# compile-and-link commands dominated its wall clock. `pids` collects each
+# background job; the final wait loop makes ANY compile failure fail the whole
+# script with a nonzero exit, preserving mutate.sh's BROKEN-on-noncompile
+# contract. There are only ~10 short compiles, so they are all launched at once
+# rather than throttled -- ten concurrent cc processes is well within any real
+# runner. PROBER_BUILD_JOBS=1 forces the old serial behaviour (a tiny or
+# heavily-loaded runner, or bisecting a build race).
+serial=0
+[ "${PROBER_BUILD_JOBS:-0}" = "1" ] && serial=1
 
+pids=""
+
+compile() {   # all args = one full $CC command line
+    if [ "$serial" = "1" ]; then
+        "$@"
+    else
+        "$@" &
+        pids="$pids $!"
+    fi
+}
+
+# shellcheck disable=SC2086
+compile $CC $CFLAGS -o prober prober.c $LIB $LDFLAGS
 built="$PWD/prober"
 
 # The fake upstream daemon. Its own link line rather than a member of $LIB
@@ -77,8 +101,7 @@ built="$PWD/prober"
 # It is also not named *_test.c, which keeps the discovery loop below from
 # treating a daemon as a self-test and running it with no arguments.
 # shellcheck disable=SC2086
-$CC $CFLAGS -o fakesrv fakesrv.c $LIB $LDFLAGS
-
+compile $CC $CFLAGS -o fakesrv fakesrv.c $LIB $LDFLAGS
 built="$built $PWD/fakesrv"
 
 # Self-tests are discovered, not listed: dropping a new *_test.c in this
@@ -90,7 +113,7 @@ for src in *_test.c; do
     bin="${src%.c}"
 
     # shellcheck disable=SC2086
-    $CC $CFLAGS -o "$bin" "$src" $LIB $LDFLAGS
+    compile $CC $CFLAGS -o "$bin" "$src" $LIB $LDFLAGS
 
     built="$built $PWD/$bin"
 done
@@ -110,10 +133,20 @@ for src in ../t/*_test.c; do
     bin="${src%.c}"
 
     # shellcheck disable=SC2086
-    $CC $CFLAGS -DNGX_TEST_HARNESS -I ../t -I ../src \
+    compile $CC $CFLAGS -DNGX_TEST_HARNESS -I ../t -I ../src \
         -o "$bin" "$src" ../src/ngx_test_probe_arm.c
 
     built="$built $(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+done
+
+# Join every background compile. A nonzero from any one must fail the script:
+# `set -e` does not fire on a plain aggregate `wait`, so each pid is waited
+# individually and `set -e` aborts on the first nonzero status. Preserves the
+# noncompile=BROKEN contract mutate.sh depends on. Waiting each pid exactly once
+# (none was reaped earlier -- there is no throttling `wait -n`) keeps every
+# status retrievable.
+for pid in $pids; do
+    wait "$pid"
 done
 
 echo "built: $built"
