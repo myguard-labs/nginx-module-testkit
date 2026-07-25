@@ -1,0 +1,24 @@
+# The post-reload coherence case, run by the driver AFTER both reloads have
+# landed and the old worker has drained. It proves the server came back
+# HEALTHY: the final worker serves a correct 200, leaks no descriptor, and
+# logs nothing on the error path in the window around this request.
+#
+# The pid oracle is STRICT (no pid_may_change), same rationale as
+# hup-storm-mid-transfer's post-reload.rule: by the time this file runs a single
+# post-reload worker is serving, so both probe snapshots see the SAME worker and
+# "same worker pid" is the stronger, true assertion. The reload-while-compressing
+# claims this scenario exists to make are the driver's own oracles (which
+# straddle the two signals and decompress the held frame); this leg only proves
+# the server came back healthy afterwards.
+#
+# Requests "/" (a plain 200, not the compressed drip path) on purpose: this leg
+# is about server health after the reloads, and delta fds == 0 must reflect a
+# normal request's descriptor accounting, not a memcached-upstream fetch.
+
+name    the final worker serves cleanly after reloading mid-compression
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+no_error_log  \[error\]

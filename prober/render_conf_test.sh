@@ -57,13 +57,14 @@ diag() { printf '# %s\n' "$1"; }
 # The placeholders prober_render_conf() is contracted to substitute. Keep in
 # sync with the sed in lib.sh; the last test asserts the scenario tree uses
 # nothing outside this set.
-KNOWN="LOAD PORT PREFIX PROBE PROBE_ZONE BACKEND_PORT"
+KNOWN="LOAD BUILD_OBJS PORT PREFIX PROBE PROBE_ZONE BACKEND_PORT"
 
 # shellcheck source=lib.sh
 . ./lib.sh
 
 # Minimal stand-ins: the renderer only cares that the variables are set.
 PROBER_LOAD="load_module /nowhere/mod.so;"
+PROBER_RESOLVED_BUILD="/nowhere/.build/nginx-1.29.0"
 PROBER_RESOLVED_PORT=18099
 PROBER_PROBE="mod_probe probezone;"
 PROBER_PROBE_ZONE="mod_ban_zone probezone:1m;"

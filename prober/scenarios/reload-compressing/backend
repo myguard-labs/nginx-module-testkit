@@ -1,0 +1,32 @@
+# The upstream serves a CORRECT, highly COMPRESSIBLE reply and DRIPS it slowly
+# enough to still be in flight when the reload lands. Two properties matter here
+# that plain hup-storm-mid-transfer does not care about:
+#
+#  * COMPRESSIBLE: the value is a long run of repeated blocks, so zstd shrinks it
+#    to a small fraction of its input. The driver asserts the wire body is
+#    STRICTLY SMALLER than the plaintext -- proof the response was actually
+#    compressed, not passed through, so "the CCtx survived the reload" is a claim
+#    about a real compression context and not a no-op.
+#  * DRIPPED across the reload: 2 bytes / 250 ms keeps the memcached fetch (and
+#    therefore the zstd body filter feeding on it) alive for several seconds --
+#    several times the cost of the one or two HUPs the driver fires, each of
+#    which is absorbed in well under a second. So on any non-pathological box the
+#    compression context is genuinely mid-stream at every HUP; if a pathological
+#    host ever reloaded slower than the drip finished, the driver's inflight-alive
+#    gate reds (held request ended too early) rather than passing falsely -- the
+#    conservative direction, a false RED that says "re-tune the drip", never a
+#    false GREEN.
+#
+# The value length is deliberately a clean multiple of the 64-byte block so the
+# plaintext checksum the driver compares against is trivial to regenerate: it is
+# exactly the same bytes seeded here.
+#
+# Gated by backend-smoke like every other fake upstream: an adversarially-timed
+# reply proves nothing unless the same fake is first proven correct told to
+# behave normally.
+proto   memcached
+seed    slow    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD
+
+# on=get:1 so ONLY the first (held) request drips; the post-reload coherence leg
+# (get:2, ...) is served at full speed and is not itself what spans the reload.
+fault   on=get:1    action=drip    bytes=2    ms=250
