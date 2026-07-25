@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+#
+# CONSUMER-SCENARIO GATE (grind item H3, "second consumer zero-hook", modeled
+# on reload-compressing's gate -- see that scenario's ./requires for the full
+# rationale of the two-shape search). This scenario's nginx.conf ALWAYS loads
+# @BUILD_OBJS@/ngx_http_cache_turbo_module.so unconditionally, so CI (which
+# builds only the ref probe module) SKIPs cleanly rather than failing on a
+# guaranteed `nginx -t` error.
+#
+# nonzero exit  => run-scenario.sh emits "1..0 # SKIP <stdout of this gate>"
+#
+# Unlike reload-compressing, this scenario needs no external CLI (no zstd, no
+# python3): the oracle reads the probe's own JSON fields and an HTTP response
+# header, both already-established harness idioms (prober_probe_field, plain
+# curl-less /dev/tcp reads). So the ONLY gate is the .so itself.
+found=0
+if [ -n "${PROBER_BUILD:-}" ]; then
+    [ -f "$PROBER_BUILD/objs/ngx_http_cache_turbo_module.so" ] && found=1
+    SEARCHED="$PROBER_BUILD/objs"
+else
+    BUILD_ROOT="${PROBER_ROOT:-.}/.build"
+    for so in "$BUILD_ROOT"/*/objs/ngx_http_cache_turbo_module.so; do
+        [ -f "$so" ] && { found=1; break; }
+    done
+    SEARCHED="$BUILD_ROOT/*/objs"
+fi
+if [ "$found" -eq 0 ]; then
+    echo "cache_turbo module .so not found in $SEARCHED -- nginx.conf load_modules ngx_http_cache_turbo_module.so unconditionally, so a statically-linked build does not satisfy it; build the module as a dynamic module to run this scenario"
+    exit 1
+fi
+
+exit 0
