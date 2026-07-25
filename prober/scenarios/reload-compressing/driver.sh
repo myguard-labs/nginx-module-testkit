@@ -223,22 +223,45 @@ fi
 # first. Equal means the compressed path is allocation-neutral at steady state
 # even after the two reloads. Both readings are post-served and quiescent, so
 # neither carries the cold-start one-off that a pre-request baseline would.
-FINAL_OK=1
-one_zstd_request() {           # drive one full-speed compressed GET, discard body
+# one_zstd_request: drive ONE full-speed compressed GET to completion under a
+# BOUNDED deadline, and report whether it actually completed as a valid zstd
+# response. This is oracle 4's stimulus, so it must not (a) hang the scenario if
+# the server wedged, nor (b) let a truncated/reset response be treated as a
+# completed request -- either would make the FINAL2 snapshot meaningless and the
+# leak comparison vacuous. So: run the fetch in a background subshell, poll for
+# it under a short deadline, KILL its subtree on overrun, and require the capture
+# to carry BOTH a 200 status line and Content-Encoding: zstd (a complete,
+# genuinely-compressed reply) before the caller trusts the second snapshot.
+# Returns 0 only on a complete valid response; nonzero otherwise.
+one_zstd_request() {
+    local out="$PROBER_PREFIX/oracle4.out" pid dl
     (
         exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
         printf 'GET /mc?key=slow HTTP/1.1\r\nHost: prober\r\nAccept-Encoding: zstd\r\nConnection: close\r\n\r\n' >&3
-        cat <&3 >/dev/null 2>&1 || true
-    ) >/dev/null 2>&1
+        cat <&3 2>/dev/null || true
+    ) >"$out" 2>/dev/null &
+    pid=$!
+    dl=$(( SECONDS + 10 ))                 # full-speed reply completes in well under 1 s
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$SECONDS" -ge "$dl" ]; then
+            pkill -P "$pid" 2>/dev/null || true
+            kill "$pid" 2>/dev/null || true
+            break
+        fi
+        sleep 0.05
+    done
+    wait "$pid" 2>/dev/null || true
+    grep -q '^HTTP/1.1 200' "$out" \
+        && grep -qi '^Content-Encoding:[[:space:]]*zstd' "$out"
 }
+FINAL_OK=1
 if snapshot; then
     FINAL_USED="$SNAP_USED"; FINAL_BLOCKS="$SNAP_BLOCKS"; FINAL_LARGE="$SNAP_LARGE"
-    one_zstd_request
-    if snapshot; then
+    if one_zstd_request && snapshot; then
         FINAL2_USED="$SNAP_USED"; FINAL2_BLOCKS="$SNAP_BLOCKS"; FINAL2_LARGE="$SNAP_LARGE"
     else
         FINAL_OK=0
-        echo "# the probe endpoint did not answer for the second post-drain snapshot"
+        echo "# oracle 4 stimulus did not complete as a valid zstd response, or the second snapshot did not answer -- oracle 4 will SKIP rather than compare against a vacuous reading"
     fi
 else
     FINAL_OK=0
