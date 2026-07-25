@@ -105,11 +105,29 @@ for ((i = 0; i < 100; i++)); do            # 100 * 50 ms = 5 s ceiling
     fi
     sleep 0.05
 done
-if [ "$SEND_SEEN" -eq 1 ]; then
-    echo "ok 1 - the in-flight reply was dripping from the upstream before the reload"
-else
+# The "send" journal record is append-only: it proves a reply STARTED dripping
+# at some point this run, but not that the request is STILL in flight right now,
+# at the instant before the HUP. A mutation that fully joined the request before
+# reloading would leave that record in place and still pass every downstream
+# oracle -- certifying a reload-survival that never straddled the signal (the
+# latent vacuity fixed in G6d's usr2-mid-transfer by ALSO asserting the in-flight
+# bg pid is alive at signal-delivery time). So ok 1 requires BOTH: the send began
+# AND the background client is still running (has not yet received the full
+# dripped body) at the moment we are about to send the HUP. The drip takes ~3 s;
+# the client cannot have completed unless the reply was NOT actually in flight.
+INFLIGHT_ALIVE=0
+if kill -0 "$INFLIGHT_PID" 2>/dev/null; then
+    INFLIGHT_ALIVE=1
+fi
+if [ "$SEND_SEEN" -eq 1 ] && [ "$INFLIGHT_ALIVE" -eq 1 ]; then
+    echo "ok 1 - the in-flight reply was dripping AND the request was still open at reload time"
+elif [ "$SEND_SEEN" -ne 1 ]; then
     echo "not ok 1 - the upstream never started dripping its reply before the reload"
     echo "# backend journal recorded no send within 5 s; ordering precondition unmet"
+    FAILED=$((FAILED + 1))
+else
+    echo "not ok 1 - the in-flight request had already completed before the reload was sent"
+    echo "# the background client exited before the HUP: nothing straddled the signal"
     FAILED=$((FAILED + 1))
 fi
 
