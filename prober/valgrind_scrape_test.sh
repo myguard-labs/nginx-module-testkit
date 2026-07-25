@@ -33,6 +33,18 @@ fi
 
 CC="${CC:-cc}"
 
+# valgrind on a 32-bit target needs glibc's 32-bit debuginfo (libc6-dbg:i386) to
+# resolve ld-linux.so.2 symbols; without it memcheck aborts ("Cannot continue")
+# rather than running. That debuginfo is an orthogonal dependency the 32-bit
+# build leg does not carry, and this test's job -- proving prober_scrape_valgrind
+# is non-vacuous -- is fully exercised on the native leg. SKIP under -m32.
+case " $CC " in
+    *" -m32 "*)
+        echo "1..0 # SKIP valgrind gate proven on the native leg; -m32 needs libc6-dbg:i386"
+        exit 0
+        ;;
+esac
+
 export TMPDIR
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/valgrind_scrape_test.XXXXXX")"
 SCRATCH="$TMPDIR"
