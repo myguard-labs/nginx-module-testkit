@@ -1543,6 +1543,60 @@ The `&r->args` parse the HTTP query string for fault directives (e.g.,
 `NGX_DECLINED` are success. The timing matters: call `arm()` *before*
 rendering the snapshot, so the response reflects the armed state.
 
+## Writing a C unit test (the runner convention)
+
+The harness runs its own parsers and assertion evaluators — the JSON reader, the
+rule engine, the scrape splitters — as pure functions under a TAP self-test
+suite that needs no server. A consumer module with C worth unit-testing in
+isolation (a parser, a small state machine, a buffer walk) uses the **same
+convention** rather than hand-rolling a shim runner: four labs modules grew four
+slightly different ones before this was written down, which is three too many.
+
+There is nothing to register. The convention is three rules:
+
+1. **Name the file `*_test.c`.** `prober/build.sh` globs `*_test.c` (and
+   `../t/*_test.c` for probe-side units), compiles each into its own binary, and
+   `prober/test.sh` runs every one. Dropping a file in is the whole wiring step —
+   *"a test that has to be registered in two places is a test that eventually is
+   not run at all"* (build.sh). A rename that stops matching the glob is caught,
+   not silently dropped: **zero discovered suites is a hard failure**, never a
+   green no-op.
+
+2. **Emit TAP with a `PLANNED` count.** `main()` ends with
+   `printf("1..%d\n", PLANNED)` where `PLANNED` is a `#define` of the number of
+   assertions, and each assertion prints `ok N - …` or `not ok N - …`. The plan
+   line is load-bearing: a suite that dies after assertion 3 of a planned 10
+   reports `1..10` with only 3 results, and the TAP consumer flags the gap — so a
+   crash mid-suite fails, it does not pass on the assertions that did run. Bump
+   `PLANNED` in the same commit that adds an assertion; a stale-low count hides
+   the new one. (`schema_test.c`, `http_test.c`, `rules_test.c` are worked
+   examples.)
+
+3. **Shell-only checks use `*_test.sh`** — a separate glob (these are run, not
+   compiled), same `echo "1..$PLANNED"` plan discipline. Use it for behaviour
+   with no C entry point (a CLI, a driver helper); use `*_test.c` for anything
+   callable as a function.
+
+The suite runs before any server boots and, in CI, standalone twice (plain and
+`SAN=1`); `test.sh` also turns on `MALLOC_PERTURB_`/`MALLOC_CHECK_` for the
+un-sanitized pass so an uninitialised read or use-after-free in the tests
+themselves surfaces as garbage instead of a quiet zero. That is deliberate: the
+harness decides whether a module's run is green, so a defect *in the harness*
+turns every rule that depends on it into a test that cannot fail — worse than a
+missing test, because the run still reports success. Unit-testing the harness's
+own logic without a server is how that class is caught at all. A consumer's own
+C deserves the same treatment; this is where it goes.
+
+**This is a runner convention, not a shared shim.** The harness does not ship a
+per-module test framework to link against (that premise was tried and rejected —
+it couples every consumer to the harness's build) — it ships the *discovery +
+plan contract* above, and each module writes plain C TAP against it. `t/` shows
+the one shim that does exist: `ngx_test_probe_arm.c` compiles a `src/` unit
+against a tiny stand-in for nginx, because the renderer beside it reads
+`ngx_cycle`, the slab pool and `/proc/self/fd` and shimming *that* would mean
+reimplementing the server. Shim only the leaf you can isolate; leave the rest to
+the compile-against-real-nginx/angie jobs and the live prober run.
+
 ## Gotchas worth knowing before you hit them
 
 - **An "unavailable" sentinel cancels under a delta.** `fds` is `-1` when
