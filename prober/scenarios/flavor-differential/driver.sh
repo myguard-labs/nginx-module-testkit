@@ -49,6 +49,16 @@
 #                           cross-flavor invariant; grouped with the other
 #                           pool.* members for the same startup-allocation
 #                           reasoning.
+#     fds               -- ENVIRONMENT-fragile, not flavor-invariant. Locally
+#     connections.free     both flavors read fds=10 / free=13, but ALL FOUR CI
+#                           matrix legs disagreed with a golden pinning those
+#                           absolutes: the open-fd count at probe time depends
+#                           on the runner's inherited fds and the build's own
+#                           descriptors (ASan opens its own), and free tracks
+#                           it. A single-host "measured identical" was mistaken
+#                           for an invariant; the CI legs are the wider sample
+#                           that refuted it. Masked so the golden asserts only
+#                           what is genuinely cross-flavor.
 #
 #   INVARIANT (asserted, exact value both flavors must produce):
 #     page_size             -- ngx_pagesize; same host, same libc, same
@@ -56,14 +66,8 @@
 #     connections.total     -- worker_connections from THIS conf, echoed back
 #                               structurally; both flavors render the same
 #                               template so this must be identical or the
-#                               config layer itself diverged.
-#     connections.free      -- MEASURED identical (13 both, 3 runs each) on a
-#                               freshly booted single-worker server with no
-#                               request yet made; both flavors reserve the same
-#                               number of connections for their own listening/
-#                               event-loop/log fds on this conf.
-#     fds                   -- MEASURED identical (10 both, 3 runs each) on
-#                               the same freshly booted conf.
+#                               config layer itself diverged. A pure config
+#                               echo, unlike free/fds which are runtime counts.
 #     zone.present           -- no zone is configured in this scenario's conf,
 #                               so both flavors must report false.
 #

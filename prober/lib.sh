@@ -642,6 +642,18 @@ prober_probe_field() {
 #   pool.cycle_large    different amount from the cycle pool during their own
 #                       startup / module init on an otherwise-identical conf.
 #                       A genuine per-flavor startup difference, not a leak.
+#   fds,                ENVIRONMENT-fragile, not flavor-invariant. Locally both
+#   connections.free    flavors read fds=10 / free=13, but the CI matrix legs
+#                       (nginx 1.28.0/1.29.0/angie 1.12.0 + the ASan leg) all
+#                       disagreed with a golden pinning those absolutes: the
+#                       open-fd baseline at probe time depends on the runner's
+#                       inherited fds, the build's own descriptors (ASan opens
+#                       its own), and per-release listener/log fd handling --
+#                       none of it a cross-flavor property. connections.free is
+#                       total minus in-use, so it moves with the same fd noise.
+#                       (An earlier note called both "MEASURED identical"; that
+#                       was a single-host measurement mistaken for an invariant
+#                       -- the CI legs are the wider sample that refuted it.)
 #
 # INVARIANT (passed through untouched -- both flavors must produce the exact
 # same value on a freshly booted, request-free server, or the diff reds):
@@ -653,10 +665,8 @@ prober_probe_field() {
 #   connections.total   worker_connections from the shared conf template,
 #                       echoed back structurally -- both flavors render the
 #                       same template, so this must be identical or the
-#                       config layer itself diverged.
-#   connections.free    MEASURED identical (13, 3 runs each) on a freshly
-#                       booted single-worker server with no request yet made.
-#   fds                 MEASURED identical (10, 3 runs each) on the same conf.
+#                       config layer itself diverged. Unlike free/fds this is
+#                       a pure config echo, not a runtime fd count.
 #   zone.present        no zone is configured in this scenario's conf, so both
 #                       flavors must report false.
 #
@@ -676,7 +686,9 @@ prober_probe_normalize() {
             -e 's/"config_generation"[[:space:]]*:[[:space:]]*[0-9]+/"config_generation":MASKED/' \
             -e 's/"cycle_used"[[:space:]]*:[[:space:]]*[0-9]+/"cycle_used":MASKED/' \
             -e 's/"cycle_blocks"[[:space:]]*:[[:space:]]*[0-9]+/"cycle_blocks":MASKED/' \
-            -e 's/"cycle_large"[[:space:]]*:[[:space:]]*[0-9]+/"cycle_large":MASKED/'
+            -e 's/"cycle_large"[[:space:]]*:[[:space:]]*[0-9]+/"cycle_large":MASKED/' \
+            -e 's/"free"[[:space:]]*:[[:space:]]*[0-9]+/"free":MASKED/' \
+            -e 's/"fds"[[:space:]]*:[[:space:]]*[0-9]+/"fds":MASKED/'
 }
 
 # prober_signal_wait SIG PID HOST PORT TIMEOUT_MS
