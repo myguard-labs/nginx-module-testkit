@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+#
+# CONSUMER-SCENARIO GATE. This is the first scenario driven by a real consumer
+# module (the http-zstd filter) rather than the harness's own ref probe, so it
+# can only run where that module's .so has actually been built into the server
+# tree. The harness itself stays generic: its CI configures the server with the
+# ref probe module ONLY (t/module), so on CI this gate declines and the scenario
+# is reported as an explicit SKIP -- never a silent pass, never a hard failure.
+# It runs for real on a developer box (or any consumer CI) that has built the
+# http-zstd filter .so alongside the probe into the same objs/ dir.
+#
+# nonzero exit  => run-scenario.sh emits "1..0 # SKIP <stdout of this gate>"
+# The reason string on stdout is what the operator sees, so make it name the
+# exact missing piece.
+set -euo pipefail
+
+# This gate runs BEFORE prober_resolve (run-scenario.sh runs `requires` first,
+# before anything expensive), so PROBER_RESOLVED_BUILD/PROBER_SERVER_BIN are NOT
+# set yet -- only the caller-facing PROBER_ROOT/PROBER_BUILD are. Resolve the
+# build root the same way prober_resolve will (lib.sh: PROBER_BUILD, else
+# PROBER_ROOT/.build), then glob every flavor-version tree under it: the gate
+# only needs to answer "is the zstd module available on this box at all". The
+# real load is done in nginx.conf against the tree prober_resolve actually picks;
+# if that specific tree happens to lack the .so, nginx -t fails loudly at boot --
+# a visible error, not a silent pass, which is acceptable for a mis-set build.
+BUILD_ROOT="${PROBER_BUILD:-${PROBER_ROOT:-.}/.build}"
+
+# The zstd filter can be built as a .so (--add-dynamic-module) or linked
+# statically into the server binary (--add-module), exactly like the probe (see
+# prober_detect_load). Accept EITHER anywhere under the build root: a filter .so
+# in some objs/, or a server binary carrying the zstd directives.
+found=0
+for so in "$BUILD_ROOT"/*/objs/ngx_http_zstd_filter_module.so; do
+    [ -f "$so" ] && { found=1; break; }
+done
+if [ "$found" -eq 0 ]; then
+    for bin in "$BUILD_ROOT"/*/objs/nginx "$BUILD_ROOT"/*/objs/angie; do
+        [ -f "$bin" ] && grep -qa 'zstd_comp_level' "$bin" && { found=1; break; }
+    done
+fi
+if [ "$found" -eq 0 ]; then
+    echo "http-zstd filter module not built under $BUILD_ROOT (no */objs/ngx_http_zstd_filter_module.so and no server binary carries the zstd directives) -- build it as a consumer .so to run this scenario"
+    exit 1
+fi
+
+# The oracle decompresses the held response with the zstd CLI and checksums the
+# plaintext; without it the whole point (byte-identical body after a reload mid
+# compression) cannot be checked.
+if ! command -v zstd >/dev/null 2>&1; then
+    echo "zstd CLI not found on PATH -- needed to decompress and checksum the held compressed response"
+    exit 1
+fi
+
+# python3 does the binary-safe de-chunk of the captured response (the driver's
+# frame splitter); it is already a harness dependency (lib.sh, mutate.sh, CI).
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 not found on PATH -- needed to de-chunk the captured compressed response"
+    exit 1
+fi
+
+exit 0

@@ -277,6 +277,16 @@ prober_render_conf() {
     # the scenarios only say WHERE they go. Empty is legitimate -- a module
     # whose probe needs no zone leaves PROBER_PROBE_ZONE unset.
     #
+    # @BUILD_OBJS@ resolves to the build tree's objs/ dir -- the directory that
+    # holds the probe .so (@LOAD@ already load_modules that one). A CONSUMER
+    # scenario that must load a SECOND, module-under-test .so (e.g. an http-zstd
+    # filter alongside the ref probe) references it here to write its own
+    # load_module line, because the probe and the auxiliary module are built
+    # into the same objs/ dir but only the probe has a dedicated macro. It is
+    # empty-safe by construction: PROBER_RESOLVED_BUILD is always set by
+    # prober_resolve before any conf is rendered. Scenarios that load no second
+    # module simply never mention it.
+    #
     # @BACKEND_PORT@ is the port a fake upstream bound, published by
     # prober_backend_start. It renders EMPTY when PROBER_BACKEND_PORT is unset,
     # and that is deliberate: a scenario with no backend is the normal case --
@@ -309,6 +319,7 @@ prober_render_conf() {
     sed_repl() { printf '%s' "$1" | sed -e 's#[\\&/]#\\&#g' -e 's#\##\\\##g'; }
 
     sed -e "s#@LOAD@#$(sed_repl "$PROBER_LOAD")#" \
+        -e "s#@BUILD_OBJS@#$(sed_repl "${PROBER_RESOLVED_BUILD:-}/objs")#" \
         -e "s#@PORT@#$(sed_repl "$PROBER_RESOLVED_PORT")#" \
         -e "s#@PREFIX@#$(sed_repl "$PROBER_PREFIX")#" \
         -e "s#@PROBE@#$(sed_repl "${PROBER_PROBE:-}")#" \
