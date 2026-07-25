@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a vanished test should show up as a plan mismatch rather
  * than as a smaller green run. */
-#define PLANNED  53
+#define PLANNED  54
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -328,6 +328,13 @@ main(void)
      * versa -- each key stands alone. */
     arms_site("fault_palloc=5&fault_slab=6", NGX_TEST_PROBE_FAULT_PALLOC, 5,
               "the earliest sibling key wins over a later one");
+
+    /* A malformed value at the earliest matching key declines outright; it does
+     * NOT fall through to a well-formed later sibling. Pins the "malformed
+     * declines rather than guesses" contract against an accidental fall-through
+     * that would silently arm a site the query's first arg did not name. */
+    declines("fault_palloc=x&fault_slab=1",
+             "a malformed earlier sibling declines despite a well-formed later one");
 
     if (tests_run != PLANNED) {
         printf("# ran %d tests but the plan says %d\n", tests_run, PLANNED);
