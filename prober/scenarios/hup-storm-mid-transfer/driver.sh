@@ -92,8 +92,10 @@ snapshot() {            # read one probe snapshot into SNAP_* globals
 #  5 the held response completed intact (full seeded value, status 200)
 #  6 the backend served the held get EXACTLY ONCE across all 10 reloads
 #  7 no worker died by signal during the storm
-#  8 post-storm coherence (prober leg, folded in as diagnostics)
-echo "1..8"
+#  8 the old worker set drained after the held request completed (no stuck
+#    old worker masked by the new one serving the coherence leg)
+#  9 post-storm coherence (prober leg, folded in as diagnostics)
+echo "1..9"
 
 # --- baseline: cycle-pool snapshot before the first HUP ---------------------
 # Taken before the held request is even fired, same as reload-soak's baseline:
@@ -265,6 +267,9 @@ else
     FAILED=$((FAILED + 1))
 fi
 
+# DRC captures whether the post-join drain actually completed; asserted as
+# oracle 8 below (a stuck old worker must red the scenario -- see there).
+DRC=0
 # --- join the held request ---------------------------------------------------
 # It must have completed by now -- the storm is over. A bare `wait` on a hung
 # request would never reach the body check below (AUD-09, see
@@ -276,7 +281,7 @@ fi
 # truncated/empty $INFLIGHT then fails the assertion below, the correct
 # verdict for a request that never completed.
 # A longer ceiling than backend-reload-inflight's 10 s: the drip here is sized
-# to outlast the WHOLE storm (~18-26 s depending on pacing, see ./backend), so
+# to outlast the WHOLE storm (~26 s at 172 B @ 2 B/300 ms, see ./backend), so
 # on a fast box the join may still need to wait out most of that after the
 # last HUP lands. 40 s is comfortably above the drip's own ceiling while still
 # being a bounded, killed deadline rather than an unbounded wait.
@@ -301,10 +306,14 @@ wait "$INFLIGHT_PID" 2>/dev/null || true
 # to actually exit -- this is the one point in the whole driver where
 # prober_drain_wait(want=$WORKERS) can genuinely succeed rather than time out
 # against a connection that is deliberately still open (see the storm-loop
-# comment above). Not a separate numbered oracle: a timeout here does not by
-# itself prove a leak, it is bookkeeping so the post-storm prober leg (oracle
-# 8) measures a settled worker rather than a transient handover state.
-prober_drain_wait "$MASTER" "$WORKERS" 10000 || true
+# comment above). This IS a numbered oracle (8): a `|| true` here would let the
+# scenario pass while an old worker stayed stuck after the held request ended,
+# because the post-storm strict probe (oracle 9) can be served entirely by the
+# NEW worker and never observe the leftover old one -- exactly the masking
+# CodeRabbit flagged. A real drain timeout (return 1) reds the scenario; a host
+# that simply cannot observe the child set (no pgrep, return 2) is a VISIBLE
+# skip, never a failure -- the same return-2 discipline reload-soak uses.
+prober_drain_wait "$MASTER" "$WORKERS" 10000 || DRC=$?
 
 # --- 5: held response completed intact ---------------------------------------
 # The response must be a complete, correct 200 carrying the full seeded value.
@@ -358,7 +367,21 @@ else
     echo "ok 7 - no worker died by signal across the whole storm"
 fi
 
-# --- 8: post-storm coherence (prober, folded in as diagnostics) --------------
+# --- 8: the old worker set drained after the held request completed ----------
+# A real drain timeout (return 1) means an old-cycle worker is still stuck after
+# the held request ended -- a leaked/hung worker, which the strict coherence leg
+# (oracle 9) cannot see because the NEW worker answers it. return 2 = no pgrep on
+# this host: a visible SKIP, never a failure (same exemption reload-soak makes).
+if [ "$DRC" -eq 0 ]; then
+    echo "ok 8 - the old worker set drained to $WORKERS after the held request completed"
+elif [ "$DRC" -eq 2 ]; then
+    echo "ok 8 - old-worker drain # SKIP pgrep unavailable; cannot observe the child set on this host"
+else
+    echo "not ok 8 - an old worker never drained after the held request ended (stuck/leaked worker)"
+    FAILED=$((FAILED + 1))
+fi
+
+# --- 9: post-storm coherence (prober, folded in as diagnostics) --------------
 # Runs a plain strict case AFTER the tenth reload has been absorbed and
 # drained: the final worker serves a correct 200, leaks no descriptor, and
 # logs nothing on the error path in the window around the request. The pid
