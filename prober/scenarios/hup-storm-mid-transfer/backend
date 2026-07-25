@@ -1,0 +1,32 @@
+# The upstream serves a CORRECT reply, but DRIPS it slowly enough to outlast a
+# whole 10-SIGHUP storm, not just one reload. backend-reload-inflight's 40-byte
+# value @ 4 B/300 ms (~3 s total) is sized for ONE reload; this scenario fires
+# TEN, each costing a prober_signal_wait round trip.
+#
+# On the timing budget (CodeRabbit raised this): prober_signal_wait is NOT a
+# wall-clock deadline -- like every wait in this harness it counts a FIXED
+# number of 50 ms attempts (5000 ms budget => 100 attempts), so a loaded runner
+# performs the same number of attempts rather than being cut off by elapsed
+# time. That is a deliberate anti-flake invariant (see the driver's SEND_SEEN
+# loop and prober_wait_listen), so the fix is NOT a wall-clock cap on each HUP
+# -- that would reintroduce exactly the host-timing flakiness the counted-step
+# discipline removes. Instead the drip is sized with generous headroom over the
+# storm's realistic cost. Each HUP is absorbed in well under a second on any
+# non-pathological box (a reload's new worker answers within a few probe polls),
+# so ten HUPs cost on the order of a few seconds; the 172-byte value @ 2 B/300 ms
+# drips for ~26 s, several times that, and still finishes safely inside the
+# driver's 40 s bounded, subtree-killing join deadline. If a genuinely
+# pathological host ever absorbed the storm slower than the drip, oracle 3 would
+# red (held request finished before the last HUP) rather than pass falsely --
+# the conservative direction: a false RED that flags "re-tune the drip on this
+# host", never a false GREEN.
+#
+# Gated by backend-smoke: an adversarially-timed reply proves nothing unless
+# the same fake is first proven correct when told to behave normally.
+proto   memcached
+seed    slow    AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMMNNNNOOOOPPPPQQQQRRRRSSSSTTTTUUUUVVVVWWWWXXXXYYYYZZZZ0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffffgggg
+
+# on=get:1 so ONLY the in-flight held request drips; the pre-storm baseline
+# ordering check and the post-storm coherence leg (get:2, get:3, ...) are
+# served at full speed and are not themselves what spans the storm.
+fault   on=get:1    action=drip    bytes=2    ms=300

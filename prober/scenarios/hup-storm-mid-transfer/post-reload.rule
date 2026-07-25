@@ -1,0 +1,21 @@
+# The post-storm coherence case, run by the driver AFTER all 10 HUPs have
+# landed and the last reload has been fully absorbed. It proves the server
+# came back HEALTHY: the final worker serves a correct 200, leaks no
+# descriptor, and logs nothing on the error path in the window around this
+# request.
+#
+# The pid oracle is STRICT (no pid_may_change), same rationale as
+# backend-reload-inflight's post-reload.rule: by the time this file runs, a
+# single post-storm worker is serving, so both of the case's probe snapshots
+# see the SAME worker and "same worker pid" is the stronger, true assertion.
+# The reload-survival claims this scenario exists to make are the driver's
+# own oracles, which straddle the ten signals; this leg only proves the
+# server came back healthy afterwards.
+
+name    the final worker serves cleanly after the 10-HUP storm
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+no_error_log  \[error\]
