@@ -57,6 +57,7 @@ FAILED=0
 # visible SKIP rather than a false pass. See oracle 6 below.
 master_fds() {
     [ -r "/proc/$MASTER/fd" ] || return 1
+    # shellcheck disable=SC2012  # /proc fd names are decimal ints, ls|wc is exact
     ls "/proc/$MASTER/fd" 2>/dev/null | wc -l
 }
 
