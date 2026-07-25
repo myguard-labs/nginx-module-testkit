@@ -66,8 +66,14 @@ accepts_so_far() {
 read_pidfile() {   # $1 = pidfile path; echoes a live pid or nothing
     [ -s "$1" ] || return 0
     local p
-    p="$(tr -d '[:space:]' < "$1" 2>/dev/null)"
+    # Brace-group the input redirect so its OWN open failure is suppressed too:
+    # `[ -s ]` and this read are not atomic, and the master may unlink/rewrite the
+    # pidfile in the two-master USR2 overlap between them. `tr ... < "$1" 2>/dev/null`
+    # only silences tr's stderr, not the shell's redirect-open error, which then
+    # leaks a "No such file or directory" line. Absence is a normal outcome here.
+    p="$( { tr -d '[:space:]' <"$1"; } 2>/dev/null )"
     [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "$p"
+    return 0
 }
 
 # TAP plan:
