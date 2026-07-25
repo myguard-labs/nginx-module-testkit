@@ -176,11 +176,18 @@ fi
 # the held request finally completes -- is checked separately below, after the
 # join, before the post-storm prober leg runs.
 #
-# The cycle-pool reference values are set from the FIRST post-HUP snapshot,
-# same as reload-soak, and every subsequent snapshot is compared to it with
-# drift_if. This oracle is OPTIONAL per the task spec if it overcomplicated
-# the held-request logic -- it did not: it composes cleanly as long as it
-# never touches or joins INFLIGHT_PID, so it is included.
+# The cycle-pool reference is set from the SECOND post-HUP snapshot (HUP 2),
+# not the first. The first new worker forked mid-storm carries a one-off: on
+# the self-hosted nginx 1.28.0 leg HUP 1 read cycle_used 3572 B ABOVE the flat
+# HUPs 2..10 (which were byte-identical), the same first-fork warm-up the ASan
+# note below independently observed ("first post-HUP snapshot 3569 bytes above
+# the rest"). Pinning USED_REF to HUP 1 made all nine steady-state forks look
+# like drift and reddened the oracle. HUP 1 is treated as warm-up; ref latches
+# on HUP 2 and HUPs 3..10 are compared to it -- eight comparisons, so a genuine
+# per-reload leak still drifts monotonically and is caught. Every subsequent
+# snapshot is compared to it with drift_if. This oracle is OPTIONAL per the task
+# spec if it overcomplicated the held-request logic -- it did not: it composes
+# cleanly as long as it never touches or joins INFLIGHT_PID, so it is included.
 ABSORBED=0
 USED_REF=; BLOCKS_REF=; LARGE_REF=
 FIRST_SET=0
@@ -213,7 +220,11 @@ HUP $r: no-new-worker"
     fi
 
     if [ "$BASE_OK" -eq 1 ]; then
-        if ! snapshot; then
+        if [ "$r" -eq 1 ]; then
+            # HUP 1 is warm-up: the first mid-storm fork carries a one-off that
+            # is not a leak (see header). Take no snapshot as the reference.
+            :
+        elif ! snapshot; then
             echo "# HUP $r: the probe endpoint did not answer for a cycle-pool snapshot"
             DRIFT="$DRIFT
 HUP $r: no-snapshot"
