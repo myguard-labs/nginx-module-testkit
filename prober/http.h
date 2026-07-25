@@ -58,6 +58,18 @@ typedef struct {
      * reads. Diagnostic elsewhere; load-bearing in http_test.c. */
     size_t  reads;
 
+    /* Effective SO_RCVBUF on the connection this response was collected over,
+     * read back with getsockopt() after http_connect() applied (or skipped)
+     * the option. Unlike `reads`, this is a DETERMINISTIC witness that the
+     * setsockopt happened: the kernel doubles-and-clamps the requested size,
+     * but a socket asked for a small buffer always reports a strictly smaller
+     * value than an untouched socket on the same box, independent of timing or
+     * load. That makes it the load-bearing oracle for "was rcvbuf applied?" in
+     * http_test.c -- the read-count comparison it replaces flipped under a
+     * loaded CI fleet because a fully-queued response can arrive in the same
+     * number of reads regardless of the receive window. 0 if unreadable. */
+    int     effective_rcvbuf;
+
     /* How the read loop ended, and how long after the request went out.
      *
      * `close_ms` is measured from the moment the last request byte is written

@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  153
+#define PLANNED  152
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -156,6 +156,11 @@ typedef struct {
      * kept here anyway so one struct carries the whole exchange. */
     int     close_reason;
     long    close_ms;
+
+    /* The connection's effective SO_RCVBUF as http_request() saw it, lifted off
+     * the response like close_reason above. The deterministic witness that a
+     * requested rcvbuf reached the socket. */
+    int     effective_rcvbuf;
 } echo_result;
 
 
@@ -350,6 +355,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
     int            rc, st;
     int            close_reason = HTTP_CLOSE_NONE;
     long           close_ms = 0;
+    int            effective_rcvbuf = 0;
 
     if (pipe(fds) != 0) {
         return -1;
@@ -369,6 +375,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
          * the buffers go away. */
         close_reason = resp.close_reason;
         close_ms = resp.close_ms;
+        effective_rcvbuf = resp.effective_rcvbuf;
         http_response_free(&resp);
     }
 
@@ -386,6 +393,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
      * this process concluded about the close. */
     out->close_reason = close_reason;
     out->close_ms = close_ms;
+    out->effective_rcvbuf = effective_rcvbuf;
 
     return rc;
 }
@@ -753,103 +761,6 @@ spawn_resetting(int *port, int reply_first)
     close(srv);
 
     return pid;
-}
-
-
-#define SPAWN_BIG_LEN  (256 * 1024)
-
-static size_t
-probe_reads_big(const http_recv *rv)
-{
-    int                 srv, one = 1, port, st;
-    struct sockaddr_in  sin;
-    socklen_t           slen = sizeof(sin);
-    pid_t               pid;
-    http_response       resp;
-    char                errbuf[256];
-    static const char   req[] = "GET /big HTTP/1.1\r\n\r\n";
-    size_t              reads;
-
-    srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) {
-        return 0;
-    }
-
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-    memset(&sin, 0, sizeof(sin));
-    sin.sin_family = AF_INET;
-    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    sin.sin_port = 0;
-
-    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
-        || listen(srv, 1) != 0
-        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
-    {
-        close(srv);
-        return 0;
-    }
-
-    port = ntohs(sin.sin_port);
-
-    fflush(stdout);
-    pid = fork();
-    if (pid < 0) {
-        close(srv);
-        return 0;
-    }
-
-    if (pid == 0) {
-        int    c = accept(srv, NULL, NULL);
-        char   scratch[512];
-        char  *big;
-
-        if (c < 0) {
-            _exit(2);
-        }
-
-        if (read(c, scratch, sizeof(scratch)) < 0) {
-            _exit(2);
-        }
-
-        big = malloc(SPAWN_BIG_LEN);
-        if (big == NULL) {
-            _exit(2);
-        }
-
-        memset(big, 'x', SPAWN_BIG_LEN);
-        memcpy(big, "HTTP/1.1 200 OK\r\n\r\n", 19);
-
-        /* MSG_NOSIGNAL for the same reason spawn_echo() uses it: the peer may
-         * be gone, and SIGPIPE would kill this child rather than the write
-         * simply failing. A short write is fine -- the client only needs
-         * enough bytes to require more than one read. */
-        (void) send(c, big, SPAWN_BIG_LEN, MSG_NOSIGNAL);
-
-        free(big);
-        close(c);
-        _exit(0);
-    }
-
-    close(srv);
-
-    memset(&resp, 0, sizeof(resp));
-
-    if (http_request("127.0.0.1", port, (const unsigned char *) req,
-                     sizeof(req) - 1, 5000, NULL, NULL, 0,
-                     HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE, rv, 0,
-                     HTTP_IDLE_NONE, 0, &resp, errbuf, sizeof(errbuf)) != 0)
-    {
-        waitpid(pid, &st, 0);
-        return 0;
-    }
-
-    reads = resp.reads;
-
-    http_response_free(&resp);
-    waitpid(pid, &st, 0);
-
-    return reads;
 }
 
 
@@ -1763,41 +1674,50 @@ main(void)
          *
          * There is no error path to probe: Linux never fails SO_RCVBUF, it
          * silently clamps whatever it is given (verified: even INT_MIN returns
-         * 0 and leaves the default in place). So the observable has to be a
-         * behavioural one -- a small receive window forces the response to be
-         * collected in more, smaller reads than the same exchange with the
-         * default buffer. Asserted as a strict inequality between two runs on
-         * the same box rather than against any absolute count, since the
-         * effective size is kernel policy.
-         */
-        /*
-         * A large response through a shrunken window: the client cannot take
-         * it in one read, so the reads counter must exceed one. This is the
-         * assertion that fails if the setsockopt call site is removed -- with
-         * the default buffer the same exchange lands in a single read.
+         * 0 and leaves the default in place). The witness is the effective
+         * buffer read back off the very connection http_request() configured
+         * (http_response.effective_rcvbuf, getsockopt on the live fd): a socket
+         * asked for a small buffer always reports a strictly smaller value than
+         * an untouched one on the same box, and the comparison is decided by
+         * kernel policy, not timing.
          *
-         * The response is sized well past any plausible clamped minimum
-         * (SPAWN_BIG_LEN) precisely so the outcome does not depend on the
-         * kernel's floor. Asserted as "more than one", never as an exact count:
-         * TCP may split a read further, and pinning the number would be
-         * asserting on scheduling.
+         * This replaces an earlier read-count inequality
+         * (probe_reads_big(shrunk) > probe_reads_big(default)). That was flaky
+         * under a loaded CI fleet: when the whole 256 KB response is already
+         * queued in the socket before the client's first recv(), the grown read
+         * buffer drains it in the same number of reads regardless of the
+         * receive window, so the strict `>` occasionally failed and let the
+         * setsockopt-dropping mutation survive. getsockopt has no such race.
          */
         {
-            memset(&rv, 0, sizeof(rv));
-            rv.rcvbuf = 128;
+            echo_result  er_small, er_plain;
+            http_recv    rv_small;
+            static const unsigned char rreq[] =
+                "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
-            ok(probe_reads_big(&rv) > 1,
-               "so_rcvbuf's shrunken window forces a big response into "
-               "several reads");
+            memset(&rv_small, 0, sizeof(rv_small));
+            rv_small.rcvbuf = 1024;
 
-            /* The comparison, not an absolute: a 256 KB response takes several
-             * reads either way (the read loop grows its buffer in steps), so
-             * "one read by default" would be wrong. What must hold is that the
-             * shrunken window needs strictly MORE of them -- which is false if
-             * the setsockopt never happens, and is the assertion that killed
-             * the mutation dropping it. */
-            ok(probe_reads_big(&rv) > probe_reads_big(NULL),
-               "a shrunken window needs more reads than the default buffer");
+            /* Same exchange twice: once asking for a small receive buffer,
+             * once leaving it at the default. The requested run must end up
+             * with a strictly smaller effective buffer -- false, and this
+             * assertion reddens, exactly when http_request() never makes the
+             * setsockopt call. */
+            if (run_echo_full(rreq, sizeof(rreq) - 1, NULL, 0, HTTP_SHUT_NONE,
+                              HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv_small, 0, 0,
+                              HTTP_IDLE_NONE, &er_small) == 0
+                && run_echo_full(rreq, sizeof(rreq) - 1, NULL, 0,
+                                 HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE,
+                                 NULL, 0, 0, HTTP_IDLE_NONE, &er_plain) == 0)
+            {
+                ok(er_small.effective_rcvbuf > 0
+                   && er_plain.effective_rcvbuf > 0
+                   && er_small.effective_rcvbuf < er_plain.effective_rcvbuf,
+                   "so_rcvbuf's setsockopt really shrinks the connection's "
+                   "receive buffer, read back off the live socket");
+            } else {
+                ok(0, "so_rcvbuf effective-buffer probe: exchange failed");
+            }
         }
     }
 

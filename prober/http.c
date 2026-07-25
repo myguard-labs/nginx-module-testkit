@@ -1269,6 +1269,24 @@ http_exchange(int fd,
     memset(resp, 0, sizeof(*resp));
     resp->status = -1;
 
+    /*
+     * Witness the effective receive buffer of the connection http_connect()
+     * just configured. Read here, on the live fd before any exchange work, so
+     * every caller records it with no signature change. This is the
+     * deterministic replacement for inferring "was SO_RCVBUF applied?" from the
+     * read count: getsockopt reports the kernel's clamped value directly, so a
+     * shrunk socket always reads strictly smaller than an untouched one
+     * regardless of load. A failure leaves the field 0 (its memset value).
+     */
+    {
+        int        eff = 0;
+        socklen_t  efflen = sizeof(eff);
+
+        if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &eff, &efflen) == 0) {
+            resp->effective_rcvbuf = eff;
+        }
+    }
+
     /* Presume the exchange ends the connection; the read-loop's framed-stop
      * path (the only one that leaves the socket reusable) opts back in. Every
      * error return leaves it 0, so a driver never reuses a broken fd. */
