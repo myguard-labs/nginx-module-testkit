@@ -37,8 +37,6 @@ PLANNED=12
 tests_run=0
 failures=0
 
-echo "1..$PLANNED"
-
 ok() {
     tests_run=$((tests_run + 1))
     if [ "$1" -eq 0 ]; then
@@ -51,7 +49,14 @@ ok() {
 
 diag() { printf '# %s\n' "$1"; }
 
+# The plan line must be printed AFTER this guard, not before: printing
+# "1..$PLANNED" unconditionally and then this guard's own "1..0 # SKIP" would
+# emit TWO plan lines in one TAP stream when jq is missing, which most TAP
+# consumers treat as malformed output rather than a clean skip (CodeRabbit,
+# pr_impact_test.sh:54, MAJOR).
 command -v jq >/dev/null 2>&1 || { echo "1..0 # SKIP pr_impact_test.sh needs jq"; exit 0; }
+
+echo "1..$PLANNED"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pr_impact_test.XXXXXX")"
 cleanup() { rm -rf "$WORK"; }
@@ -100,6 +105,17 @@ mkdir -p "$REPO/prober/fuzz/corpus/lib"
 git -C "$REPO" init -q
 git -C "$REPO" config user.email "test@example.invalid"
 git -C "$REPO" config user.name "pr-impact self-test"
+
+# Now that the clean-baseline cases (CodeRabbit, pr_impact_test.sh:294) each
+# drive a REAL diff, pr-impact's phases 1/3 genuinely compile lib_test in
+# this working tree -- a build artifact that must NEVER get swept into a
+# fixture commit by one of the many `git add -A` calls below (that would
+# both pollute the diffs those calls are trying to construct and make
+# cross-branch checkouts fail with "local changes would be overwritten").
+cat >"$REPO/.gitignore" <<'EOF'
+lib_test
+*.o
+EOF
 
 write_lib_c() {   # $1 = 1 (correct) | 2 (broken add_one)
     if [ "$1" = "1" ]; then
@@ -242,18 +258,38 @@ SEMANTIC	prober/mutate.sh	lib_test	fast
 SEMANTIC	prober/lib_test.c	lib_test	fast
 EOF
 
-# pr-impact under test, LIB list swapped to the fixture's single lib.c --
+# pr-impact under test, LIB lists swapped to the fixture's single lib.c --
 # mirrors coverage_director_test.sh's own sed-swap of coverage-director.sh's
-# LIB constant, so the phase-1/2 build commands compile the fixture's LIB
+# LIB constant, so every phase's build commands compile the fixture's LIB
 # instead of the real repo's 6-file LIB (which does not exist in this
-# throwaway tree).
+# throwaway tree). pr-impact has TWO separate LIB-shaped assignments by
+# design -- the hoisted "LIB=..." shared by phases 1/2, and phase 3's own,
+# deliberately independent "VG_LIB=..." (its -O0/pinned-toolchain memcheck
+# build must not share a mutable variable with phases 1/2's ambient-$CC
+# build) -- BOTH need the fixture swap, or phase 3 will try to compile the
+# real repo's 6-file LIB in this tiny fixture tree and always fail closed
+# regardless of any injected fault, which is not what that phase's
+# non-vacuity pair is supposed to be testing.
 make_pr_impact_copy() {   # $1 = dest path
-    # Two occurrences in pr-impact share this literal LIB="..." assignment
-    # (phase 1's unit-test build and phase 2's fuzz-replay build) at DIFFERENT
-    # indentation levels -- match on the assignment text only, not indentation,
-    # so both get swapped to the fixture's single lib.c.
-    sed 's/^\([[:space:]]*\)LIB="json\.c http\.c util\.c rules\.c assert\.c backend\.c"$/\1LIB="lib.c"/' \
+    sed -e 's/^\([[:space:]]*\)LIB="json\.c http\.c util\.c rules\.c assert\.c backend\.c"$/\1LIB="lib.c"/' \
+        -e 's/^\([[:space:]]*\)VG_LIB="json\.c http\.c util\.c rules\.c assert\.c backend\.c"$/\1VG_LIB="lib.c"/' \
         "$PR_IMPACT_SRC" >"$1"
+    # `sed` exits 0 even when zero substitutions occur -- if pr-impact's own
+    # LIB="..."/VG_LIB="..." literals are ever reworded (new file added,
+    # quoting changed), this swap would silently leave the copy pointing at
+    # files that don't exist in the fixture tree, and every phase that
+    # builds against them would fail with a confusing "no such file"
+    # compiler error instead of a clear "fixture out of sync" diagnostic
+    # (CodeRabbit, pr_impact_test.sh:259, TRIVIAL). Fail loudly instead, and
+    # check BOTH assignments got swapped, not just the first one.
+    grep -qE '^[[:space:]]*LIB="lib\.c"$' "$1" || {
+        echo "make_pr_impact_copy: LIB= substitution did not match pr-impact's source -- fixture out of sync" >&2
+        exit 1
+    }
+    grep -qE '^[[:space:]]*VG_LIB="lib\.c"$' "$1" || {
+        echo "make_pr_impact_copy: VG_LIB= substitution did not match pr-impact's source -- fixture out of sync" >&2
+        exit 1
+    }
     chmod +x "$1"
 }
 make_pr_impact_copy "$REPO/prober/pr-impact"
@@ -265,6 +301,24 @@ BASE_SHA="$(git -C "$REPO" rev-parse HEAD)"
 run_pri() {
     ( cd "$REPO/prober" && ./pr-impact --base "$BASE_SHA" --budget 45 \
         --junit "$WORK/junit.xml" --summary "$WORK/summary.json" )
+}
+
+# Every case branches off, builds/mutates, runs pr-impact, then checks back
+# out -- but `lib_test` (now genuinely compiled by phases 1/3 since the
+# clean-baseline fix above makes them ACTUALLY run, not select nothing) is
+# gitignored and therefore untracked, so `git checkout` between branches
+# does NOT remove or refresh it. A stale binary from a PREVIOUS case (e.g.
+# one built from a faulted lib.c) can then satisfy phase 1's own
+# "reuse if not older than source" mtime check on a LATER, unrelated case
+# and get reused instead of rebuilt, corrupting that case's own result.
+# Always start a fresh case branch with no leftover binary.
+checkout_case() {   # $1 = -b|"" $2 = branch name $3 = start point
+    if [ "$1" = "-b" ]; then
+        git -C "$REPO" checkout -q -b "$2" "$3"
+    else
+        git -C "$REPO" checkout -q "$2"
+    fi
+    rm -f "$REPO/prober/lib_test"
 }
 
 tap_line_for() {   # $1 = phase name -> prints its TAP line from the last run's stdout
@@ -282,20 +336,38 @@ phase_is_ok() {   # $1 = phase name; 0 if "ok N <phase>" (not "not ok")
 }
 
 # =========================== PHASE 1: unit_test =============================
-# clean baseline
+# clean baseline: BASE == HEAD (no commit at all) means verify-impact's own
+# diff is EMPTY, so it selects NOTHING -- an "ok" from that run only proves
+# the phase was empty-classified, not that lib_test actually ran and passed
+# (CodeRabbit, pr_impact_test.sh:294, MAJOR -- confirmed: run_pri() always
+# used the still-current BASE_SHA==HEAD with zero intervening commits). Give
+# the clean case a REAL, behaviourally-no-op diff to lib.c -- mirroring phase
+# 4's own no-op-reformat pattern below -- so verify-impact genuinely selects
+# lib_test and phase 1 must actually build+run it to report "ok".
+checkout_case -b case-p1-clean "$BASE_SHA"
+BASE_P1="$(git -C "$REPO" rev-parse HEAD)"
+printf '#include "lib.h"\nint add_one(int x) { return (x + 1); }\n' >"$REPO/prober/lib.c"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "no-op reformat of lib.c -- selects lib_test"
 set +e
-LAST_OUT="$(run_pri)"; LAST_STATUS=$?
+LAST_OUT="$( cd "$REPO/prober" && ./pr-impact --base "$BASE_P1" --budget 45 \
+    --junit "$WORK/junit1.xml" --summary "$WORK/summary1.json" )"
+LAST_STATUS=$?
 set -e
-if phase_is_ok unit_test; then
-    ok 0 "phase1 unit_test: clean lib.c reports ok"
+p1_clean_selected="$(jq -r '.phases.unit_test.selected | length' "$WORK/summary1.json" 2>/dev/null || echo 0)"
+if phase_is_ok unit_test && [ "$p1_clean_selected" != "0" ]; then
+    ok 0 "phase1 unit_test: a real diff selects+runs lib_test and reports ok"
 else
-    ok 1 "phase1 unit_test: clean lib.c reports ok"
+    ok 1 "phase1 unit_test: a real diff selects+runs lib_test and reports ok"
     diag "$LAST_OUT"
+    diag "selected count: $p1_clean_selected"
 fi
+checkout_case "" "$BASE_SHA"
+git -C "$REPO" branch -q -D case-p1-clean
 
 # fault: break add_one's own logic AND its owning test's expectation stays the
 # same, so the test itself (not just the phase runner) goes red.
-git -C "$REPO" checkout -q -b case-p1-fault "$BASE_SHA"
+checkout_case -b case-p1-fault "$BASE_SHA"
 write_lib_c 2
 git -C "$REPO" -C prober 2>/dev/null add -A || git -C "$REPO" add -A
 git -C "$REPO" commit -q -m "fault: add_one returns x+2"
@@ -308,24 +380,37 @@ else
     ok 1 "phase1 unit_test: faulted add_one() is caught (not ok)"
     diag "$LAST_OUT"
 fi
-git -C "$REPO" checkout -q "$BASE_SHA"
+checkout_case "" "$BASE_SHA"
 git -C "$REPO" branch -q -D case-p1-fault
 
 # =========================== PHASE 2: fuzz_replay ===========================
-# clean baseline: seed corpus does not start with 'X', fuzz_lib.c added.
-git -C "$REPO" checkout -q -b case-p2-clean "$BASE_SHA"
-git -C "$REPO" commit -q --allow-empty -m "p2 baseline (fuzz already wired)"
-BASE_P2="$(git -C "$REPO" rev-parse HEAD)"
+# clean baseline: an empty diff (--allow-empty commit, BASE unchanged) means
+# verify-impact selects NOTHING, so an "ok" there only proves the phase was
+# empty-classified, never that fuzz_lib was actually built+replayed
+# (CodeRabbit, pr_impact_test.sh:294, MAJOR). Add a SAFE corpus seed (does
+# not start with 'X', so it does not reach the abort() path) as the diff
+# itself -- impact.map's SEMANTIC row on prober/fuzz/corpus/lib selects
+# fuzz/fuzz_lib for real, so phase 2 must actually replay it to report "ok".
+checkout_case -b case-p2-clean "$BASE_SHA"
+printf 'another safe seed\n' >"$REPO/prober/fuzz/corpus/lib/seed2"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "add another safe corpus seed -- selects fuzz/fuzz_lib"
+# --base must be the commit BEFORE this real diff (BASE_SHA), not "rev-parse
+# HEAD" taken AFTER committing the diff -- that would diff HEAD..HEAD (empty)
+# and defeat the very fix this clean case exists to prove.
+BASE_P2="$BASE_SHA"
 set +e
 LAST_OUT="$( cd "$REPO/prober" && ./pr-impact --base "$BASE_P2" --budget 45 \
     --junit "$WORK/junit2.xml" --summary "$WORK/summary2.json" )"
 LAST_STATUS=$?
 set -e
-if phase_is_ok fuzz_replay; then
-    ok 0 "phase2 fuzz_replay: safe corpus seed reports ok"
+p2_clean_selected="$(jq -r '.phases.fuzz_replay.selected | length' "$WORK/summary2.json" 2>/dev/null || echo 0)"
+if phase_is_ok fuzz_replay && [ "$p2_clean_selected" != "0" ]; then
+    ok 0 "phase2 fuzz_replay: a real diff selects+replays fuzz_lib and reports ok"
 else
-    ok 1 "phase2 fuzz_replay: safe corpus seed reports ok"
+    ok 1 "phase2 fuzz_replay: a real diff selects+replays fuzz_lib and reports ok"
     diag "$LAST_OUT"
+    diag "selected count: $p2_clean_selected"
 fi
 
 # fault: a corpus seed that starts with 'X' reaches the abort() path.
@@ -341,25 +426,39 @@ else
     ok 1 "phase2 fuzz_replay: crash-triggering seed is caught (not ok)"
     diag "$LAST_OUT"
 fi
-git -C "$REPO" checkout -q "$BASE_SHA"
+checkout_case "" "$BASE_SHA"
 git -C "$REPO" branch -q -D case-p2-clean
 
 # ======================= PHASE 3: memcheck_microtarget =======================
-# clean baseline (no leak define).
-git -C "$REPO" checkout -q -b case-p3-clean "$BASE_SHA"
-git -C "$REPO" commit -q --allow-empty -m "p3 baseline"
-BASE_P3="$(git -C "$REPO" rev-parse HEAD)"
+# clean baseline: an --allow-empty commit makes verify-impact's diff EMPTY, so
+# it selects NOTHING and an "ok" only proves the phase was empty-classified,
+# never that lib_test's OWN -O0 memcheck binary was actually built and run
+# under valgrind (CodeRabbit, pr_impact_test.sh:294, MAJOR). Give the clean
+# case a real no-op reformat of lib.c (mirrors phase 1's own fix above) so
+# verify-impact genuinely selects lib_test and phase 3 must actually memcheck
+# it to report "ok".
+checkout_case -b case-p3-clean "$BASE_SHA"
+# --base must be the commit BEFORE this real diff (BASE_SHA), captured before
+# committing the no-op reformat -- capturing "rev-parse HEAD" AFTER the
+# commit would diff HEAD..HEAD (empty) and defeat this fix's whole point
+# (same class of bug CodeRabbit's pr_impact_test.sh:294 finding was about).
+BASE_P3="$BASE_SHA"
+printf '#include "lib.h"\nint add_one(int x) { return (x + 1); }\n' >"$REPO/prober/lib.c"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "no-op reformat of lib.c -- selects lib_test"
 if command -v valgrind >/dev/null 2>&1; then
     set +e
     LAST_OUT="$( cd "$REPO/prober" && ./pr-impact --base "$BASE_P3" --budget 45 \
         --junit "$WORK/junit3.xml" --summary "$WORK/summary3.json" )"
     LAST_STATUS=$?
     set -e
-    if phase_is_ok memcheck_microtarget; then
-        ok 0 "phase3 memcheck: clean lib_test reports ok under Memcheck"
+    p3_clean_selected="$(jq -r '.phases.memcheck_microtarget.selected | length' "$WORK/summary3.json" 2>/dev/null || echo 0)"
+    if phase_is_ok memcheck_microtarget && [ "$p3_clean_selected" != "0" ]; then
+        ok 0 "phase3 memcheck: a real diff selects+memchecks lib_test and reports ok"
     else
-        ok 1 "phase3 memcheck: clean lib_test reports ok under Memcheck"
+        ok 1 "phase3 memcheck: a real diff selects+memchecks lib_test and reports ok"
         diag "$LAST_OUT"
+        diag "selected count: $p3_clean_selected"
     fi
 
     # fault: lib_test.c itself leaks a malloc'd int -- still asserts
@@ -368,7 +467,7 @@ if command -v valgrind >/dev/null 2>&1; then
     # coincidental unit-test failure. Source edit only, no build.sh
     # involvement: pr-impact's phase 1 compiles lib_test.c with its own
     # hardcoded command line, never via the fixture's build.sh.
-    git -C "$REPO" checkout -q -b case-p3-fault "$BASE_SHA"
+    checkout_case -b case-p3-fault "$BASE_SHA"
     # volatile forces the store through memory and forbids the compiler from
     # proving the allocation dead, so the leak is un-elidable at -O0 *and*
     # at higher optimization levels/compilers (phase 3 now builds its own
@@ -390,7 +489,12 @@ EOF
     git -C "$REPO" commit -q -m "fault: lib_test.c leaks a malloc'd int"
     rm -f "$REPO/prober/lib_test"
     set +e
-    LAST_OUT="$( cd "$REPO/prober" && ./pr-impact --base "$BASE_P3" --budget 45 \
+    # NOTE: diffs against BASE_SHA (the true original base case-p3-fault
+    # branched from), not BASE_P3 -- BASE_P3 now carries the clean case's
+    # OWN lib.c reformat commit (added above so that case's "ok" is real,
+    # not vacuous), and case-p3-fault never includes that commit, so
+    # diffing against BASE_P3 here would spuriously reverse-diff it back in.
+    LAST_OUT="$( cd "$REPO/prober" && ./pr-impact --base "$BASE_SHA" --budget 45 \
         --junit "$WORK/junit3b.xml" --summary "$WORK/summary3b.json" )"
     LAST_STATUS=$?
     set -e
@@ -400,7 +504,7 @@ EOF
         ok 1 "phase3 memcheck: a baked-in leak is caught (not ok) under Memcheck"
         diag "$LAST_OUT"
     fi
-    git -C "$REPO" checkout -q "$BASE_SHA"
+    checkout_case "" "$BASE_SHA"
     git -C "$REPO" branch -q -D case-p3-clean case-p3-fault
 else
     diag "valgrind not present -- phase3 pair reported via classification-only check"
@@ -415,7 +519,7 @@ else
     ok "$((case3_skipped == 1 ? 0 : 1))" \
         "phase3 memcheck: SKIP classification when valgrind absent (clean run)"
     ok 0 "phase3 memcheck: fault pair skipped (no valgrind on this box)"
-    git -C "$REPO" checkout -q "$BASE_SHA"
+    checkout_case "" "$BASE_SHA"
     git -C "$REPO" branch -q -D case-p3-clean
 fi
 
@@ -423,7 +527,7 @@ fi
 # clean baseline: coverage-map.json names lib_test as covering lib.c line 2
 # (the `return x + 1;` line -- actually the whole one-liner is line 2 in the
 # fixture's lib.c: line1 #include, line2 the function).
-git -C "$REPO" checkout -q -b case-p4-clean "$BASE_SHA"
+checkout_case -b case-p4-clean "$BASE_SHA"
 printf '{"prober/lib.c": {"2": ["lib_test"]}}\n' >"$REPO/prober/coverage-map.json"
 git -C "$REPO" add -A
 git -C "$REPO" commit -q -m "p4 baseline: coverage-map.json covers line 2"
@@ -445,7 +549,7 @@ fi
 
 # fault: remove line 2's entry from coverage-map.json (the changed line is now
 # uncovered by ANY selected test) at the same base commit.
-git -C "$REPO" checkout -q -b case-p4-fault "$BASE_P4"
+checkout_case -b case-p4-fault "$BASE_P4"
 printf '{"prober/lib.c": {"1": ["lib_test"]}}\n' >"$REPO/prober/coverage-map.json"
 git -C "$REPO" add -A
 git -C "$REPO" commit -q -m "fault: coverage-map.json no longer covers line 2"
@@ -464,30 +568,45 @@ else
     ok 1 "phase4 changed_coverage: an uncovered changed line is caught (not ok)"
     diag "$LAST_OUT"
 fi
-git -C "$REPO" checkout -q "$BASE_SHA"
+checkout_case "" "$BASE_SHA"
 git -C "$REPO" branch -q -D case-p4-clean case-p4-fault
 
 # ======================== PHASE 5: mapped_mutation ============================
-# clean baseline: the mutate.sh case as wired (caught).
-git -C "$REPO" checkout -q -b case-p5-clean "$BASE_SHA"
-git -C "$REPO" commit -q --allow-empty -m "p5 baseline"
-BASE_P5="$(git -C "$REPO" rev-parse HEAD)"
+# clean baseline: an --allow-empty commit means verify-impact's diff is EMPTY,
+# so it selects NOTHING and an "ok" only proves the phase was
+# empty-classified, never that mutate.sh actually ran the add_one mutation
+# and it was genuinely caught (CodeRabbit, pr_impact_test.sh:294, MAJOR).
+# Give the clean case a real no-op reformat of lib.c (mirrors the fault
+# case's own "touch lib.c so mutate:add_one is selected too" pattern below)
+# so impact.map's mutate:add_one owner is genuinely selected and phase 5
+# must actually invoke mutate.sh to report "ok".
+checkout_case -b case-p5-clean "$BASE_SHA"
+# --base must be the commit BEFORE this real diff, captured before
+# committing the no-op reformat -- capturing "rev-parse HEAD" AFTER the
+# commit would diff HEAD..HEAD (empty), the exact same mistake this whole
+# fix exists to close (CodeRabbit, pr_impact_test.sh:294, MAJOR).
+BASE_P5="$BASE_SHA"
+printf '#include "lib.h"\nint add_one(int x) { return (x + 1); }\n' >"$REPO/prober/lib.c"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "no-op reformat of lib.c -- selects mutate:add_one"
 set +e
 LAST_OUT="$( cd "$REPO/prober" && ./pr-impact --base "$BASE_P5" --budget 45 \
     --junit "$WORK/junit5.xml" --summary "$WORK/summary5.json" )"
 LAST_STATUS=$?
 set -e
-if phase_is_ok mapped_mutation; then
-    ok 0 "phase5 mapped_mutation: the wired mutation case is caught (reports ok)"
+p5_clean_selected="$(jq -r '.phases.mapped_mutation.selected | length' "$WORK/summary5.json" 2>/dev/null || echo 0)"
+if phase_is_ok mapped_mutation && [ "$p5_clean_selected" != "0" ]; then
+    ok 0 "phase5 mapped_mutation: a real diff selects+runs mutate:add_one and reports ok"
 else
-    ok 1 "phase5 mapped_mutation: the wired mutation case is caught (reports ok)"
+    ok 1 "phase5 mapped_mutation: a real diff selects+runs mutate:add_one and reports ok"
     diag "$LAST_OUT"
+    diag "selected count: $p5_clean_selected"
 fi
 
 # fault: widen lib_test's own assertion so the mutation SURVIVES -- mutate.sh
 # itself must then report SURVIVED and exit nonzero, which pr-impact's phase 5
 # must propagate as "not ok".
-git -C "$REPO" checkout -q -b case-p5-fault "$BASE_SHA"
+checkout_case -b case-p5-fault "$BASE_SHA"
 cat >"$REPO/prober/lib_test.c" <<'EOF'
 #include <stdio.h>
 #include <stdlib.h>
@@ -523,11 +642,11 @@ else
     ok 1 "phase5 mapped_mutation: a weakened suite lets the mutant SURVIVE (not ok)"
     diag "$LAST_OUT"
 fi
-git -C "$REPO" checkout -q "$BASE_SHA"
+checkout_case "" "$BASE_SHA"
 git -C "$REPO" branch -q -D case-p5-clean case-p5-fault
 
 # ---- docs-only diff: selects nothing, exits 0, all 5 phases empty ----------
-git -C "$REPO" checkout -q -b case-docs "$BASE_SHA"
+checkout_case -b case-docs "$BASE_SHA"
 printf 'notes\n' >"$REPO/README.md"
 git -C "$REPO" add -A
 git -C "$REPO" commit -q -m "docs only"
@@ -547,11 +666,11 @@ for p in unit_test fuzz_replay memcheck_microtarget changed_coverage mapped_muta
 done
 ok "$((docs_ok == 1 ? 0 : 1))" \
     "a docs-only diff exits 0 and every phase is empty with a classification"
-git -C "$REPO" checkout -q "$BASE_SHA"
+checkout_case "" "$BASE_SHA"
 git -C "$REPO" branch -q -D case-docs
 
 # ---- unmapped executable diff: verify-impact's fail-closed exit propagates -
-git -C "$REPO" checkout -q -b case-unmapped "$BASE_SHA"
+checkout_case -b case-unmapped "$BASE_SHA"
 printf 'int surprise(void) { return 1; }\n' >"$REPO/prober/newthing.c"
 git -C "$REPO" add -A
 git -C "$REPO" commit -q -m "add an unmapped source file"
@@ -570,7 +689,7 @@ VI_EXPECTED=$?
 set -e
 ok "$((UNMAPPED_STATUS != 0 && UNMAPPED_STATUS == VI_EXPECTED ? 0 : 1))" \
     "an unmapped executable diff propagates verify-impact's own fail-closed exit status ($VI_EXPECTED), not a swallowed 0"
-git -C "$REPO" checkout -q "$BASE_SHA"
+checkout_case "" "$BASE_SHA"
 git -C "$REPO" branch -q -D case-unmapped
 
 # ---- plan reconciliation ----------------------------------------------------

@@ -185,6 +185,23 @@ report_phase() {   # $1=index(1-5) $2=name $3=status(ok|not_ok) $4=classificatio
     fi
 }
 
+# --- shared build inputs for phases 1 (unit test) and 2 (fuzz replay) ------
+# Computed ONCE here rather than duplicated per-phase (and, in phase 1's old
+# form, recomputed via a fresh pkg-config subprocess for every rebuilt test --
+# CodeRabbit, pr-impact:224). Both phases link the same consumer source set;
+# phase 3 keeps its OWN copy deliberately (its -O0 pinned-toolchain memcheck
+# build must stay independent of ambient $CC -- see the phase 3 header note).
+LIB="json.c http.c util.c rules.c assert.c backend.c"
+LDFLAGS="${LDFLAGS:-}"
+if command -v pkg-config >/dev/null 2>&1; then
+    LDFLAGS="$LDFLAGS $(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
+    LDFLAGS="$LDFLAGS $(pkg-config --libs zlib 2>/dev/null || echo '-lz')"
+else
+    LDFLAGS="$LDFLAGS -lssl -lcrypto -lz"
+fi
+LDLIBS="$LDFLAGS"
+CC="${CC:-cc}"
+
 # =========================== PHASE 1: unit tests ============================
 p1_start="$SECONDS"
 if [ -z "$UNIT_LIST" ]; then
@@ -196,6 +213,16 @@ else
     p1_detail=""
     while IFS= read -r t; do
         [ -n "$t" ] || continue
+        # Re-check remaining budget on EVERY iteration, not just once before
+        # the loop: several selected unit tests, each individually fast, can
+        # still exhaust the whole outer budget in aggregate (CodeRabbit,
+        # pr-impact:229) -- phases 2/3 already did this, phase 1 did not.
+        left="$(remaining)"
+        if [ "$left" -le 0 ]; then
+            p1_rc=1
+            p1_detail="$p1_detail budget exhausted before $t;"
+            break
+        fi
         src="$t.c"
         bin="$t"
         if [ ! -e "$src" ]; then
@@ -206,15 +233,6 @@ else
         # Reuse a fresh binary if present (mtime check mirroring build.sh):
         # rebuild only when missing or older than its source.
         if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ]; then
-            LIB="json.c http.c util.c rules.c assert.c backend.c"
-            LDFLAGS="${LDFLAGS:-}"
-            if command -v pkg-config >/dev/null 2>&1; then
-                LDFLAGS="$LDFLAGS $(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
-                LDFLAGS="$LDFLAGS $(pkg-config --libs zlib 2>/dev/null || echo '-lz')"
-            else
-                LDFLAGS="$LDFLAGS -lssl -lcrypto -lz"
-            fi
-            CC="${CC:-cc}"
             # shellcheck disable=SC2086
             if ! "$CC" -O1 -g -std=c11 -o "$bin" "$src" $LIB $LDFLAGS 2>"$WORK/p1_build_$t.log"; then
                 p1_rc=1
@@ -222,9 +240,33 @@ else
                 continue
             fi
         fi
-        if ! ./"$bin" >"$WORK/p1_run_$t.log" 2>&1; then
+        # A hung unit test (infinite loop, blocking I/O) must not be able to
+        # overrun the outer budget: bound the run itself, not just the
+        # between-iteration checks (CodeRabbit, pr-impact:229, CRITICAL --
+        # this is the runner's own load-bearing invariant).
+        left="$(remaining)"
+        if [ "$left" -le 0 ]; then
             p1_rc=1
-            p1_detail="$p1_detail $t: FAILED;"
+            p1_detail="$p1_detail budget exhausted before running $t;"
+            continue
+        fi
+        # `if ! cmd; then rc=$?` is WRONG: bash's `!` negation collapses the
+        # exit status to 0/1 before `$?` is read inside `then`, so a real
+        # timeout (124) is never distinguishable from an ordinary failure --
+        # found while proving this very timeout with a deliberately-slow
+        # fixture. Use the NON-negated form so `$?` in the `else` branch is
+        # the real underlying exit code.
+        if timeout "$left" ./"$bin" >"$WORK/p1_run_$t.log" 2>&1; then
+            :
+        else
+            rc=$?
+            if [ "$rc" -eq 124 ]; then
+                p1_rc=1
+                p1_detail="$p1_detail $t: TIMED OUT after ${left}s (budget exhausted mid-run);"
+            else
+                p1_rc=1
+                p1_detail="$p1_detail $t: FAILED;"
+            fi
         fi
     done <<<"$UNIT_LIST"
     if [ "$p1_rc" -eq 0 ]; then
@@ -241,27 +283,22 @@ if [ -z "$FUZZ_LIST" ]; then
 elif [ "$(remaining)" -le 0 ]; then
     report_phase 2 fuzz_replay not_ok "budget exhausted before phase could start" "$FUZZ_LIST" "$(( (SECONDS - p2_start) * 1000 ))"
 else
-    LIB="json.c http.c util.c rules.c assert.c backend.c"
+    # LIB/LDLIBS/CC are the phase-1/2 shared build inputs computed once above
+    # (CodeRabbit, pr-impact:224) -- only the fuzz-specific ../-relative
+    # LIBPATHS (fuzz/ subshells cd one level down) is local to this phase.
     LIBPATHS=""
     for f in $LIB; do
         LIBPATHS="$LIBPATHS ../$f"
     done
-    LDLIBS="${LDLIBS:-}"
-    if command -v pkg-config >/dev/null 2>&1; then
-        LDLIBS="$LDLIBS $(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
-        LDLIBS="$LDLIBS $(pkg-config --libs zlib 2>/dev/null || echo '-lz')"
-    else
-        LDLIBS="$LDLIBS -lssl -lcrypto -lz"
-    fi
     SAN="-fsanitize=address,undefined -fno-omit-frame-pointer"
     export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=1:halt_on_error=1}"
     export UBSAN_OPTIONS="${UBSAN_OPTIONS:-halt_on_error=1:print_stacktrace=1}"
-    CC="${CC:-cc}"
     p2_rc=0
     p2_detail=""
     while IFS= read -r t; do
         [ -n "$t" ] || continue
-        if [ "$(remaining)" -le 0 ]; then
+        left="$(remaining)"
+        if [ "$left" -le 0 ]; then
             p2_rc=1
             p2_detail="$p2_detail budget exhausted before $t;"
             break
@@ -276,9 +313,28 @@ else
             p2_detail="$p2_detail $t: build failed;"
             continue
         fi
-        if ! ( cd fuzz && "$bin" "corpus/${t#fuzz_}" >"$WORK/p2_run_$t.log" 2>&1 ); then
+        # Bound the replay itself so a genuine hang (not just a crash) can't
+        # overrun the outer budget (CodeRabbit, pr-impact:229, CRITICAL).
+        left="$(remaining)"
+        if [ "$left" -le 0 ]; then
             p2_rc=1
-            p2_detail="$p2_detail $t: crashed/aborted;"
+            p2_detail="$p2_detail budget exhausted before running $t;"
+            continue
+        fi
+        # Non-negated form (see phase 1's own note above): `if ! cmd; then
+        # rc=$?` loses the real exit code to bash's boolean-collapsing `!`,
+        # making a real 124 timeout indistinguishable from a crash.
+        if ( cd fuzz && timeout "$left" "$bin" "corpus/${t#fuzz_}" >"$WORK/p2_run_$t.log" 2>&1 ); then
+            :
+        else
+            rc=$?
+            if [ "$rc" -eq 124 ]; then
+                p2_rc=1
+                p2_detail="$p2_detail $t: TIMED OUT after ${left}s (budget exhausted mid-run);"
+            else
+                p2_rc=1
+                p2_detail="$p2_detail $t: crashed/aborted;"
+            fi
         fi
     done <<<"$FUZZ_LIST"
     if [ "$p2_rc" -eq 0 ]; then
@@ -309,7 +365,12 @@ else
     # whatever cc/clang is available) so leak shape is deterministic across
     # the CI compiler matrix, independent of ambient $CC used by phases 1/2.
     VG_CC="$(command -v gcc || command -v cc || command -v clang)"
-    LIB="json.c http.c util.c rules.c assert.c backend.c"
+    # Deliberately a SEPARATE variable from the hoisted $LIB (phase 1/2 shared
+    # build inputs) even though the value happens to match today: phase 3's
+    # -O0/pinned-toolchain memcheck build must stay independent of whatever
+    # phases 1/2 use for $CC, so it must not silently start sharing a mutable
+    # variable name with them.
+    VG_LIB="json.c http.c util.c rules.c assert.c backend.c"
     VG_LDFLAGS="${LDFLAGS:-}"
     if command -v pkg-config >/dev/null 2>&1; then
         VG_LDFLAGS="$VG_LDFLAGS $(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
@@ -319,7 +380,8 @@ else
     fi
     while IFS= read -r t; do
         [ -n "$t" ] || continue
-        if [ "$(remaining)" -le 0 ]; then
+        left="$(remaining)"
+        if [ "$left" -le 0 ]; then
             p3_rc=1
             p3_detail="$p3_detail budget exhausted before $t;"
             break
@@ -332,17 +394,40 @@ else
             continue
         fi
         # shellcheck disable=SC2086
-        if ! "$VG_CC" -O0 -g -std=c11 -o "$vg_bin" "$src" $LIB $VG_LDFLAGS \
+        if ! "$VG_CC" -O0 -g -std=c11 -o "$vg_bin" "$src" $VG_LIB $VG_LDFLAGS \
             2>"$WORK/p3_build_$t.log"; then
             p3_rc=1
             p3_detail="$p3_detail $t: memcheck build failed;"
             continue
         fi
-        if ! valgrind --error-exitcode=99 --leak-check=full \
+        # Bound the valgrind run itself (CodeRabbit, pr-impact:229, CRITICAL)
+        # AND guard the zero-`left` edge case explicitly before constructing
+        # `timeout "$left"`: GNU coreutils `timeout 0` DISABLES the timeout
+        # rather than firing immediately (CodeRabbit, pr-impact:453, MINOR --
+        # confirmed via upstream timeout.c: "'0' means don't timeout"), so a
+        # `left` of exactly 0 must be caught as "budget exhausted" here, not
+        # handed to `timeout` as an accidental "run unbounded".
+        left="$(remaining)"
+        if [ "$left" -le 0 ]; then
+            p3_rc=1
+            p3_detail="$p3_detail budget exhausted before running $t under memcheck;"
+            continue
+        fi
+        # Non-negated form (see phase 1's own note above): `if ! cmd; then
+        # rc=$?` loses the real exit code to bash's boolean-collapsing `!`.
+        if timeout "$left" valgrind --error-exitcode=99 --leak-check=full \
             --errors-for-leak-kinds=definite "${VG_SUPP_ARGS[@]}" \
             "$vg_bin" >"$WORK/p3_run_$t.log" 2>&1; then
-            p3_rc=1
-            p3_detail="$p3_detail $t: memcheck reported an error;"
+            :
+        else
+            rc=$?
+            if [ "$rc" -eq 124 ]; then
+                p3_rc=1
+                p3_detail="$p3_detail $t: memcheck TIMED OUT after ${left}s (budget exhausted mid-run);"
+            else
+                p3_rc=1
+                p3_detail="$p3_detail $t: memcheck reported an error;"
+            fi
         fi
     done <<<"$UNIT_LIST"
     if [ "$p3_rc" -eq 0 ]; then
@@ -382,6 +467,15 @@ else
         report_phase 4 changed_coverage ok "no changed prober/*.c lines to check" "$UNIT_LIST" "$(( (SECONDS - p4_start) * 1000 ))"
     else
         uncovered=""
+        # Collect every changed (file,line) pair FIRST, then resolve them all
+        # against coverage-map.json in a SINGLE jq invocation below, instead
+        # of spawning one jq process (which fully re-parses the whole map
+        # file each time) per changed line -- a diff touching dozens/hundreds
+        # of lines could otherwise burn the shared 45s budget purely on
+        # process-spawn + reparse overhead rather than an actual coverage gap
+        # (CodeRabbit, pr-impact:427, MAJOR/heavy-lift).
+        PAIRS_FILE="$WORK/p4_pairs.txt"
+        : >"$PAIRS_FILE"
         while IFS= read -r f; do
             [ -n "$f" ] || continue
             relf="prober/${f#prober/}"
@@ -409,23 +503,49 @@ else
                 i=0
                 while [ "$i" -lt "$count" ]; do
                     line=$((start + i))
-                    tests="$(jq -r --arg fl "$relf" --arg ln "$line" '.[$fl][$ln] // [] | .[]' "$COVERAGE_MAP" 2>/dev/null || true)"
-                    covered_by_selected=0
-                    if [ -n "$tests" ]; then
-                        while IFS= read -r tt; do
-                            [ -n "$tt" ] || continue
-                            if printf '%s\n' "$UNIT_LIST" | grep -qx "$tt"; then
-                                covered_by_selected=1
-                            fi
-                        done <<<"$tests"
-                    fi
-                    if [ "$covered_by_selected" -eq 0 ]; then
-                        uncovered="$uncovered $relf:$line"
-                    fi
+                    printf '%s\t%s\n' "$relf" "$line" >>"$PAIRS_FILE"
                     i=$((i + 1))
                 done
             done <<<"$hunks"
         done <<<"$changed_files"
+        # One jq call: build a JSON array of {file,line} objects on the fly
+        # from the tab-separated pairs file (--rawfile + `inputs`/split, no
+        # per-line subprocess), look each up in coverage-map.json, and emit
+        # "file\tline\tcovered_by_any(0|1 test names...)" rows -- selection
+        # filtering (is a covering test actually SELECTED for this diff)
+        # stays in bash against $UNIT_LIST, same as before.
+        # -n (null input): this filter never reads `.` -- everything comes
+        # from --rawfile/--slurpfile -- so without -n jq waits on stdin
+        # (empty/closed here) and silently produces ZERO rows regardless of
+        # the actual pairs/map content, which read back as "everything is
+        # covered" (an uncovered-line fault would never be caught). Found
+        # while verifying this very batching change against a real fault.
+        cov_rows="$(jq -rn --rawfile pairs "$PAIRS_FILE" --slurpfile map "$COVERAGE_MAP" '
+            $map[0] as $m |
+            ($pairs | rtrimstr("\n") | split("\n") | map(select(length > 0))) as $lines |
+            $lines[] | split("\t") as $p |
+            ($p[0]) as $f | ($p[1]) as $l |
+            ($m[$f][$l] // []) as $tests |
+            "\($f)\t\($l)\t\($tests | join(","))"
+        ' 2>/dev/null || true)"
+        if [ -n "$cov_rows" ]; then
+            while IFS=$'\t' read -r relf line testcsv; do
+                [ -n "$relf" ] || continue
+                covered_by_selected=0
+                if [ -n "$testcsv" ]; then
+                    IFS=',' read -ra tt_arr <<<"$testcsv"
+                    for tt in "${tt_arr[@]}"; do
+                        [ -n "$tt" ] || continue
+                        if printf '%s\n' "$UNIT_LIST" | grep -qx "$tt"; then
+                            covered_by_selected=1
+                        fi
+                    done
+                fi
+                if [ "$covered_by_selected" -eq 0 ]; then
+                    uncovered="$uncovered $relf:$line"
+                fi
+            done <<<"$cov_rows"
+        fi
         if [ -n "$uncovered" ]; then
             p4_rc=1
             p4_detail="changed lines not covered by any selected test:$uncovered"
@@ -447,21 +567,41 @@ elif [ "$(remaining)" -le 0 ]; then
 else
     p5_rc=0
     p5_detail=""
-    left="$(remaining)"
-    if MUT_SUITE_TIMEOUT="${MUT_SUITE_TIMEOUT:-$left}" timeout "$left" \
-        ./mutate.sh "$(printf '%s\n' "$MUT_LIST" | paste -sd'|' -)" \
-        >"$WORK/p5_mutate.log" 2>&1; then
-        :
-    else
-        mrc=$?
-        if [ "$mrc" -eq 124 ]; then
+    # mutate.sh's own FILTER contract is a single SUBSTRING match ("$FILTER"
+    # in the mutation's name), not a regex alternation -- joining several
+    # selected mutation names with `paste -sd'|'` into ONE call built a
+    # literal filter like "send_slow|shutdown" that cannot substring-match
+    # any real mutation name, so mutate.sh would silently select ZERO cases
+    # and phase 5 would vacuously report "ok" no matter what the diff broke
+    # (CodeRabbit, pr-impact:453, MAJOR -- confirmed against mutate.sh's own
+    # `[[ "$name" != *"$FILTER"* ]]` matcher). Invoke mutate.sh ONCE PER
+    # selected mutation name instead.
+    while IFS= read -r m; do
+        [ -n "$m" ] || continue
+        # Same zero-`left` guard as phases 1-3: GNU `timeout 0` disables the
+        # timeout instead of firing immediately (CodeRabbit, pr-impact:453,
+        # MINOR), so a `left` of exactly 0 must be caught here explicitly
+        # rather than handed to `timeout` as an accidental "run unbounded".
+        left="$(remaining)"
+        if [ "$left" -le 0 ]; then
             p5_rc=1
-            p5_detail="budget exhausted mid-run (mutate.sh timed out)"
-        else
-            p5_rc=1
-            p5_detail="mutate.sh reported survived/broken case(s), see log"
+            p5_detail="$p5_detail budget exhausted before $m;"
+            break
         fi
-    fi
+        if MUT_SUITE_TIMEOUT="${MUT_SUITE_TIMEOUT:-$left}" timeout "$left" \
+            ./mutate.sh "$m" >>"$WORK/p5_mutate.log" 2>&1; then
+            :
+        else
+            mrc=$?
+            if [ "$mrc" -eq 124 ]; then
+                p5_rc=1
+                p5_detail="$p5_detail $m: budget exhausted mid-run (mutate.sh timed out);"
+            else
+                p5_rc=1
+                p5_detail="$p5_detail $m: mutate.sh reported survived/broken case(s), see log;"
+            fi
+        fi
+    done <<<"$MUT_LIST"
     if [ "$p5_rc" -eq 0 ]; then
         report_phase 5 mapped_mutation ok "selected mutation case(s) all caught" "$MUT_LIST" "$(( (SECONDS - p5_start) * 1000 ))"
     else
@@ -494,11 +634,33 @@ fi
 # ============================ impact-summary.json ============================
 #
 # Byte-identical across two runs on the same inputs: sorted target lists,
-# jq -S for stable key order, no timestamps in the payload (elapsed_ms is
-# the one field that legitimately varies run-to-run and is documented as
-# such -- determinism is checked structurally by the caller, not by diffing
-# elapsed_ms).
-{
+# jq -S for stable key order (when jq is present -- see fallback below), no
+# timestamps in the payload (elapsed_ms is the one field that legitimately
+# varies run-to-run and is documented as such -- determinism is checked
+# structurally by the caller, not by diffing elapsed_ms).
+#
+# Neither jq nor python3 is a hard prerequisite: phase 4 already treats a
+# missing jq as a graceful SKIP rather than a hard dependency, so this final
+# summary/JUnit write must degrade the same way instead of dying via
+# set -euo pipefail's "command not found" before ANY output is produced
+# (CodeRabbit, pr-impact:523, MAJOR). sel_json falls back to the same
+# hand-rolled sed escaper phase_json_escape already uses when python3 is
+# absent; the object is built key-by-key in a FIXED, already-deterministic
+# order (PHASE_NAMES is a fixed array), so `jq -S .` is a formatting nicety,
+# not a correctness requirement -- write the raw constructed JSON directly
+# when jq is unavailable instead of failing.
+sel_json_escape() {   # $1 = newline-joined, already-sorted+deduped list
+    local out="" first=1 line
+    out="["
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        [ "$first" -eq 1 ] || out="$out,"
+        first=0
+        out="$out$(phase_json_escape "$line")"
+    done <<<"$1"
+    printf '%s]' "$out"
+}
+SUMMARY_JSON="$(
     printf '{'
     printf '"base":%s,' "$( [ -n "$BASE" ] && phase_json_escape "$BASE" || printf 'null' )"
     printf '"budget":%s,' "$BUDGET"
@@ -507,10 +669,15 @@ fi
     for n in "${PHASE_NAMES[@]}"; do
         [ "$first" -eq 1 ] || printf ','
         first=0
-        sel_json="$(printf '%s\n' "${PHASE_SELECTED[$n]}" | { grep -v '^$' || true; } | LC_ALL=C sort -u | \
-            python3 -c 'import json,sys; print(json.dumps([l.rstrip("\n") for l in sys.stdin if l.strip()]))')"
+        sel_sorted="$(printf '%s\n' "${PHASE_SELECTED[$n]}" | { grep -v '^$' || true; } | LC_ALL=C sort -u)"
+        if command -v python3 >/dev/null 2>&1; then
+            sel_json="$(printf '%s\n' "$sel_sorted" | \
+                python3 -c 'import json,sys; print(json.dumps([l.rstrip("\n") for l in sys.stdin if l.strip()]))' 2>/dev/null || true)"
+        else
+            sel_json=""
+        fi
         if [ -z "$sel_json" ]; then
-            sel_json="[]"
+            sel_json="$(sel_json_escape "$sel_sorted")"
         fi
         printf '%s:{"selected":%s,"status":%s,"classification":%s,"elapsed_ms":%s}' \
             "$(phase_json_escape "$n")" \
@@ -520,7 +687,12 @@ fi
             "${PHASE_ELAPSED[$n]}"
     done
     printf '}}'
-} | jq -S . >"$SUMMARY"
+)"
+if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$SUMMARY_JSON" | jq -S . >"$SUMMARY"
+else
+    printf '%s\n' "$SUMMARY_JSON" >"$SUMMARY"
+fi
 
 overall=0
 for n in "${PHASE_NAMES[@]}"; do
