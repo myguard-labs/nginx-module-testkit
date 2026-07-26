@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# rss-slope needs /proc/self/smaps_rollup (Linux >= 4.14) for the RSS oracle,
-# and /proc/self/fd for the probe fd fields. Skip VISIBLY where either is
-# absent (a non-Linux runner, or a sandbox without smaps_rollup) rather than
-# fail -- same contract as every other /proc-dependent scenario.
+# rss-slope needs /proc/self/smaps_rollup (Linux >= 4.14) for the RSS oracle
+# (private_dirty). The other oracle reads pool.cycle_used, which needs no /proc
+# at all -- so smaps_rollup is the ONLY gate. Skip VISIBLY where it is absent
+# (a non-Linux runner, or a sandbox without smaps_rollup) rather than fail --
+# same contract as every other /proc-dependent scenario. (The driver reads no
+# fd fields, so /proc/self/fd is deliberately not gated here.)
 test -r /proc/self/smaps_rollup
