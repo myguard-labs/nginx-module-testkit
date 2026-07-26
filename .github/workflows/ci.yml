@@ -776,7 +776,12 @@ jobs:
           # runs the prober), so leaving it out would be the same silent-hole
           # the explicit-list comment above warns about. --source-path=prober
           # still resolves its `# shellcheck source=lib.sh` directive.
-          shellcheck -x --source-path=prober prober/*.sh prober/scenarios/*/driver.sh
+          # verify-impact carries no .sh extension (P2-A spec names it as a
+          # bare entry point, matching prober/build.sh's own style of naming
+          # things by role) so the *.sh glob above does not pick it up --
+          # list it explicitly rather than rename it and lose the intended
+          # invocation form (`prober/verify-impact`, not `prober/verify-impact.sh`).
+          shellcheck -x --source-path=prober prober/*.sh prober/verify-impact prober/scenarios/*/driver.sh
 
       # Downloaded and hash-checked, same as the server tarballs above: a
       # linter that gates the build is as much a supply-chain dependency as

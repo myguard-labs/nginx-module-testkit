@@ -1,0 +1,99 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# impact.map -- declarative source-to-target map for prober/verify-impact.
+#
+# WHY. Every *_test.c links the whole prober LIB (see build.sh:58), so a
+# compiler .d file alone would tell you a change to json.c reaches every unit
+# binary -- true but useless for selecting the ONE test that actually proves
+# the change. This file records the PRIMARY semantic owner explicitly (a
+# json.c change is proven first and foremost by json_test) while the LIB-wide
+# fallback still applies for anything not listed here (see FALLBACK row).
+#
+# SCHEMA. TSV, one row per edge, fields separated by a single tab:
+#
+#   TYPE<TAB>SOURCE<TAB>TARGET<TAB>LANE
+#
+#   TYPE    one of: PRIMARY, SEMANTIC, FALLBACK, SLOW
+#   SOURCE  a path or glob relative to the repo root (prober/json.c,
+#           prober/scenarios/backend-smoke/**, prober/fuzz/fuzz_json.c).
+#           A bare glob with no directory is matched against the basename.
+#   TARGET  the artifact that exercises SOURCE: a unit binary name
+#           (json_test), a fuzz target (fuzz/fuzz_json), a scenario dir
+#           (scenarios/backend-smoke), a mutation name substring (as passed to
+#           mutate.sh's positional filter), or "ALL_UNIT_TESTS" for the LIB
+#           fallback.
+#   LANE    fast (runs on every PR) or slow (valgrind/weekly/soak -- owner
+#           only, verify-impact reports it but does not gate PR CI on it).
+#
+# Comment lines (#) and blank lines are ignored. Rows are free-form order in
+# this file; verify-impact sorts its OWN output, not this map.
+#
+# GENERATED EDGES. Header (.h) and #include edges are NOT hand-listed here --
+# they come from compiler .d files, either emitted by build.sh when
+# PROBER_EMIT_DEPS=1 (writes prober/*.d next to each object) or synthesized
+# on demand by `verify-impact --regen-deps` (runs $CC -MM per source). Rows
+# below marked SEMANTIC are edges no #include expresses (a scenario conf that
+# exercises rules.c's reload path, a fuzz target keyed to one parser) and are
+# the only hand-written class that is safe to keep by hand: it does not drift
+# out of sync with the source the way a header list would.
+
+# --- PRIMARY: one owning unit test per LIB translation unit (build.sh:58) ---
+PRIMARY	prober/json.c	json_test	fast
+PRIMARY	prober/rules.c	rules_test	fast
+PRIMARY	prober/http.c	http_test	fast
+PRIMARY	prober/backend.c	backend_test	fast
+PRIMARY	prober/util.c	util_test	fast
+PRIMARY	prober/assert.c	assert_test	fast
+
+# --- FALLBACK: any LIB .c not caught above (or any LIB .c at all, as the
+# conservative catch-all every *_test.c binary links against) still selects
+# every unit test, because every *_test.c binary links the whole LIB and a
+# defect can surface through any of them regardless of which owns the change
+# semantically. This is intentionally coarse -- it is a safety net, not the
+# primary selection signal.
+FALLBACK	prober/json.c	ALL_UNIT_TESTS	fast
+FALLBACK	prober/rules.c	ALL_UNIT_TESTS	fast
+FALLBACK	prober/http.c	ALL_UNIT_TESTS	fast
+FALLBACK	prober/backend.c	ALL_UNIT_TESTS	fast
+FALLBACK	prober/util.c	ALL_UNIT_TESTS	fast
+FALLBACK	prober/assert.c	ALL_UNIT_TESTS	fast
+
+# --- SEMANTIC: fuzz targets keyed to the parser they drive (fuzz/fuzz.sh) ---
+SEMANTIC	prober/json.c	fuzz/fuzz_json	fast
+SEMANTIC	prober/http.c	fuzz/fuzz_http	fast
+SEMANTIC	prober/fuzz/fuzz_json.c	fuzz/fuzz_json	fast
+SEMANTIC	prober/fuzz/fuzz_http.c	fuzz/fuzz_http	fast
+SEMANTIC	prober/fuzz/fuzz_memcached.c	fuzz/fuzz_memcached	fast
+SEMANTIC	prober/fuzz/fuzz_resp.c	fuzz/fuzz_resp	fast
+SEMANTIC	prober/fuzz/corpus	fuzz/fuzz_json	fast
+
+# --- SEMANTIC: mutation owners (mutate.sh NAME<->file pairing, see mutate.sh)
+SEMANTIC	prober/http.c	mutate:send_slow	fast
+SEMANTIC	prober/http.c	mutate:abort	fast
+SEMANTIC	prober/http.c	mutate:recv_slow	fast
+SEMANTIC	prober/http.c	mutate:shutdown	fast
+SEMANTIC	prober/http.c	mutate:so_rcvbuf	fast
+SEMANTIC	prober/http.c	mutate:hold	fast
+SEMANTIC	prober/rules.c	mutate:shutdown	fast
+SEMANTIC	prober/rules.c	mutate:abort	fast
+SEMANTIC	prober/rules.c	mutate:send_slow	fast
+
+# --- SEMANTIC: scenario tree exercises the live probe compiled against a
+# real nginx/angie -- no #include links prober/scenarios/** back to src/, the
+# link is "this scenario's driver.sh boots a probe built from this source".
+SEMANTIC	prober/scenarios	scenarios/*	fast
+SEMANTIC	src/ngx_test_probe_arm.c	scenarios/*	fast
+SEMANTIC	src/ngx_test_probe_arm.c	t/*	fast
+
+# --- SEMANTIC: the selector's own inputs. impact.map and verify-impact are
+# proven by their own self-test, not by any unit/fuzz/scenario target above.
+SEMANTIC	prober/impact.map	verify_impact_test	fast
+SEMANTIC	prober/verify-impact	verify_impact_test	fast
+
+# --- SLOW: owners that only run out-of-band (Valgrind/weekly/soak), not on
+# every PR. verify-impact reports these under the "slow" lane so --explain
+# can show them, but PR CI (P2-A's own scope) does not gate on the slow lane.
+SLOW	prober/backend.c	scenarios/reload-soak	slow
+SLOW	prober/http.c	scenarios/soak-delta	slow
+SLOW	prober/rules.c	scenarios/property-fuzz	slow
