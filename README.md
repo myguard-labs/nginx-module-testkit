@@ -1335,7 +1335,7 @@ a 45 s outer budget, so a PR pays seconds for its own targets' leak +
 uninitialised-read surface instead of minutes for the whole tree.
 
 ```sh
-prober/pr-memcheck --base <merge-base-sha>   # runs in the selftest CI job
+prober/pr-memcheck --base <merge-base-sha>   # self-test (pr_memcheck_test.sh) runs in the selftest job; the adapter itself is not yet wired into a PR-lane CI job
 ```
 
 It **refuses** any selected target that needs a full nginx boot (a `scenarios/*`

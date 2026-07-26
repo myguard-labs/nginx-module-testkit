@@ -79,6 +79,18 @@ while [ $# -gt 0 ]; do
             ;;
         --budget)
             BUDGET="${2:?--budget requires <secs>}"
+            # Validate as a bare decimal BEFORE it ever reaches bash arithmetic:
+            # `remaining()` computes `$((DEADLINE - SECONDS))`, and bash
+            # arithmetic expansion EVALUATES a command substitution embedded in
+            # an operand -- so an unvalidated `--budget 'x[$(cmd)0]'` would run
+            # cmd (CWE-78, CodeRabbit). A budget is always a non-negative integer
+            # count of seconds; reject anything else at the boundary.
+            case "$BUDGET" in
+                ''|*[!0-9]*)
+                    echo "pr-memcheck: --budget must be a non-negative integer (got '$BUDGET')" >&2
+                    exit 2
+                    ;;
+            esac
             shift 2
             ;;
         *)
@@ -138,11 +150,24 @@ NATIVE_ORACLE="test-scenarios.sh (native scenario probe/resource oracles, scenar
 WEEKLY_OWNER="valgrind-scenarios.sh (whole-server memcheck, weekly lane)"
 
 # --- run verify-impact once -------------------------------------------------
+# overall must exist before the cleanup trap references it (a memcheck run's
+# "not ok ... see $log" points INSIDE $WORK, so cleanup keeps $WORK when
+# anything failed -- else the log a failure names is gone before CI reads it,
+# CodeRabbit). Initialised here, updated by emit() below.
+overall=0
 VI_OUT="$(mktemp)"
 VI_ERR="$(mktemp)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pr-memcheck.XXXXXX")"
 # shellcheck disable=SC2317 # invoked indirectly via `trap ... EXIT`, not a dead call
-cleanup() { rm -f "$VI_OUT" "$VI_ERR"; rm -rf "$WORK"; }
+cleanup() {
+    rm -f "$VI_OUT" "$VI_ERR"
+    if [ "$overall" -eq 0 ]; then
+        rm -rf "$WORK"
+    else
+        # A failing run's TAP names logs inside $WORK -- keep them readable.
+        echo "# pr-memcheck: diagnostics preserved at $WORK" >&2
+    fi
+}
 trap cleanup EXIT
 
 if [ -n "$BASE" ]; then
@@ -184,7 +209,7 @@ if [ "$VI_STATUS" -eq 0 ] && [ -s "$VI_OUT" ]; then
                 # mutation cases are pr-impact phase 5's job, not a memcheck
                 # target -- this adapter memchecks binaries, not mutants.
                 ;;
-            scenarios/*|corpus/*)
+            scenarios/*)
                 printf '%s\n' "$target" >>"$REFUSED"
                 ;;
             *_test)
@@ -193,7 +218,13 @@ if [ "$VI_STATUS" -eq 0 ] && [ -s "$VI_OUT" ]; then
             *)
                 # Anything else verify-impact emits is treated as boot-required
                 # and refused rather than silently run -- fail closed, never
-                # attempt an unclassified target under memcheck.
+                # attempt an unclassified target under memcheck. NB a corpus
+                # change does NOT surface here: impact.map maps corpus SOURCE
+                # rows to a `fuzz/<name>` TARGET, so verify-impact emits the fuzz
+                # target (handled by the fuzz/* arm above), never a bare
+                # `corpus/*` -- so scenarios/* is the only real boot-required
+                # class, and this arm is the fail-closed net for a genuinely
+                # unknown target shape (CodeRabbit).
                 printf '%s\n' "$target" >>"$REFUSED"
                 ;;
         esac
@@ -241,7 +272,7 @@ while IFS= read -r t; do [ -n "$t" ] && n_tests=$((n_tests + 1)); done <<<"$DREF
 echo "1..$n_tests"
 
 idx=0
-overall=0
+# overall already initialised (0) before the cleanup trap above.
 ran=0
 
 emit() {   # $1=status(ok|not_ok) $2=description
@@ -260,8 +291,17 @@ HAVE_VG=1
 command -v valgrind >/dev/null 2>&1 || HAVE_VG=0
 
 # --- nothing selected -------------------------------------------------------
+# Distinguish a genuinely-empty (docs-only) diff from a verify-impact fail-closed
+# error: both leave the buckets empty (rows are only classified when VI_STATUS
+# is 0), but the former is a real `ok`, the latter must NOT read as a green
+# "nothing selected" line to a TAP consumer who never sees stderr (CodeRabbit).
+# The overall exit still propagates VI_STATUS at the end regardless.
 if [ -z "$DTESTS" ] && [ -z "$DFUZZ" ] && [ -z "$DREFUSED" ]; then
-    emit ok "no memcheck target selected by diff -- nothing to run or refuse"
+    if [ "$VI_STATUS" -ne 0 ]; then
+        emit not_ok "verify-impact failed (exit $VI_STATUS, fail-closed) -- see stderr; no targets could be classified"
+    else
+        emit ok "no memcheck target selected by diff -- nothing to run or refuse"
+    fi
 fi
 
 # --- DIRECT: unit test binaries under memcheck ------------------------------
@@ -350,6 +390,13 @@ while IFS= read -r t; do
         continue
     fi
     corpus="fuzz/corpus/${t#fuzz_}"
+    if [ ! -e "$corpus" ]; then
+        # A missing/renamed corpus is a clear diagnosis, not a generic
+        # "memcheck run failed" the direct-test leg already guards its own src
+        # against (CodeRabbit).
+        emit not_ok "fuzz/$t: corpus file missing ($corpus)"
+        continue
+    fi
     left="$(remaining)"
     if [ "$left" -le 0 ]; then
         emit not_ok "fuzz/$t: budget exhausted before running under memcheck"
@@ -357,7 +404,7 @@ while IFS= read -r t; do
     fi
     log="$WORK/vg_fuzz_$t.log"
     if ( cd fuzz && timeout "$left" valgrind "${VG_FLAGS[@]}" "${VG_SUPP_ARGS[@]}" \
-        --log-file="$log" "$fbin" "corpus/${t#fuzz_}" >"$WORK/run_fuzz_$t.log" 2>&1 ); then
+        --log-file="$log" "$fbin" "${corpus#fuzz/}" >"$WORK/run_fuzz_$t.log" 2>&1 ); then
         if grep -qE "$VG_FIND_RE" "$log" 2>/dev/null; then
             emit not_ok "fuzz/$t: memcheck log carries a finding despite exit 0 -- see $log"
         else
@@ -373,8 +420,6 @@ while IFS= read -r t; do
             emit not_ok "fuzz/$t: memcheck run failed (exit $rc)"
         fi
     fi
-    # referenced for shellcheck clarity (corpus dir echoed in-line above)
-    : "$corpus"
 done <<<"$DFUZZ"
 
 # --- REFUSE: boot-required (scenario) targets -------------------------------

@@ -39,7 +39,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 PR_MEMCHECK_SRC="$PWD/pr-memcheck"
 
-PLANNED=8
+PLANNED=9
 tests_run=0
 failures=0
 
@@ -279,17 +279,39 @@ fi
 
 # =========================== 8: verify-impact fail-closed propagates ========
 # verify-impact exiting nonzero (an unmapped executable line) must make
-# pr-memcheck exit nonzero too, not read as "no targets, all green".
+# pr-memcheck exit nonzero too AND emit a not_ok TAP line that names the
+# fail-closed error -- NOT a green "nothing selected" ok line that a TAP reader
+# (who never sees stderr) would misread as a clean empty diff. Assert BOTH the
+# exit code and the TAP-line content, so the VI-failure vs genuine-empty
+# distinction is proven, not just the exit status (CodeRabbit).
 set_rows ""
 set_vi_rc 2
 prm_rc=0
-( cd "$REPO" && ./pr-memcheck --budget 45 >/dev/null 2>&1 ) || prm_rc=$?
+LAST_OUT="$( cd "$REPO"; ./pr-memcheck --budget 45 2>/dev/null )" || prm_rc=$?
 set_vi_rc 0
-if [ "$prm_rc" -ne 0 ]; then
-    ok 0 "verify-impact fail-closed exit propagates through pr-memcheck"
+vi_line="$(printf '%s\n' "$LAST_OUT" | grep -E '^(ok|not ok) 1 ' || true)"
+if [ "$prm_rc" -ne 0 ] \
+   && printf '%s' "$vi_line" | grep -q '^not ok' \
+   && printf '%s' "$vi_line" | grep -qi 'verify-impact failed'; then
+    ok 0 "verify-impact fail-closed exits nonzero AND emits a not_ok (not a green 'nothing selected')"
 else
-    ok 1 "verify-impact fail-closed exit propagates through pr-memcheck"
-    diag "pr-memcheck rc=$prm_rc (expected nonzero)"
+    ok 1 "verify-impact fail-closed exits nonzero AND emits a not_ok (not a green 'nothing selected')"
+    diag "rc=$prm_rc line=$vi_line"
+fi
+
+# =========================== 9: --budget is validated (CWE-78) ==============
+# A --budget carrying a command substitution must be REJECTED at the boundary
+# (exit 2), never assigned into DEADLINE where bash arithmetic would evaluate
+# it. The control: prove the embedded command does NOT run and the exit is 2.
+PWN_MARKER="$WORK/pwn_marker"
+rm -f "$PWN_MARKER"
+prm_rc=0
+( cd "$REPO"; ./pr-memcheck --budget "x[\$(touch $PWN_MARKER)0]" >/dev/null 2>&1 ) || prm_rc=$?
+if [ "$prm_rc" -eq 2 ] && [ ! -e "$PWN_MARKER" ]; then
+    ok 0 "a --budget with a command substitution is rejected (exit 2) and does NOT execute it"
+else
+    ok 1 "a --budget with a command substitution is rejected (exit 2) and does NOT execute it"
+    diag "rc=$prm_rc marker-exists=$( [ -e "$PWN_MARKER" ] && echo yes || echo no )"
 fi
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
