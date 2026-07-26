@@ -378,6 +378,21 @@ parse_fault(backend_script *s, char *arg, const char *file, int lineno)
     f->nth = BACKEND_NTH_ANY;
 
     /*
+     * Commit the slot to the script NOW, before any of the parse steps below
+     * that can die() (parse_on/action_from_name/xstrtol/validate_fault). The
+     * slot's only heap fields are cmd and raw, both NULL after the memset, and
+     * any that a later step allocates before dying is then owned by *s -- so
+     * backend_free() reaches and releases them. On the on-disk backend_load()
+     * path die() exits the process and the OS reclaims everything, so this is
+     * invisible there; it matters for backend_load_buf(), where the fuzz target
+     * recovers from die() via longjmp and must not leak the partial fault. A
+     * fault that dies mid-parse is never looked up (backend_fault_for walks the
+     * committed count, but the script is discarded on the error path), so
+     * counting an incomplete slot is safe.
+     */
+    s->n_faults++;
+
+    /*
      * `data=` is handled before tokenising because its value is raw bytes that
      * may legitimately contain spaces, and strtok_r would cut it at the first
      * one. Everything up to `data=` is whitespace-separated key=value; the rest
@@ -456,24 +471,33 @@ parse_fault(backend_script *s, char *arg, const char *file, int lineno)
     validate_fault(f, have_after, have_delta, have_bytes, have_ms, have_data,
                    file, lineno);
 
-    s->n_faults++;
+    /* Slot was committed (s->n_faults++) up front so a die() mid-parse does not
+     * leak its cmd/raw under the fuzz longjmp path; nothing to do here. */
 }
 
 
-void
-backend_load(const char *file, backend_script *s)
+/*
+ * backend_load_fp -- the whole .backend parser, reading lines from an already
+ * open FILE* rather than opening a path. Splitting the line source out is what
+ * lets backend_load() (a real file) and backend_load_buf() (an in-memory byte
+ * buffer, the fuzz entry) drive the SAME parser, so no fuzz-only
+ * reimplementation exists to drift from what the prober actually runs.
+ *
+ * `file` is only the name printed in die() diagnostics; it is not reopened.
+ * The whole-script contract lives HERE, not split across the two wrappers:
+ * *s is zeroed before the first line and the "no proto directive" check runs
+ * after the last, so both callers get identical parse-and-validate behaviour
+ * from one place (and the mutation registry has a single anchor for the
+ * missing-proto rule, not one per wrapper).
+ */
+static void
+backend_load_fp(FILE *fp, const char *file, backend_script *s)
 {
-    FILE *fp;
     char  line[4096];
     int   lineno = 0;
     int   have_proto = 0;
 
     memset(s, 0, sizeof(*s));
-
-    fp = fopen(file, "r");
-    if (fp == NULL) {
-        die("cannot open backend script %s", file);
-    }
 
     while (fgets(line, sizeof(line), fp) != NULL) {
         char *p, *directive;
@@ -582,8 +606,6 @@ backend_load(const char *file, backend_script *s)
         }
     }
 
-    fclose(fp);
-
     /*
      * The protocol is not defaulted. Guessing memcached would make a redis
      * script that forgot the line answer memcached replies to RESP commands,
@@ -593,6 +615,67 @@ backend_load(const char *file, backend_script *s)
     if (!have_proto) {
         die("%s: no proto directive (memcached or redis)", file);
     }
+}
+
+
+void
+backend_load(const char *file, backend_script *s)
+{
+    FILE *fp;
+
+    fp = fopen(file, "r");
+    if (fp == NULL) {
+        die("cannot open backend script %s", file);
+    }
+
+    backend_load_fp(fp, file, s);
+    fclose(fp);
+}
+
+
+/*
+ * backend_load_buf -- parse a .backend script supplied as an in-memory byte
+ * buffer rather than a path. The fuzz target's entry point: it feeds
+ * libFuzzer's (data, size) straight in without a temp file, so a malformed
+ * script is exercised as untrusted bytes. fmemopen gives backend_load_fp() the
+ * same FILE* line source fgets() reads from a real file, so the parser is
+ * byte-for-byte the one production runs -- no fuzz-only reimplementation to
+ * drift, and no duplicated whole-script validation to fall out of step (the
+ * proto check lives in backend_load_fp, run for both callers).
+ *
+ * On die() (any malformed line, or a missing proto directive) the caller's
+ * armed prober_die_jmp longjmps out before this returns, so the on-disk
+ * backend_load() path is byte-identical aside from the fmemopen-vs-fopen line
+ * source: the same parser, the same proto check, the same fatal contract.
+ *
+ * A NULL from fmemopen (only on an allocation failure here) leaves *s untouched
+ * and returns without dying; the fuzz target arms prober_die_jmp and treats a
+ * script that produced nothing as a non-event, and its static backend_script is
+ * cleared by backend_free() after each input regardless. (backend_load_fp's
+ * memset only runs once fmemopen succeeds, so on this path *s is whatever the
+ * previous iteration left; the fuzz caller's backend_free already zeroed it.)
+ */
+void
+backend_load_buf(const char *buf, size_t len, backend_script *s)
+{
+    FILE *fp;
+
+    /* fmemopen's first parameter is void*, not const void*, even in "r" mode
+     * where it only reads -- a historical POSIX signature wart. The cast
+     * discards const, which -Werror=cast-qual flags; it is safe HERE because
+     * the "r" mode means fmemopen never writes through the pointer. Suppressed
+     * at this one line, not file-wide, the same way die()'s -Wformat-nonliteral
+     * is. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
+    fp = fmemopen((void *) buf, len, "r");
+#pragma GCC diagnostic pop
+    if (fp == NULL) {
+        return;
+    }
+
+    backend_load_fp(fp, "<buf>", s);
+    fclose(fp);
 }
 
 

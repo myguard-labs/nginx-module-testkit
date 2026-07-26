@@ -1,0 +1,2 @@
+proto memcached
+fault on=get:3 action=drip bytes=1 ms=10

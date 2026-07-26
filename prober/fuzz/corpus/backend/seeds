@@ -1,0 +1,4 @@
+proto memcached
+seed key hello
+seed empty ""
+seed esc \x41\x42\r\n

@@ -1,0 +1,2 @@
+proto memcached
+fault on=get action=truncate after=99999999999999999999

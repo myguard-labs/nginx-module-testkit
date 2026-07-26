@@ -1,0 +1,2 @@
+proto memcached
+fault on=get action=cursor_never_zero
