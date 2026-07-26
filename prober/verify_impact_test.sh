@@ -30,8 +30,9 @@
 #   - header fanout:          a changed .h selects its .d-declared dependents'
 #                             owners                                       -- vs
 #                             the same run with no .d files present, which
-#                             must WARN (not silently pass) and fail-closed
-#                             on the header itself having no direct row.
+#                             must WARN and FAIL-CLOSED (nonzero) -- with no
+#                             dep evidence and no direct row the tool cannot
+#                             prove what the header reaches.
 #   - empty/docs-only diff:   exits zero, selects nothing                  -- vs
 #                             the same diff with one real code line added,
 #                             which must then select a target (proves the
@@ -41,7 +42,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 VERIFY_IMPACT="$PWD/verify-impact"
 
-PLANNED=10
+PLANNED=12
 tests_run=0
 failures=0
 
@@ -93,7 +94,7 @@ printf 'int surprise(void) { return 1; }\n' >"$REPO/prober/newthing.c"
 git -C "$REPO" add -A
 git -C "$REPO" commit -q -m "add unmapped source"
 set +e
-out="$(run_vi 2>/tmp/vi_err.$$)"
+out="$(run_vi 2>"$WORK/vi_err")"
 s=$?
 set -e
 ok "$((s != 0 ? 0 : 1))" "unmapped new source file fails closed (nonzero exit)"
@@ -108,7 +109,7 @@ git -C "$REPO" checkout -q -b case-mapped case-unmapped
 git -C "$REPO" add -A
 git -C "$REPO" commit -q -m "map the new source"
 set +e
-out="$(run_vi 2>/tmp/vi_err2.$$)"
+out="$(run_vi 2>"$WORK/vi_err2")"
 s=$?
 set -e
 ok "$s" "the same file, once mapped in impact.map, no longer fails"
@@ -116,7 +117,6 @@ if [ "$s" -eq 0 ] && ! printf '%s\n' "$out" | grep -q "newthing_test"; then
     diag "expected newthing_test in output, got: $out"
     failures=$((failures + 1))
 fi
-rm -f /tmp/vi_err.$$ /tmp/vi_err2.$$
 
 # ---- case 2: rename carries the old path's edges to the new path ----------
 git -C "$REPO" checkout -q -b case-rename "$BASE_SHA"
@@ -204,11 +204,16 @@ git -C "$REPO" add -A
 git -C "$REPO" commit -q -m "change json.h with no .d present"
 set +e
 errout="$(cd "$REPO" && ./prober/verify-impact --base "$NODEP_BASE" 2>&1 >/dev/null)"
+s=$?
 set -e
 warned=1
 printf '%s\n' "$errout" | grep -qi "WARNING" || warned=0
-ok "$((warned == 1 ? 0 : 1))" \
-    "the same header change with no .d files present WARNS instead of silently passing"
+# The header has no direct impact.map row AND no .d evidence exists to compute
+# its dependents -- the tool cannot prove what it reaches, so it must both WARN
+# and FAIL-CLOSED (nonzero). Asserting only the WARNING would let the inverse
+# vacuity trap (WARN-then-exit-0) pass (CR #122 Major).
+ok "$((warned == 1 && s != 0 ? 0 : 1))" \
+    "a header change with no .d files present WARNS and fails closed (nonzero exit)"
 
 # ---- case 5: empty/docs-only diff selects nothing, exit 0 ------------------
 git -C "$REPO" checkout -q -b case-docs "$BASE_SHA"
@@ -239,6 +244,38 @@ s=$?
 set -e
 ok "$((s == 0 && $(printf '%s\n' "$out" | grep -c json_test) > 0 ? 0 : 1))" \
     "the same diff, with a real code line added, DOES select a target"
+
+# ---- case 6: a `#`-prefixed line in a .c file is a preprocessor directive,
+# NOT a comment -- it must count as executable and select the file's owner.
+# This is the CR #122 CRITICAL: the shell-`#`-comment heuristic must never
+# exempt a changed #include/#define in C, or a fail-closed gate fails OPEN.
+git -C "$REPO" checkout -q -b case-c-preprocessor "$BASE_SHA"
+printf '#include <string.h>\nint json_a(void) { return 1; }\n' >"$REPO/prober/json.c"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "add an #include to json.c"
+set +e
+out="$(run_vi)"
+s=$?
+set -e
+ok "$((s == 0 && $(printf '%s\n' "$out" | grep -c json_test) > 0 ? 0 : 1))" \
+    "a changed #include in a .c file is executable (selects json_test), not a comment"
+
+# non-vacuity pair: a real whole-line C comment (// ...) added to the SAME file
+# IS exempt -- proves case 6's selection is the `#`-is-executable rule, not
+# "any change to json.c always selects".
+git -C "$REPO" checkout -q -b case-c-comment "$BASE_SHA"
+printf '// a genuine comment\nint json_a(void) { return 1; }\n' >"$REPO/prober/json.c"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "add a // comment to json.c"
+set +e
+out="$(run_vi)"
+s=$?
+set -e
+comment_exempt=1
+[ "$s" -eq 0 ] || comment_exempt=0
+[ -z "$out" ] || comment_exempt=0
+ok "$((comment_exempt == 1 ? 0 : 1))" \
+    "a whole-line // comment added to json.c IS exempt (selects nothing)"
 
 # ---- plan reconciliation ----------------------------------------------------
 if [ "$tests_run" -ne "$PLANNED" ]; then
