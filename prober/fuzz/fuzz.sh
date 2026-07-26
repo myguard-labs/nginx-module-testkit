@@ -36,7 +36,7 @@ else
     LDLIBS="-lssl -lcrypto -lz"
 fi
 
-TARGETS="json http memcached resp rules"
+TARGETS="json http memcached resp rules backend"
 
 SAN="-fsanitize=address,undefined -fno-omit-frame-pointer"
 export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=1:halt_on_error=1}"

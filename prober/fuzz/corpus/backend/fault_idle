@@ -1,0 +1,2 @@
+proto memcached
+fault on=idle action=close_after ms=50

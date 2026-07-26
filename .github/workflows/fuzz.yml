@@ -8,13 +8,16 @@ name: fuzz
 # half -- clang -fsanitize=fuzzer exploring NEW inputs on a fixed time budget,
 # off-hour, so a genuinely new crasher surfaces without taxing every commit.
 #
-# What it fuzzes: the same four narrow, engine-neutral parser targets the PR
-# path replays -- json_parse_n (untrusted response body), http_parse_response
-# (status/header/body split over adversarial bytes), and the fake upstream's
+# What it fuzzes: the same narrow, engine-neutral parser targets the PR path
+# replays -- json_parse_n (untrusted response body), http_parse_response
+# (status/header/body split over adversarial bytes), the fake upstream's
 # memcached and RESP command parsers (length-prefix confusion off a client
-# socket). Each is a pure function over a byte buffer, chosen because its
-# interesting inputs (embedded NUL, lying length, missing terminator) are
-# exactly the ones a live socket will not produce on demand.
+# socket), and the two file-grammar parsers load_rules (the ~40-directive rule
+# file) and backend_load (the .backend fault-script) driven over an in-memory
+# buffer via fmemopen. Each is a function over a byte buffer, chosen because its
+# interesting inputs (embedded NUL, lying length, missing terminator, malformed
+# directive) are exactly the ones a live socket or a hand-written fixture will
+# not produce on demand.
 #
 # A crasher is uploaded as an artifact for triage and fails the run, so a real
 # find is loud rather than buried in a log nobody reads.

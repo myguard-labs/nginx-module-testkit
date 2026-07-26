@@ -174,6 +174,16 @@ typedef struct {
  */
 void backend_load(const char *file, backend_script *s);
 
+/*
+ * Parse a .backend script from an in-memory byte buffer rather than a path.
+ * The fuzz target's entry point (fuzz/fuzz_backend.c): drives the SAME parser
+ * as backend_load() via fmemopen, so no fuzz-only reimplementation can drift.
+ * die()s on any malformed line and on a missing proto directive, exactly as
+ * backend_load() does; a fuzz caller arms prober_die_jmp (util.h) to survive
+ * it. Leaves *s zeroed (and returns without dying) only if fmemopen fails.
+ */
+void backend_load_buf(const char *buf, size_t len, backend_script *s);
+
 /* Release everything backend_load() allocated, and zero the struct. */
 void backend_free(backend_script *s);
 

@@ -17,10 +17,18 @@ interesting inputs a live socket will not produce on demand:
 | `http`      | `http_parse_response`       | no header terminator, body containing CRLFCRLF, embedded NUL, truncated status line |
 | `memcached` | `backend_parse_memcached`   | storage command with a lying data-length, too many args, unterminated line |
 | `resp`      | `backend_parse_resp`        | lying `$` bulk length, overrunning `*` multibulk count, embedded NUL in a bulk value |
+| `rules`     | `load_rules` (via `load_rules_buf`) | malformed directive line, per-directive numeric bounds, bad escape, pipeline sub-block, cross-line budget overflow |
+| `backend`   | `backend_load` (via `backend_load_buf`) | unknown proto/directive/action, `fault` with missing/contradictory params, `data=`-carries-spaces line, escape decode, `on=cmd:nth` bounds |
 
-`rules.c`'s `load_rules` is deliberately **not** a target: it takes a file path
-and `die()`s on any syntax error by design, so every malformed input "crashes" —
-a fuzz target over it would be vacuous.
+`rules` and `backend` are **file-grammar** parsers: production reads a PATH via
+`fopen`/`fgets` and `die()`s (exit(2)) on any syntax error, which would make a
+naive fuzz target abort on every malformed input. Two shared pieces make them
+work — a `_buf` entry point that `fmemopen`s the fuzzer bytes into the *same*
+line-reading parser (`load_rules_fp` / `backend_load_fp`), and the `die()`
+recovery hook `prober_die_jmp` (util.h): the target arms an `setjmp` env so a
+`die()` `longjmp`s back and a rejected file is a handled non-event, leaving only
+a real crash (ASan/UBSan finding) to fail the run. Production `die()` is
+unchanged (hook NULL → `exit(2)` byte-identical).
 
 ## The two halves
 

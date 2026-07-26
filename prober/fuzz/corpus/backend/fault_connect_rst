@@ -1,0 +1,2 @@
+proto memcached
+fault on=connect action=rst
