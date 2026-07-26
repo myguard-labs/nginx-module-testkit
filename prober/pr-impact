@@ -233,8 +233,15 @@ else
         # Reuse a fresh binary if present (mtime check mirroring build.sh):
         # rebuild only when missing or older than its source.
         if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ]; then
+            # $CC MUST be word-split (unquoted), not `"$CC"` -- CI's 32-bit
+            # leg sets CC="gcc -m32" (a compiler COMMAND, not a bare binary
+            # name), exactly like build.sh already handles it (`compile $CC
+            # $CFLAGS ...`, unquoted). Quoting "$CC" here treats "gcc -m32"
+            # as one literal binary name and fails with "command not found"
+            # (verified: exit 127) -- confirmed as the real regression this
+            # exact bug caused in CI's build-32bit leg.
             # shellcheck disable=SC2086
-            if ! "$CC" -O1 -g -std=c11 -o "$bin" "$src" $LIB $LDFLAGS 2>"$WORK/p1_build_$t.log"; then
+            if ! $CC -O1 -g -std=c11 -o "$bin" "$src" $LIB $LDFLAGS 2>"$WORK/p1_build_$t.log"; then
                 p1_rc=1
                 p1_detail="$p1_detail $t: build failed;"
                 continue
@@ -306,8 +313,12 @@ else
         bin="$WORK/replay_$t"
         # $t is already the full "fuzz_<name>" basename (verify-impact emits
         # "fuzz/fuzz_json" and only the "fuzz/" prefix was stripped above).
+        # $CC word-split, unquoted -- same reasoning as phase 1's own note:
+        # CI's 32-bit leg sets CC="gcc -m32", and quoting "$CC" here would
+        # fail with "command not found" instead of compiling a 32-bit
+        # replay binary (this exact bug regressed CI's build-32bit leg).
         # shellcheck disable=SC2086
-        if ! (cd fuzz && "$CC" -O1 -g -std=c11 $SAN -o "$bin" "$t.c" fuzz_standalone.c $LIBPATHS $LDLIBS) \
+        if ! (cd fuzz && $CC -O1 -g -std=c11 $SAN -o "$bin" "$t.c" fuzz_standalone.c $LIBPATHS $LDLIBS) \
             2>"$WORK/p2_build_$t.log"; then
             p2_rc=1
             p2_detail="$p2_detail $t: build failed;"
