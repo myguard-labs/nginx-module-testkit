@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+#
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# verify-impact -- select which targets a diff must run, from prober/impact.map
+# plus generated header/#include edges. Pure diff+map analysis: this never
+# boots a server, a prober, or a scenario -- it only decides what SHOULD run,
+# so a caller (CI, a human) can then run only that.
+#
+# FAIL-CLOSED CONTRACT (P2 acceptance): a changed executable source line that
+# maps to no target is an ERROR, not a silent skip. A selector that quietly
+# selects nothing for an unmapped change is worse than no selector, because a
+# green run then proves nothing about the changed code. Documentation,
+# comment-only and blank-line diffs are the sole exemption -- P2's own
+# acceptance criterion is that a docs-only PR starts no sanitizer/fuzzer/
+# Valgrind process, so those diffs must select nothing AND exit 0.
+#
+# USAGE
+#   verify-impact --base <sha> [--explain] [--regen-deps]
+#
+#   --base <sha>   diff <sha>..HEAD (defaults to the working tree against
+#                  HEAD when omitted -- see resolve_range()).
+#   --explain      also print, per row, WHY the edge fired (the map row or
+#                  generated-dep line responsible).
+#   --regen-deps   (re)synthesize prober/*.d next to each prober/*.c via
+#                  `$CC -MM`, then use them for this run's header-fanout
+#                  classification, instead of requiring a PROBER_EMIT_DEPS=1
+#                  build to have already produced them. Exits after
+#                  regenerating if no --base is also given.
+#
+# OUTPUT: sorted, deduplicated, deterministic TAB-separated rows on stdout.
+#   default:   TARGET<TAB>LANE          (2 columns -- REASON is omitted)
+#   --explain: TARGET<TAB>REASON<TAB>LANE (3 columns -- REASON shows WHY the
+#              edge fired: the map row or generated-dep line responsible)
+# Sorted with `sort` (no locale-dependent collation surprises: LC_ALL=C),
+# so the same diff always prints the same rows in the same order.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+REPO_ROOT="$(cd .. && pwd)"
+MAP_FILE="impact.map"
+CC="${CC:-cc}"
+
+BASE=""
+EXPLAIN=0
+REGEN_DEPS=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --base)
+            BASE="${2:?--base requires a <sha>}"
+            shift 2
+            ;;
+        --explain)
+            EXPLAIN=1
+            shift
+            ;;
+        --regen-deps)
+            REGEN_DEPS=1
+            shift
+            ;;
+        *)
+            echo "verify-impact: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# --- --regen-deps: synthesize prober/*.d via `$CC -MM`, mirroring the opt-in
+# PROBER_EMIT_DEPS=1 path build.sh can take (kept separate from the normal
+# build so an ordinary `build.sh` run is unchanged, per the P2-A spec).
+regen_deps() {
+    local src base out_d
+    for src in *.c; do
+        [ -e "$src" ] || continue
+        base="${src%.c}"
+        out_d="${base}.d"
+        # CWE-59: refuse to write through a pre-existing symlink -- an attacker
+        # who can plant `prober/json.d -> /etc/passwd` must not get us to
+        # redirect our `>` through it. Only ever write a regular file (or a
+        # fresh one); remove a symlink/irregular target first.
+        if [ -L "$out_d" ] || { [ -e "$out_d" ] && [ ! -f "$out_d" ]; }; then
+            rm -f "$out_d"
+        fi
+        # -MM (not -M): omit system headers -- a change to <string.h> is not
+        # this repo's to select on, and including it would make every source
+        # file "depend" on paths outside the map's universe.
+        if ! "$CC" -MM -MT "$base" "$src" >"$out_d" 2>/dev/null; then
+            # Do not silently leave stale/partial .d data: a source that fails
+            # to preprocess (missing header, syntax error) would otherwise get
+            # no dep entry and read downstream as "no dependents" rather than
+            # "could not compute" (CR #122). WARN and drop the partial file.
+            rm -f "$out_d"
+            echo "verify-impact: WARNING: \$CC -MM failed for $src (missing header / syntax error?) -- no dep data generated for it; header-fanout for its headers will be incomplete" >&2
+        fi
+    done
+}
+
+if [ "$REGEN_DEPS" = 1 ]; then
+    regen_deps
+    [ -n "$BASE" ] || exit 0
+fi
+
+# --- resolve the changed-file list -----------------------------------------
+#
+# With --base: diff <base>..HEAD, including renames (-M) so a renamed file's
+# edges carry forward under its NEW path (classify_rename below maps that back
+# to the map's OLD-path row). Without --base: the working tree against HEAD,
+# for a human running this uncommitted.
+resolve_diff() {
+    if [ -n "$BASE" ]; then
+        git -C "$REPO_ROOT" diff --name-status -M "$BASE"..HEAD
+    else
+        git -C "$REPO_ROOT" diff --name-status -M HEAD
+    fi
+}
+
+# --- is a changed file's diff entirely non-executable? ---------------------
+#
+# Exempts: paths outside prober/+src/+t/ that aren't code (docs, memory), and
+# for in-tree files, a diff whose only changed lines are blank or a whole-line
+# comment in that file's language (C: // /* */ *; shell: #) -- heuristic, not a
+# real parser, but the P2 acceptance test is specifically "a docs-only PR", not
+# "every possible comment-only diff", so a heuristic that catches whole-line
+# comment/blank changes is the contracted scope. `#` is language-sensitive
+# (comment in shell, preprocessor directive in C) -- see diff_is_comment_only.
+is_docs_path() {
+    case "$1" in
+        *.md|*.txt|README*|LICENSE*|CHANGELOG*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Given a file path and a ref range, print 1 if every added/removed line in
+# the diff is blank or a comment-only line, else print 0. A file with NO
+# hunks (e.g. rename-only, or pure mode change) counts as non-executable too.
+#
+# Comment SYNTAX is language-dispatched on the file's extension, because `#`
+# means opposite things across the tree: in a shell/*.sh file it starts a
+# comment, but in a .c/.h file it starts a preprocessor directive
+# (#include/#define/#ifdef) -- a real, executable-affecting line that must
+# NEVER be treated as an inert comment, or a changed #include would silently
+# bypass the fail-closed contract (CR #122 CRITICAL). So the C-family regex
+# below deliberately does NOT list `#`; only shell-family files do.
+diff_is_comment_only() {
+    local path="$1" range_from="$2" range_to="$3" body
+    if [ -n "$range_from" ]; then
+        body="$(git -C "$REPO_ROOT" diff -M "$range_from".."$range_to" -- "$path" 2>/dev/null || true)"
+    else
+        body="$(git -C "$REPO_ROOT" diff -M "$range_to" -- "$path" 2>/dev/null || true)"
+    fi
+    # Lines that are part of the actual change (+/- but not the +++/--- file
+    # headers), with the leading marker stripped.
+    local changed
+    changed="$(printf '%s\n' "$body" | grep -E '^[+-][^+-]' | cut -c2- || true)"
+    if [ -z "$changed" ]; then
+        echo 1
+        return
+    fi
+    # Pick the comment grammar by extension. Unknown/no-extension files get the
+    # C grammar (the conservative choice: `#` is treated as executable, so a
+    # `#`-prefixed line is NEVER exempted for a non-shell file).
+    local re
+    case "$path" in
+        *.sh|*.bash)
+            # shell: blank or whole-line `#` comment.
+            re='^[[:space:]]*($|#)'
+            ;;
+        *)
+            # C family (.c/.h/.cc/... and anything unknown): blank or a
+            # whole-line C comment (// /* */ *). `#` is NOT a comment here --
+            # it is a preprocessor directive and must count as executable.
+            re='^[[:space:]]*($|//|/\*|\*/|\*([^/]|$))'
+            ;;
+    esac
+    if printf '%s\n' "$changed" | grep -qvE "$re"; then
+        echo 0
+    else
+        echo 1
+    fi
+}
+
+# --- map lookup --------------------------------------------------------
+#
+# Returns TAB-separated TARGET/REASON/LANE rows for a given repo-relative
+# path, matching impact.map rows whose SOURCE is an exact path, a directory
+# prefix (SOURCE/), or a glob (fnmatch via case).
+map_lookup() {
+    local path="$1" line type src target lane
+    while IFS=$'\t' read -r line; do
+        case "$line" in
+            \#*|'') continue ;;
+        esac
+        IFS=$'\t' read -r type src target lane <<<"$line"
+        case "$path" in
+            "$src"|"$src"/*)
+                printf '%s\t%s (%s: %s -> %s)\t%s\n' "$target" "impact.map" "$type" "$src" "$target" "$lane"
+                ;;
+            *)
+                # Glob-match a SOURCE that contains a `*`. impact.map's schema:
+                # a bare glob with NO directory (e.g. `*.md`, `fuzz_*.c`) is
+                # matched against the BASENAME; a glob WITH a directory
+                # (`prober/*.c`) is matched against the full path.
+                case "$src" in
+                    *\*)
+                        local match_target
+                        case "$src" in
+                            */*) match_target="$path" ;;        # dir in pattern -> full path
+                            *)    match_target="${path##*/}" ;;  # bare glob -> basename
+                        esac
+                        # shellcheck disable=SC2254 # $src is a literal glob pattern from the map, word-splitting is not in play
+                        case "$match_target" in
+                            $src)
+                                printf '%s\t%s (%s: %s -> %s)\t%s\n' "$target" "impact.map" "$type" "$src" "$target" "$lane"
+                                ;;
+                        esac
+                        ;;
+                esac
+                ;;
+        esac
+    done <"$MAP_FILE"
+}
+
+# --- generated header-fanout: which .c files #include a changed .h ---------
+#
+# Reads prober/*.d (either left over from a PROBER_EMIT_DEPS=1 build.sh run,
+# or synthesized by --regen-deps above) and returns the *.c whose .d lists the
+# given header. A .d with no matching entry is silently skipped -- that means
+# no generated-dep data exists for it, which is reported as a WARNING by the
+# caller rather than papered over, so a stale/missing .d doesn't look like "no
+# dependents" when it is really "no data".
+dependents_of_header() {
+    local hdr="$1" d src
+    for d in *.d; do
+        [ -e "$d" ] || continue
+        # -F: $hdr is a literal filename, not a regex (its `.` must not match
+        # any char). -w: word-boundaried, so `json.h` does not match inside
+        # `myjson.h` or `json.hpp` -- only broadens selection when the header
+        # genuinely appears as a dependency token (CR #122 Major).
+        if grep -Fqw "$hdr" "$d"; then
+            src="${d%.d}.c"
+            printf '%s\n' "$src"
+        fi
+    done
+}
+
+have_dep_files() {
+    local d
+    for d in *.d; do
+        [ -e "$d" ] && return 0
+    done
+    return 1
+}
+
+# --- main classification ----------------------------------------------------
+out="$(mktemp)"
+warn="$(mktemp)"
+trap 'rm -f "$out" "$warn"' EXIT
+
+while IFS=$'\t' read -r status path path2; do
+    [ -n "$status" ] || continue
+
+    # git diff --name-status -M prints "R100<TAB>old<TAB>new" for a rename.
+    case "$status" in
+        R*)
+            new_path="$path2"
+            old_path="$path"
+            ;;
+        *)
+            new_path="$path"
+            old_path=""
+            ;;
+    esac
+
+    # Deletions: edges drop with the file. No orphan target is emitted for a
+    # delete -- classify and move on without adding rows.
+    if [ "$status" = "D" ]; then
+        continue
+    fi
+
+    # Docs-only path, or a comment/blank-only diff on an in-tree file: exempt.
+    if is_docs_path "$new_path"; then
+        continue
+    fi
+    # One call, correct range for both modes: with --base, diff BASE..HEAD;
+    # without, diff the working tree against HEAD. (No double call -- the
+    # empty-BASE case is handled by passing "" "HEAD", which the function's
+    # else-branch turns into `git diff -M HEAD -- <path>`.)
+    if [ -n "$BASE" ]; then
+        only_comments="$(diff_is_comment_only "$new_path" "$BASE" "HEAD")"
+    else
+        only_comments="$(diff_is_comment_only "$new_path" "" "HEAD")"
+    fi
+    if [ "$only_comments" = "1" ]; then
+        continue
+    fi
+
+    # Only files under prober/ or src/ or t/ are in this map's universe; a
+    # change anywhere else that isn't a docs path and isn't comment-only is
+    # itself fail-closed below via "no rows matched".
+    case "$new_path" in
+        prober/*|src/*|t/*) ;;
+        *)
+            # Outside the harness tree entirely (e.g. .github/, packaging) --
+            # not this selector's job to gate; treat as exempt like docs.
+            continue
+            ;;
+    esac
+
+    rows="$(map_lookup "$new_path")"
+
+    # Header fanout: a changed .h selects every .c whose generated .d lists
+    # it, and each of THOSE .c's own map rows. Track whether we had dep
+    # evidence (fanout_had_deps) and whether it produced any selection
+    # (fanout_hit) -- both feed the fail-closed decision below.
+    is_header=0 fanout_had_deps=0
+    case "$new_path" in
+        prober/*.h)
+            is_header=1
+            hdr="$(basename "$new_path")"
+            if have_dep_files; then
+                fanout_had_deps=1
+                for dep_c in $(dependents_of_header "$hdr"); do
+                    dep_rows="$(map_lookup "prober/$dep_c")"
+                    if [ -n "$dep_rows" ]; then
+                        while IFS=$'\t' read -r t r l; do
+                            printf '%s\t%s (header-fanout: %s -> prober/%s)\t%s\n' "$t" "$r" "$hdr" "$dep_c" "$l" >>"$out"
+                        done <<<"$dep_rows"
+                    fi
+                done
+            else
+                echo "verify-impact: WARNING: no generated dep files (prober/*.d) -- run build.sh with PROBER_EMIT_DEPS=1 or verify-impact --regen-deps for header-fanout coverage of $new_path" >>"$warn"
+            fi
+            ;;
+    esac
+
+    if [ -n "$rows" ]; then
+        printf '%s\n' "$rows" >>"$out"
+    elif [ "$is_header" = 1 ] && [ "$fanout_had_deps" = 1 ]; then
+        # A header with no direct row is fine ONLY when we HAD generated-dep
+        # evidence to answer with: the .d files either named its dependents
+        # (fanout_hit=1, rows already emitted) or genuinely showed none. A
+        # header with dep evidence and no dependents legitimately selects
+        # nothing of its own.
+        :
+    elif [ "$is_header" = 1 ]; then
+        # A changed header with NO direct row and NO dep evidence (no .d files
+        # at all) is unproven, not exempt: we cannot know what it reaches.
+        # WARN already emitted above; fail-closed here (CR #122 Major -- the
+        # inverse vacuity trap: a fail-closed gate must not fail OPEN on its
+        # own missing-evidence path).
+        echo "verify-impact: ERROR: $new_path changed, has no direct impact.map row, and no generated dep files exist to compute its dependents -- cannot prove what it reaches (regen with --regen-deps or a PROBER_EMIT_DEPS=1 build)" >&2
+        echo "__UNMAPPED__" >>"$out"
+    else
+        # FAIL-CLOSED: a changed executable source line with no matching row
+        # and no header-fanout hit is an error, not a silent skip. This is
+        # what makes a new, never-mapped source file (or a rename target
+        # whose old path was mapped but whose new path is unlisted) loud
+        # instead of quietly unproven.
+        echo "verify-impact: ERROR: $new_path changed but maps to no target in $MAP_FILE (rename-carry checked, header-fanout checked)" >&2
+        echo "__UNMAPPED__" >>"$out"
+    fi
+
+    if [ -n "$old_path" ] && [ "$old_path" != "$new_path" ]; then
+        : # rename: edges already carried via new_path's own map_lookup call
+    fi
+done < <(resolve_diff)
+
+if [ -s "$warn" ]; then
+    cat "$warn" >&2
+fi
+
+if grep -qx "__UNMAPPED__" "$out"; then
+    exit 1
+fi
+
+if [ ! -s "$out" ]; then
+    # Empty/docs-only diff: select nothing, exit 0 (P2 acceptance: docs-only
+    # PR starts no sanitizer/fuzzer/Valgrind process).
+    exit 0
+fi
+
+if [ "$EXPLAIN" = 1 ]; then
+    LC_ALL=C sort -u "$out"
+else
+    LC_ALL=C sort -u "$out" | cut -f1,3
+fi
