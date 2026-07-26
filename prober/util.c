@@ -12,10 +12,16 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+
+/* NULL in every normal build -- see util.h. The fuzz target arms it so die()
+ * longjmps back instead of exiting. */
+jmp_buf *prober_die_jmp = NULL;
 
 
 _Noreturn void
@@ -58,6 +64,15 @@ die(const char *fmt, ...)
 
     fprintf(stderr, "\n");
     va_end(ap);
+
+    /* A harness that armed the recovery hook (the rules fuzz target) unwinds
+     * back to its setjmp instead of exiting, so a die-on-syntax-error rule
+     * file returns to the fuzzer as a handled reject rather than aborting the
+     * process. longjmp is _Noreturn, so die()'s noreturn contract still holds.
+     * NULL in every normal build -- the exit(2) below is the only path then. */
+    if (prober_die_jmp != NULL) {
+        longjmp(*prober_die_jmp, 1);
+    }
 
     exit(2);
 }

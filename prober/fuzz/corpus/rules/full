@@ -1,0 +1,6 @@
+name full
+block a
+send GET /a HTTP/1.1\r\n\r\n
+pause 5
+expect status_like 200
+probe /x == y

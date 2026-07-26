@@ -5,6 +5,10 @@
  * rules.c -- see rules.h.
  */
 
+/* fmemopen (load_rules_buf) is POSIX.1-2008; under -std=c11 glibc hides it
+ * without a feature-test macro. Same _GNU_SOURCE the sibling .c files set. */
+#define _GNU_SOURCE
+
 #include "rules.h"
 #include "util.h"
 
@@ -446,19 +450,24 @@ parse_assert(probe_assert *list, size_t *count, const char *directive,
 }
 
 
-size_t
-load_rules(const char *file, test_case *cases, size_t max)
+/*
+ * load_rules_fp -- the whole rule-file parser, reading lines from an already
+ * open FILE*. The two public entries below differ ONLY in where that FILE*
+ * comes from: load_rules() fopen()s a path, load_rules_buf() fmemopen()s an
+ * in-memory buffer (the fuzz target's entry, so a hostile rule file is a byte
+ * array rather than a temp file on disk). Neither the line loop nor any
+ * directive's semantics change with the source, so the body lives here once.
+ * The caller owns fp and closes it -- this function never does, so an error
+ * that die()s (or, in the fuzz build, longjmps out via die's hook) does not
+ * leave a half-closed stream either way.
+ */
+static size_t
+load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
 {
-    FILE    *fp;
     char     line[4096];
     size_t   n = 0, cap = 0, i;
     int      lineno = 0;
     int      open_case = 0;
-
-    fp = fopen(file, "r");
-    if (fp == NULL) {
-        die("cannot open rule file %s", file);
-    }
 
     while (fgets(line, sizeof(line), fp) != NULL) {
         char *p, *directive, *arg;
@@ -1358,8 +1367,6 @@ load_rules(const char *file, test_case *cases, size_t max)
         }   /* per-exchange routing scope (tc/blk) */
     }
 
-    fclose(fp);
-
     /*
      * Re-check pause budgets now that every request buffer is final.
      *
@@ -1576,5 +1583,59 @@ load_rules(const char *file, test_case *cases, size_t max)
         }
     }
 
+    return n;
+}
+
+
+size_t
+load_rules(const char *file, test_case *cases, size_t max)
+{
+    FILE    *fp;
+    size_t   n;
+
+    fp = fopen(file, "r");
+    if (fp == NULL) {
+        die("cannot open rule file %s", file);
+    }
+
+    n = load_rules_fp(fp, file, cases, max);
+    fclose(fp);
+    return n;
+}
+
+
+/*
+ * load_rules_buf -- parse a rule file supplied as an in-memory byte buffer
+ * rather than a path. The fuzz target's entry point: it feeds libFuzzer's
+ * (data, size) straight in without a temp file, so a malformed rule file is
+ * exercised as untrusted bytes. fmemopen gives load_rules_fp() the same FILE*
+ * line source fgets() reads from a real file, so the parser is byte-for-byte
+ * the one production runs -- no fuzz-only reimplementation to drift.
+ *
+ * A NULL from fmemopen (only on an allocation failure here) yields 0 cases,
+ * the same as an empty file; the fuzz target treats "no cases" as a non-event.
+ */
+size_t
+load_rules_buf(const char *buf, size_t len, test_case *cases, size_t max)
+{
+    FILE    *fp;
+    size_t   n;
+
+    /* fmemopen's first parameter is void*, not const void*, even in "r" mode
+     * where it only reads -- a historical POSIX signature wart. The cast
+     * discards const, which -Werror=cast-qual flags; it is safe HERE because
+     * the "r" mode means fmemopen never writes through the pointer. Suppressed
+     * at this one line, not file-wide, the same way die()'s -Wformat-nonliteral
+     * is. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
+    fp = fmemopen((void *) buf, len, "r");
+#pragma GCC diagnostic pop
+    if (fp == NULL) {
+        return 0;
+    }
+
+    n = load_rules_fp(fp, "<buf>", cases, max);
+    fclose(fp);
     return n;
 }

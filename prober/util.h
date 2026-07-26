@@ -9,6 +9,7 @@
 #ifndef NGX_TEST_HARNESS_UTIL_H
 #define NGX_TEST_HARNESS_UTIL_H
 
+#include <setjmp.h>
 #include <stddef.h>
 
 /*
@@ -34,6 +35,18 @@
 _Noreturn void die(const char *fmt, ...)
     __attribute__((format(printf, 1, 2)))
     __attribute__((noreturn));
+
+/*
+ * Recovery hook for die(), NULL in every normal build so die() exit(2)s
+ * exactly as before. A test/fuzz harness that must survive a die() (the rules
+ * fuzz target, which feeds die-on-syntax-error rule files by the thousand)
+ * points this at an armed jmp_buf; die() then longjmp(*prober_die_jmp, 1)s to
+ * it instead of exiting, still without returning to its caller (longjmp is
+ * _Noreturn), so die()'s noreturn contract holds. Single-threaded use only:
+ * the prober and its self-tests never call die() from more than one thread.
+ * The value passed to longjmp is 1 (setjmp returns it), never 0.
+ */
+extern jmp_buf *prober_die_jmp;
 
 /* strdup(), or die trying. */
 char *xstrdup(const char *s);

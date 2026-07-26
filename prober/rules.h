@@ -554,6 +554,15 @@ typedef struct {
  */
 size_t load_rules(const char *file, test_case *cases, size_t max);
 
+/*
+ * As load_rules(), but reads the rule text from an in-memory buffer instead of
+ * a path -- the fuzz target's entry, so a hostile rule file is (data, size)
+ * with no temp file. Same parser, same fatal-on-syntax-error contract (the
+ * fuzz build installs a die() hook that longjmps out instead of exiting, so a
+ * malformed input returns to the harness rather than aborting the process).
+ */
+size_t load_rules_buf(const char *buf, size_t len, test_case *cases, size_t max);
+
 void case_free(test_case *tc);
 
 #endif /* NGX_TEST_HARNESS_RULES_H */
