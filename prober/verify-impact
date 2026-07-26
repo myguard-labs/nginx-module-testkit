@@ -253,6 +253,73 @@ have_dep_files() {
     return 1
 }
 
+# --- coverage-map.json: an ADDITIONAL, layered selector input ---------------
+#
+# P2-B: prober/coverage-director.sh (opt-in, never run by build.sh) records
+# which test binary executes which line of which LIB source file. This is a
+# SUPPLEMENT to impact.map, not a replacement -- impact.map's PRIMARY/
+# FALLBACK/SEMANTIC rows still fire regardless of whether this file exists.
+# If coverage-map.json is ABSENT, this layer is silently skipped: impact.map
+# remains the primary signal and a missing coverage map is no different from
+# never having run coverage-director.sh at all (same posture as the .d-absent
+# header case only WARNing, not erroring, when deps were never generated).
+COVERAGE_MAP="coverage-map.json"
+
+have_coverage_map() {
+    [ -f "$COVERAGE_MAP" ] && command -v jq >/dev/null 2>&1
+}
+
+# Changed (added) line numbers on the NEW side of a file's diff, one per
+# line, derived from `git diff -U0` hunk headers -- @@ -a,b +c,d @@ means the
+# new side gained `d` lines (default 1 when omitted) starting at line `c`.
+# -U0 emits pure hunk headers with no surrounding context lines to filter,
+# so every hunk header in the body is a real change, not a comment/context
+# line reprinted around one.
+changed_lines_of() {
+    local path="$1" range_from="$2" range_to="$3" body
+    if [ -n "$range_from" ]; then
+        body="$(git -C "$REPO_ROOT" diff -U0 -M "$range_from".."$range_to" -- "$path" 2>/dev/null || true)"
+    else
+        body="$(git -C "$REPO_ROOT" diff -U0 -M "$range_to" -- "$path" 2>/dev/null || true)"
+    fi
+    printf '%s\n' "$body" | grep -E '^@@ ' | while IFS= read -r hdr; do
+        # Extract the "+start,count" (or "+start" when count is omitted,
+        # meaning count=1) new-side hunk range.
+        new_range="$(printf '%s\n' "$hdr" | sed -n 's/^@@ -[0-9,]* +\([0-9]*\)\(,\([0-9]*\)\)\{0,1\} @@.*/\1 \3/p')"
+        start="${new_range%% *}"
+        count="${new_range##* }"
+        [ -n "$start" ] || continue
+        [ -n "$count" ] || count=1
+        [ "$count" -gt 0 ] || continue
+        i=0
+        while [ "$i" -lt "$count" ]; do
+            printf '%s\n' "$((start + i))"
+            i=$((i + 1))
+        done
+    done
+}
+
+# Rows selected by coverage-map.json for one changed .c file: for every
+# changed line covered by at least one test in the map, emit that test as a
+# TARGET, tagged "fast" (coverage-director.sh only instruments unit tests,
+# which are all fast-lane). Only .c files are looked up here -- a .h has no
+# entry of its own in coverage-map.json (gcovr attributes lines to the
+# translation unit that defines them), so headers stay on the impact.map +
+# header-fanout path above; this function is not called for them.
+coverage_rows_for() {
+    local path="$1" range_from="$2" range_to="$3" line tests t
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        tests="$(jq -r --arg f "$path" --arg l "$line" \
+            '.[$f][$l] // [] | .[]' "$COVERAGE_MAP" 2>/dev/null || true)"
+        [ -n "$tests" ] || continue
+        while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            printf '%s\t%s (coverage-map: %s:%s)\tfast\n' "$t" "coverage-map.json" "$path" "$line"
+        done <<<"$tests"
+    done < <(changed_lines_of "$path" "$range_from" "$range_to")
+}
+
 # --- main classification ----------------------------------------------------
 out="$(mktemp)"
 warn="$(mktemp)"
@@ -309,6 +376,33 @@ while IFS=$'\t' read -r status path path2; do
     esac
 
     rows="$(map_lookup "$new_path")"
+
+    # Coverage-map layer (P2-B): a SUPPLEMENT to impact.map, only for .c
+    # files (a .h has no lines of its own in coverage-map.json -- see
+    # coverage_rows_for) and only when coverage-map.json actually exists.
+    # Appended to $rows BEFORE the fail-closed decision below, so a line
+    # proven only by coverage-map.json (no impact.map row at all) still
+    # counts as proven and does not fail closed -- while a line proven by
+    # NEITHER impact.map NOR coverage-map.json still does.
+    case "$new_path" in
+        prober/*.c)
+            if have_coverage_map; then
+                if [ -n "$BASE" ]; then
+                    cov_rows="$(coverage_rows_for "$new_path" "$BASE" "HEAD")"
+                else
+                    cov_rows="$(coverage_rows_for "$new_path" "" "HEAD")"
+                fi
+                if [ -n "$cov_rows" ]; then
+                    if [ -n "$rows" ]; then
+                        rows="$rows
+$cov_rows"
+                    else
+                        rows="$cov_rows"
+                    fi
+                fi
+            fi
+            ;;
+    esac
 
     # Header fanout: a changed .h selects every .c whose generated .d lists
     # it, and each of THOSE .c's own map rows. Track whether we had dep
