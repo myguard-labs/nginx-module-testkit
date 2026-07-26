@@ -369,12 +369,17 @@ if command -v valgrind >/dev/null 2>&1; then
     # involvement: pr-impact's phase 1 compiles lib_test.c with its own
     # hardcoded command line, never via the fixture's build.sh.
     git -C "$REPO" checkout -q -b case-p3-fault "$BASE_SHA"
+    # volatile forces the store through memory and forbids the compiler from
+    # proving the allocation dead, so the leak is un-elidable at -O0 *and*
+    # at higher optimization levels/compilers (phase 3 now builds its own
+    # -O0 memcheck binary regardless, but the fixture itself must not rely
+    # on that -- see the clang-DCE regression this fixed).
     cat >"$REPO/prober/lib_test.c" <<'EOF'
 #include <stdio.h>
 #include <stdlib.h>
 #include "lib.h"
 int main(void) {
-    int *leaked = malloc(sizeof(int));
+    int * volatile leaked = malloc(sizeof(int));
     *leaked = add_one(1);
     if (*leaked != 2) { fprintf(stderr, "not ok\n"); return 1; }
     printf("ok\n");

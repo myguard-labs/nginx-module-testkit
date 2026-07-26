@@ -301,6 +301,22 @@ else
     p3_detail=""
     VG_SUPP_ARGS=()
     [ -f "$VALGRIND_SUPP" ] && VG_SUPP_ARGS=(--suppressions="$VALGRIND_SUPP")
+    # Memcheck must not reuse phase 1's optimized (-O1, ambient $CC) binary:
+    # a leak that's still observable at -O1 under gcc can be dead-code-eliminated
+    # by clang at the same -O1 (the CI matrix runs CC=clang), silently making
+    # the phase 3 non-vacuity mutant survive. Build a SEPARATE, memcheck-only
+    # binary at -O0 with a pinned toolchain preference (gcc, falling back to
+    # whatever cc/clang is available) so leak shape is deterministic across
+    # the CI compiler matrix, independent of ambient $CC used by phases 1/2.
+    VG_CC="$(command -v gcc || command -v cc || command -v clang)"
+    LIB="json.c http.c util.c rules.c assert.c backend.c"
+    VG_LDFLAGS="${LDFLAGS:-}"
+    if command -v pkg-config >/dev/null 2>&1; then
+        VG_LDFLAGS="$VG_LDFLAGS $(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
+        VG_LDFLAGS="$VG_LDFLAGS $(pkg-config --libs zlib 2>/dev/null || echo '-lz')"
+    else
+        VG_LDFLAGS="$VG_LDFLAGS -lssl -lcrypto -lz"
+    fi
     while IFS= read -r t; do
         [ -n "$t" ] || continue
         if [ "$(remaining)" -le 0 ]; then
@@ -308,15 +324,23 @@ else
             p3_detail="$p3_detail budget exhausted before $t;"
             break
         fi
-        bin="$t"
-        if [ ! -x "$bin" ]; then
+        src="$t.c"
+        vg_bin="$WORK/memcheck_$t"
+        if [ ! -e "$src" ]; then
             p3_rc=1
-            p3_detail="$p3_detail $t: binary missing (phase 1 must build it first);"
+            p3_detail="$p3_detail $t: source missing;"
+            continue
+        fi
+        # shellcheck disable=SC2086
+        if ! "$VG_CC" -O0 -g -std=c11 -o "$vg_bin" "$src" $LIB $VG_LDFLAGS \
+            2>"$WORK/p3_build_$t.log"; then
+            p3_rc=1
+            p3_detail="$p3_detail $t: memcheck build failed;"
             continue
         fi
         if ! valgrind --error-exitcode=99 --leak-check=full \
             --errors-for-leak-kinds=definite "${VG_SUPP_ARGS[@]}" \
-            ./"$bin" >"$WORK/p3_run_$t.log" 2>&1; then
+            "$vg_bin" >"$WORK/p3_run_$t.log" 2>&1; then
             p3_rc=1
             p3_detail="$p3_detail $t: memcheck reported an error;"
         fi
