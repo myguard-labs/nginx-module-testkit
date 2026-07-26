@@ -54,7 +54,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-PLANNED=6
+PLANNED=10
 tests_run=0
 failures=0
 
@@ -189,6 +189,120 @@ if prober_scrape_valgrind >/dev/null 2>&1; then
     ok 0 "prober_scrape_valgrind returns 0 on a clean valgrind log"
 else
     ok 1 "prober_scrape_valgrind returns 0 on a clean valgrind log"
+fi
+
+# --- 7/8: --track-origins=yes turns an uninitialised READ into a failing exit
+#
+# The bare leak-check adapter caught only "definitely lost". This pair proves
+# the --track-origins=yes half of valgrind-scenarios.sh's flag set is
+# load-bearing: an uninitialised-value read is a distinct finding class a
+# module owns (it read a struct field it forgot to zero), and --track-origins
+# makes the report name WHERE the value came from rather than emitting a bare,
+# unactionable "uninitialised value was created" line. Both flags together
+# must (1) fail the exit status with --error-exitcode=99 and (2) leave the
+# finding in the log for prober_scrape_valgrind's belt to catch.
+#
+# uninit.c: allocate a byte, never initialise it, and branch on it into a
+# `volatile` sink so the compiler cannot fold the read away at -O0 (an
+# unobservable branch WOULD be elided -- a no-op then/else lets gcc drop the
+# conditional read entirely, and memcheck sees nothing). Writing the branch's
+# outcome to a volatile global keeps the read observable, so memcheck reports a
+# "Conditional jump or move depends on uninitialised value(s)" finding and
+# --track-origins names the malloc above as its origin. Returning 0
+# unconditionally keeps the exit status owned by --error-exitcode.
+cat > "$SCRATCH/uninit.c" <<'EOF'
+#include <stdlib.h>
+volatile int sink;
+int main(void) {
+    char *p = malloc(1);
+    if (p == NULL) { return 2; }
+    /* branch on the uninitialised byte, storing the outcome in a volatile
+     * global: the store is an observable side effect the compiler must keep,
+     * which keeps the uninitialised read alive for memcheck to catch. */
+    if (p[0] & 0x40) { sink = 1; } else { sink = 0; }
+    free(p);
+    return 0;
+}
+EOF
+# shellcheck disable=SC2086
+$CC -O0 -g -o "$SCRATCH/uninit" "$SCRATCH/uninit.c"
+
+rc=0
+valgrind --error-exitcode=99 --leak-check=full --track-origins=yes \
+    --log-file="$SCRATCH/vg_uninit.log" "$SCRATCH/uninit" >/dev/null 2>&1 || rc=$?
+
+if [ "$rc" -eq 99 ]; then
+    ok 0 "--error-exitcode=99 fails the exit status on an uninitialised read"
+else
+    ok 1 "--error-exitcode=99 fails the exit status on an uninitialised read (got rc=$rc)"
+fi
+
+# The origin line (--track-origins) turns an unactionable report into one that
+# names the allocation. Assert the finding AND its origin are both in the log.
+if grep -qE 'depends on uninitialised value|uninitialised value' "$SCRATCH/vg_uninit.log" \
+   && grep -qE 'Uninitialised value was created|by a heap allocation' "$SCRATCH/vg_uninit.log"; then
+    ok 0 "--track-origins names the origin of the uninitialised value"
+else
+    ok 1 "--track-origins names the origin of the uninitialised value"
+    diag "log contents:"
+    sed 's/^/# /' "$SCRATCH/vg_uninit.log"
+fi
+
+# --- 9/10: --track-fds=all names a leaked FILE DESCRIPTOR in the log
+#
+# The --track-fds=all half. A leaked fd (module opens a socket/temp file, never
+# closes it on the error path) is a real resource exhaustion under load and is
+# invisible to leak-check -- the memory behind it is not "lost". --track-fds
+# reports the still-open fd at exit with the open() site that created it.
+#
+# WHY THIS PAIR ASSERTS THE LOG, NOT THE EXIT CODE. Whether a leaked fd bumps
+# memcheck's error count (and so trips --error-exitcode=99) is VERSION-
+# DEPENDENT: valgrind 3.24 counts it as an error and exits 99, but other
+# versions on the CI fleet report the open fd purely informationally and exit
+# 0. The portable, version-independent guarantee --track-fds gives is the LOG
+# LINE naming the leaked descriptor and its open site -- which is exactly what
+# a weekly triage run reads. So this pair asserts the log content, and stays
+# non-vacuous by requiring the descriptor for OUR /dev/null open specifically,
+# not just any of valgrind's own always-open fds (0/1/2 and its log file).
+#
+# fdleak.c: open /dev/null and never close it. At exit --track-fds reports the
+# open descriptor and its open() call site.
+cat > "$SCRATCH/fdleak.c" <<'EOF'
+#include <fcntl.h>
+#include <unistd.h>
+int main(void) {
+    int fd = open("/dev/null", O_RDONLY);
+    if (fd < 0) { return 2; }
+    /* deliberately never close(fd): a leaked descriptor at exit. */
+    return 0;
+}
+EOF
+# shellcheck disable=SC2086
+$CC -O0 -g -o "$SCRATCH/fdleak" "$SCRATCH/fdleak.c"
+
+# WITH --track-fds: the leaked /dev/null fd must be named in the log.
+valgrind --track-fds=all \
+    --log-file="$SCRATCH/vg_fdleak.log" "$SCRATCH/fdleak" >/dev/null 2>&1 || true
+
+if grep -qiE 'Open file descriptor [0-9]+: /dev/null' "$SCRATCH/vg_fdleak.log"; then
+    ok 0 "--track-fds names the leaked /dev/null descriptor in the log"
+else
+    ok 1 "--track-fds names the leaked /dev/null descriptor in the log"
+    diag "log contents:"
+    sed 's/^/# /' "$SCRATCH/vg_fdleak.log"
+fi
+
+# VACUITY PROOF for the fd half: the SAME program WITHOUT --track-fds leaves no
+# such line, so the flag is what surfaces it -- not something already in every
+# valgrind log.
+valgrind --log-file="$SCRATCH/vg_fdleak_off.log" "$SCRATCH/fdleak" >/dev/null 2>&1 || true
+
+if grep -qiE 'Open file descriptor [0-9]+: /dev/null' "$SCRATCH/vg_fdleak_off.log"; then
+    ok 1 "VACUITY PROOF: without --track-fds the /dev/null fd is NOT reported"
+    diag "log contents:"
+    sed 's/^/# /' "$SCRATCH/vg_fdleak_off.log"
+else
+    ok 0 "VACUITY PROOF: without --track-fds the /dev/null fd is NOT reported"
 fi
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
