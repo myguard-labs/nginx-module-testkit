@@ -87,6 +87,7 @@ FAILED=0
 # TAP plan:
 #  1 the cycle-pool slope is flat (== 0/op) after warmup
 #  2 the RSS (private_dirty) slope stays under the per-op bound
+#    (SKIPped, not failed, on a sanitizer build -- see oracle 2 below)
 echo "1..2"
 
 # --- oracle 1: cycle-pool slope is exactly flat -----------------------------
@@ -113,7 +114,21 @@ fi
 # (naming it), never subtracting to a passing zero -- but the `requires` gate
 # has already established the file is present, so a failure here is a real read
 # problem, not an unsupported kernel.
-if out="$(prober_slope_check "$HOST" "$PORT" private_dirty / \
+#
+# SKIPPED ON A SANITIZER BUILD. An ASan/UBSan runtime dirties fresh pages of its
+# OWN as the worker services requests -- shadow memory, the allocator's redzones
+# and quarantine, lazy servicing -- so private_dirty climbs steadily (measured
+# ~91 kB/op on the san leg vs 0/op on a bare build) for reasons that are the
+# sanitizer's memory surface, not a module leak. Widening MAX_DIRTY to absorb it
+# would dull the bound on every uninstrumented leg for a san-only artifact, the
+# same trap syscall-allowlist documents for its syscall set. So this ONE oracle
+# SKIPs under a sanitizer binary; oracle 1 (cycle_used) is unaffected -- ASan
+# does not allocate on the nginx cycle pool -- and still runs, so the san leg
+# keeps a live slope assertion. Detected with the same `__asan_`/`__ubsan_`
+# binary scan lib.sh and syscall-allowlist use.
+if grep -qa '__asan_\|__ubsan_' "$PROBER_SERVER_BIN"; then
+    echo "ok 2 - RSS private_dirty slope # SKIP sanitizer build dirties its own pages (not a module leak)"
+elif out="$(prober_slope_check "$HOST" "$PORT" private_dirty / \
             "$WARMUP" "$OPS" "$MAX_DIRTY")"; then
     echo "ok 2 - RSS private_dirty slope stays under ${MAX_DIRTY} kB/op"
     printf '%s\n' "$out"
