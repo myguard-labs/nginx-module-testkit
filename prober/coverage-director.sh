@@ -24,8 +24,32 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-CC="${CC:-cc}"
+# Coverage instrumentation here is gcc/gcovr-specific: gcovr reads the
+# .gcno/.gcda gcc emits under --coverage. clang's --coverage needs
+# llvm-cov/llvm-profdata (a different, often-absent toolchain), so this
+# director does NOT follow the ambient $CC (CI sets CC=clang for one selftest
+# leg -- see ci.yml). It picks a gcov-compatible compiler explicitly:
+# COVERAGE_CC if set, else gcc, else the ambient CC only if it is itself gcc.
+# If no gcov-compatible compiler AND gcovr are available, the map is optional
+# infra, so skip cleanly (exit 0) rather than fail the build.
 GCOVR="${GCOVR:-gcovr}"
+if [ -n "${COVERAGE_CC:-}" ]; then
+    CC="$COVERAGE_CC"
+elif command -v gcc >/dev/null 2>&1; then
+    CC="gcc"
+else
+    CC="${CC:-cc}"
+fi
+case "$("$CC" --version 2>/dev/null | head -1)" in
+    *[Cc]lang*)
+        echo "coverage-director: SKIP -- $CC is clang; need a gcov-compatible compiler (gcc). Set COVERAGE_CC or install gcc." >&2
+        exit 0
+        ;;
+esac
+if ! command -v "$CC" >/dev/null 2>&1 || ! command -v "$GCOVR" >/dev/null 2>&1; then
+    echo "coverage-director: SKIP -- need gcc + gcovr (have CC=$CC GCOVR=$GCOVR)" >&2
+    exit 0
+fi
 
 LIB="json.c http.c util.c rules.c assert.c backend.c"
 OUT_JSON="coverage-map.json"

@@ -55,12 +55,19 @@ ok() {
 
 diag() { printf '# %s\n' "$1"; }
 
-CC="${CC:-cc}"
-if ! command -v "$CC" >/dev/null 2>&1 || ! command -v gcovr >/dev/null 2>&1 \
+# coverage-director.sh is gcc/gcovr-specific (it self-selects a gcov-compatible
+# compiler regardless of the ambient $CC -- CI runs one selftest leg with
+# CC=clang, under which the director SKIPs). This test exercises real
+# attribution, so it needs the same gcc+gcovr the director does; skip the
+# whole suite (never fake-pass) when they are absent. jq is needed to read the
+# emitted map.
+COVERAGE_CC="${COVERAGE_CC:-gcc}"
+if ! command -v "$COVERAGE_CC" >/dev/null 2>&1 || ! command -v gcovr >/dev/null 2>&1 \
    || ! command -v jq >/dev/null 2>&1; then
-    echo "1..0 # SKIP coverage_director_test.sh needs cc, gcovr and jq"
+    echo "1..0 # SKIP coverage_director_test.sh needs gcc (gcov-compatible), gcovr and jq"
     exit 0
 fi
+export COVERAGE_CC
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/coverage_director_test.XXXXXX")"
 cleanup() { rm -rf "$WORK"; }
