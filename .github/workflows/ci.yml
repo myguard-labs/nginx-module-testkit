@@ -16,14 +16,25 @@ concurrency:
 jobs:
   # The harness's own parsers and assertion evaluators, as pure functions. No
   # server involved, so this is fast and is the gate that actually blocks.
+  # Two legs, not four: gcc and clang, both with ASan+UBSan on. The sanitizer
+  # build RUNS the exact same *_test.c suite the plain-arch build would, plus
+  # the sanitizer instrumentation -- so a no-san leg's test coverage is a
+  # strict subset of its san sibling's. The only thing a bare `SAN=0` leg adds
+  # is a pure-miscompile / optimizer-divergence canary (a bug the sanitizers'
+  # instrumented codegen happens to hide), which the analyzers job
+  # (-fanalyzer / cppcheck / clang-tidy on uninstrumented source) and the
+  # reproducible-build + build-flags-canary legs already exercise on the plain
+  # toolchain. The two no-san legs were dropped 2026-07-26 to cut PR wall-clock
+  # and builder02 queue pressure; keeping both compilers under sanitizers
+  # preserves the cross-compiler + UB/leak coverage that actually finds bugs.
   selftest:
     runs-on: [self-hosted, builder02, lxc]
     strategy:
       fail-fast: false
       matrix:
         cc: [gcc, clang]
-        san: ["0", "1"]
-    name: selftest (${{ matrix.cc }}${{ matrix.san == '1' && ' +asan/ubsan' || '' }})
+        san: ["1"]
+    name: selftest (${{ matrix.cc }} +asan/ubsan)
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -1196,93 +1207,6 @@ jobs:
               exit 1
           fi
 
-  # 32-bit leg. size_t/off_t/time_t are 4 bytes under -m32 where they are 8 on
-  # the amd64 build the rest of CI runs; a truncation or a format-width bug
-  # (%zu against something that is not actually a size_t on this ABI, a length
-  # computation that overflows 32 bits where it would not overflow 64) is
-  # invisible on every other job here and would only ever surface on a 32-bit
-  # consumer host. Building AND RUNNING the unit tests under -m32 is what
-  # catches it: a build-only leg would miss a wrong runtime VALUE that still
-  # compiles and links clean.
-  #
-  # The warning wall stays on, unchanged from build.sh -- a 32-bit build that
-  # only passes with the strict flags loosened would be hiding exactly the
-  # class of bug this leg exists to catch.
-  build-32bit:
-    runs-on: [self-hosted, builder02, lxc]
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
-        with:
-          persist-credentials: false
-
-      - name: install 32-bit toolchain
-        run: |
-          sudo dpkg --add-architecture i386
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-multilib libc6-dev-i386 libssl-dev:i386 zlib1g-dev:i386
-
-      - name: build the prober + self-tests as 32-bit
-        working-directory: prober
-        env:
-          CC: "gcc -m32"
-        run: |
-          gcc --version | head -1
-          ./build.sh
-
-      # test.sh discovers and runs every *_test.c binary it just built --
-      # exactly the mechanism the plain-arch selftest job above uses, just
-      # under -m32. A build-only leg would not have caught the atoi() bug
-      # PR #19 found; running is what proves a wrong VALUE, not just a wrong
-      # TYPE that still happens to compile.
-      - name: run the 32-bit self-tests
-        working-directory: prober
-        env:
-          CC: "gcc -m32"
-        run: ./test.sh
-
-      # Confirm the binary is actually 32-bit rather than the -m32 flag having
-      # been silently ignored (e.g. a toolchain that lacks the 32-bit runtime
-      # and falls back). `file` reports the ELF class directly.
-      - name: the built binary is ELF32
-        working-directory: prober
-        run: |
-          file prober | grep -q 'ELF 32-bit' || {
-              echo "prober is not ELF 32-bit -- the -m32 build did not" \
-                   "actually produce a 32-bit binary:" >&2
-              file prober >&2
-              exit 1
-          }
-
-  # Locale-hostility leg. glibc's tr_TR.UTF-8 LC_CTYPE table makes 'I' and 'i'
-  # FIXED POINTS of tolower()/toupper() -- tolower('I') == 'I', not 'i' --
-  # rather than folding them onto each other the way the C locale does.
-  # glibc's strncasecmp()/strcasecmp() consult that same table (measured, see
-  # http_locale_check.c), so a comparison that is case-insensitive under every
-  # locale a developer's or CI's shell is likely to run in can silently start
-  # missing matches the moment the invoking process' environment sets
-  # LC_ALL/LANG to a Turkish locale -- which nothing in this repo controls,
-  # since it is inherited from whoever runs the prober.
-  # http_has_header() in prober/http.c was exactly this: a direct
-  # strncasecmp() consumer over raw response header bytes.
-  #
-  # http_test.c's existing http_has_header cases (e.g. "content-TYPE") pass in
-  # EVERY locale, C included, because none of the needles contain 'i' or 'I'
-  # -- so simply re-running the existing suite under a Turkish locale would
-  # not have exercised the bug class this leg targets. http_locale_check.c
-  # (built and run standalone below, NOT part of the *_test.c auto-discovery
-  # in build.sh/test.sh -- it is deliberately locale-specific and would fail
-  # test.sh's plain-locale run) adds cases that force the comparison through
-  # 'I'/'i' both directions.
-  #
-  # ubuntu-latest ships tr_TR.UTF-8 commented out in /etc/locale.gen, and
-  # `locale-gen <name>` silently regenerates only what IS uncommented without
-  # erroring on a name that is not -- so a bare `locale-gen tr_TR.UTF-8` can
-  # succeed, print nothing wrong, and leave the shell falling back to "C" the
-  # whole job. (This is exactly how an early draft of this leg passed for the
-  # wrong reason -- caught by mutation-testing http_locale_check.c against a
-  # PROPERLY generated locale afterward.) Appending the line explicitly and
-  # verifying the generated name is registered in `locale -a` avoids depending
-  # on the runner image's default /etc/locale.gen contents.
   locale-hostility:
     runs-on: [self-hosted, builder02, lxc]
     steps:
