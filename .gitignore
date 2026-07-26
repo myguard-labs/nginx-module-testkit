@@ -11,3 +11,4 @@ prober/perf/cg_scale.bin
 *.gcno
 t/*_test
 /.build/
+prober/coverage-map.json
