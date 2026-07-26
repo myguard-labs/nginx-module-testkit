@@ -1,0 +1,100 @@
+# Fault source for the backend leg of stateful-property-fuzz. Every generated
+# step the driver routes to /mc (the `backend` step kind) exercises one
+# occurrence of the memcached `get` command against this fake, and the fault
+# stanzas below are keyed to those occurrences in order -- get:1 is the FIRST
+# backend-routed step, get:2 the second, and so on. Copied from
+# property-fuzz/backend (which mirrors backend-rst-midreply/backend and
+# backend-lying-length/backend).
+#
+# Sized generously (40 stanzas) for a checked-in seed that produces roughly a
+# sixth of NUM_STEPS as backend steps (fate==0 of six): the generator's branch
+# is a property of the PRNG stream, not something this file can predict exactly,
+# so there is headroom rather than an exact count. A fault whose occurrence
+# number the run never reaches is inert -- unused fault stanzas cost nothing --
+# so headroom is free and an exact count is not worth chasing (and would
+# silently go stale the day the seed, the corpus size, or the branch
+# probability changes).
+#
+# WHY 40 STANZAS (headroom, not replay). Unlike property-fuzz, this scenario has
+# NO prober-TAP replay pass: its determinism/replay guarantee is PLAN-LEVEL (the
+# step plan regenerates byte-identically from the seed), and the lifecycle
+# events (kill respawn pids, phase-shifted fakesrv counter) make byte-identical
+# TAP replay impossible on purpose (see driver.sh's header). So 40 is pure
+# headroom for the single forward walk of the plan -- the fakesrv is one process
+# whose get:N counter runs over the whole scenario lifetime, and 40 stanzas
+# comfortably covers the backend steps a NUM_STEPS=32 plan can draw with the
+# rotation-of-four fault shapes intact. It is NOT sized for a second replay run.
+#
+# Four actions rotate across the occurrences, each a distinct upstream-failure
+# shape that unwinds through ngx_http_upstream_finalize_request differently:
+#   truncate      -- correct reply cut mid-frame, then RST (earliest possible
+#                     upstream death: the client has parsed nothing usable)
+#   rst           -- reset with nothing sent at all
+#   accept_close  -- accepted then closed before a byte is read either way
+#   lie_bytes     -- declared length disagrees with the payload (the classic
+#                     reply-framing off-by-one, in both directions)
+# None of these differ per key, so every seeded value is the same shape; what
+# varies is how CORRECTLY it dies, not what it contains.
+proto   memcached
+
+seed    k1   0123456789abcdefghij
+seed    k2   0123456789abcdefghij
+seed    k3   0123456789abcdefghij
+seed    k4   0123456789abcdefghij
+seed    k5   0123456789abcdefghij
+seed    k6   0123456789abcdefghij
+seed    k7   0123456789abcdefghij
+seed    k8   0123456789abcdefghij
+seed    k9   0123456789abcdefghij
+seed    k10  0123456789abcdefghij
+seed    k11  0123456789abcdefghij
+seed    k12  0123456789abcdefghij
+seed    k13  0123456789abcdefghij
+seed    k14  0123456789abcdefghij
+seed    k15  0123456789abcdefghij
+seed    k16  0123456789abcdefghij
+seed    k17  0123456789abcdefghij
+seed    k18  0123456789abcdefghij
+seed    k19  0123456789abcdefghij
+seed    k20  0123456789abcdefghij
+
+fault   on=get:1     action=truncate      after=8
+fault   on=get:2     action=rst
+fault   on=get:3     action=accept_close
+fault   on=get:4     action=lie_bytes     delta=+5
+fault   on=get:5     action=truncate      after=8
+fault   on=get:6     action=rst
+fault   on=get:7     action=accept_close
+fault   on=get:8     action=lie_bytes     delta=-5
+fault   on=get:9     action=truncate      after=8
+fault   on=get:10    action=rst
+fault   on=get:11    action=accept_close
+fault   on=get:12    action=lie_bytes     delta=+5
+fault   on=get:13    action=truncate      after=8
+fault   on=get:14    action=rst
+fault   on=get:15    action=accept_close
+fault   on=get:16    action=lie_bytes     delta=-5
+fault   on=get:17    action=truncate      after=8
+fault   on=get:18    action=rst
+fault   on=get:19    action=accept_close
+fault   on=get:20    action=lie_bytes     delta=+5
+fault   on=get:21    action=truncate      after=8
+fault   on=get:22    action=rst
+fault   on=get:23    action=accept_close
+fault   on=get:24    action=lie_bytes     delta=-5
+fault   on=get:25    action=truncate      after=8
+fault   on=get:26    action=rst
+fault   on=get:27    action=accept_close
+fault   on=get:28    action=lie_bytes     delta=+5
+fault   on=get:29    action=truncate      after=8
+fault   on=get:30    action=rst
+fault   on=get:31    action=accept_close
+fault   on=get:32    action=lie_bytes     delta=-5
+fault   on=get:33    action=truncate      after=8
+fault   on=get:34    action=rst
+fault   on=get:35    action=accept_close
+fault   on=get:36    action=lie_bytes     delta=+5
+fault   on=get:37    action=truncate      after=8
+fault   on=get:38    action=rst
+fault   on=get:39    action=accept_close
+fault   on=get:40    action=lie_bytes     delta=-5

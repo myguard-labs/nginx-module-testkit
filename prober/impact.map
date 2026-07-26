@@ -113,3 +113,13 @@ SLOW	prober/rules.c	scenarios/property-fuzz	slow
 # slope/soak is weekly" -- plan.md P2-E).
 SLOW	prober/lib.sh	scenarios/rss-slope	slow
 SLOW	src/ngx_test_probe.c	scenarios/rss-slope	slow
+# The stateful property-fuzz model (P2-G5) drives a generated SEQUENCE of
+# connection-lifecycle + signal (reload/kill) steps and checkpoints worker
+# lineage/log/pool/generation/zone after each. It boots a real server, fires
+# signals and drains between steps, so it is a soak on the weekly lane like
+# property-fuzz -- not the PR path ("PR runs only models mapped from the diff
+# and stays inside P2-C; discovery is weekly" -- plan.md P2-G5). Its lib.sh
+# owner is the signal/drain/config-wait helper set it choreographs.
+SLOW	prober/rules.c	scenarios/stateful-property-fuzz	slow
+SLOW	prober/lib.sh	scenarios/stateful-property-fuzz	slow
+SLOW	src/ngx_test_probe.c	scenarios/stateful-property-fuzz	slow
