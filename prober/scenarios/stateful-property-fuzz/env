@@ -1,0 +1,18 @@
+# This scenario SIGKILLs the serving worker on kill-lifecycle steps, so the
+# master legitimately logs
+#   [alert] <master>#0: worker process <pid> exited on signal 9
+# which prober_scrape_log (run by run-scenario.sh AFTER the driver, in the
+# parent process) would otherwise treat as a server-side failure and red the
+# whole scenario at full-green TAP. Exempt exactly that line -- and ONLY that
+# line. Must live in `env` (sourced pre-boot by run-scenario.sh), NOT be
+# exported from driver.sh: the driver runs in a subprocess and its exports never
+# reach the parent's scrape (worker-death's env-file lesson).
+#
+# The regex is pinned to "exited on signal 9": a FAULT signal (SIGSEGV=11,
+# SIGABRT=6, SIGBUS=7) carries an [alert] this pattern does NOT match, so it
+# stays un-exempted and reds the log scrape -- the backstop to the driver's C2
+# checkpoint (no forbidden death). Blanket-allowing all alerts would throw that
+# backstop away. An extra signal-9 line is exempted here too ("[0-9]+" matches
+# any pid); the protection against an unexpected additional kill is C2's exact
+# EXPECT_SIG9 count comparison, not this exemption.
+PROBER_ALLOW_LOG='worker process [0-9]+ exited on signal 9'

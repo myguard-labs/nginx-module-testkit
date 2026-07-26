@@ -1096,3 +1096,35 @@ mutate "property-fuzz: generated rule not persisted to the replay path" \
     scenarios/property-fuzz/driver.sh \
     'build_rule "$SEED" > "$GENRULE"' \
     'build_rule "$SEED" > "$GENRULE.decoy"' scenarios/property-fuzz/mutate-suite.sh
+
+# --- scenarios/stateful-property-fuzz (P2-G5 generator, not module code) -----
+#
+# The stateful scenario's PRNG/plan-persistence non-vacuity claims live in its
+# driver.sh (a bash+gawk generator), wired exactly like property-fuzz's above.
+# The lifecycle CHECKPOINT oracles (C1..C5) are NOT wired here -- catching them
+# needs a real reload/kill to land on a booted server inside the per-mutant
+# budget, so they are proven by the documented manually-run driver mutations in
+# the scenario's driver.sh header (the sanctioned fallback, same as
+# property-fuzz's leak-oracle claim 1).
+
+# Claim: the step-plan PRNG must be seed-sensitive. Collapsing the seed to a
+# constant makes seed and seed+1 generate byte-identical plans -- driver.sh's
+# own test 2 ("seed+1 ... produced a different step plan") must catch it.
+# SC2016: the single-quoted text is gawk source inside driver.sh being patched.
+# shellcheck disable=SC2016
+mutate "stateful-property-fuzz: PRNG ignores its seed" \
+    scenarios/stateful-property-fuzz/driver.sh \
+    'x = seed + 0' \
+    'x = seed * 0' scenarios/stateful-property-fuzz/mutate-suite.sh
+
+# Claim: the executed step plan must be persisted where the driver's diagnostics
+# point. Redirecting the save to a decoy path means test 3 ("the executed step
+# plan is saved ... for replay") finds an empty/absent $PLAN and reds.
+# SC2016: the single-quoted text is a line of driver.sh's own bash being patched.
+# shellcheck disable=SC2016
+mutate "stateful-property-fuzz: step plan not persisted to the replay path" \
+    scenarios/stateful-property-fuzz/driver.sh \
+    'build_plan "$SEED"          > "$PLAN"
+' \
+    'build_plan "$SEED"          > "$PLAN.decoy"
+' scenarios/stateful-property-fuzz/mutate-suite.sh

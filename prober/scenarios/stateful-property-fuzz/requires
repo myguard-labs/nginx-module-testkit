@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# The step generator's PRNG is xorshift64 written against gawk's bitwise
+# extensions (and/or/xor/lshift/rshift), which POSIX awk/mawk do not provide --
+# identical constraint to scenarios/property-fuzz/requires, from which this
+# stateful scenario descends. Absence of gawk is an environment fact, not a bug:
+# SKIP the harness-native way rather than fail with a cryptic awk syntax error.
+#
+# This scenario ALSO needs pgrep, because its worker-lineage / drain settlement
+# oracles count the master's direct children (prober_drain_wait returns 2 = "no
+# pgrep on this host", which those oracles surface as a visible skip, but the
+# drain-settle GATE between signal steps has no honest fallback without it -- an
+# unsettled cycle would be measured as if settled). A host without pgrep cannot
+# run the lifecycle half of this property soundly, so SKIP rather than degrade.
+set -eu
+if ! command -v gawk >/dev/null 2>&1; then
+    echo "gawk not installed (stateful-property-fuzz's PRNG needs gawk's bitwise ops)"
+    exit 1
+fi
+if ! command -v pgrep >/dev/null 2>&1; then
+    echo "pgrep not installed (stateful-property-fuzz's lineage/drain oracles need it)"
+    exit 1
+fi
+exit 0

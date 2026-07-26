@@ -1109,6 +1109,50 @@ See `prober/scenarios/property-fuzz/driver.sh`'s header comment for the full
 non-vacuity accounting (three claims, three proofs) and cross-links to the
 `mutate.sh` entries and the documented leak negative-control run.
 
+### Stateful property-based fuzzing (`scenarios/stateful-property-fuzz`)
+
+Where `property-fuzz` throws a batch of independent request *shapes* at a fresh
+connection each, `stateful-property-fuzz` draws a fixed-count **sequence of
+stateful steps** from the same style of deterministic `gawk` xorshift64 PRNG and
+walks it in order: connection reuse (keepalive pipeline), client `abort`/
+half-close, upstream faults *and* server-lifecycle events — a `SIGHUP` reload
+and a `SIGKILL` of the serving worker — interleaved. Request steps run as stock
+`.rule` batches (the whole `property-fuzz` generator, reused); after every
+lifecycle event the driver runs five **checkpoint oracles**:
+
+- **C1 lineage** — the answering worker is still a child of the *original*
+  master (a master that died moves `ppid` or stops answering).
+- **C2 no forbidden death** — no `SIGSEGV`/`SIGABRT`/`SIGBUS` worker exit, and
+  the `signal 9` count equals exactly the number of kills this run sent (an
+  unsent kill or a cascade reds). Exactly `worker-death`'s non-vacuity control,
+  folded into every kill step.
+- **C3 cycle-pool settlement** — *generation-scoped*: a kill re-forks the same
+  cycle so the footprint must match exactly; a reload builds a new cycle so it
+  re-baselines but must not climb past a running high-water mark (a per-reload
+  cycle-pool leak grows monotonically and breaches it).
+- **C4 generation coherence** — after a reload `config_generation` must strictly
+  advance and settle (`prober_config_wait` streak — the reload was *absorbed*,
+  not rejected-and-old-cycle-kept); after a kill it must hold (a bump would mean
+  a spurious reload).
+- **C5 zone/probe coherence** — the probe still parses and reports the expected
+  `zone.present` after the event.
+
+Determinism and replay work as in `property-fuzz`, with one difference stated in
+the driver header: a kill's respawn pid and the shared fakesrv counter make
+byte-identical prober-TAP replay impossible, so the replay guarantee here is
+**plan-level** — the same seed regenerates the byte-identical step plan (the
+`$PROBER_PREFIX/stateful-property-fuzz.plan` file, named in every failure
+diagnostic), and each request batch is separately saved as `batch-N.rule` for
+`./prober` reproduction. USR2 binary-upgrade is deliberately out of the step
+alphabet (it needs the `PROBER_DAEMON_MODE=on` contract, incompatible with the
+mandatory `daemon off;`); the USR2 lifecycle is owned by `usr2-mid-transfer` /
+`backend-usr2-keepalive` / `usr2-state-machine`.
+
+See `prober/scenarios/stateful-property-fuzz/driver.sh`'s header for the full
+non-vacuity accounting — two `mutate.sh`-wired claims (PRNG determinism, plan
+persistence) plus four documented manually-run driver mutations, one per
+checkpoint oracle C1–C4.
+
 ### Reload accounting (`scenarios/reload-cycle`)
 
 A reload builds a new cycle and must release the old one. A module that

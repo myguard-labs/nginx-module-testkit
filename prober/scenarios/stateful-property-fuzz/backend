@@ -1,0 +1,106 @@
+# Fault source for the backend leg of property-fuzz. Every generated case that
+# the driver routes to /mc exercises one occurrence of the memcached `get`
+# command against this fake, and the fault stanzas below are keyed to those
+# occurrences in order -- get:1 is the FIRST backend-routed generated case,
+# get:2 the second, and so on. See backend-rst-midreply/backend and
+# backend-lying-length/backend, which this mirrors.
+#
+# Sized generously (40 stanzas) for a checked-in seed that currently produces
+# 11 backend-routed cases out of 40 iterations: the generator's branch
+# (roughly one in four cases) is a property of the PRNG stream, not something
+# this file can predict exactly, so there is headroom rather than an exact
+# count. A fault whose occurrence number the run never reaches is inert --
+# unused fault stanzas cost nothing -- so headroom is free and an exact count
+# is not worth chasing (and would silently go stale the day the seed, the
+# corpus size, or the branch probability changes).
+#
+# WHY 40, NOT 20 -- the REPLAY (driver.sh test 4) matters here. This fakesrv is
+# a SINGLE process booted once by run-scenario.sh; its get:N counter runs over
+# the whole process LIFETIME, and driver.sh runs the prober TWICE against it
+# (test 3, then the test-4 replay). The second run therefore does NOT restart
+# the counter -- it continues where the first left off (first run get:1..K,
+# replay get:K+1..2K). With only 20 stanzas the replay's later backend cases
+# would fall off the end onto NO fault stanza, i.e. hit a healthy backend and
+# silently stop exercising ngx_http_upstream_finalize_request -- the exact
+# teardown path this leg exists to cover. 40 stanzas guarantees BOTH runs stay
+# inside a real fault for the current 11-per-run rate (22 total < 40) with the
+# same headroom margin. NOTE this is verdict-level reproduction, not identical-
+# fault-stream: the replay's backend cases traverse a DIFFERENT (phase-shifted)
+# fault stanza than the first run, because the counter cannot be reset from the
+# driver. Test 4 proves the leak/alive VERDICT reproduces (and still catches a
+# case that flips pass->fail on replay); it does not claim the underlying fault
+# stanza is byte-identical across the two runs.
+#
+# Four actions rotate across the occurrences, each a distinct upstream-failure
+# shape that unwinds through ngx_http_upstream_finalize_request differently:
+#   truncate      -- correct reply cut mid-frame, then RST (earliest possible
+#                     upstream death: the client has parsed nothing usable)
+#   rst           -- reset with nothing sent at all
+#   accept_close  -- accepted then closed before a byte is read either way
+#   lie_bytes     -- declared length disagrees with the payload (the classic
+#                     reply-framing off-by-one, in both directions)
+# None of these differ per key, so every seeded value is the same shape; what
+# varies is how CORRECTLY it dies, not what it contains.
+proto   memcached
+
+seed    k1   0123456789abcdefghij
+seed    k2   0123456789abcdefghij
+seed    k3   0123456789abcdefghij
+seed    k4   0123456789abcdefghij
+seed    k5   0123456789abcdefghij
+seed    k6   0123456789abcdefghij
+seed    k7   0123456789abcdefghij
+seed    k8   0123456789abcdefghij
+seed    k9   0123456789abcdefghij
+seed    k10  0123456789abcdefghij
+seed    k11  0123456789abcdefghij
+seed    k12  0123456789abcdefghij
+seed    k13  0123456789abcdefghij
+seed    k14  0123456789abcdefghij
+seed    k15  0123456789abcdefghij
+seed    k16  0123456789abcdefghij
+seed    k17  0123456789abcdefghij
+seed    k18  0123456789abcdefghij
+seed    k19  0123456789abcdefghij
+seed    k20  0123456789abcdefghij
+
+fault   on=get:1     action=truncate      after=8
+fault   on=get:2     action=rst
+fault   on=get:3     action=accept_close
+fault   on=get:4     action=lie_bytes     delta=+5
+fault   on=get:5     action=truncate      after=8
+fault   on=get:6     action=rst
+fault   on=get:7     action=accept_close
+fault   on=get:8     action=lie_bytes     delta=-5
+fault   on=get:9     action=truncate      after=8
+fault   on=get:10    action=rst
+fault   on=get:11    action=accept_close
+fault   on=get:12    action=lie_bytes     delta=+5
+fault   on=get:13    action=truncate      after=8
+fault   on=get:14    action=rst
+fault   on=get:15    action=accept_close
+fault   on=get:16    action=lie_bytes     delta=-5
+fault   on=get:17    action=truncate      after=8
+fault   on=get:18    action=rst
+fault   on=get:19    action=accept_close
+fault   on=get:20    action=lie_bytes     delta=+5
+fault   on=get:21    action=truncate      after=8
+fault   on=get:22    action=rst
+fault   on=get:23    action=accept_close
+fault   on=get:24    action=lie_bytes     delta=-5
+fault   on=get:25    action=truncate      after=8
+fault   on=get:26    action=rst
+fault   on=get:27    action=accept_close
+fault   on=get:28    action=lie_bytes     delta=+5
+fault   on=get:29    action=truncate      after=8
+fault   on=get:30    action=rst
+fault   on=get:31    action=accept_close
+fault   on=get:32    action=lie_bytes     delta=-5
+fault   on=get:33    action=truncate      after=8
+fault   on=get:34    action=rst
+fault   on=get:35    action=accept_close
+fault   on=get:36    action=lie_bytes     delta=+5
+fault   on=get:37    action=truncate      after=8
+fault   on=get:38    action=rst
+fault   on=get:39    action=accept_close
+fault   on=get:40    action=lie_bytes     delta=-5
