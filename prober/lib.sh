@@ -654,6 +654,19 @@ prober_probe_field() {
 #                       (An earlier note called both "MEASURED identical"; that
 #                       was a single-host measurement mistaken for an invariant
 #                       -- the CI legs are the wider sample that refuted it.)
+#   fds_by_kind.*       the same fd total split by kind -- environment-fragile
+#                       for the same reasons fds is, only more so: the runner's
+#                       inherited descriptors, ASan's own fds, and per-release
+#                       listener/log handling land in different buckets. Never a
+#                       cross-flavor property.
+#   smaps.pss,          RSS lineage. Depends on kernel version, page-cache
+#   smaps.private_dirty  sharing, glibc arena chunking and ASLR -- an absolute
+#                       differential over these is pure noise. The rss-slope
+#                       scenario asserts their SLOPE (a property of the leak, not
+#                       the absolute), which is the flavor-independent claim.
+#   pool.cycle_cleanup   the cleanup-handler count is a per-flavor startup detail
+#                       (nginx and angie register a different set of cycle-pool
+#                       cleanups during module init), like cycle_used above.
 #
 # INVARIANT (passed through untouched -- both flavors must produce the exact
 # same value on a freshly booted, request-free server, or the diff reds):
@@ -687,8 +700,134 @@ prober_probe_normalize() {
             -e 's/"cycle_used"[[:space:]]*:[[:space:]]*[0-9]+/"cycle_used":MASKED/' \
             -e 's/"cycle_blocks"[[:space:]]*:[[:space:]]*[0-9]+/"cycle_blocks":MASKED/' \
             -e 's/"cycle_large"[[:space:]]*:[[:space:]]*[0-9]+/"cycle_large":MASKED/' \
+            -e 's/"cycle_cleanup"[[:space:]]*:[[:space:]]*-?[0-9]+/"cycle_cleanup":MASKED/' \
             -e 's/"free"[[:space:]]*:[[:space:]]*[0-9]+/"free":MASKED/' \
-            -e 's/"fds"[[:space:]]*:[[:space:]]*[0-9]+/"fds":MASKED/'
+            -e 's/"fds"[[:space:]]*:[[:space:]]*-?[0-9]+/"fds":MASKED/' \
+            -e 's/"socket"[[:space:]]*:[[:space:]]*-?[0-9]+/"socket":MASKED/' \
+            -e 's/"file"[[:space:]]*:[[:space:]]*-?[0-9]+/"file":MASKED/' \
+            -e 's/"anon"[[:space:]]*:[[:space:]]*-?[0-9]+/"anon":MASKED/' \
+            -e 's/"other"[[:space:]]*:[[:space:]]*-?[0-9]+/"other":MASKED/' \
+            -e 's/"pss"[[:space:]]*:[[:space:]]*-?[0-9]+/"pss":MASKED/' \
+            -e 's/"private_dirty"[[:space:]]*:[[:space:]]*-?[0-9]+/"private_dirty":MASKED/'
+}
+
+# prober_stimulus_get HOST PORT PATH
+#
+# Issue one bounded GET to PATH and discard the body. The slope oracle's unit of
+# "one operation": the thing whose repetition a resource is asserted NOT to grow
+# with. Bounded by PROBER_PROBE_TIMEOUT like every other read here so a stalling
+# server cannot hang the sweep, and SIGPIPE-ignored for the same reason
+# prober_probe_body is (a Connection: close peer may close before the write
+# finishes). The return status is ignored on purpose -- a stimulus request only
+# has to REACH the worker to make it do the per-op work; whether it 200s or 404s
+# is the scenario's concern, not the slope's.
+prober_stimulus_get() {
+    local host="$1" port="$2" path="$3"
+
+    ( trap '' PIPE
+      exec 3<>"/dev/tcp/$host/$port" 2>/dev/null && {
+          printf 'GET %s HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' \
+              "$path" >&3 2>/dev/null
+          timeout "${PROBER_PROBE_TIMEOUT:-2}" cat <&3 >/dev/null 2>&1
+      } ) 2>/dev/null
+    return 0
+}
+
+# prober_slope_check HOST PORT FIELD PATH WARMUP SAMPLES MAX_PER_OP
+#
+# The third resource-scoreboard oracle (per plan.md P2-E, after per-operation
+# delta = `delta` and suite-origin bound = `probe_baseline`): the POST-WARMUP
+# SLOPE. A single request's delta can be zero by luck (an allocation freed by the
+# next request, a page reclaimed) or hidden by a startup one-off; a slope over
+# many operations after the server has warmed up is what a slow, steady leak
+# actually looks like. This asserts that, once WARMUP operations have settled the
+# server, FIELD grows by no more than MAX_PER_OP per operation across the next
+# SAMPLES operations.
+#
+# Emits a `# `-prefixed TAP diagnostic on failure and returns 1; returns 0 on
+# pass. Meant to be called from a scenario driver.sh (the slope/soak cadence is
+# weekly per the plan, not the PR path), which prints the ok/not ok line itself.
+#
+# DESIGN NOTES, each guarding a way this oracle could measure nothing:
+#
+#  * FAIL CLOSED ON THE SENTINEL. FIELD is read with prober_probe_field, which
+#    matches only [0-9]+ and so returns FAILURE (not -1) on the unavailable
+#    sentinel the /proc fields render. A sample that cannot be read aborts the
+#    sweep with a diagnostic rather than being treated as 0 -- a -1 read as 0
+#    would flatten a real slope to nothing. Absent-vs-zero is the same hazard
+#    prober_probe_field documents; here it is load-bearing twice over.
+#
+#  * WARMUP IS DISCARDED, NOT AVERAGED IN. The first allocations after boot are a
+#    one-off (lazy zone init, first-request buffers); folding them into the slope
+#    would show a leak on a healthy server (reload-soak's trap, in reverse). The
+#    baseline is the field AFTER warmup, and the slope is measured from there.
+#
+#  * MEASURED PER OPERATION, NOT PER WALL-SECOND. SAMPLES is a fixed count and
+#    every step is one stimulus GET, so the sweep runs the same program on a
+#    loaded runner as an idle one -- the counted-iteration discipline the rest of
+#    this file uses so a flake reproduces somewhere.
+#
+#  * SLOPE, NOT ENDPOINT DELTA. The bound is on (last - baseline)/(SAMPLES) --
+#    average growth per operation -- so a single transient blip is amortised while
+#    a steady climb is not, which is the difference between noise and a leak.
+prober_slope_check() {
+    local host="$1" port="$2" field="$3" path="$4"
+    local warmup="$5" samples="$6" max_per_op="$7"
+    local i body baseline last val slope
+
+    if [ "$samples" -lt 1 ]; then
+        echo "# slope: SAMPLES must be >= 1 (got $samples)"
+        return 1
+    fi
+
+    # Warm the server: run the per-op stimulus WARMUP times and throw the
+    # readings away. The baseline is taken after the last warmup op.
+    for (( i = 0; i < warmup; i++ )); do
+        prober_stimulus_get "$host" "$port" "$path"
+    done
+
+    body="$(prober_probe_body "$host" "$port")" || {
+        echo "# slope: probe unreadable at baseline"
+        return 1
+    }
+    baseline="$(prober_probe_field "$body" "$field")" || {
+        echo "# slope: field \"$field\" unavailable at baseline" \
+             "(sentinel or absent) -- cannot measure a slope over it"
+        return 1
+    }
+
+    last="$baseline"
+
+    # Post-warmup sweep: one operation, one sample, SAMPLES times.
+    for (( i = 0; i < samples; i++ )); do
+        prober_stimulus_get "$host" "$port" "$path"
+
+        body="$(prober_probe_body "$host" "$port")" || {
+            echo "# slope: probe unreadable at sample $((i + 1))"
+            return 1
+        }
+        val="$(prober_probe_field "$body" "$field")" || {
+            echo "# slope: field \"$field\" unavailable at sample" \
+                 "$((i + 1)) (sentinel or absent)"
+            return 1
+        }
+        last="$val"
+    done
+
+    # Average growth per operation across the post-warmup window, rounded toward
+    # zero by integer division. A field that grew by G over SAMPLES operations
+    # has a per-op slope of G/SAMPLES; the assertion is slope <= MAX_PER_OP.
+    slope=$(( (last - baseline) / samples ))
+
+    if [ "$slope" -gt "$max_per_op" ]; then
+        echo "# slope: \"$field\" $baseline -> $last over $samples ops" \
+             "= ${slope}/op, want <= ${max_per_op}/op"
+        return 1
+    fi
+
+    echo "# slope: \"$field\" $baseline -> $last over $samples ops" \
+         "= ${slope}/op (<= ${max_per_op}/op)"
+    return 0
 }
 
 # prober_signal_wait SIG PID HOST PORT TIMEOUT_MS

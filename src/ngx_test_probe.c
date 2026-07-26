@@ -154,7 +154,178 @@ ngx_test_probe_fd_count(void)
 
 
 /*
- * Bytes handed out from the CYCLE pool, plus its block and large-alloc counts.
+ * File descriptors held by THIS worker, split by kind.
+ *
+ * The bare "fds" count above answers "did the module leak a descriptor"; this
+ * answers "what KIND", which is what separates a leaked upstream socket from a
+ * leaked temp file when both push the total up by one. Kinds are read from the
+ * /proc/self/fd/<n> symlink target: a "socket:[...]" or "anon_inode:..." link
+ * is not a path, a link that begins with '/' is a real file (regular, device,
+ * pipe-as-fifo on disk), and everything else -- most importantly "pipe:[...]"
+ * -- falls in "other".
+ *
+ * Every field shares the -1 sentinel discipline of ngx_test_probe_fd_count():
+ * if /proc cannot be read at all, or a readlink fails mid-scan, EVERY bucket is
+ * reported as -1 so a delta over it cannot cancel to a passing zero. A partial
+ * count would understate exactly the leak this exists to catch, so it is not
+ * reported as a smaller-but-real number.
+ */
+static void
+ngx_test_probe_fd_kinds(ngx_int_t *sockets, ngx_int_t *files, ngx_int_t *anon,
+    ngx_int_t *other)
+{
+    *sockets = -1;
+    *files = -1;
+    *anon = -1;
+    *other = -1;
+
+#if (NGX_LINUX)
+    {
+    ngx_dir_t   dir;
+    ngx_err_t   err;
+    ngx_int_t   nsock, nfile, nanon, noth;
+    ngx_str_t   name = ngx_string("/proc/self/fd");
+
+    if (ngx_open_dir(&name, &dir) == NGX_ERROR) {
+        return;
+    }
+
+    nsock = 0;
+    nfile = 0;
+    nanon = 0;
+    noth = 0;
+    err = 0;
+
+    for ( ;; ) {
+        u_char   path[64];
+        u_char   target[256];
+        u_char  *end;
+        ssize_t  len;
+
+        ngx_set_errno(0);
+
+        if (ngx_read_dir(&dir) == NGX_ERROR) {
+            err = ngx_errno;
+            break;
+        }
+
+        if (ngx_de_name(&dir)[0] == '.') {
+            continue;                     /* "." and ".." and the dir handle */
+        }
+
+        end = ngx_snprintf(path, sizeof(path) - 1, "/proc/self/fd/%s",
+                           ngx_de_name(&dir));
+        *end = '\0';
+
+        len = readlink((const char *) path, (char *) target,
+                       sizeof(target) - 1);
+
+        if (len < 0) {
+            /* The fd may have closed between readdir and readlink -- a benign
+             * race for our own descriptors, but we cannot tell that from a real
+             * failure, and a dropped entry understates a kind. Fail closed. */
+            err = ngx_errno ? ngx_errno : EIO;
+            break;
+        }
+
+        target[len] = '\0';
+
+        if (ngx_strncmp(target, "socket:", 7) == 0) {
+            nsock++;
+
+        } else if (ngx_strncmp(target, "anon_inode:", 11) == 0) {
+            nanon++;
+
+        } else if (target[0] == '/') {
+            nfile++;
+
+        } else {
+            noth++;                       /* pipe:[...], and anything unknown */
+        }
+    }
+
+    (void) ngx_close_dir(&dir);
+
+    if (err != 0) {
+        return;                           /* leave all four at -1 */
+    }
+
+    /* The directory handle was one of the entries just listed and is a real
+     * path under /proc, so it landed in "files"; it is closed by the time the
+     * caller sees these numbers. Discount it there, matching the total's -1. */
+    *sockets = nsock;
+    *files = nfile > 0 ? nfile - 1 : nfile;
+    *anon = nanon;
+    *other = noth;
+    }
+#endif
+}
+
+
+/*
+ * Resident-set lineage from /proc/self/smaps_rollup: PSS and Private_Dirty, in
+ * kB, as the kernel reports them.
+ *
+ * These are the external-observer memory signals the cycle-pool walk cannot
+ * give -- they see growth in ANY mapping (mmap'd temp files, a module's own
+ * malloc arena, thread stacks), not just the nginx pool. PSS shares each page's
+ * cost across the processes mapping it, so a per-request leak in a single
+ * worker shows as a monotonic PSS climb; Private_Dirty is the pages this worker
+ * alone has written, the tightest signal for its own heap growth.
+ *
+ * smaps_rollup is a single pre-summed record (unlike smaps, which is per-VMA
+ * and expensive to sum in userspace). It appeared in Linux 4.14; on a kernel or
+ * sandbox without it, both fields are -1, the same fail-loud sentinel as fds so
+ * a delta cannot cancel to a passing zero.
+ */
+static void
+ngx_test_probe_smaps(ngx_int_t *pss, ngx_int_t *private_dirty)
+{
+    *pss = -1;
+    *private_dirty = -1;
+
+#if (NGX_LINUX)
+    {
+    FILE   *f;
+    char    line[256];
+
+    f = fopen("/proc/self/smaps_rollup", "re");
+
+    if (f == NULL) {
+        return;
+    }
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        long        kb;
+        const char *rest = NULL;
+
+        if (ngx_strncmp(line, "Pss:", 4) == 0) {
+            rest = line + 4;
+
+            kb = strtol(rest, NULL, 10);
+            if (kb >= 0) {
+                *pss = (ngx_int_t) kb;
+            }
+
+        } else if (ngx_strncmp(line, "Private_Dirty:", 14) == 0) {
+            rest = line + 14;
+
+            kb = strtol(rest, NULL, 10);
+            if (kb >= 0) {
+                *private_dirty = (ngx_int_t) kb;
+            }
+        }
+    }
+
+    (void) fclose(f);
+    }
+#endif
+}
+
+
+/*
+ * Bytes handed out from the CYCLE pool, plus its block, large-alloc and
+ * cleanup-handler counts.
  *
  * Request pools are freed wholesale at request end, so a per-request pool leak
  * is invisible from outside -- which is exactly why this measures the cycle
@@ -163,18 +334,27 @@ ngx_test_probe_fd_count(void)
  * unbounded leak. The delta across a request is therefore expected to be 0,
  * and any other value is a bug even though ASan and valgrind both stay quiet
  * (the memory is still reachable and still freed at exit).
+ *
+ * cycle_cleanup is the length of the pool's cleanup-handler chain. A module
+ * that registers an ngx_pool_cleanup_t on the CYCLE pool per request (rather
+ * than the request pool) leaks a handler node AND grows an unbounded callback
+ * list the master walks at shutdown -- a leak the byte count also reflects, but
+ * the handler count names it precisely as "a cleanup was parked on the wrong
+ * pool" rather than as anonymous bytes.
  */
 static void
 ngx_test_probe_pool_stats(ngx_pool_t *pool, size_t *used, ngx_uint_t *blocks,
-    ngx_uint_t *large)
+    ngx_uint_t *large, ngx_uint_t *cleanup)
 {
-    u_char            *start;
-    ngx_pool_t        *p;
-    ngx_pool_large_t  *l;
+    u_char              *start;
+    ngx_pool_t          *p;
+    ngx_pool_large_t    *l;
+    ngx_pool_cleanup_t  *c;
 
     *used = 0;
     *blocks = 0;
     *large = 0;
+    *cleanup = 0;
 
     if (pool == NULL) {
         return;
@@ -196,6 +376,11 @@ ngx_test_probe_pool_stats(ngx_pool_t *pool, size_t *used, ngx_uint_t *blocks,
             (*large)++;
         }
     }
+
+    /* The cleanup chain likewise hangs off the head pool. */
+    for (c = pool->cleanup; c != NULL; c = c->next) {
+        (*cleanup)++;
+    }
 }
 
 
@@ -204,16 +389,18 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
 {
     size_t           pool_used;
     u_char          *p;
-    ngx_int_t        fds;
-    ngx_uint_t       pages_free, present, pool_blocks, pool_large;
+    ngx_int_t        fds, fd_sock, fd_file, fd_anon, fd_other, pss, priv_dirty;
+    ngx_uint_t       pages_free, present, pool_blocks, pool_large, pool_cleanup;
     ngx_slab_pool_t *shpool;
 
     pages_free = 0;
     present = 0;
 
     fds = ngx_test_probe_fd_count();
+    ngx_test_probe_fd_kinds(&fd_sock, &fd_file, &fd_anon, &fd_other);
+    ngx_test_probe_smaps(&pss, &priv_dirty);
     ngx_test_probe_pool_stats(ngx_cycle->pool, &pool_used, &pool_blocks,
-                              &pool_large);
+                              &pool_large, &pool_cleanup);
 
     /*
      * Worker identity and connection accounting.
@@ -240,8 +427,11 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                      "\"page_size\":%uz,"
                      "\"connections\":{\"total\":%ui,\"free\":%ui},"
                      "\"fds\":%i,"
+                     "\"fds_by_kind\":{\"socket\":%i,\"file\":%i,"
+                     "\"anon\":%i,\"other\":%i},"
+                     "\"smaps\":{\"pss\":%i,\"private_dirty\":%i},"
                      "\"pool\":{\"cycle_used\":%uz,\"cycle_blocks\":%ui,"
-                     "\"cycle_large\":%ui}",
+                     "\"cycle_large\":%ui,\"cycle_cleanup\":%ui}",
                      (u_char *) NGX_TEST_PROBE_FLAVOR,
                      (u_char *) NGX_TEST_PROBE_FLAVOR_VER,
                      ngx_pid,
@@ -251,9 +441,12 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                      (ngx_uint_t) ngx_cycle->connection_n,
                      (ngx_uint_t) ngx_cycle->free_connection_n,
                      fds,
+                     fd_sock, fd_file, fd_anon, fd_other,
+                     pss, priv_dirty,
                      pool_used,
                      pool_blocks,
-                     pool_large);
+                     pool_large,
+                     pool_cleanup);
 
     if (zone == NULL) {
         return ngx_slprintf(p, last, ",\"zone\":{\"present\":false}}");

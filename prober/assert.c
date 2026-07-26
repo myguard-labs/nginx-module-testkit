@@ -502,6 +502,38 @@ eval_probe(const json_value *doc, const probe_assert *pa, char *why,
 }
 
 
+/*
+ * The probe fields whose -1 is an "unreadable /proc" sentinel rather than a
+ * real value. Kept as an explicit list rather than a "-1 is always unavailable"
+ * blanket: a module hook could legitimately render a signed field that reaches
+ * -1, and silently swallowing a delta over it would be the very fail-open this
+ * check exists to prevent. Every entry here is a generic field this file's own
+ * probe renders, so the list cannot drift out from under a consumer.
+ */
+static int
+path_is_proc_sentinel_field(const char *path)
+{
+    static const char *const fields[] = {
+        "fds",
+        "fds_by_kind.socket",
+        "fds_by_kind.file",
+        "fds_by_kind.anon",
+        "fds_by_kind.other",
+        "smaps.pss",
+        "smaps.private_dirty",
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        if (strcmp(path, fields[i]) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 int
 eval_delta(const json_value *before, const json_value *after,
            const probe_assert *pa, const char *label, char *why, size_t whylen)
@@ -528,17 +560,22 @@ eval_delta(const json_value *before, const json_value *after,
     }
 
     /*
-     * "fds" is -1 when the probe could not read /proc/self/fd at all. Both
-     * snapshots then carry -1, and the subtraction below cancels them into a
-     * delta of 0 -- so every `delta fds == 0` rule would PASS while measuring
-     * nothing. An assertion that cannot fail is worse than a missing one.
+     * The /proc-derived fields render -1 when the probe could not read /proc at
+     * all: "fds", every "fds_by_kind.*" bucket, and both "smaps.*" figures.
+     * Both snapshots then carry -1, and the subtraction below cancels them into
+     * a delta of 0 -- so a `delta <field> == 0` rule would PASS while measuring
+     * nothing. An assertion that cannot fail is worse than a missing one, so the
+     * sentinel is rejected in EITHER snapshot before it can cancel. -1 is not a
+     * reachable real value for any of these (a count is >= 0, and PSS/dirty kB
+     * are >= 0), so treating it as "unavailable" never masks a legitimate
+     * reading.
      */
-    if (strcmp(pa->path, "fds") == 0
+    if (path_is_proc_sentinel_field(pa->path)
         && (b->number == -1 || a->number == -1))
     {
         snprintf(why, whylen,
-                 "%s path \"fds\" is unavailable (-1) in the %s snapshot",
-                 label, (b->number == -1) ? "origin" : "after");
+                 "%s path \"%.128s\" is unavailable (-1) in the %s snapshot",
+                 label, pa->path, (b->number == -1) ? "origin" : "after");
         return 0;
     }
 

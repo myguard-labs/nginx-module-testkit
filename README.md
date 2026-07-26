@@ -102,11 +102,19 @@ ngx_test_probe_register(&my_hooks);
 ```
 
 Both hooks are **optional**. Registering nothing still gets you the whole
-generic document — flavor, pid, connections, `fds`, cycle-pool stats, and the
+generic document — flavor, pid, connections, `fds` (total and split by kind in
+`fds_by_kind`: socket / file / anon / other), resident-set lineage in `smaps`
+(`pss` and `private_dirty`, in kB, from `/proc/self/smaps_rollup`), cycle-pool
+stats (`cycle_used` / `cycle_blocks` / `cycle_large` / `cycle_cleanup`), and the
 zone's name, size and slab page accounting. That is already enough for fd and
 memory leak assertions without a line of module-specific C. Slab occupancy
 works for any zone because every nginx shm zone begins with an
 `ngx_slab_pool_t`.
+
+The `/proc`-derived fields (`fds`, every `fds_by_kind` bucket, both `smaps`
+figures) render **-1** where `/proc` cannot be read — a fail-loud sentinel, not
+a fabricated zero. The `delta` / `probe_baseline` / slope oracles reject it
+rather than subtracting `-1 − -1 = 0` into a passing result.
 
 **Buffer sizing in the HTTP handler.** When you allocate a buffer for the
 response, size it as:
@@ -204,6 +212,33 @@ counter reset does not read as a leak. A fault counter is therefore visible to a
 `probe_baseline` and not to a `delta`. If the origin snapshot cannot be read the
 run aborts rather than starting: a `probe_baseline` with nothing to subtract from
 would silently assert nothing.
+
+### Catching a slow leak, third form: the post-warmup slope
+
+`delta` and `probe_baseline` are two of the three resource oracles; the third is
+a **slope over many operations, after warmup**. A single `delta` can read zero by
+luck — an allocation the next request frees, a page the kernel reclaims — and a
+`probe_baseline` bound has to be set generously enough to clear the boot one-off.
+A slope divides the *total* growth over N identical operations by N, so a per-op
+leak of even a few bytes is a nonzero slope while a healthy server sits flat, and
+the warmup prefix (discarded, not averaged in) absorbs the startup allocations
+that would otherwise read as a leak.
+
+The slope is driven from a scenario `driver.sh` via `prober_slope_check` (it
+needs a sequence of snapshots around repeated operations, which no single rule
+case straddles), not a rule directive:
+
+```sh
+# field  stimulus  warmup  ops  max-growth-per-op
+prober_slope_check "$HOST" "$PORT" cycle_used     / 10 60 0   # flat: 0/op
+prober_slope_check "$HOST" "$PORT" private_dirty  / 10 60 4   # bounded: <= 4 kB/op
+```
+
+`cycle_used` is asserted **flat** (`0`/op — nothing may allocate on the cycle
+pool per request), and `private_dirty` (RSS) is **bounded** rather than zero
+because the kernel and glibc settle a healthy worker by a page here and there.
+`scenarios/rss-slope` is the reference scenario. Like the other soaks its cadence
+is weekly, not the PR path.
 
 `send` lines concatenate into one buffer and reach the socket in a single
 write, so splitting a request across several `send` lines does **not** split it

@@ -66,3 +66,16 @@ fstat
 newfstatat
 statx
 close_range
+
+# --- the probe classifies each fd by kind and reads a memory rollup ---
+# The resource-scoreboard fields (P2-E) add two honest probe capabilities on
+# every request, both /proc reads with no side effect:
+#   * fds_by_kind readlink()s each /proc/self/fd/<n> link to bucket it as a
+#     socket / file / anon / other -- readlink (or readlinkat on some libc).
+#   * smaps reads /proc/self/smaps_rollup for PSS + private_dirty -- an openat
+#     (already listed above) plus the read/close of a plain file.
+# These are baseline behaviour of the reference probe, exactly like the
+# /proc/self/fd walk above; the gate's sharp edge stays the syscalls the probe
+# path does NOT make (getrandom, socket, connect, execve, clone, ptrace).
+readlink
+readlinkat

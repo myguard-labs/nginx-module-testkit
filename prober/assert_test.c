@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  131
+#define PLANNED  137
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -517,9 +517,44 @@ main(void)
     delta_is("{\"fds\":9}", "{\"fds\":-1}", "fds", "==", "-10", 0,
              "an unavailable fd count in the after snapshot fails");
 
-    /* -1 is only special for fds; a module counter may legitimately hold it. */
+    /*
+     * The resource-scoreboard fields share the /proc-unreadable sentinel: every
+     * fds_by_kind bucket and both smaps figures render -1 together when the scan
+     * fails, so a delta over any of them must reject -1 in EITHER snapshot for
+     * the same reason fds does -- otherwise `delta smaps.pss == 0` certifies "no
+     * memory grew" while measuring an unreadable /proc.
+     */
+    delta_is("{\"smaps\":{\"pss\":-1}}", "{\"smaps\":{\"pss\":-1}}",
+             "smaps.pss", "==", "0", 0,
+             "an unavailable PSS fails rather than cancelling to zero");
+    delta_is("{\"smaps\":{\"private_dirty\":-1}}",
+             "{\"smaps\":{\"private_dirty\":9}}",
+             "smaps.private_dirty", "==", "10", 0,
+             "an unavailable private_dirty in the before snapshot fails");
+    delta_is("{\"fds_by_kind\":{\"socket\":-1}}",
+             "{\"fds_by_kind\":{\"socket\":-1}}",
+             "fds_by_kind.socket", "==", "0", 0,
+             "an unavailable socket fd kind fails rather than cancelling");
+    delta_is("{\"fds_by_kind\":{\"file\":4}}",
+             "{\"fds_by_kind\":{\"file\":-1}}",
+             "fds_by_kind.file", "==", "-5", 0,
+             "an unavailable file fd kind in the after snapshot fails");
+
+    /* A real reading of these fields still deltas normally -- the guard rejects
+     * ONLY the -1 sentinel, not every value. */
+    delta_is("{\"smaps\":{\"pss\":184}}", "{\"smaps\":{\"pss\":184}}",
+             "smaps.pss", "==", "0", 1, "a steady PSS is a zero delta");
+    delta_is("{\"fds_by_kind\":{\"socket\":4}}",
+             "{\"fds_by_kind\":{\"socket\":5}}",
+             "fds_by_kind.socket", "==", "1", 1, "a leaked socket fd is +1");
+
+    /*
+     * -1 is special ONLY for the generic /proc-derived fields above; a module
+     * hook may legitimately render a signed field that reaches -1, and the guard
+     * must not swallow a delta over it.
+     */
     delta_is("{\"zone\":{\"n\":-1}}", "{\"zone\":{\"n\":-1}}", "zone.n", "==",
-             "0", 1, "-1 is not special outside fds");
+             "0", 1, "-1 is not special outside the generic /proc fields");
 
     /* A path that changes shape between snapshots is a broken probe, not a
      * delta of zero. */
