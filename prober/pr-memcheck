@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+#
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# pr-memcheck -- PR-lane Memcheck adapter (P2-F half 2). The COUNTERPART of
+# valgrind-scenarios.sh: that script runs the WHOLE scenario tree under memcheck
+# in the WEEKLY lane (minutes, boots a real nginx per scenario); this one runs
+# only the DIRECT-CALLABLE targets a PR diff selected, under the leak +
+# uninitialised-read memcheck flags, inside the PR time budget -- AND, crucially,
+# REFUSES any selected target that needs a full nginx boot rather than silently
+# running it (which would blow the PR budget) or silently dropping it (which
+# would leave a memcheck path unverified with a green result).
+#
+# WHY A SEPARATE ADAPTER FROM pr-impact's PHASE 3. pr-impact already runs a
+# selected unit binary under a BARE memcheck (--leak-check=full only) as one of
+# five fast phases. This adapter adds --track-origins=yes so a PR's direct-target
+# memcheck reports the uninitialised-read class WITH its origin, the same
+# actionable form valgrind-scenarios.sh's weekly whole-server run gives (proven
+# load-bearing in valgrind_scrape_test.sh). It also establishes the budget-
+# REFUSAL semantic that later scenarios trust: a boot-required memcheck target is
+# not attempted on a PR, it is deferred to its named weekly owner with its fast
+# native PR oracle named alongside -- a silent skip of an expensive check is a
+# failure, per the P2 admission rules.
+#
+# THE FD-LEAK CLASS STAYS WITH THE WEEKLY ADAPTER, DELIBERATELY. P2-F's mutation
+# PAIR (a real uninitialised read AND a leaked fd, both naming their origin and
+# exiting 99) is proven for the WHOLE-SERVER adapter, where nginx is the real fd
+# owner. This PR adapter does NOT pass --track-fds: the direct unit binaries it
+# runs (rules_test/backend_test) drive an `expect_die` FORK harness -- each
+# forked child inherits the parent's open temp-file descriptor and _exit()s
+# without closing it (correct: the parent owns the temp file), and --track-fds
+# reports every such inherited fd as a "leaked" descriptor in the child and
+# COUNTS it toward --error-exitcode=99. That is a fork-inheritance false positive,
+# not a module leak (verified: `definitely lost: 0 bytes` in every child), and it
+# would red every forking target. The fd-leak surface belongs to the weekly lane
+# that boots a non-forking-into-short-lived-children server; the PR lane owns the
+# leak + uninitialised-read classes, which are reliable on a single forking
+# binary. --leak-check=full --errors-for-leak-kinds=definite + --track-origins is
+# exactly that surface.
+#
+# USAGE
+#   pr-memcheck [--base <sha>] [--budget <secs>]
+#
+#   --base <sha>    forwarded verbatim to verify-impact --base.
+#   --budget <secs> outer wall-clock budget for the whole run (default 45).
+#
+# OUTPUT. TAP: one line per selected direct-callable target (ok/not ok under
+# memcheck) plus one line per REFUSED boot-required target (ok -- a refusal is
+# the designed contract, not a failure -- carrying the native oracle + weekly
+# owner it points to). An empty selection is a single explained ok line, never
+# a bare silent skip. Overall exit is nonzero iff a memcheck run found an error,
+# a build failed, a run timed out, a refused scenario has no native oracle to
+# point at, or verify-impact's own fail-closed contract tripped.
+#
+# BUDGET. bash's own $SECONDS (not `date`: a caller-adjusted clock or a leap
+# second could skew it mid-run). Each target checks remaining budget before it
+# starts AND bounds its own memcheck run with `timeout "$left"`, so a hung
+# target cannot overrun the deadline. GNU `timeout 0` DISABLES the timeout
+# (upstream timeout.c: "'0' means don't timeout"), so a `left` of exactly 0 is
+# caught explicitly as "budget exhausted" before ever constructing the timeout
+# invocation -- never handed to timeout as an accidental "run unbounded".
+set -euo pipefail
+export LC_ALL=C
+
+cd "$(dirname "$0")"
+
+VERIFY_IMPACT="$PWD/verify-impact"
+VALGRIND_SUPP="$PWD/valgrind.supp"
+
+BASE=""
+BUDGET=45
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --base)
+            BASE="${2:?--base requires a <sha>}"
+            shift 2
+            ;;
+        --budget)
+            BUDGET="${2:?--budget requires <secs>}"
+            shift 2
+            ;;
+        *)
+            echo "pr-memcheck: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# --- budget: computed ONCE, checked before each target ----------------------
+SECONDS=0
+DEADLINE="$BUDGET"
+
+remaining() {
+    local left=$((DEADLINE - SECONDS))
+    [ "$left" -lt 0 ] && left=0
+    printf '%s\n' "$left"
+}
+
+# --- the PR memcheck flag set (P2-F) ----------------------------------------
+# The leak + uninitialised-read surface of valgrind-scenarios.sh's flag set,
+# minus --trace-children (single-process direct binary, no exec'd child to
+# trace), minus --gen-suppressions (a PR gate wants a red/green verdict, not a
+# suppression stanza to copy-paste), and minus --track-fds (the fd-leak class is
+# the weekly whole-server adapter's -- see the header note on the fork-inherited
+# temp-fd false positive that --track-fds produces on the forking unit binaries).
+# --track-origins=yes is the one that widens beyond "definitely lost": an
+# uninitialised read names WHERE the value came from rather than an unactionable
+# bare line (valgrind_scrape_test.sh proves it load-bearing). --error-exitcode=99
+# is the belt; the log grep (VG_FIND_RE, the SAME pattern prober_scrape_valgrind
+# greps) is the suspenders -- both, exactly as the weekly adapter, so neither
+# vouches for itself.
+VG_FLAGS=(--error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite
+          --track-origins=yes)
+# The finding pattern the weekly prober_scrape_valgrind uses verbatim: a nonzero
+# ERROR SUMMARY count OR a nonzero definite-leak byte count. Kept identical so
+# the PR lane and the weekly lane agree on what "memcheck found something" means.
+VG_FIND_RE='ERROR SUMMARY: [1-9]|definitely lost: [1-9]'
+VG_SUPP_ARGS=()
+[ -f "$VALGRIND_SUPP" ] && VG_SUPP_ARGS=(--suppressions="$VALGRIND_SUPP")
+
+# --- native-oracle map for REFUSED boot-required targets --------------------
+# A scenario memcheck target is refused on PR (a full nginx boot under memcheck
+# is minutes, not the PR budget's seconds). The refusal is only non-vacuous if
+# it names WHERE the coverage actually lives instead: (1) the fast native PR
+# check that runs the same scenario without memcheck, and (2) the weekly memcheck
+# owner. Both are the same two entry points for every scenario, so this is a
+# rule, not a per-scenario table:
+#   native PR oracle : test-scenarios.sh runs the scenario natively (its probe /
+#                      resource oracles) on the PR path via the scenarios matrix.
+#   weekly owner     : valgrind-scenarios.sh runs the whole tree under the full
+#                      memcheck flag set in the weekly lane.
+# A refusal that could not name both would be a silent drop -- so the refusal
+# text is asserted to carry both (pr_memcheck_test.sh), and a boot-required
+# target reaching this adapter with neither available is a hard failure.
+NATIVE_ORACLE="test-scenarios.sh (native scenario probe/resource oracles, scenarios CI matrix)"
+WEEKLY_OWNER="valgrind-scenarios.sh (whole-server memcheck, weekly lane)"
+
+# --- run verify-impact once -------------------------------------------------
+VI_OUT="$(mktemp)"
+VI_ERR="$(mktemp)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/pr-memcheck.XXXXXX")"
+# shellcheck disable=SC2317 # invoked indirectly via `trap ... EXIT`, not a dead call
+cleanup() { rm -f "$VI_OUT" "$VI_ERR"; rm -rf "$WORK"; }
+trap cleanup EXIT
+
+if [ -n "$BASE" ]; then
+    vi_set=("$VERIFY_IMPACT" --base "$BASE")
+else
+    vi_set=("$VERIFY_IMPACT")
+fi
+
+set +e
+"${vi_set[@]}" >"$VI_OUT" 2>"$VI_ERR"
+VI_STATUS=$?
+set -e
+
+cat "$VI_ERR" >&2 || true
+
+# --- classify selected targets: direct-callable vs boot-required ------------
+# DIRECT: *_test unit binaries and fuzz/* targets -- pure entry points this
+#         adapter can compile and launch under memcheck with no server.
+#         ALL_UNIT_TESTS fans out to every *_test.c, same as pr-impact.
+# REFUSE: scenarios/* (and any non-direct row) -- needs an nginx boot.
+DIRECT_TESTS="$(mktemp)"
+DIRECT_FUZZ="$(mktemp)"
+REFUSED="$(mktemp)"
+: >"$DIRECT_TESTS"; : >"$DIRECT_FUZZ"; : >"$REFUSED"
+
+ALL_UNIT_SELECTED=0
+
+if [ "$VI_STATUS" -eq 0 ] && [ -s "$VI_OUT" ]; then
+    while IFS=$'\t' read -r target _lane; do
+        [ -n "$target" ] || continue
+        case "$target" in
+            ALL_UNIT_TESTS)
+                ALL_UNIT_SELECTED=1
+                ;;
+            fuzz/*)
+                printf '%s\n' "${target#fuzz/}" >>"$DIRECT_FUZZ"
+                ;;
+            mutate:*)
+                # mutation cases are pr-impact phase 5's job, not a memcheck
+                # target -- this adapter memchecks binaries, not mutants.
+                ;;
+            scenarios/*|corpus/*)
+                printf '%s\n' "$target" >>"$REFUSED"
+                ;;
+            *_test)
+                printf '%s\n' "$target" >>"$DIRECT_TESTS"
+                ;;
+            *)
+                # Anything else verify-impact emits is treated as boot-required
+                # and refused rather than silently run -- fail closed, never
+                # attempt an unclassified target under memcheck.
+                printf '%s\n' "$target" >>"$REFUSED"
+                ;;
+        esac
+    done <"$VI_OUT"
+fi
+
+if [ "$ALL_UNIT_SELECTED" -eq 1 ]; then
+    for src in *_test.c; do
+        [ -e "$src" ] || continue
+        printf '%s\n' "${src%.c}" >>"$DIRECT_TESTS"
+    done
+fi
+
+sort_uniq() { LC_ALL=C sort -u "$1"; }
+DTESTS="$(sort_uniq "$DIRECT_TESTS")"
+DFUZZ="$(sort_uniq "$DIRECT_FUZZ")"
+DREFUSED="$(sort_uniq "$REFUSED")"
+
+# --- shared build inputs ----------------------------------------------------
+# Pinned toolchain preference (gcc, then cc, then clang) at -O0, INDEPENDENT of
+# ambient $CC: a leak still observable at -O1 under gcc can be dead-code-
+# eliminated by clang at the same -O1 (the CI matrix runs CC=clang), silently
+# making a real finding vanish under memcheck. -O0 + a stable compiler keeps the
+# leak/uninit shape deterministic -- the same reasoning pr-impact phase 3 pins.
+VG_CC="$(command -v gcc || command -v cc || command -v clang)"
+VG_LIB="json.c http.c util.c rules.c assert.c backend.c"
+VG_LDFLAGS="${LDFLAGS:-}"
+if command -v pkg-config >/dev/null 2>&1; then
+    VG_LDFLAGS="$VG_LDFLAGS $(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
+    VG_LDFLAGS="$VG_LDFLAGS $(pkg-config --libs zlib 2>/dev/null || echo '-lz')"
+else
+    VG_LDFLAGS="$VG_LDFLAGS -lssl -lcrypto -lz"
+fi
+
+# --- TAP --------------------------------------------------------------------
+# Count the plan up front from the selection so a truncated stream (a memcheck
+# run that dies mid-way) is caught by the plan-vs-ran check at the end rather
+# than read as "the rest passed".
+n_tests=0
+while IFS= read -r t; do [ -n "$t" ] && n_tests=$((n_tests + 1)); done <<<"$DTESTS"
+while IFS= read -r t; do [ -n "$t" ] && n_tests=$((n_tests + 1)); done <<<"$DFUZZ"
+while IFS= read -r t; do [ -n "$t" ] && n_tests=$((n_tests + 1)); done <<<"$DREFUSED"
+[ "$n_tests" -eq 0 ] && n_tests=1   # the single "nothing selected" line
+
+echo "1..$n_tests"
+
+idx=0
+overall=0
+ran=0
+
+emit() {   # $1=status(ok|not_ok) $2=description
+    idx=$((idx + 1))
+    ran=$((ran + 1))
+    if [ "$1" = "ok" ]; then
+        echo "ok $idx - $2"
+    else
+        echo "not ok $idx - $2"
+        overall=1
+    fi
+}
+
+# --- no valgrind at all: SKIP the direct-target legs, still emit refusals ----
+HAVE_VG=1
+command -v valgrind >/dev/null 2>&1 || HAVE_VG=0
+
+# --- nothing selected -------------------------------------------------------
+if [ -z "$DTESTS" ] && [ -z "$DFUZZ" ] && [ -z "$DREFUSED" ]; then
+    emit ok "no memcheck target selected by diff -- nothing to run or refuse"
+fi
+
+# --- DIRECT: unit test binaries under memcheck ------------------------------
+while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    if [ "$HAVE_VG" -eq 0 ]; then
+        emit ok "$t: SKIP -- valgrind not available on this box"
+        continue
+    fi
+    left="$(remaining)"
+    if [ "$left" -le 0 ]; then
+        emit not_ok "$t: budget exhausted before memcheck could start"
+        continue
+    fi
+    src="$t.c"
+    bin="$WORK/memcheck_$t"
+    if [ ! -e "$src" ]; then
+        emit not_ok "$t: source missing"
+        continue
+    fi
+    # shellcheck disable=SC2086
+    if ! "$VG_CC" -O0 -g -std=c11 -o "$bin" "$src" $VG_LIB $VG_LDFLAGS 2>"$WORK/build_$t.log"; then
+        emit not_ok "$t: memcheck build failed"
+        continue
+    fi
+    left="$(remaining)"
+    if [ "$left" -le 0 ]; then
+        emit not_ok "$t: budget exhausted before running $t under memcheck"
+        continue
+    fi
+    log="$WORK/vg_$t.log"
+    # Non-negated form: `if ! cmd; then rc=$?` collapses the exit code to 0/1
+    # through bash's `!`, making a real 124 timeout indistinguishable from a
+    # memcheck error. Read $? in the else branch instead.
+    if timeout "$left" valgrind "${VG_FLAGS[@]}" "${VG_SUPP_ARGS[@]}" \
+        --log-file="$log" "$bin" >"$WORK/run_$t.log" 2>&1; then
+        # Exit 0 is the belt; still grep the log (suspenders) -- a finding that
+        # somehow did not trip --error-exitcode must still red the target, the
+        # same non-vacuous pairing valgrind_scrape_test.sh proves for the weekly.
+        if grep -qE "$VG_FIND_RE" "$log" 2>/dev/null; then
+            emit not_ok "$t: memcheck log carries a finding despite exit 0 -- see $log"
+        else
+            emit ok "$t: clean under memcheck (--track-origins, exit 0)"
+        fi
+    else
+        rc=$?
+        if [ "$rc" -eq 124 ]; then
+            emit not_ok "$t: memcheck TIMED OUT after ${left}s (budget exhausted mid-run)"
+        elif grep -qE "$VG_FIND_RE" "$log" 2>/dev/null; then
+            emit not_ok "$t: memcheck reported a finding (exit $rc) -- see $log"
+        else
+            emit not_ok "$t: memcheck run failed (exit $rc)"
+        fi
+    fi
+done <<<"$DTESTS"
+
+# --- DIRECT: fuzz targets replayed under memcheck ---------------------------
+# A fuzz target is a pure entry point (fuzz_standalone.c reads a corpus file and
+# calls the parser) -- direct-callable, so it is memchecked here too, not
+# refused. Replays its checked-in minimized corpus, same input pr-impact phase 2
+# replays under ASan/UBSan; memcheck adds the leak surface those sanitizers under
+# -O1 can miss on the parser's cleanup path.
+while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    if [ "$HAVE_VG" -eq 0 ]; then
+        emit ok "fuzz/$t: SKIP -- valgrind not available on this box"
+        continue
+    fi
+    left="$(remaining)"
+    if [ "$left" -le 0 ]; then
+        emit not_ok "fuzz/$t: budget exhausted before memcheck could start"
+        continue
+    fi
+    fsrc="fuzz/$t.c"
+    if [ ! -e "$fsrc" ]; then
+        emit not_ok "fuzz/$t: source missing"
+        continue
+    fi
+    fbin="$WORK/memcheck_$t"
+    LIBPATHS=""
+    for f in $VG_LIB; do LIBPATHS="$LIBPATHS ../$f"; done
+    # shellcheck disable=SC2086
+    if ! ( cd fuzz && "$VG_CC" -O0 -g -std=c11 -o "$fbin" "$t.c" fuzz_standalone.c $LIBPATHS $VG_LDFLAGS ) \
+        2>"$WORK/build_fuzz_$t.log"; then
+        emit not_ok "fuzz/$t: memcheck build failed"
+        continue
+    fi
+    corpus="fuzz/corpus/${t#fuzz_}"
+    left="$(remaining)"
+    if [ "$left" -le 0 ]; then
+        emit not_ok "fuzz/$t: budget exhausted before running under memcheck"
+        continue
+    fi
+    log="$WORK/vg_fuzz_$t.log"
+    if ( cd fuzz && timeout "$left" valgrind "${VG_FLAGS[@]}" "${VG_SUPP_ARGS[@]}" \
+        --log-file="$log" "$fbin" "corpus/${t#fuzz_}" >"$WORK/run_fuzz_$t.log" 2>&1 ); then
+        if grep -qE "$VG_FIND_RE" "$log" 2>/dev/null; then
+            emit not_ok "fuzz/$t: memcheck log carries a finding despite exit 0 -- see $log"
+        else
+            emit ok "fuzz/$t: corpus replay clean under memcheck"
+        fi
+    else
+        rc=$?
+        if [ "$rc" -eq 124 ]; then
+            emit not_ok "fuzz/$t: memcheck TIMED OUT after ${left}s (budget exhausted mid-run)"
+        elif grep -qE "$VG_FIND_RE" "$log" 2>/dev/null; then
+            emit not_ok "fuzz/$t: memcheck reported a finding (exit $rc) -- see $log"
+        else
+            emit not_ok "fuzz/$t: memcheck run failed (exit $rc)"
+        fi
+    fi
+    # referenced for shellcheck clarity (corpus dir echoed in-line above)
+    : "$corpus"
+done <<<"$DFUZZ"
+
+# --- REFUSE: boot-required (scenario) targets -------------------------------
+# The budget-refusal contract. A scenario memcheck needs a full nginx boot --
+# minutes under memcheck, not the PR budget. This adapter REFUSES it rather than
+# attempting it (budget blown) or dropping it (silent unverified path). The
+# refusal is a designed outcome, so it is `ok`, but it MUST name where the
+# coverage lives: the native PR oracle and the weekly memcheck owner. Both are
+# fixed entry points; a refusal that could not name them would be the silent
+# skip the P2 admission rules forbid -- so if neither is resolvable this is a
+# hard failure instead (guarded below).
+while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    if [ -n "$NATIVE_ORACLE" ] && [ -n "$WEEKLY_OWNER" ]; then
+        emit ok "$s: REFUSED on PR (needs nginx boot; over PR memcheck budget) -> native PR oracle: $NATIVE_ORACLE; weekly memcheck: $WEEKLY_OWNER"
+    else
+        emit not_ok "$s: boot-required memcheck target has no native oracle / weekly owner to defer to -- would be a silent skip"
+    fi
+done <<<"$DREFUSED"
+
+# --- plan-vs-ran: a truncated stream is not a passing one -------------------
+if [ "$ran" -ne "$n_tests" ]; then
+    echo "# planned $n_tests memcheck targets, ran $ran" >&2
+    exit 1
+fi
+
+# Propagate verify-impact's own fail-closed exit status: an unmapped diff must
+# fail pr-memcheck too, not read as "no targets, all green".
+if [ "$VI_STATUS" -ne 0 ]; then
+    exit "$VI_STATUS"
+fi
+
+exit "$overall"

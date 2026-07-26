@@ -793,7 +793,7 @@ jobs:
           # pick them up -- list them explicitly rather than rename them and
           # lose the intended invocation form (`prober/pr-impact`, not
           # `prober/pr-impact.sh`).
-          shellcheck -x --source-path=prober prober/*.sh prober/verify-impact prober/pr-impact prober/scenarios/*/driver.sh
+          shellcheck -x --source-path=prober prober/*.sh prober/verify-impact prober/pr-impact prober/pr-memcheck prober/scenarios/*/driver.sh
 
       # Downloaded and hash-checked, same as the server tarballs above: a
       # linter that gates the build is as much a supply-chain dependency as
