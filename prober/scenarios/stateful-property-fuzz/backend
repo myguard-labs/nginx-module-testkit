@@ -1,35 +1,29 @@
-# Fault source for the backend leg of property-fuzz. Every generated case that
-# the driver routes to /mc exercises one occurrence of the memcached `get`
-# command against this fake, and the fault stanzas below are keyed to those
-# occurrences in order -- get:1 is the FIRST backend-routed generated case,
-# get:2 the second, and so on. See backend-rst-midreply/backend and
-# backend-lying-length/backend, which this mirrors.
+# Fault source for the backend leg of stateful-property-fuzz. Every generated
+# step the driver routes to /mc (the `backend` step kind) exercises one
+# occurrence of the memcached `get` command against this fake, and the fault
+# stanzas below are keyed to those occurrences in order -- get:1 is the FIRST
+# backend-routed step, get:2 the second, and so on. Copied from
+# property-fuzz/backend (which mirrors backend-rst-midreply/backend and
+# backend-lying-length/backend).
 #
-# Sized generously (40 stanzas) for a checked-in seed that currently produces
-# 11 backend-routed cases out of 40 iterations: the generator's branch
-# (roughly one in four cases) is a property of the PRNG stream, not something
-# this file can predict exactly, so there is headroom rather than an exact
-# count. A fault whose occurrence number the run never reaches is inert --
-# unused fault stanzas cost nothing -- so headroom is free and an exact count
-# is not worth chasing (and would silently go stale the day the seed, the
-# corpus size, or the branch probability changes).
+# Sized generously (40 stanzas) for a checked-in seed that produces roughly a
+# sixth of NUM_STEPS as backend steps (fate==0 of six): the generator's branch
+# is a property of the PRNG stream, not something this file can predict exactly,
+# so there is headroom rather than an exact count. A fault whose occurrence
+# number the run never reaches is inert -- unused fault stanzas cost nothing --
+# so headroom is free and an exact count is not worth chasing (and would
+# silently go stale the day the seed, the corpus size, or the branch
+# probability changes).
 #
-# WHY 40, NOT 20 -- the REPLAY (driver.sh test 4) matters here. This fakesrv is
-# a SINGLE process booted once by run-scenario.sh; its get:N counter runs over
-# the whole process LIFETIME, and driver.sh runs the prober TWICE against it
-# (test 3, then the test-4 replay). The second run therefore does NOT restart
-# the counter -- it continues where the first left off (first run get:1..K,
-# replay get:K+1..2K). With only 20 stanzas the replay's later backend cases
-# would fall off the end onto NO fault stanza, i.e. hit a healthy backend and
-# silently stop exercising ngx_http_upstream_finalize_request -- the exact
-# teardown path this leg exists to cover. 40 stanzas guarantees BOTH runs stay
-# inside a real fault for the current 11-per-run rate (22 total < 40) with the
-# same headroom margin. NOTE this is verdict-level reproduction, not identical-
-# fault-stream: the replay's backend cases traverse a DIFFERENT (phase-shifted)
-# fault stanza than the first run, because the counter cannot be reset from the
-# driver. Test 4 proves the leak/alive VERDICT reproduces (and still catches a
-# case that flips pass->fail on replay); it does not claim the underlying fault
-# stanza is byte-identical across the two runs.
+# WHY 40 STANZAS (headroom, not replay). Unlike property-fuzz, this scenario has
+# NO prober-TAP replay pass: its determinism/replay guarantee is PLAN-LEVEL (the
+# step plan regenerates byte-identically from the seed), and the lifecycle
+# events (kill respawn pids, phase-shifted fakesrv counter) make byte-identical
+# TAP replay impossible on purpose (see driver.sh's header). So 40 is pure
+# headroom for the single forward walk of the plan -- the fakesrv is one process
+# whose get:N counter runs over the whole scenario lifetime, and 40 stanzas
+# comfortably covers the backend steps a NUM_STEPS=32 plan can draw with the
+# rotation-of-four fault shapes intact. It is NOT sized for a second replay run.
 #
 # Four actions rotate across the occurrences, each a distinct upstream-failure
 # shape that unwinds through ngx_http_upstream_finalize_request differently:

@@ -307,6 +307,11 @@ emit_request_step() {
                 printf 'expect  status=200\n'
                 printf 'expect  body~OK\n'
                 printf 'delta   fds == 0\n'
+                # The pipeline path gets the SAME cycle-pool leak oracle as every
+                # other request kind -- a keepalive-reuse-specific leak into the
+                # long-lived cycle pool must red HERE at the step, not wait to be
+                # caught (approximately) by a later reload checkpoint's C3.
+                printf 'delta   pool.cycle_used == 0\n'
                 echo
             } >>"$RULE_TMP"
             ;;
@@ -327,7 +332,12 @@ snapshot() {
     SNAP_BLOCKS="$(prober_probe_field "$body" cycle_blocks)" || return 1
     SNAP_LARGE="$(prober_probe_field "$body" cycle_large)"   || return 1
     SNAP_GEN="$(prober_probe_field "$body" config_generation || true)"
-    SNAP_ZONE="$(prober_probe_field "$body" present || true)"   # zone.present
+    # zone.present is a BOOLEAN, so prober_probe_field (numeric-only) can never
+    # extract it -- it would always return empty and make C5 vacuously pass on
+    # an enabled zone. Grep the literal true/false out of the raw body instead.
+    SNAP_ZONE="$(printf '%s' "$body" \
+                 | grep -o '"present"[[:space:]]*:[[:space:]]*\(true\|false\)' \
+                 | grep -o '\(true\|false\)$' | head -1 || true)"
     return 0
 }
 
@@ -386,7 +396,7 @@ if ! snapshot; then
 fi
 BASE_PPID="$SNAP_PPID"
 USED_REF="$SNAP_USED"; BLOCKS_REF="$SNAP_BLOCKS"; LARGE_REF="$SNAP_LARGE"
-USED_HWM="$SNAP_USED"          # running high-water mark for the C3 reload-leak backstop
+RELOAD_REF=""                  # fixed C3 leak ceiling; anchored at the FIRST reload
 GEN_REF="${SNAP_GEN:-}"
 EXPECT_SIG9=0                   # how many contained kills we have deliberately sent
 CKPT_FAIL=0                     # checkpoint (C1..C5) failures, folded into FAILED
@@ -468,25 +478,30 @@ checkpoint() {
     # re-parsed config, so its footprint legitimately differs from the old
     # cycle's -- pinning it to the old baseline would be the cold-baseline trap
     # this repo keeps re-learning (a reload's fresh cycle is not the old one).
-    # So: on a reload, RE-BASELINE to the settled new-cycle footprint (and
-    # separately guard against a LEAK by requiring the new cycle_used not to
-    # EXCEED the running high-water mark by more than one slab block's worth --
-    # a genuine per-reload cycle-pool leak grows monotonically and would breach
-    # it, while ordinary config re-parse variance stays under it). On a kill,
-    # require exact equality with the current baseline.
+    # So: on a reload, RE-BASELINE the intra-generation reference (USED_REF, used
+    # by the following kills' exact-equality check) to the settled new-cycle
+    # footprint, and separately guard against a per-reload LEAK against a FIXED
+    # ceiling. The ceiling is the FIRST reload's settled footprint + one pool
+    # block (RELOAD_REF, set once and never moved): a genuine per-reload leak
+    # ACCUMULATES across reloads and breaches a fixed ceiling, whereas a ceiling
+    # that climbed with each reload (a moving high-water mark) would absorb a
+    # 1-4096 B/reload leak forever and never fire -- the exact defect CodeRabbit
+    # flagged on the first draft. On a kill, require exact equality.
     if [ "$event" = "reload" ]; then
-        # leak backstop: a monotonic climb across reloads is the failure this
-        # scenario adds over reload-cycle's single reload. HWM starts at the
-        # cold baseline; tolerance is one 4 kB pool block (nginx grows the
-        # cycle pool in ngx_pagesize-ish chunks, so sub-block jitter is noise).
+        # tolerance is one 4 kB pool block (nginx grows the cycle pool in
+        # ngx_pagesize-ish chunks, so sub-block re-parse jitter is noise); the
+        # ref config is fixed, so a SECOND reload's fresh cycle should reproduce
+        # the first's footprint almost exactly.
         local tol=4096
-        if [ "$SNAP_USED" -gt $((USED_HWM + tol)) ]; then
-            echo "# $tag C3: cycle_used climbed to $SNAP_USED, past HWM $USED_HWM + ${tol}B (reload leak?)"
+        if [ -z "${RELOAD_REF:-}" ]; then
+            RELOAD_REF="$SNAP_USED"     # fixed ceiling anchor, set ONCE
+            echo "# $tag C3: first reload cycle footprint used=$SNAP_USED (leak ceiling = ${RELOAD_REF}+${tol}B)"
+        elif [ "$SNAP_USED" -gt $((RELOAD_REF + tol)) ]; then
+            echo "# $tag C3: cycle_used=$SNAP_USED exceeds fixed reload ceiling ${RELOAD_REF}+${tol}B (per-reload leak?)"
             CKPT_FAIL=$((CKPT_FAIL + 1))
         else
-            echo "# $tag C3: new cycle footprint used=$SNAP_USED (<= HWM $USED_HWM + ${tol}B); re-baselining"
+            echo "# $tag C3: reload cycle footprint used=$SNAP_USED (<= fixed ceiling ${RELOAD_REF}+${tol}B)"
         fi
-        [ "$SNAP_USED" -gt "$USED_HWM" ] && USED_HWM="$SNAP_USED"
         USED_REF="$SNAP_USED"; BLOCKS_REF="$SNAP_BLOCKS"; LARGE_REF="$SNAP_LARGE"
     else   # kill or end-of-run: same cycle, footprint must be identical
         local drift=""
@@ -505,8 +520,17 @@ checkpoint() {
     if [ -z "$GEN_REF" ] || [ -z "${SNAP_GEN:-}" ]; then
         echo "# $tag C4: config_generation not emitted -- SKIP generation coherence"
     elif [ "$event" = "reload" ]; then
-        if [ "$SNAP_GEN" -gt "$GEN_REF" ]; then
-            echo "# $tag C4: generation advanced $GEN_REF -> $SNAP_GEN (reload absorbed)"
+        # CONFIG_SETTLED carries prober_config_wait's verdict for THIS reload:
+        # 0 = the new generation held for a 3-sample streak (genuinely absorbed);
+        # 1 = it never settled (a transient advance a not-yet-retired old worker
+        # served); 2 = no config_generation field (SKIP, handled by the guard
+        # above -- GEN_REF/SNAP_GEN would be empty). A streak that never settled
+        # is a reload-coherence failure even if this one snapshot reads advanced.
+        if [ "${CONFIG_SETTLED:-0}" -eq 1 ]; then
+            echo "# $tag C4: generation reached $SNAP_GEN but never SETTLED (3-sample streak failed); reload not cleanly absorbed"
+            CKPT_FAIL=$((CKPT_FAIL + 1))
+        elif [ "$SNAP_GEN" -gt "$GEN_REF" ]; then
+            echo "# $tag C4: generation advanced $GEN_REF -> $SNAP_GEN and settled (reload absorbed)"
             GEN_REF="$SNAP_GEN"
         else
             echo "# $tag C4: generation did NOT advance ($GEN_REF -> $SNAP_GEN); reload rejected/not absorbed"
@@ -558,8 +582,15 @@ while read -r line; do
 
     if [ "$step_verb" = "reload" ]; then
         if prober_signal_wait HUP "$MASTER" "$HOST" "$PORT" 8000; then
-            # generation streak confirms the reload was absorbed (C4 reads it)
-            prober_config_wait "$HOST" "$PORT" "${GEN_REF:-0}" 3 8000 >/dev/null 2>&1 || true
+            # The generation 3-sample STREAK is the real "reload absorbed" gate:
+            # a single transiently-advanced snapshot can be served by a not-yet-
+            # retired old worker. Capture its verdict (do NOT `|| true` it away)
+            # so C4 folds a non-settling reload into the checkpoint. rc 2 = the
+            # probe emits no config_generation (module .so predates it) -- a
+            # visible SKIP, not a failure; rc 1 = it never settled -- a failure.
+            CONFIG_SETTLED=0
+            prober_config_wait "$HOST" "$PORT" "${GEN_REF:-0}" 3 8000 >/dev/null 2>&1 \
+                || CONFIG_SETTLED=$?
             checkpoint reload
         else
             echo "# step $step_n reload: no new worker answered within 8 s after SIGHUP"
