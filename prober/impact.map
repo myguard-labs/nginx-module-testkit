@@ -90,6 +90,7 @@ SEMANTIC	src/ngx_test_probe_arm.c	t/*	fast
 # proven by their own self-test, not by any unit/fuzz/scenario target above.
 SEMANTIC	prober/impact.map	verify_impact_test	fast
 SEMANTIC	prober/verify-impact	verify_impact_test	fast
+SEMANTIC	prober/pr-memcheck	pr_memcheck_test	fast
 
 # --- SLOW: owners that only run out-of-band (Valgrind/weekly/soak), not on
 # every PR. verify-impact reports these under the "slow" lane so --explain

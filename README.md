@@ -1324,6 +1324,32 @@ jobs:
           ./valgrind-scenarios.sh nginx 1.31.3
 ```
 
+### PR-lane counterpart: `prober/pr-memcheck`
+
+`valgrind-scenarios.sh` is the **weekly** whole-server memcheck. Its PR-lane
+counterpart is `prober/pr-memcheck` (P2-F): it consumes `verify-impact`'s
+diff-selected targets and runs only the **direct-callable** ones (the unit test
+binaries and fuzz targets a change actually touched) under
+`--leak-check=full --errors-for-leak-kinds=definite --track-origins=yes`, inside
+a 45 s outer budget, so a PR pays seconds for its own targets' leak +
+uninitialised-read surface instead of minutes for the whole tree.
+
+```sh
+prober/pr-memcheck --base <merge-base-sha>   # self-test (pr_memcheck_test.sh) runs in the selftest job; the adapter itself is not yet wired into a PR-lane CI job
+```
+
+It **refuses** any selected target that needs a full nginx boot (a `scenarios/*`
+row) rather than blow the budget on it, and the refusal names both where that
+coverage does live — the native scenario oracles on the PR path
+(`test-scenarios.sh`) and the weekly memcheck owner (`valgrind-scenarios.sh`) —
+so an expensive check is never silently skipped. The fd-leak class stays with
+the weekly whole-server run deliberately: `pr-memcheck` does **not** pass
+`--track-fds`, because the forking `expect_die` unit binaries inherit the
+parent's temp-file descriptor into each short-lived child, which `--track-fds`
+would report as a leak in every one. `prober/pr_memcheck_test.sh` proves the
+memcheck verdict, the refusal (with a blanked-oracle negative control), the
+budget refusal and the empty-selection path are all non-vacuous.
+
 ## Fake upstream (`prober/fakesrv`)
 
 A scriptable fake redis/memcached backend, for testing modules that talk to an
