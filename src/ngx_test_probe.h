@@ -133,7 +133,7 @@ typedef enum {
  * bound, not a safety boundary -- but a truncated document fails to parse in
  * the prober, which reads as a broken probe rather than a silent wrong answer.
  */
-#define NGX_TEST_PROBE_JSON_MAX  768
+#define NGX_TEST_PROBE_JSON_MAX  1024
 
 
 /*
@@ -240,6 +240,16 @@ ngx_uint_t ngx_test_probe_config_generation(void);
  * then fails loudly instead of comparing against a fabricated zero. Consumers
  * computing a DELTA must reject the sentinel explicitly -- -1 minus -1 is 0,
  * which looks exactly like a clean result.
+ *
+ * The resource-scoreboard additions share that discipline. "fds_by_kind"
+ * (socket/file/anon/other) splits the same descriptor total by the kind read
+ * from each /proc/self/fd link; every bucket is -1 together if the scan cannot
+ * complete. "smaps" (pss, private_dirty, in kB from /proc/self/smaps_rollup)
+ * gives external-observer memory lineage the cycle-pool walk cannot -- growth
+ * in ANY mapping, not just the nginx pool -- and is -1 where smaps_rollup is
+ * absent. "pool.cycle_cleanup" is the cleanup-handler chain length, naming a
+ * cleanup parked on the cycle pool per request. The prober's delta/slope
+ * oracles reject each -1 sentinel the same way they reject it for "fds".
  */
 u_char *ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone);
 

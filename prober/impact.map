@@ -86,6 +86,15 @@ SEMANTIC	prober/scenarios	scenarios/*	fast
 SEMANTIC	src/ngx_test_probe_arm.c	scenarios/*	fast
 SEMANTIC	src/ngx_test_probe_arm.c	t/*	fast
 
+# The probe renderer (src/ngx_test_probe.c) emits the document schema_test.c and
+# schema_emitter_test.sh pin the SHAPE of, and every scenario boots a server
+# built from it. probe-schema.json is the checked-in shape contract those tests
+# read. A change to either selects the two schema gates (which run in the
+# selftest job, no server) plus the scenario tree (which boots the live probe).
+SEMANTIC	src/ngx_test_probe.c	schema_test	fast
+SEMANTIC	src/ngx_test_probe.c	scenarios/*	fast
+SEMANTIC	probe-schema.json	schema_test	fast
+
 # --- SEMANTIC: the selector's own inputs. impact.map and verify-impact are
 # proven by their own self-test, not by any unit/fuzz/scenario target above.
 SEMANTIC	prober/impact.map	verify_impact_test	fast
@@ -98,3 +107,9 @@ SEMANTIC	prober/pr-memcheck	pr_memcheck_test	fast
 SLOW	prober/backend.c	scenarios/reload-soak	slow
 SLOW	prober/http.c	scenarios/soak-delta	slow
 SLOW	prober/rules.c	scenarios/property-fuzz	slow
+# The resource-scoreboard slope oracle (P2-E) is a soak: it runs N post-warmup
+# operations to measure a per-op slope, so it belongs in the weekly/slow lane
+# like the other soaks, not the PR path ("PR runs the mapped smallest case;
+# slope/soak is weekly" -- plan.md P2-E).
+SLOW	prober/lib.sh	scenarios/rss-slope	slow
+SLOW	src/ngx_test_probe.c	scenarios/rss-slope	slow

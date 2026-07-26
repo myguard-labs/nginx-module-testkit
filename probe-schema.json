@@ -37,10 +37,19 @@
     "connections.total":      { "type": "number", "required": true },
     "connections.free":       { "type": "number", "required": true },
     "fds":                    { "type": "number", "required": true },
+    "fds_by_kind":            { "type": "object", "required": true },
+    "fds_by_kind.socket":     { "type": "number", "required": true },
+    "fds_by_kind.file":       { "type": "number", "required": true },
+    "fds_by_kind.anon":       { "type": "number", "required": true },
+    "fds_by_kind.other":      { "type": "number", "required": true },
+    "smaps":                  { "type": "object", "required": true },
+    "smaps.pss":              { "type": "number", "required": true },
+    "smaps.private_dirty":    { "type": "number", "required": true },
     "pool":                   { "type": "object", "required": true },
     "pool.cycle_used":        { "type": "number", "required": true },
     "pool.cycle_blocks":      { "type": "number", "required": true },
     "pool.cycle_large":       { "type": "number", "required": true },
+    "pool.cycle_cleanup":     { "type": "number", "required": true },
     "zone":                   { "type": "object", "required": true },
     "zone.present":           { "type": "bool",   "required": true },
 
@@ -49,10 +58,13 @@
     "zone.slab_pages_free":  { "type": "number", "required": "when-zone-present" }
   },
 
-  "closed": ["", "connections", "pool"],
+  "closed": ["", "connections", "fds_by_kind", "smaps", "pool"],
 
   "notes": {
     "fds": "-1 means /proc was unreadable, NOT zero descriptors. A delta over that sentinel cancels to a passing zero, which is why the prober rejects it explicitly rather than subtracting it.",
+    "fds_by_kind": "The same descriptor total split by the kind of each /proc/self/fd link (socket/file/anon/other). Every bucket is -1 together if the scan cannot complete; the prober rejects that sentinel like it does for fds. socket:/anon_inode: links are matched by prefix, a leading '/' is a file, everything else (pipe:[...]) is other.",
+    "smaps": "PSS and Private_Dirty in kB from /proc/self/smaps_rollup. External-observer memory lineage the cycle-pool walk cannot give -- growth in ANY mapping. Both -1 where smaps_rollup is absent (pre-4.14 kernel or a sandbox); the prober rejects that sentinel like fds.",
+    "pool.cycle_cleanup": "Length of the cycle pool's cleanup-handler chain. Names a cleanup parked on the cycle pool per request -- a leak the byte count also reflects but this identifies by shape.",
     "zone.present": "false has two causes -- no zone configured at all, and a zone whose shm.addr is not mapped yet (a probe racing a reload). Neither promises the sibling members."
   }
 }

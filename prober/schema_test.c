@@ -48,8 +48,10 @@
 static const char doc_zone_present[] =
     "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
     "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
-    "\"fds\":9,\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
-    "\"cycle_large\":0},"
+    "\"fds\":9,\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
+    "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
+    "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
+    "\"cycle_large\":0,\"cycle_cleanup\":2},"
     "\"zone\":{\"present\":true,\"name\":\"demo\",\"size\":1048576,"
     "\"slab_pages_free\":248,\"nodes\":2}}";
 
@@ -57,8 +59,10 @@ static const char doc_zone_present[] =
 static const char doc_zone_absent[] =
     "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
     "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
-    "\"fds\":9,\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
-    "\"cycle_large\":0},"
+    "\"fds\":9,\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
+    "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
+    "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
+    "\"cycle_large\":0,\"cycle_cleanup\":2},"
     "\"zone\":{\"present\":false}}";
 
 /*
@@ -84,10 +88,19 @@ static const schema_field SCHEMA[] = {
     { "connections.total",   JSON_NUMBER, 0 },
     { "connections.free",    JSON_NUMBER, 0 },
     { "fds",                 JSON_NUMBER, 0 },
+    { "fds_by_kind",         JSON_OBJECT, 0 },
+    { "fds_by_kind.socket",  JSON_NUMBER, 0 },
+    { "fds_by_kind.file",    JSON_NUMBER, 0 },
+    { "fds_by_kind.anon",    JSON_NUMBER, 0 },
+    { "fds_by_kind.other",   JSON_NUMBER, 0 },
+    { "smaps",               JSON_OBJECT, 0 },
+    { "smaps.pss",           JSON_NUMBER, 0 },
+    { "smaps.private_dirty", JSON_NUMBER, 0 },
     { "pool",                JSON_OBJECT, 0 },
     { "pool.cycle_used",     JSON_NUMBER, 0 },
     { "pool.cycle_blocks",   JSON_NUMBER, 0 },
     { "pool.cycle_large",    JSON_NUMBER, 0 },
+    { "pool.cycle_cleanup",  JSON_NUMBER, 0 },
     { "zone",                JSON_OBJECT, 0 },
     { "zone.present",        JSON_BOOL,   0 },
     { "zone.name",           JSON_STRING, 1 },
@@ -102,15 +115,17 @@ static const schema_field SCHEMA[] = {
  * one means drift. "zone" is absent from this list by design: zone_render lets
  * a consuming module add its own members there.
  */
-static const char *CLOSED_LEVELS[] = { "", "connections", "pool" };
+static const char *CLOSED_LEVELS[] = {
+    "", "connections", "fds_by_kind", "smaps", "pool"
+};
 
 #define CLOSED_N  ((int) (sizeof(CLOSED_LEVELS) / sizeof(CLOSED_LEVELS[0])))
 
 /*
- * 17 schema fields against the zone-present document, 14 against the
- * zone-absent one (the three zone-present-only members are asserted ABSENT
- * there instead, which is the same count either way), 3 closed levels, plus
- * the schema-file agreement checks and the two parses.
+ * SCHEMA_N schema fields against the zone-present document, SCHEMA_N against
+ * the zone-absent one (the three zone-present-only members are asserted ABSENT
+ * there instead, which is the same count either way), CLOSED_N closed levels,
+ * SCHEMA_N schema-file agreement checks, plus the two parses.
  */
 #define PLANNED  (SCHEMA_N + SCHEMA_N + CLOSED_N + SCHEMA_N + 2)
 
