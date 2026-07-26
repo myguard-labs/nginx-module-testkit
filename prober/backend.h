@@ -180,7 +180,9 @@ void backend_load(const char *file, backend_script *s);
  * as backend_load() via fmemopen, so no fuzz-only reimplementation can drift.
  * die()s on any malformed line and on a missing proto directive, exactly as
  * backend_load() does; a fuzz caller arms prober_die_jmp (util.h) to survive
- * it. Leaves *s zeroed (and returns without dying) only if fmemopen fails.
+ * it. Returns without dying (and without touching *s) only if fmemopen fails;
+ * the fuzz caller's static script is already cleared by backend_free between
+ * inputs, so a no-op parse leaves it in the same swept state.
  */
 void backend_load_buf(const char *buf, size_t len, backend_script *s);
 

@@ -484,14 +484,20 @@ parse_fault(backend_script *s, char *arg, const char *file, int lineno)
  * reimplementation exists to drift from what the prober actually runs.
  *
  * `file` is only the name printed in die() diagnostics; it is not reopened.
- * Callers zero *s before the first line and validate `have_proto` after the
- * last, so this helper does neither -- it is the loop body between them.
+ * The whole-script contract lives HERE, not split across the two wrappers:
+ * *s is zeroed before the first line and the "no proto directive" check runs
+ * after the last, so both callers get identical parse-and-validate behaviour
+ * from one place (and the mutation registry has a single anchor for the
+ * missing-proto rule, not one per wrapper).
  */
 static void
-backend_load_fp(FILE *fp, const char *file, backend_script *s, int *have_proto)
+backend_load_fp(FILE *fp, const char *file, backend_script *s)
 {
     char  line[4096];
     int   lineno = 0;
+    int   have_proto = 0;
+
+    memset(s, 0, sizeof(*s));
 
     while (fgets(line, sizeof(line), fp) != NULL) {
         char *p, *directive;
@@ -536,7 +542,7 @@ backend_load_fp(FILE *fp, const char *file, backend_script *s, int *have_proto)
                 die("%s:%d: unknown proto \"%s\"", file, lineno, name);
             }
 
-            *have_proto = 1;
+            have_proto = 1;
 
         } else if (strcmp(directive, "seed") == 0) {
             char *key, *save = NULL, *value;
@@ -599,24 +605,6 @@ backend_load_fp(FILE *fp, const char *file, backend_script *s, int *have_proto)
             die("%s:%d: unknown directive \"%s\"", file, lineno, directive);
         }
     }
-}
-
-
-void
-backend_load(const char *file, backend_script *s)
-{
-    FILE *fp;
-    int   have_proto = 0;
-
-    memset(s, 0, sizeof(*s));
-
-    fp = fopen(file, "r");
-    if (fp == NULL) {
-        die("cannot open backend script %s", file);
-    }
-
-    backend_load_fp(fp, file, s, &have_proto);
-    fclose(fp);
 
     /*
      * The protocol is not defaulted. Guessing memcached would make a redis
@@ -630,6 +618,21 @@ backend_load(const char *file, backend_script *s)
 }
 
 
+void
+backend_load(const char *file, backend_script *s)
+{
+    FILE *fp;
+
+    fp = fopen(file, "r");
+    if (fp == NULL) {
+        die("cannot open backend script %s", file);
+    }
+
+    backend_load_fp(fp, file, s);
+    fclose(fp);
+}
+
+
 /*
  * backend_load_buf -- parse a .backend script supplied as an in-memory byte
  * buffer rather than a path. The fuzz target's entry point: it feeds
@@ -637,24 +640,25 @@ backend_load(const char *file, backend_script *s)
  * script is exercised as untrusted bytes. fmemopen gives backend_load_fp() the
  * same FILE* line source fgets() reads from a real file, so the parser is
  * byte-for-byte the one production runs -- no fuzz-only reimplementation to
- * drift.
+ * drift, and no duplicated whole-script validation to fall out of step (the
+ * proto check lives in backend_load_fp, run for both callers).
  *
  * On die() (any malformed line, or a missing proto directive) the caller's
  * armed prober_die_jmp longjmps out before this returns, so the on-disk
- * backend_load() path is byte-identical: same fmemopen-vs-fopen line source
- * aside, the same parser, the same have_proto check, the same fatal contract.
+ * backend_load() path is byte-identical aside from the fmemopen-vs-fopen line
+ * source: the same parser, the same proto check, the same fatal contract.
  *
- * A NULL from fmemopen (only on an allocation failure here) leaves *s zeroed
- * and returns; the fuzz target treats a script that produced nothing as a
- * non-event.
+ * A NULL from fmemopen (only on an allocation failure here) leaves *s untouched
+ * and returns without dying; the fuzz target arms prober_die_jmp and treats a
+ * script that produced nothing as a non-event, and its static backend_script is
+ * cleared by backend_free() after each input regardless. (backend_load_fp's
+ * memset only runs once fmemopen succeeds, so on this path *s is whatever the
+ * previous iteration left; the fuzz caller's backend_free already zeroed it.)
  */
 void
 backend_load_buf(const char *buf, size_t len, backend_script *s)
 {
     FILE *fp;
-    int   have_proto = 0;
-
-    memset(s, 0, sizeof(*s));
 
     /* fmemopen's first parameter is void*, not const void*, even in "r" mode
      * where it only reads -- a historical POSIX signature wart. The cast
@@ -670,12 +674,8 @@ backend_load_buf(const char *buf, size_t len, backend_script *s)
         return;
     }
 
-    backend_load_fp(fp, "<buf>", s, &have_proto);
+    backend_load_fp(fp, "<buf>", s);
     fclose(fp);
-
-    if (!have_proto) {
-        die("<buf>: no proto directive (memcached or redis)");
-    }
 }
 
 
