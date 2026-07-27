@@ -46,6 +46,13 @@ PRIMARY	prober/backend.c	backend_test	fast
 PRIMARY	prober/util.c	util_test	fast
 PRIMARY	prober/assert.c	assert_test	fast
 
+# lib.sh is bash, not a LIB translation unit, but it owns the arithmetic the
+# resource oracles assert through and slope_check_test.sh pins that arithmetic
+# with no server involved -- so a change to it gets a FAST answer on the PR
+# lane here, not only the weekly SLOW scenario rows further down. Those rows
+# stay: they cover the live boot/probe path this test deliberately stubs out.
+PRIMARY	prober/lib.sh	slope_check_test.sh	fast
+
 # --- FALLBACK: any LIB .c not caught above (or any LIB .c at all, as the
 # conservative catch-all every *_test.c binary links against) still selects
 # every unit test, because every *_test.c binary links the whole LIB and a

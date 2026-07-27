@@ -767,13 +767,19 @@ prober_stimulus_get() {
 #    loaded runner as an idle one -- the counted-iteration discipline the rest of
 #    this file uses so a flake reproduces somewhere.
 #
-#  * SLOPE, NOT ENDPOINT DELTA. The bound is on (last - baseline)/(SAMPLES) --
-#    average growth per operation -- so a single transient blip is amortised while
-#    a steady climb is not, which is the difference between noise and a leak.
+#  * SLOPE, NOT ENDPOINT DELTA. The bound is on growth per operation -- so a
+#    single transient blip is amortised while a steady climb is not, which is the
+#    difference between noise and a leak.
+#
+#  * ENFORCED AS TOTAL vs BUDGET, NOT AS A TRUNCATED AVERAGE. The check is
+#    (last - baseline) <= MAX_PER_OP * SAMPLES. Dividing the growth by SAMPLES
+#    first would truncate toward zero and floor any sub-SAMPLES growth to 0/op,
+#    which made a "MAX_PER_OP=0, exactly flat" oracle accept up to SAMPLES-1
+#    units of real growth. The per-op figure in the output is informational.
 prober_slope_check() {
     local host="$1" port="$2" field="$3" path="$4"
     local warmup="$5" samples="$6" max_per_op="$7"
-    local i body baseline last val slope
+    local i body baseline last val slope growth budget
 
     if [ "$samples" -lt 1 ]; then
         echo "# slope: SAMPLES must be >= 1 (got $samples)"
@@ -814,19 +820,39 @@ prober_slope_check() {
         last="$val"
     done
 
-    # Average growth per operation across the post-warmup window, rounded toward
-    # zero by integer division. A field that grew by G over SAMPLES operations
-    # has a per-op slope of G/SAMPLES; the assertion is slope <= MAX_PER_OP.
-    slope=$(( (last - baseline) / samples ))
+    # The assertion is on TOTAL growth against the budget the per-op bound
+    # allows, NOT on a per-op average computed by integer division.
+    #
+    # WHY NOT (last - baseline) / samples: that division truncates toward zero,
+    # so it floors any growth smaller than SAMPLES to 0/op. With the standard
+    # SAMPLES=30 an oracle documented as "exactly flat" (MAX_PER_OP=0) silently
+    # tolerated up to 29 bytes of total growth, and a MAX_PER_OP=4 bound
+    # tolerated up to 4 + 29/30 per op -- a slow leak below one unit per op was
+    # invisible to every consumer. Multiplying out instead keeps the bound
+    # meaning exactly what the callers' comments claim: growth may not exceed
+    # MAX_PER_OP for each of the SAMPLES operations.
+    growth=$(( last - baseline ))
+    budget=$(( max_per_op * samples ))
 
-    if [ "$slope" -gt "$max_per_op" ]; then
+    # Reported per-op figure only -- the verdict is growth vs budget above.
+    # Rounded AWAY from zero for positive growth so the number shown can never
+    # read lower than the bound it just failed.
+    if [ "$growth" -gt 0 ]; then
+        slope=$(( (growth + samples - 1) / samples ))
+    else
+        slope=$(( growth / samples ))
+    fi
+
+    if [ "$growth" -gt "$budget" ]; then
         echo "# slope: \"$field\" $baseline -> $last over $samples ops" \
-             "= ${slope}/op, want <= ${max_per_op}/op"
+             "= +${growth} total (~${slope}/op)," \
+             "want <= ${budget} total (${max_per_op}/op)"
         return 1
     fi
 
     echo "# slope: \"$field\" $baseline -> $last over $samples ops" \
-         "= ${slope}/op (<= ${max_per_op}/op)"
+         "= +${growth} total (~${slope}/op)," \
+         "within ${budget} total (<= ${max_per_op}/op)"
     return 0
 }
 
