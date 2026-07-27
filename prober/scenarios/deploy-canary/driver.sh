@@ -296,6 +296,22 @@ fi
 prober_check_conf
 prober_boot
 
+# run-scenario.sh's own EXIT trap (prober_cleanup) kills whatever
+# PROBER_SERVER_PID names in ITS shell -- and this driver runs as a plain
+# CHILD PROCESS (run-scenario.sh execs "$SCENARIO/driver.sh", never sources
+# it), so prober_boot's reassignment of PROBER_SERVER_PID to the CANDIDATE's
+# pid is local to this process and never reaches the parent. Left alone, the
+# parent's cleanup kills the (already-dead) CONTROL pid it still remembers and
+# the CANDIDATE master orphans, holding its port and a live worker for the
+# rest of the CI job -- confirmed the cause of an unrelated sibling scenario
+# (reload-soak) failing "0 of 100 reloads absorbed" immediately after this one
+# in the same test-scenarios.sh sweep, diagnosed via the resource exhaustion
+# an orphaned second server leaves on a shared runner. This driver must
+# therefore own killing its OWN second boot -- on every exit path, including
+# the Bail out! early-exits above and below, not just the happy path at the
+# bottom of the file.
+trap 'prober_stop || true' EXIT
+
 for _i in 1 2 3; do
     raw_request GET / >/dev/null 2>&1 || true
 done
