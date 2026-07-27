@@ -108,8 +108,17 @@ prober_resolve() {
 # filename would have caught one and missed the other.
 #
 # PROBER_ALLOW_STALE_SO=1 lifts exactly this bail, for the deliberate case of
-# driving a known-old artifact on purpose. Scoped like PROBER_ALLOW_LOG and
-# PROBER_ALLOW_MULTIWORKER -- one named gate, never a blanket off-switch.
+# driving a known-old artifact on purpose. Scoped to the literal value 1 -- one
+# named gate, never a blanket off-switch, so a stray =0 cannot disable it.
+#
+# UNLIKE PROBER_ALLOW_LOG and PROBER_ALLOW_MULTIWORKER, this one must come from
+# the CALLER'S environment, not a scenario `env` file. Those two are read by
+# prober_check_conf and prober_scrape_log, which run AFTER run-scenario.sh
+# sources the scenario env; this runs from prober_detect_load, which is several
+# steps BEFORE it -- the load decision has to be made before anything is
+# rendered or booted. A scenario cannot opt itself in, and should not want to:
+# a stale artifact is a property of the developer's build tree, not of a
+# scenario's requirements.
 #
 # Missing src/ is NOT a bail: a CONSUMER repo vendors this harness and builds
 # its own module, so there is no probe source to compare against and nothing

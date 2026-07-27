@@ -31,7 +31,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=8
+PLANNED=9
 tests_run=0
 failures=0
 
@@ -145,6 +145,36 @@ ok "$((s != 0 ? 0 : 1))" "PROBER_ALLOW_STALE_SO=0 does not lift the bail"
 rm -rf "$ROOT/src"
 ( prober_stale_so_check ) >/dev/null 2>&1 && s=0 || s=$?
 ok "$s" "a tree with no src/ passes (the consumer case)"
+
+# ---- the guard runs BEFORE the scenario env is sourced ----------------------
+# The docs promise that PROBER_ALLOW_STALE_SO must come from the caller's
+# environment and NOT from a scenario `env` file, unlike its two siblings. That
+# asymmetry is a consequence of call order in run-scenario.sh -- prober_detect_load
+# (which calls this guard) runs several lines before the `. "$SCENARIO/env"`, while
+# prober_check_conf and prober_scrape_log run after it.
+#
+# Assert the order directly against the script, so the day someone reorders
+# run-scenario.sh the docs stop being quietly wrong instead of loudly wrong.
+# `|| true` on each grep is load-bearing under `set -e`: a grep that matches
+# nothing exits 1, and an unguarded $( ) assignment would kill this script
+# outright -- the TAP stream would stop at 8 with no `not ok` printed, which
+# reads as a pass to anything counting failures. Verified: without the guards,
+# reordering run-scenario.sh truncated the stream instead of failing test 9.
+# Matching `prober_detect_load` anywhere on the line (not anchored to column 0)
+# is deliberate for the same reason -- an indented call is still a call, and
+# anchoring would make the assertion silently unable to find a relocated one.
+detect_ln="$(grep -n 'prober_detect_load' run-scenario.sh | head -1 | cut -d: -f1 || true)"
+# SC2016: the single quotes are the point -- this greps for the LITERAL text
+# `. "$SCENARIO/env"` in another script's source, so expanding it here would
+# search for this test's own (empty) $SCENARIO instead.
+# shellcheck disable=SC2016
+env_ln="$(grep -n '\. "\$SCENARIO/env"' run-scenario.sh | head -1 | cut -d: -f1 || true)"
+if [ -n "$detect_ln" ] && [ -n "$env_ln" ] && [ "$detect_ln" -lt "$env_ln" ]; then
+    s=0
+else
+    s=1
+fi
+ok "$s" "prober_detect_load runs before the scenario env is sourced (docs claim)"
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
     echo "# PLAN MISMATCH: ran $tests_run, planned $PLANNED"

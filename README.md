@@ -1712,9 +1712,22 @@ The check compares the artifact's mtime against the newest
 field means rebuilding the reference module for every flavor you run locally**,
 or that field's own scenario skips itself green. A tree with no `src/` — a
 consumer repo vendoring this harness and building its own module — has nothing
-to compare against and is passed silently. Like `PROBER_ALLOW_LOG`, the opt-in
-is honoured only for the exact value `1`, so a stray `=0` in a scenario's `env`
-cannot quietly disable it.
+to compare against and is passed silently.
+
+Set it in the environment of the command you run:
+
+```
+PROBER_ALLOW_STALE_SO=1 prober/run-scenario.sh scenarios/<name> nginx 1.29.0
+```
+
+Unlike `PROBER_ALLOW_LOG` and `PROBER_ALLOW_MULTIWORKER`, **a scenario's `env`
+file cannot set this one**. Those are read by `prober_check_conf` and
+`prober_scrape_log`, which run after `run-scenario.sh` sources the scenario
+`env`; this is read by `prober_detect_load`, several steps earlier, because the
+load decision precedes rendering and boot. That asymmetry is deliberate: a stale
+artifact is a property of your build tree, not of a scenario's requirements. The
+opt-in is honoured only for the exact value `1`, so a stray `=0` cannot quietly
+disable it.
 
 **`PROBER_DAEMON_MODE` (environment variable, optional)**
 
