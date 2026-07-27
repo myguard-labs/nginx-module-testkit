@@ -835,23 +835,33 @@ prober_slope_check() {
     budget=$(( max_per_op * samples ))
 
     # Reported per-op figure only -- the verdict is growth vs budget above.
-    # Rounded AWAY from zero for positive growth so the number shown can never
-    # read lower than the bound it just failed.
+    # Rounded AWAY from zero in BOTH directions, so the number shown can never
+    # read as satisfying a bound the total just failed. Truncating a negative
+    # slope toward zero would print "0/op" next to "want <= -1/op" on a line
+    # that failed, which reads as a harness bug rather than as the verdict.
     if [ "$growth" -gt 0 ]; then
         slope=$(( (growth + samples - 1) / samples ))
     else
-        slope=$(( growth / samples ))
+        slope=$(( -(( -growth + samples - 1 ) / samples) ))
+    fi
+
+    # Sign is formatted rather than hardcoded: growth is negative whenever the
+    # field shrank, and a literal "+" would render that as "+-5".
+    if [ "$growth" -gt 0 ]; then
+        growth_str="+${growth}"
+    else
+        growth_str="${growth}"
     fi
 
     if [ "$growth" -gt "$budget" ]; then
         echo "# slope: \"$field\" $baseline -> $last over $samples ops" \
-             "= +${growth} total (~${slope}/op)," \
+             "= ${growth_str} total (~${slope}/op)," \
              "want <= ${budget} total (${max_per_op}/op)"
         return 1
     fi
 
     echo "# slope: \"$field\" $baseline -> $last over $samples ops" \
-         "= +${growth} total (~${slope}/op)," \
+         "= ${growth_str} total (~${slope}/op)," \
          "within ${budget} total (<= ${max_per_op}/op)"
     return 0
 }

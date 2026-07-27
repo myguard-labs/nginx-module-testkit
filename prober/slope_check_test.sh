@@ -37,7 +37,7 @@ export PROBER_LIB
 # shellcheck source=lib.sh
 . ./lib.sh
 
-echo "1..12"
+echo "1..13"
 
 n=0
 FAILED=0
@@ -181,6 +181,24 @@ check "MAX_PER_OP=-1 reds a flat field (deploy-canary's mutate row stays valid)"
 # bound is unsatisfiable by construction.
 check "MAX_PER_OP=-1 passes a field that actually shrinks" \
     "0" "$(run 10 30 -1 1000 29x1000 900)"
+
+# --- the reported figures on a shrinking field ----------------------------
+#
+# Growth is negative whenever the field shrank, which only a negative bound can
+# reach -- i.e. the mutate row above. Two things have to hold on that line, and
+# neither affects the verdict, which is why they are easy to get wrong: the
+# total must not render as "+-5" (a hardcoded sign meeting a negative number),
+# and the per-op figure must round AWAY from zero. Truncating -5/10 toward zero
+# prints "~0/op" beside "want <= -1/op" on a line that FAILED, which reads as a
+# broken harness rather than as the verdict it is.
+run 2 10 -1 1000 9x1000 995 >/dev/null
+case "$SLOPE_OUT" in
+    *'+-'*)      got="rendered a doubled sign: $SLOPE_OUT" ;;
+    *'~-1/op'*)  got=ok ;;
+    *)           got="$SLOPE_OUT" ;;
+esac
+check "a failing shrink reports a signed total and rounds per-op away from zero" \
+    "ok" "$got"
 
 # --- fail-closed paths ----------------------------------------------------
 #
