@@ -780,6 +780,7 @@ prober_slope_check() {
     local host="$1" port="$2" field="$3" path="$4"
     local warmup="$5" samples="$6" max_per_op="$7"
     local i body baseline last val slope growth budget
+    local slope_q slope_r over growth_str
 
     if [ "$samples" -lt 1 ]; then
         echo "# slope: SAMPLES must be >= 1 (got $samples)"
@@ -832,17 +833,44 @@ prober_slope_check() {
     # meaning exactly what the callers' comments claim: growth may not exceed
     # MAX_PER_OP for each of the SAMPLES operations.
     growth=$(( last - baseline ))
-    budget=$(( max_per_op * samples ))
 
-    # Reported per-op figure only -- the verdict is growth vs budget above.
-    # Rounded AWAY from zero in BOTH directions, so the number shown can never
-    # read as satisfying a bound the total just failed. Truncating a negative
-    # slope toward zero would print "0/op" next to "want <= -1/op" on a line
-    # that failed, which reads as a harness bug rather than as the verdict.
-    if [ "$growth" -gt 0 ]; then
-        slope=$(( (growth + samples - 1) / samples ))
+    # The verdict is `growth > max_per_op * samples`, but that product is NOT
+    # computed: bash arithmetic wraps silently at intmax_t, and a wrapped
+    # product flips the sense of the comparison. An absurd bound
+    # (max_per_op=-307445734561825861, samples=30) mathematically means "must
+    # shrink enormously" but multiplies out to a large POSITIVE budget, so a
+    # flat field would pass a bound designed to be unsatisfiable. Nothing in
+    # tree passes a value near that today -- both callers read a small integer
+    # from the environment -- but a fail-open on a corrupted bound is precisely
+    # the failure this helper exists to prevent, and the guard costs one
+    # division.
+    #
+    # Compare via quotient and remainder instead, which stays in range for any
+    # representable operands: with q and r from truncating division,
+    # growth > max_per_op * samples  <=>  q > max_per_op, or q == max_per_op
+    # with a remainder that pushes it over. r is exact and takes growth's sign
+    # (bash truncates toward zero), so a positive remainder means "above q".
+    slope_q=$(( growth / samples ))
+    slope_r=$(( growth - slope_q * samples ))
+
+    if [ "$slope_q" -gt "$max_per_op" ]; then
+        over=1
+    elif [ "$slope_q" -eq "$max_per_op" ] && [ "$slope_r" -gt 0 ]; then
+        over=1
     else
-        slope=$(( -(( -growth + samples - 1 ) / samples) ))
+        over=0
+    fi
+
+    # Reported per-op figure only. Rounded toward POSITIVE INFINITY (ceiling),
+    # which is the rounding the `<=` bound implies: the printed number must
+    # never read as satisfying a bound the exact average fails. Rounding away
+    # from zero instead would render -5/10 as "-1/op" beside "want <= -1/op"
+    # on a line that FAILED, since -0.5 does not satisfy <= -1. Ceiling gives
+    # "0/op" there, which is above the bound and agrees with the verdict.
+    if [ "$slope_r" -gt 0 ]; then
+        slope=$(( slope_q + 1 ))
+    else
+        slope="$slope_q"
     fi
 
     # Sign is formatted rather than hardcoded: growth is negative whenever the
@@ -853,16 +881,21 @@ prober_slope_check() {
         growth_str="${growth}"
     fi
 
-    if [ "$growth" -gt "$budget" ]; then
+    # Only for the message -- the verdict above never forms this product. It
+    # can still wrap on an absurd bound, so say what was asked for, not a
+    # wrapped total.
+    budget="${max_per_op}/op over ${samples} ops"
+
+    if [ "$over" -eq 1 ]; then
         echo "# slope: \"$field\" $baseline -> $last over $samples ops" \
              "= ${growth_str} total (~${slope}/op)," \
-             "want <= ${budget} total (${max_per_op}/op)"
+             "want <= ${budget}"
         return 1
     fi
 
     echo "# slope: \"$field\" $baseline -> $last over $samples ops" \
          "= ${growth_str} total (~${slope}/op)," \
-         "within ${budget} total (<= ${max_per_op}/op)"
+         "within ${budget}"
     return 0
 }
 

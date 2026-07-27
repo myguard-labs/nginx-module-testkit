@@ -134,10 +134,27 @@ if [ "$VI_STATUS" -eq 0 ] && [ -s "$VI_OUT" ]; then
             *_test)
                 printf '%s\n' "$target" >>"$UNIT_TESTS"
                 ;;
+            *_test.sh)
+                # A shell TAP suite (slope_check_test.sh and friends). Same
+                # phase-1 lane as a C unit test -- it is a fast, direct-callable
+                # target -- but it needs no build step, so phase 1 keys off the
+                # .sh extension rather than compiling "$t.c". Without this arm
+                # the target fell through to SCENARIOS, a bucket nothing reads,
+                # so a mapped shell suite was selected and then silently never
+                # run: a green phase that proved nothing.
+                printf '%s\n' "$target" >>"$UNIT_TESTS"
+                ;;
             *)
                 # Anything else verify-impact might legitimately emit (a
                 # scenario dir without the scenarios/ prefix, etc.) is kept
                 # in the scenarios bucket rather than dropped silently.
+                #
+                # NOTE: nothing in this runner CONSUMES $SCENARIOS -- boot-
+                # required scenarios are owned by test-scenarios.sh (PR lane)
+                # and valgrind-scenarios.sh (weekly), exactly as pr-memcheck
+                # documents for its own refusal. So this arm is a deliberate
+                # "not ours to run", not a queue. It is reported below so a
+                # target landing here is visible rather than silently dropped.
                 printf '%s\n' "$target" >>"$SCENARIOS"
                 ;;
         esac
@@ -223,6 +240,38 @@ else
             p1_detail="$p1_detail budget exhausted before $t;"
             break
         fi
+        # A shell suite is already executable -- no source to compile, no
+        # binary to stale-check. Run it directly under the same budget and
+        # timeout discipline as a C target below.
+        case "$t" in
+        *_test.sh)
+            if [ ! -e "$t" ]; then
+                p1_rc=1
+                p1_detail="$p1_detail $t: script missing;"
+                continue
+            fi
+            left="$(remaining)"
+            if [ "$left" -le 0 ]; then
+                p1_rc=1
+                p1_detail="$p1_detail budget exhausted before running $t;"
+                continue
+            fi
+            if timeout "$left" bash "$t" >"$WORK/p1_run_$t.log" 2>&1; then
+                :
+            else
+                rc=$?
+                if [ "$rc" -eq 124 ]; then
+                    p1_rc=1
+                    p1_detail="$p1_detail $t: TIMED OUT after ${left}s (budget exhausted mid-run);"
+                else
+                    p1_rc=1
+                    p1_detail="$p1_detail $t: FAILED;"
+                fi
+            fi
+            continue
+            ;;
+        esac
+
         src="$t.c"
         bin="$t"
         if [ ! -e "$src" ]; then
@@ -397,6 +446,16 @@ else
             p3_detail="$p3_detail budget exhausted before $t;"
             break
         fi
+        # A shell TAP suite has no C translation unit to memcheck -- valgrind
+        # would profile bash itself, which says nothing about the code under
+        # test. Skip it here rather than reporting "source missing"; phase 1
+        # already ran it.
+        case "$t" in
+        *_test.sh)
+            continue
+            ;;
+        esac
+
         src="$t.c"
         vg_bin="$WORK/memcheck_$t"
         if [ ! -e "$src" ]; then
@@ -697,7 +756,21 @@ SUMMARY_JSON="$(
             "$(phase_json_escape "${PHASE_CLASS[$n]}")" \
             "${PHASE_ELAPSED[$n]}"
     done
-    printf '}}'
+    printf '},'
+    # Targets this runner deliberately does NOT execute: boot-required
+    # scenarios, owned by test-scenarios.sh (PR lane) and valgrind-scenarios.sh
+    # (weekly). Emitted so a selected-but-not-run target is auditable instead of
+    # disappearing into a bucket nothing reads.
+    scen_sorted="$(sort_uniq "$SCENARIOS")"
+    if command -v python3 >/dev/null 2>&1; then
+        scen_json="$(printf '%s\n' "$scen_sorted" | \
+            python3 -c 'import json,sys; print(json.dumps([l.rstrip("\n") for l in sys.stdin if l.strip()]))' 2>/dev/null || true)"
+    else
+        scen_json=""
+    fi
+    [ -n "$scen_json" ] || scen_json="$(sel_json_escape "$scen_sorted")"
+    printf '"deferred_to_scenario_runners":%s' "$scen_json"
+    printf '}'
 )"
 if command -v jq >/dev/null 2>&1; then
     printf '%s' "$SUMMARY_JSON" | jq -S . >"$SUMMARY"

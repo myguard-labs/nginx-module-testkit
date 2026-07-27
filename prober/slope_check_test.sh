@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# TAP self-test for prober_slope_check (lib.sh), the growth oracle every
-# resource scenario asserts through (rss-slope, stateful-property-fuzz,
-# deploy-canary).
+# TAP self-test for prober_slope_check (lib.sh), the growth oracle the
+# resource scenarios assert through: rss-slope (oracles 1 and 2) and
+# deploy-canary (O7). Both are merged, so a change here moves a bound they
+# already assert against.
 #
 # WHY IT NEEDS ITS OWN TEST rather than being covered by those three scenarios:
 # the defect this test was written for was PURE ARITHMETIC, and a scenario
@@ -12,11 +13,10 @@
 # 0/op. With the standard SAMPLES=30, an oracle whose own comment says "EXACTLY
 # flat, 0/op" accepted up to 29 units of real growth, and the 4 kB/op RSS bound
 # accepted 4 + 29/30 per op. Every consumer went green on the leak it existed to
-# catch. A live scenario can only distinguish those two if the planted leak
-# happens to be bigger than SAMPLES -- which the rss-slope control's leak is
-# (439/op), so it kept passing and proved nothing about the boundary. Only a
-# test that can DICTATE the exact sequence of readings can hold the bound at its
-# edge.
+# catch. The existing controls could not see it either: rss-slope's planted
+# leak is ~439/op, three orders of magnitude past the boundary, so it reddened
+# either way and proved nothing about where the bound actually sits. Only a
+# test that can DICTATE the exact sequence of readings can hold it at the edge.
 #
 # HOW THE SERVER IS STUBBED. prober_slope_check reads the world through exactly
 # two helpers -- prober_stimulus_get (one operation) and prober_probe_body (one
@@ -37,7 +37,7 @@ export PROBER_LIB
 # shellcheck source=lib.sh
 . ./lib.sh
 
-echo "1..13"
+echo "1..17"
 
 n=0
 FAILED=0
@@ -132,7 +132,7 @@ run() {
 # --- the boundary the bug lived on ----------------------------------------
 #
 # SAMPLES=30, MAX_PER_OP=0 -- the "exactly flat" contract rss-slope oracle 1 and
-# deploy-canary O5 both assert. Baseline 1000, and the field climbs by ONE unit
+# deploy-canary O7 both assert. Baseline 1000, and the field climbs by ONE unit
 # in total across the whole sweep. Under the old truncating division that was
 # 1/30 == 0/op and passed. It is real growth against a bound of zero, so it must
 # fail.
@@ -185,20 +185,55 @@ check "MAX_PER_OP=-1 passes a field that actually shrinks" \
 # --- the reported figures on a shrinking field ----------------------------
 #
 # Growth is negative whenever the field shrank, which only a negative bound can
-# reach -- i.e. the mutate row above. Two things have to hold on that line, and
-# neither affects the verdict, which is why they are easy to get wrong: the
-# total must not render as "+-5" (a hardcoded sign meeting a negative number),
-# and the per-op figure must round AWAY from zero. Truncating -5/10 toward zero
-# prints "~0/op" beside "want <= -1/op" on a line that FAILED, which reads as a
-# broken harness rather than as the verdict it is.
+# reach -- i.e. the mutate row above. Neither thing checked here affects the
+# verdict, which is why both are easy to get wrong.
+#
+# -5 over 10 ops against -1/op: the exact average is -0.5, which does NOT
+# satisfy <= -1, so this FAILS. The printed per-op figure therefore must not
+# read as satisfying -1/op. That means rounding toward POSITIVE INFINITY, the
+# direction a `<=` bound implies -- ceiling(-0.5) is 0, which is visibly above
+# the bound. Rounding away from zero would print "-1/op" beside "want <= -1/op"
+# on a failing line, and truncation happens to agree with ceiling here only
+# because the remainder is negative.
+#
+# The total must also render as "-5", not "+-5" from a hardcoded sign.
 run 2 10 -1 1000 9x1000 995 >/dev/null
 case "$SLOPE_OUT" in
-    *'+-'*)      got="rendered a doubled sign: $SLOPE_OUT" ;;
-    *'~-1/op'*)  got=ok ;;
-    *)           got="$SLOPE_OUT" ;;
+    *'+-'*)                    got="doubled sign: $SLOPE_OUT" ;;
+    *'-5 total (~0/op)'*)      got=ok ;;
+    *)                         got="$SLOPE_OUT" ;;
 esac
-check "a failing shrink reports a signed total and rounds per-op away from zero" \
+check "a failing shrink reports a signed total and a ceiling per-op figure" \
     "ok" "$got"
+
+# --- the overflow the verdict must not form -------------------------------
+#
+# The bound is conceptually `growth <= max_per_op * samples`, but bash
+# arithmetic wraps silently at intmax_t. Computing that product directly turns
+# an absurd NEGATIVE bound into a large POSITIVE budget:
+#
+#   $(( -307445734561825861 * 30 )) == 9223372036854775786
+#
+# so a flat field would PASS a bound that means "must shrink by more than the
+# universe" -- fail-open on a corrupted bound, the exact failure mode this
+# helper exists to prevent. The quotient/remainder comparison never forms the
+# product, so the verdict stays correct at any representable operand.
+check "an absurd negative bound stays unsatisfiable instead of wrapping positive" \
+    "1" "$(run 2 30 -307445734561825861 1000 30x1000)"
+
+# The mirror case: an absurd POSITIVE bound wraps to a negative budget, which
+# would red a healthy flat field. It must still pass.
+check "an absurd positive bound stays satisfiable instead of wrapping negative" \
+    "0" "$(run 2 30 307445734561825861 1000 30x1000)"
+
+# samples=1 is the degenerate window -- quotient is the whole growth and the
+# remainder is always 0, so it is the case where a quotient/remainder split is
+# most likely to be written wrong.
+check "samples=1 reds growth above the bound" \
+    "1" "$(run 2 1 0 1000 1001)"
+
+check "samples=1 passes growth at the bound" \
+    "0" "$(run 2 1 4 1000 1004)"
 
 # --- fail-closed paths ----------------------------------------------------
 #
