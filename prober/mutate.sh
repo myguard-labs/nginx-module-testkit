@@ -1128,3 +1128,24 @@ mutate "stateful-property-fuzz: step plan not persisted to the replay path" \
 ' \
     'build_plan "$SEED"          > "$PLAN.decoy"
 ' scenarios/stateful-property-fuzz/mutate-suite.sh
+
+# --- scenarios/fault-matrix (P2-G6 named fault matrix, not module code) ------
+#
+# The branch under test is nginx's own upstream cleanup, which this repo cannot
+# mutate in-budget (see the scenario driver's NON-VACUITY header). The
+# deterministic cycle_used oracle is proven load-bearing here by CORRUPTING its
+# baseline: BASE_USED is knocked down by one, so every healthy row reads a
+# cycle_used != baseline and reds. This proves the exact cycle-pool oracle fires
+# and raises the exit status (not merely prints). The fds CEILING oracle is
+# proven by the documented-only CONTROL A (fds oscillates with the keepalive
+# pool, so it is not a deterministic in-budget mutant). Anchored on the pid line,
+# which runs AFTER BASE_USED is assigned in the warmup loop, so the corruption
+# lands on a set variable.
+# SC2016: the single-quoted text is a line of driver.sh's own bash being patched.
+# shellcheck disable=SC2016
+mutate "fault-matrix: cycle_used oracle vacuous (baseline corrupted, suite must still red)" \
+    scenarios/fault-matrix/driver.sh \
+    '    BASE_PID="$(snap_field "$wbody" pid)" || {' \
+    '    BASE_USED=$((BASE_USED - 1))
+    BASE_PID="$(snap_field "$wbody" pid)" || {' \
+    scenarios/fault-matrix/mutate-suite.sh
