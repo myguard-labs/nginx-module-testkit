@@ -73,7 +73,8 @@ check() {
 # has to survive the subshell, so it is the only part kept out of the shell.
 SERIES_FILE="$(mktemp)"
 CURSOR_FILE="$(mktemp)"
-trap 'rm -f "$SERIES_FILE" "$CURSOR_FILE"' EXIT
+EXHAUSTED_FILE="$(mktemp)"
+trap 'rm -f "$SERIES_FILE" "$CURSOR_FILE" "$EXHAUSTED_FILE"' EXIT
 
 prober_stimulus_get() {
     :
@@ -91,6 +92,14 @@ prober_probe_body() {
     echo "$((idx + 1))" > "$CURSOR_FILE"
     v="$(sed -n "$((idx + 1))p" "$SERIES_FILE")"
     if [ -z "$v" ]; then
+        # `exit` CANNOT abort the run from here: prober_slope_check reads every
+        # body as `body="$(prober_probe_body ...)"`, so this function always
+        # runs in a subshell and exiting kills only that. The caller would see
+        # a failed substitution, print "probe unreadable" and return 1 -- which
+        # is the EXPECTED value for most cases in this file, so a series that
+        # is too short (a bug in the test, not the code) would read as a pass.
+        # Leave a marker the parent shell checks instead.
+        echo "read $((idx + 1))" > "$EXHAUSTED_FILE"
         echo "slope_check_test: series exhausted at read $((idx + 1))" >&2
         exit 99
     fi
@@ -124,8 +133,17 @@ run() {
         fi
     done
     echo 0 > "$CURSOR_FILE"
+    : > "$EXHAUSTED_FILE"
     local rc=0
     SLOPE_OUT="$(prober_slope_check host 1 used / "$warmup" "$samples" "$max")" || rc=$?
+    # A series shorter than 1+SAMPLES means the CASE is malformed, and the rc it
+    # produces (1) is indistinguishable from a legitimate fail-closed result.
+    # Turn it into an unmistakable value no case expects, so the bug surfaces as
+    # a red line naming itself rather than as a green one.
+    if [ -s "$EXHAUSTED_FILE" ]; then
+        echo "SERIES-EXHAUSTED($(cat "$EXHAUSTED_FILE"))"
+        return
+    fi
     echo "$rc"
 }
 
