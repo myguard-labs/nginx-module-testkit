@@ -31,7 +31,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=9
+PLANNED=10
 tests_run=0
 failures=0
 
@@ -145,6 +145,35 @@ ok "$((s != 0 ? 0 : 1))" "PROBER_ALLOW_STALE_SO=0 does not lift the bail"
 rm -rf "$ROOT/src"
 ( prober_stale_so_check ) >/dev/null 2>&1 && s=0 || s=$?
 ok "$s" "a tree with no src/ passes (the consumer case)"
+
+# ---- many stale sources still bail cleanly ----------------------------------
+# The scan uses `find ... -print -quit` rather than `find ... -print | head -1`.
+# The pipe form is a latent SIGPIPE hazard: every caller runs `set -euo
+# pipefail`, and head closes the pipe once it has its line, so a find still
+# writing further matches is killed by signal 13 and pipefail reports 141.
+# Measured standalone with 3000 matching files: rc=141, reproducible.
+#
+# NOT a regression test, deliberately: inside this function the bail's `exit 1`
+# consistently wins the race (20/20 runs return 1, never 141), because find
+# yields its first match long before it has written enough to be signalled.
+# This case therefore asserts only that a large src/ still bails cleanly -- it
+# would ALSO pass with the pipe form restored, and claiming otherwise would be
+# the vacuous-gate shape the rest of this file exists to avoid. The fix stands
+# on the standalone measurement; this case guards the size dimension, not the
+# pipeline form.
+MANY="$WORK/many"
+mkdir -p "$MANY/src"
+i=0
+while [ "$i" -lt 3000 ]; do
+    : >"$MANY/src/ngx_test_probe_$i.c"
+    i=$((i + 1))
+done
+: >"$MANY/mod.so"
+old "$MANY/mod.so"
+new "$MANY/src"/*.c
+( PROBER_RESOLVED_ROOT="$MANY" PROBER_MODULE_PATH="$MANY/mod.so" \
+  prober_stale_so_check ) >/dev/null 2>&1 && s=0 || s=$?
+ok "$((s == 1 ? 0 : 1))" "a src/ of 3000 newer sources bails with rc 1, not a signal"
 
 # ---- the guard runs BEFORE the scenario env is sourced ----------------------
 # The docs promise that PROBER_ALLOW_STALE_SO must come from the caller's

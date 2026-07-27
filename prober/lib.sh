@@ -132,10 +132,18 @@ prober_stale_so_check() {
     src_dir="$PROBER_RESOLVED_ROOT/src"
     [ -d "$src_dir" ] || return 0
 
-    # Newest probe source by mtime. -maxdepth 1: src/ is flat, and a consumer
-    # tree underneath it must not vote on this harness's artifact.
+    # First probe source newer than the artifact. -maxdepth 1: src/ is flat, and
+    # a consumer tree underneath it must not vote on this harness's artifact.
+    #
+    # `-print -quit`, NOT `-print | head -1`: every caller runs `set -euo
+    # pipefail`, and `head -1` closes the pipe as soon as it has its line, so a
+    # find with more matches still to write dies of SIGPIPE (141). pipefail
+    # propagates that and `set -e` aborts the scenario, so the bail this
+    # function exists to print never appears -- a guard that kills the run
+    # silently instead of naming the stale artifact. -quit makes find stop after
+    # the first hit itself, so nothing is ever written into a closed pipe.
     newest="$(find "$src_dir" -maxdepth 1 -name 'ngx_test_probe*.[ch]' \
-              -newer "$PROBER_MODULE_PATH" -print 2>/dev/null | head -1)"
+              -newer "$PROBER_MODULE_PATH" -print -quit 2>/dev/null)"
 
     if [ -n "$newest" ]; then
         echo "Bail out! stale module artifact --" \
