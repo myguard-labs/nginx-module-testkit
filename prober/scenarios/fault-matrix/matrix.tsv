@@ -1,0 +1,22 @@
+# P2-G6 NAMED FAULT MATRIX.
+#
+# Machine-readable form of the plan's required record:
+#   branch -> fault -> fast target -> resource oracle -> mutation.
+# The driver reads columns 1-3 (name, fault-summary, get-ordinal); columns 4-6
+# document the uncovered upstream error branch each fault reaches, the oracle
+# that judges it, and the mutation that proves the row is non-vacuous. Add a row
+# by editing this file, the backend script (arm the fault on the same ordinal)
+# and, if a new mutation is wanted, mutate.sh -- the driver's plan-count is this
+# file's row count, so a drift between table and driver reds the scenario.
+#
+# get-ordinal is (driver WARMUP=8) + row index -- the driver issues 8 clean
+# warmup gets first, so the faults sit at ordinals 9..14 and the driver asserts
+# each row's ordinal equals the get it is about to issue (a table/backend/driver
+# drift reds the scenario, never passes on an unfaulted get).
+# name	fault-summary	get-ordinal	upstream-branch	resource-oracle	mutation
+reset	rst	9	ngx_http_upstream_finalize_request via a peer reset mid-transfer	cycle_used exact (primary) + fds ceiling	cycle_used-oracle-vacuous (BASE_USED corrupted, wired)
+truncate	truncate after=8	10	upstream reply shorter than declared -> bad-response finalize	cycle_used exact (primary) + fds ceiling	(covered by cycle_used-oracle-vacuous)
+undercount	lie_bytes delta=-20	11	memcached length undercount -> short read finalize	cycle_used exact (primary) + fds ceiling	(covered by cycle_used-oracle-vacuous)
+overcount	lie_bytes delta=40	12	memcached length overcount -> read-timeout finalize	cycle_used exact (primary) + fds ceiling	(covered by cycle_used-oracle-vacuous)
+drip	drip bytes=4 ms=50	13	slow trickle upstream -> read-timeout finalize	cycle_used exact (primary) + fds ceiling	(covered by cycle_used-oracle-vacuous)
+idleclose	close_after ms=10	14	reply then close -> keepalive-pool teardown finalize	cycle_used exact (primary) + fds ceiling	(covered by cycle_used-oracle-vacuous)

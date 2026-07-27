@@ -1153,6 +1153,45 @@ non-vacuity accounting — two `mutate.sh`-wired claims (PRNG determinism, plan
 persistence) plus four documented manually-run driver mutations, one per
 checkpoint oracle C1–C4.
 
+### Named fault matrix (`scenarios/fault-matrix`)
+
+Every named upstream fault the fake backend can express — `rst`, `truncate`
+(short read), `lie_bytes` under/overcount, `drip`, idle `close_after` — reaches
+a *different* nginx upstream error branch
+(`ngx_http_upstream_finalize_request` + the memcached upstream module), and
+after that branch has run the request pool and the upstream connection must be
+back to exactly what a clean request would leave. `fault-matrix` sweeps them:
+one fakesrv script arms all six, each pinned to a distinct 1-based get ordinal
+(`on=get:<nth>`), and the driver issues the gets in order so get *N* triggers
+exactly matrix row *N* — a stable, byte-reproducible `site:nth` injection with
+no timer and no race.
+
+The matrix itself is `matrix.tsv` beside the driver, the plan's required record
+`branch → fault → fast target → resource oracle → mutation`; the table, the
+backend script and the driver are three views of one list (the driver's plan
+count is the table's row count, so a drift reds the scenario). The oracle is
+**harness-owned resource neutrality** read from the probe, not the faulted
+reply's status/body (that is `backend-lying-length` / `backend-rst-midreply`):
+
+- **`cycle_used` — EXACT.** The long-lived cycle pool is deterministic (measured
+  identical to the byte across 20 faulted gets); a per-request cycle-pool leak on
+  any branch makes it climb. This is the primary oracle.
+- **`fds` — CEILING.** The keepalive upstream pool parks a connection between
+  requests, so the worker's fd count legitimately oscillates by one; the oracle
+  is therefore a monotonic-growth backstop (baseline = the max settled count, a
+  row fails only if it *exceeds* it — a leaked descriptor climbs to
+  `baseline + N`, a parked keepalive fd never does), not an equality.
+- worker liveness (per-row pid + an error-log signal-death backstop).
+
+Because the branch under test is nginx's own upstream cleanup (not this repo's
+C, and not on the ref module's `/__probe` path), non-vacuity is proven by
+documented baseline-corruption controls — the sanctioned fallback used by
+`stateful-property-fuzz`'s C1–C5. One is `mutate.sh`-wired (corrupting
+`BASE_USED` reds every row, proving the exact `cycle_used` oracle fires and
+raises the exit status); the fds-ceiling control is documented-only because
+`fds` oscillates. Weekly-lane sweep (`impact.map` `SLOW`), like `property-fuzz`
+— PR runs only sites mapped from the diff.
+
 ### Reload accounting (`scenarios/reload-cycle`)
 
 A reload builds a new cycle and must release the old one. A module that

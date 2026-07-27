@@ -123,3 +123,13 @@ SLOW	src/ngx_test_probe.c	scenarios/rss-slope	slow
 SLOW	prober/rules.c	scenarios/stateful-property-fuzz	slow
 SLOW	prober/lib.sh	scenarios/stateful-property-fuzz	slow
 SLOW	src/ngx_test_probe.c	scenarios/stateful-property-fuzz	slow
+# The named fault matrix (P2-G6) sweeps every fakesrv upstream fault (reset,
+# short read, length under/overcount, drip, idle close) through nginx's memcached
+# upstream and, after each, reads fd + cycle-pool neutrality from the probe. It
+# boots a real server and issues an ordinal-keyed sequence of faulted upstream
+# requests, so it is a weekly-lane sweep like property-fuzz -- not the PR path
+# ("PR injects only sites in the impact set; weekly sweeps the matrix" -- plan.md
+# P2-G6). Its owners are the fake backend's fault model and the probe's resource
+# fields the oracle reads.
+SLOW	prober/backend.c	scenarios/fault-matrix	slow
+SLOW	src/ngx_test_probe.c	scenarios/fault-matrix	slow

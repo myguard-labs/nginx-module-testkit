@@ -1,0 +1,45 @@
+# P2-G6 NAMED FAULT MATRIX -- the upstream half.
+#
+# One fakesrv script arms EVERY named upstream fault the fake can express, each
+# pinned to a distinct 1-based get occurrence (`on=get:<nth>`). The driver issues
+# the gets in order, so get N triggers exactly the fault on row N of the matrix
+# and nothing else -- a stable `site:nth` injection point (the plan's phrase),
+# reproducible byte-for-byte because the fault is keyed to the request ORDINAL,
+# never to a timer or a race.
+#
+# WHY THE FAKE UPSTREAM AND NOT A MODULE fault_set HOOK. The plan's boundary is
+# "no generic nginx core fault without a consumer-owned assertion". Here the
+# CONSUMER whose cleanup is under test is nginx's own ngx_http_upstream machinery
+# -- ngx_http_upstream_finalize_request and the memcached upstream module -- which
+# owns the per-request pool and the upstream connection on EVERY one of these
+# error branches. The harness owns the assertion (fd + cycle-pool neutrality read
+# from the probe), so the pair is complete without shipping a fault_set hook the
+# ref module deliberately omits. The probe's fault_slab=/fault_palloc= sites (H1)
+# need a real module fault site + a consumer .so; the upstream-fault matrix needs
+# neither and therefore runs on the stock ref-probe CI legs.
+#
+# Gated by backend-smoke: a fault proves nothing about cleanup unless the same
+# fake is first proven to serve correctly when told to behave normally. get 1
+# below is that clean baseline get -- no fault on it.
+proto   memcached
+seed    k       matrix-baseline-value-0123456789abcdefghij
+
+# --- the matrix rows, one named fault per get ordinal ----------------------
+# CRITICAL: the driver issues WARMUP (8) CLEAN gets FIRST to settle the fd and
+# cycle-pool baseline; those consume get ordinals 1..8. The faults must therefore
+# start at ordinal 9, or they would fire DURING warmup and the matrix-loop gets
+# would be unfaulted -- a silently vacuous scenario. The get-ordinal column in
+# matrix.tsv is (WARMUP + row index) and the driver asserts each row's declared
+# ordinal equals the get number it is about to issue, so a drift between this
+# file's ordinals, the table and the driver's WARMUP reds the scenario rather
+# than passing on unfaulted gets.
+#
+# Every row's action is one the memcached reply path can actually carry (a real
+# command target accepts every action; validate_fault only restricts the
+# reply-less connect/idle pseudo-targets), so none is silently dropped.
+fault   on=get:9     action=rst
+fault   on=get:10    action=truncate     after=8
+fault   on=get:11    action=lie_bytes    delta=-20
+fault   on=get:12    action=lie_bytes    delta=40
+fault   on=get:13    action=drip         bytes=4     ms=50
+fault   on=get:14    action=close_after  ms=10
