@@ -1169,28 +1169,52 @@ no timer and no race.
 The matrix itself is `matrix.tsv` beside the driver, the plan's required record
 `branch → fault → fast target → resource oracle → mutation`; the table, the
 backend script and the driver are three views of one list (the driver's plan
-count is the table's row count, so a drift reds the scenario). The oracle is
-**harness-owned resource neutrality** read from the probe, not the faulted
-reply's status/body (that is `backend-lying-length` / `backend-rst-midreply`):
+count is `2 × row count + 1` — each row gets a fault-fired assertion and a
+resource-neutrality assertion — so a drift between the three reds the
+scenario). `memcached_read_timeout` is pinned to `200ms` (not a round `1s`):
+nginx applies it *between* successive reads, not to the whole response
+(`ngx_http_memcached_module` docs), so it has to sit strictly between the
+`drip` row's 50ms inter-chunk gap and its ~800ms total transfer time — a
+timeout at or above 800ms lets `drip` complete as an ordinary slow-but-clean
+transfer and never reach the read-timeout branch its own row claims.
 
-- **`cycle_used` — EXACT.** The long-lived cycle pool is deterministic (measured
-  identical to the byte across 20 faulted gets); a per-request cycle-pool leak on
-  any branch makes it climb. This is the primary oracle.
-- **`fds` — CEILING.** The keepalive upstream pool parks a connection between
-  requests, so the worker's fd count legitimately oscillates by one; the oracle
-  is therefore a monotonic-growth backstop (baseline = the max settled count, a
-  row fails only if it *exceeds* it — a leaked descriptor climbs to
-  `baseline + N`, a parked keepalive fd never does), not an equality.
-- worker liveness (per-row pid + an error-log signal-death backstop).
+Each row asserts two different things, in order:
 
-Because the branch under test is nginx's own upstream cleanup (not this repo's
-C, and not on the ref module's `/__probe` path), non-vacuity is proven by
-documented baseline-corruption controls — the sanctioned fallback used by
-`stateful-property-fuzz`'s C1–C5. One is `mutate.sh`-wired (corrupting
-`BASE_USED` reds every row, proving the exact `cycle_used` oracle fires and
-raises the exit status); the fds-ceiling control is documented-only because
-`fds` oscillates. Weekly-lane sweep (`impact.map` `SLOW`), like `property-fuzz`
-— PR runs only sites mapped from the diff.
+- **Fault fired — read from the backend JOURNAL, not inferred.** fakesrv
+  journals `{"ev":"fault","nth":N,"action":"...","applied":true|false}` the
+  moment it decides to run a fault (`journal_fault()`, `fakesrv.c`); the driver
+  polls for THIS row's own `nth`+`action` pair before trusting anything else. A
+  backend that silently drops or misnumbers a fault (stale `matrix.tsv` row, a
+  deleted `fault` line) serves an ordinary correct reply — the get-ordinal
+  guard still matches and the resource oracle still reads clean baseline — so
+  without this check every row would print `ok` for having tested nothing. This
+  same poll is also what synchronizes the final `close_after` row: its socket
+  close is asynchronous on fakesrv's own event loop, and polling to
+  `applied:true` is the one wait between issuing that get and taking the
+  resource snapshot, so the probe cannot race ahead of the fault being armed.
+- **Harness-owned resource neutrality** read from the probe, not the faulted
+  reply's status/body (that is `backend-lying-length` / `backend-rst-midreply`):
+  - **`cycle_used` — EXACT.** The long-lived cycle pool is deterministic
+    (measured identical to the byte across 20 faulted gets); a per-request
+    cycle-pool leak on any branch makes it climb. This is the primary oracle.
+  - **`fds` — CEILING.** The keepalive upstream pool parks a connection
+    between requests, so the worker's fd count legitimately oscillates by one;
+    the oracle is therefore a monotonic-growth backstop (baseline = the max
+    settled count, a row fails only if it *exceeds* it — a leaked descriptor
+    climbs to `baseline + N`, a parked keepalive fd never does), not an
+    equality.
+  - worker liveness (per-row pid + an error-log signal-death backstop).
+
+Non-vacuity: the fault-fired oracle's own neg-control is deleting a backend
+`fault` line — proven by hand (removing `drip`'s line reds its row's fault-fired
+assertion and raises the scenario's exit status; restored, re-verified clean).
+The resource-neutrality oracle is proven by documented baseline-corruption
+controls — the sanctioned fallback used by `stateful-property-fuzz`'s C1–C5.
+One is `mutate.sh`-wired (corrupting `BASE_USED` reds every row, proving the
+exact `cycle_used` oracle fires and raises the exit status); the fds-ceiling
+control is documented-only because `fds` oscillates. Weekly-lane sweep
+(`impact.map` `SLOW`), like `property-fuzz` — PR runs only sites mapped from
+the diff.
 
 ### Reload accounting (`scenarios/reload-cycle`)
 
