@@ -1153,10 +1153,14 @@ mutate "fault-matrix: cycle_used oracle vacuous (baseline corrupted, suite must 
 # --- scenarios/deploy-canary (P2-H deployment canary/shadow verifier) -------
 #
 # The default (unmutated) tree boots CANDIDATE identical to CONTROL (D-2, one
-# conf, one binary) -- so every row below patches either the checked-in
-# nginx.conf's /canary block (O1/O2/O3: a real candidate-only behavioural
-# difference on the SECOND boot, see driver.sh) or driver.sh's own oracle
-# constant (O5/O7: corrupting the expectation/bound, same "cannot mutate
+# conf, one binary) -- so every row below patches driver.sh, in one of two
+# ways: O1/O2/O3 set driver.sh's CANARY_ARM_SED, which the driver applies to
+# the RENDERED $PROBER_PREFIX/conf/nginx.conf strictly between the control
+# capture and the candidate reboot (a real candidate-only behavioural
+# difference on the SECOND boot; the checked-in nginx.conf is never patched --
+# patching it would arm BOTH legs identically, see that variable's comment in
+# driver.sh), or O5/O7 patch driver.sh's own oracle
+# constant (corrupting the expectation/bound, same "cannot mutate
 # nginx's own crash or pool-bookkeeping machinery in-budget" boundary
 # fault-matrix's header documents for its cycle_used oracle), then requires
 # scenarios/deploy-canary/mutate-suite.sh to go red on the named oracle.

@@ -156,16 +156,37 @@ PLAN_METHODS=(GET HEAD GET GET)
 # is GET-only and does not expose the status line or headers, only the body,
 # so this scenario needs its own thin raw reader.
 raw_request() {
-    local method="$1" path="$2" resp status headers body
+    local method="$1" path="$2" resp status headers body rc
+    # The read must be COMPLETE, not merely non-empty. `Connection: close`
+    # means a healthy server closes the socket when the reply is done, so
+    # `cat` exits 0; a candidate that STALLS mid-reply instead trips the
+    # timeout, which exits 124 with whatever prefix arrived so far. Accepting
+    # that prefix (the earlier `|| true`) let a stalling candidate whose
+    # headers and body PREFIX still matched control hash-match its way to a
+    # promote verdict -- the exact "canary passes while the candidate is
+    # broken" vacuity this scenario exists to prevent. Fail closed on any
+    # non-zero exit instead.
+    set +e
     resp="$(
         trap '' PIPE
         exec 3<>"/dev/tcp/$HOST/$PORT" 2>/dev/null || exit 1
         printf '%s %s HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' \
             "$method" "$path" >&3 2>/dev/null
         timeout "${PROBER_PROBE_TIMEOUT:-2}" cat <&3 2>/dev/null
-    )" || true
+    )"
+    rc=$?
+    set -e
+    [ "$rc" -eq 0 ] || { echo "PROBE_UNREADABLE"; return 1; }
 
     [ -n "$resp" ] || { echo "PROBE_UNREADABLE"; return 1; }
+
+    # Framing completeness: the reply must carry a full header block (status
+    # line + the CRLF CRLF terminator). A truncated read that happened to exit
+    # 0 -- or a candidate that closed the socket early -- has no blank-line
+    # terminator and must not be hashed as if it were a whole response.
+    printf '%s' "$resp" | grep -q $'\r\n\r\n\|^\r\?$' || {
+        echo "PROBE_UNREADABLE"; return 1
+    }
 
     # Split status line, headers (up to the first blank line) and body. CRLF
     # terminated; the blank line is CRLF CRLF, so splitting on a literal CR
@@ -268,6 +289,15 @@ CONTROL_BODY="$(prober_probe_body "$HOST" "$PORT")" || {
     exit 1
 }
 prober_stop
+
+# O5 counts signal deaths in error.log, but that log is APPEND-ONLY across both
+# boots -- the control leg's own entries are still in it here. Left alone, a
+# control-side signal exit (or anything a sibling oracle deliberately killed
+# during the control leg) is counted as a CANDIDATE worker death and reds O5,
+# rolling back a healthy candidate for the control's sin. Truncate now, after
+# the control server is fully stopped and before the candidate boots, so
+# everything O5 later reads is candidate-era by construction.
+: > "$PROBER_PREFIX/logs/error.log"
 
 # --- CANDIDATE leg: reboot the SAME conf (D-2), armed by CANARY_ARM_SED -----
 # prober_boot re-execs $PROBER_SERVER_BIN against $PROBER_PREFIX/conf/nginx.conf

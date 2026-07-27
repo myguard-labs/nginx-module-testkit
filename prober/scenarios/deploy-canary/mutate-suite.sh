@@ -7,9 +7,11 @@
 # that cwd.
 #
 # Each of mutate.sh's five deploy-canary rows (O1 status, O2 headers, O3 body,
-# O5 death, O7 growth) patches EITHER the checked-in nginx.conf's /canary
-# block (O1/O2/O3 -- a real behavioural difference on the candidate's second
-# boot) OR driver.sh's own oracle constant (O5/O7 -- corrupting the
+# O5 death, O7 growth) patches driver.sh: O1/O2/O3 set its CANARY_ARM_SED, so
+# the driver seds the RENDERED conf between the control capture and the
+# candidate reboot (a real behavioural difference on the candidate's second
+# boot; the checked-in nginx.conf is never patched -- that would arm both legs
+# identically) OR driver.sh's own oracle constant (O5/O7 -- corrupting the
 # expectation/bound, same "cannot mutate nginx's own crash or pool-bookkeeping
 # machinery in-budget" boundary fault-matrix's header documents), then runs
 # THIS script once. O4/O6/O8 are documented-only manual neg-controls (see
