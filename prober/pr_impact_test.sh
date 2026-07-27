@@ -33,7 +33,7 @@ cd "$(dirname "$0")"
 PR_IMPACT_SRC="$PWD/pr-impact"
 VERIFY_IMPACT_SRC="$PWD/verify-impact"
 
-PLANNED=12
+PLANNED=14
 tests_run=0
 failures=0
 
@@ -382,6 +382,69 @@ else
 fi
 checkout_case "" "$BASE_SHA"
 git -C "$REPO" branch -q -D case-p1-fault
+
+# --- a mapped SHELL suite is actually EXECUTED, not silently bucketed -------
+# Regression for the routing hole this lane was added to close: a *_test.sh
+# TARGET matched no case arm in the classifier, fell through to $SCENARIOS --
+# a bucket this runner never consumes -- and was reported green without ever
+# running. Both directions are asserted, because "selected" alone was exactly
+# the false signal: a passing suite must report ok, and a FAILING one must
+# turn phase 1 red. The second half is the load-bearing one.
+checkout_case -b case-p1-shell "$BASE_SHA"
+# The suite AND its map row land in the base commit, so the measured diff below
+# touches only the suite's body. Editing impact.map inside the measured diff
+# would make verify-impact fail closed on the fixture's own map (it has no
+# self-owning row) before phase 1 ever ran.
+cat >"$REPO/prober/shellunit_test.sh" <<'SHTEST'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "1..1"
+echo "ok 1 - placeholder shell suite"
+exit 0
+SHTEST
+chmod +x "$REPO/prober/shellunit_test.sh"
+printf 'PRIMARY\tprober/shellunit_test.sh\tshellunit_test.sh\tfast\n' >>"$REPO/prober/impact.map"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "seed: a mapped shell suite and its row"
+BASE_SH="$(git -C "$REPO" rev-parse HEAD)"
+# A real, behaviourally-no-op edit to the suite itself: this is what the
+# selector sees, and its PRIMARY row selects the suite as its own owner.
+sed -i 's/^echo "1\.\.1"$/echo "1..1"   # selected by its own PRIMARY row/' "$REPO/prober/shellunit_test.sh"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "no-op edit to the shell suite -- selects itself"
+set +e
+LAST_OUT="$( cd "$REPO/prober" && ./pr-impact --base "$BASE_SH" --budget 45 \
+    --junit "$WORK/junitsh.xml" --summary "$WORK/summarysh.json" )"
+LAST_STATUS=$?
+set -e
+sh_selected="$(jq -r '.phases.unit_test.selected | index("shellunit_test.sh") // "none"' "$WORK/summarysh.json" 2>/dev/null || echo none)"
+if phase_is_ok unit_test && [ "$sh_selected" != "none" ]; then
+    ok 0 "phase1 unit_test: a mapped shell suite is selected and runs green"
+else
+    ok 1 "phase1 unit_test: a mapped shell suite is selected and runs green"
+    diag "$LAST_OUT"
+    diag "selected index: $sh_selected"
+fi
+
+# Now make that same suite FAIL. If the runner were still bucketing it away,
+# this would stay green -- which is precisely how the hole hid.
+sed -i 's/^exit 0$/exit 1/' "$REPO/prober/shellunit_test.sh"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "fault: the mapped shell suite now fails"
+set +e
+LAST_OUT="$( cd "$REPO/prober" && ./pr-impact --base "$BASE_SH" --budget 45 \
+    --junit "$WORK/junitsh2.xml" --summary "$WORK/summarysh2.json" )"
+LAST_STATUS=$?
+set -e
+if ! phase_is_ok unit_test && [ "$LAST_STATUS" -ne 0 ]; then
+    ok 0 "phase1 unit_test: a FAILING mapped shell suite reds the phase and the exit status"
+else
+    ok 1 "phase1 unit_test: a FAILING mapped shell suite reds the phase and the exit status"
+    diag "$LAST_OUT"
+    diag "exit status: $LAST_STATUS"
+fi
+checkout_case "" "$BASE_SHA"
+git -C "$REPO" branch -q -D case-p1-shell
 
 # =========================== PHASE 2: fuzz_replay ===========================
 # clean baseline: an empty diff (--allow-empty commit, BASE unchanged) means

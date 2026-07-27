@@ -46,6 +46,18 @@ PRIMARY	prober/backend.c	backend_test	fast
 PRIMARY	prober/util.c	util_test	fast
 PRIMARY	prober/assert.c	assert_test	fast
 
+# lib.sh is bash, not a LIB translation unit, but it owns the arithmetic the
+# resource oracles assert through and slope_check_test.sh pins that arithmetic
+# with no server involved -- so a change to it gets a FAST answer on the PR
+# lane here, not only the weekly SLOW scenario rows further down. Those rows
+# stay: they cover the live boot/probe path this test deliberately stubs out.
+PRIMARY	prober/lib.sh	slope_check_test.sh	fast
+
+# The suite is its own owner: editing a test must select that test, or the
+# selector fails closed on an unmapped executable change (which is exactly what
+# it did on the PR that added this file).
+PRIMARY	prober/slope_check_test.sh	slope_check_test.sh	fast
+
 # --- FALLBACK: any LIB .c not caught above (or any LIB .c at all, as the
 # conservative catch-all every *_test.c binary links against) still selects
 # every unit test, because every *_test.c binary links the whole LIB and a
@@ -97,8 +109,8 @@ SEMANTIC	probe-schema.json	schema_test	fast
 
 # --- SEMANTIC: the selector's own inputs. impact.map and verify-impact are
 # proven by their own self-test, not by any unit/fuzz/scenario target above.
-SEMANTIC	prober/impact.map	verify_impact_test	fast
-SEMANTIC	prober/verify-impact	verify_impact_test	fast
+SEMANTIC	prober/impact.map	verify_impact_test.sh	fast
+SEMANTIC	prober/verify-impact	verify_impact_test.sh	fast
 SEMANTIC	prober/pr-memcheck	pr_memcheck_test	fast
 
 # --- SLOW: owners that only run out-of-band (Valgrind/weekly/soak), not on
