@@ -1695,6 +1695,27 @@ every case reproduces the wall of false pid failures the bail exists to
 prevent, so it is a per-scenario opt-in, never a run default. The `multi-worker`
 scenario is the reference user.
 
+**`PROBER_ALLOW_STALE_SO` (environment variable, optional)**
+
+Set to `1` to drive a reference module `.so` that is older than the probe
+sources under `src/`. By default the harness bails: a `.so` built before a probe
+field was added still loads, still carries the directive, and still boots — it
+simply omits that field, so the oracle reading it sees the absent-field sentinel
+and fails closed. The red then lands on whichever *flavor* happens to hold the
+older artifact, which reads as a flavor-specific bug in the diff under test.
+That has cost a full session twice (a `.so` predating `ppid`; an angie `.so`
+predating `smaps`/`fds_by_kind`), and CI never reproduces it, because CI
+rebuilds every flavor from source on every run.
+
+The check compares the artifact's mtime against the newest
+`src/ngx_test_probe*.{c,h}` and names both paths in the bail. **Adding a probe
+field means rebuilding the reference module for every flavor you run locally**,
+or that field's own scenario skips itself green. A tree with no `src/` — a
+consumer repo vendoring this harness and building its own module — has nothing
+to compare against and is passed silently. Like `PROBER_ALLOW_LOG`, the opt-in
+is honoured only for the exact value `1`, so a stray `=0` in a scenario's `env`
+cannot quietly disable it.
+
 **`PROBER_DAEMON_MODE` (environment variable, optional)**
 
 Set to `on` (in a scenario's `env` file) to run the server with `daemon on;`

@@ -53,10 +53,20 @@ PRIMARY	prober/assert.c	assert_test	fast
 # stay: they cover the live boot/probe path this test deliberately stubs out.
 PRIMARY	prober/lib.sh	slope_check_test.sh	fast
 
+# Same reasoning for the two other lib.sh gates that need no server: the stale
+# artifact check and the pre-boot conf gate. Both are pure shell over staged
+# fixtures, so they answer on the PR lane in milliseconds. check_conf_test.sh
+# had no row at all until s143 -- the same unmapped-suite gap that let the
+# slope-floor bug (#134) live in a function with zero fast-lane coverage.
+PRIMARY	prober/lib.sh	stale_so_test.sh	fast
+PRIMARY	prober/lib.sh	check_conf_test.sh	fast
+
 # The suite is its own owner: editing a test must select that test, or the
 # selector fails closed on an unmapped executable change (which is exactly what
 # it did on the PR that added this file).
 PRIMARY	prober/slope_check_test.sh	slope_check_test.sh	fast
+PRIMARY	prober/stale_so_test.sh	stale_so_test.sh	fast
+PRIMARY	prober/check_conf_test.sh	check_conf_test.sh	fast
 
 # --- FALLBACK: any LIB .c not caught above (or any LIB .c at all, as the
 # conservative catch-all every *_test.c binary links against) still selects
