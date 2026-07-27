@@ -1149,3 +1149,62 @@ mutate "fault-matrix: cycle_used oracle vacuous (baseline corrupted, suite must 
     '    BASE_USED=$((BASE_USED - 1))
     BASE_PID="$(snap_field "$wbody" pid)" || {' \
     scenarios/fault-matrix/mutate-suite.sh
+
+# --- scenarios/deploy-canary (P2-H deployment canary/shadow verifier) -------
+#
+# The default (unmutated) tree boots CANDIDATE identical to CONTROL (D-2, one
+# conf, one binary) -- so every row below patches either the checked-in
+# nginx.conf's /canary block (O1/O2/O3: a real candidate-only behavioural
+# difference on the SECOND boot, see driver.sh) or driver.sh's own oracle
+# constant (O5/O7: corrupting the expectation/bound, same "cannot mutate
+# nginx's own crash or pool-bookkeeping machinery in-budget" boundary
+# fault-matrix's header documents for its cycle_used oracle), then requires
+# scenarios/deploy-canary/mutate-suite.sh to go red on the named oracle.
+# O4 (latency bucket), O6 (lineage) and O8 (fd neutrality) are documented-only
+# manual neg-controls in driver.sh's header, same tier as rss-slope's and
+# fault-matrix's own by-hand controls -- not wired here.
+
+# O1/O2/O3 arm the fault via CANARY_ARM_SED (driver.sh), applied to the
+# RENDERED conf strictly between the control capture and the candidate
+# reboot -- see that variable's own comment for why patching the checked-in
+# nginx.conf directly does NOT work (it arms both legs identically, since D-2
+# reboots the same source conf for both).
+# SC2016: the single-quoted text is a line of driver.sh's own bash being patched.
+# shellcheck disable=SC2016
+mutate "deploy-canary: O1 status differential (candidate 500s on /canary)" \
+    scenarios/deploy-canary/driver.sh \
+    'CANARY_ARM_SED="${CANARY_ARM_SED:-}"' \
+    'CANARY_ARM_SED="${CANARY_ARM_SED:-s/return 200 \"canary-stable-payload/return 500 \"canary-stable-payload/}"' \
+    scenarios/deploy-canary/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "deploy-canary: O2 header differential (candidate-only header on /canary)" \
+    scenarios/deploy-canary/driver.sh \
+    'CANARY_ARM_SED="${CANARY_ARM_SED:-}"' \
+    'CANARY_ARM_SED="${CANARY_ARM_SED:-/location \\/canary/a\\            add_header X-Canary-Debug leaked always;}"' \
+    scenarios/deploy-canary/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "deploy-canary: O3 body differential (candidate flips one byte of /canary)" \
+    scenarios/deploy-canary/driver.sh \
+    'CANARY_ARM_SED="${CANARY_ARM_SED:-}"' \
+    'CANARY_ARM_SED="${CANARY_ARM_SED:-s/canary-stable-payload/canary-Stable-payload/}"' \
+    scenarios/deploy-canary/mutate-suite.sh
+
+# SC2016: the single-quoted text is a line of driver.sh's own bash being patched.
+# shellcheck disable=SC2016
+mutate "deploy-canary: O5 death oracle vacuous (expectation corrupted, suite must still red)" \
+    scenarios/deploy-canary/driver.sh \
+    'EXPECT_SIG9=0
+died=$(grep -cE' \
+    'EXPECT_SIG9=1
+died=$(grep -cE' \
+    scenarios/deploy-canary/mutate-suite.sh
+
+# SC2016: the single-quoted text is a line of driver.sh's own bash being patched.
+# shellcheck disable=SC2016
+mutate "deploy-canary: O7 growth oracle vacuous (slope bound corrupted, suite must still red)" \
+    scenarios/deploy-canary/driver.sh \
+    '    SLOPE_CEIL_ADJUST=0' \
+    '    SLOPE_CEIL_ADJUST=-1' \
+    scenarios/deploy-canary/mutate-suite.sh

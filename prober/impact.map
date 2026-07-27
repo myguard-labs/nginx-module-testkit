@@ -133,3 +133,13 @@ SLOW	src/ngx_test_probe.c	scenarios/stateful-property-fuzz	slow
 # fields the oracle reads.
 SLOW	prober/backend.c	scenarios/fault-matrix	slow
 SLOW	src/ngx_test_probe.c	scenarios/fault-matrix	slow
+# The deployment canary / shadow verifier (P2-H) sequential-boots a CONTROL
+# then a CANDIDATE server from the same conf, drives a fixed GET/HEAD request
+# plan at each, diffs status/headers/body, and slope-checks the candidate's
+# own cycle_used/private_dirty across a post-warmup sweep. Two boots plus a
+# slope is a soak like rss-slope -- weekly lane, not the PR path (design pass:
+# memory/labs/nginx-test-harness/design-p2h-canary.md D-8). Its owners are the
+# boot/probe/slope helper set (lib.sh) and the probe document the differential
+# and O7 growth oracles both read.
+SLOW	prober/lib.sh	scenarios/deploy-canary	slow
+SLOW	src/ngx_test_probe.c	scenarios/deploy-canary	slow

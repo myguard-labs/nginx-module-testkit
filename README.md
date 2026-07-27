@@ -1216,6 +1216,51 @@ control is documented-only because `fds` oscillates. Weekly-lane sweep
 (`impact.map` `SLOW`), like `property-fuzz` — PR runs only sites mapped from
 the diff.
 
+### Deployment canary / shadow verifier (`scenarios/deploy-canary`)
+
+An external sidecar that drives a fixed, synthetic GET/HEAD request plan at a
+CONTROL server, then at a CANDIDATE server, and diffs what each answered.
+Design pass: `memory/labs/nginx-test-harness/design-p2h-canary.md`.
+
+- **Sequential boot, one conf.** There is no "previous release" tree to diff
+  against in this harness, so control and candidate are the *same*
+  nginx/ref-module binary booted twice from the *same* checked-in
+  `nginx.conf` — `run-scenario.sh`'s own boot is control, and `driver.sh`
+  captures its tuples, `prober_stop`s it, then reboots the identical rendered
+  conf as candidate. Neither server is ever live at the same time as the
+  other; the driver alone holds both result sets, which is the "external
+  sidecar" isolation the design means, not a network service.
+- **The request plan** is four fixed requests (GET `/`, HEAD `/canary`, GET
+  `/canary`, GET `/__probe`) issued identically to both legs — no writes, no
+  timers, no random, so "no PII/credentials in the plan" holds by
+  construction: there are none to redact.
+- **The oracles (O1–O8):** status/headers/body diffed per request (O1–O3,
+  headers masked the same way `prober_probe_normalize` masks run-identity
+  probe fields), no candidate worker death (O5), no monotonic cycle-pool or
+  RSS growth on the candidate across a post-warmup slope sweep (O7, skipped
+  on a sanitizer build for the same reason `rss-slope` skips it — ASan dirties
+  its own pages). Latency bucket (O4), lineage (O6) and fd neutrality (O8) are
+  documented manual neg-controls in `driver.sh`'s header, the same tier as
+  `rss-slope`'s and `fault-matrix`'s own by-hand controls — the repo cannot
+  mutate nginx's own timing/fork/fd-holding machinery in-budget.
+- **Verdict + evidence bundle.** `promote` iff every oracle is zero-diff (the
+  NULL canary, candidate == control, is the default unmutated-tree run);
+  `rollback` iff any oracle trips, naming the first tripped oracle and its
+  control-vs-candidate values in a small evidence bundle written to the run's
+  temp prefix (never committed).
+- **Arming a fault is driver-local, not a conf edit.** `CANARY_ARM_SED`, empty
+  by default, is a `sed` program `driver.sh` applies to the *rendered* conf
+  strictly between the control capture and the candidate reboot — patching
+  the checked-in `nginx.conf` directly would arm both legs identically (D-2:
+  one conf, read at both boots) and every differential oracle would read a
+  false "equal". `EXPECT_SIG9` (O5) and `SLOPE_CEIL_ADJUST` (O7) are corrupted
+  the same way `fault-matrix` corrupts `BASE_USED` — the branch under test is
+  nginx's own crash/pool-bookkeeping machinery, which this repo cannot mutate
+  in-budget, so the oracle's own expectation/bound is corrupted instead,
+  proving the comparison is live and raises the exit status.
+- Weekly-lane sweep (`impact.map` `SLOW`), like `rss-slope` and
+  `stateful-property-fuzz` — two boots plus a slope is not the PR path.
+
 ### Reload accounting (`scenarios/reload-cycle`)
 
 A reload builds a new cycle and must release the old one. A module that
