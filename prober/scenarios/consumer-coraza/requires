@@ -31,7 +31,15 @@
 # exactly as run-scenario.sh passes them (with the same defaults).
 FLAVOR="${2:-nginx}"
 VERSION="${3:-1.31.3}"
-BUILD="${PROBER_BUILD:-${PROBER_ROOT:-.}/.build/${FLAVOR}-${VERSION}}"
+# The root fallback MUST match prober/lib.sh:77 exactly -- $(cd ../.. && pwd),
+# evaluated from prober/, which is where run-scenario.sh has already cd'd by the
+# time this gate runs. That fallback is written for the VENDORED layout
+# (t/harness/prober/ -> the consumer's repo root); in a standalone checkout of
+# this repo it lands one level above the repo, so PROBER_ROOT has to be set
+# either way. Matching lib.sh is still the correct contract: a gate that
+# computes a DIFFERENT root than the engine can SKIP on a tree the engine would
+# have booted fine, and that SKIP reads as a pass.
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-$(cd ../.. && pwd)}/.build/${FLAVOR}-${VERSION}}"
 
 if [ ! -f "$BUILD/objs/ngx_http_coraza_module.so" ]; then
     echo "ngx_http_coraza_module.so not found in $BUILD/objs -- nginx.conf load_modules it unconditionally, so this tree cannot run the scenario; build it as a dynamic module (tools/build-consumers.sh --stage ${FLAVOR}-${VERSION}) to run this scenario"

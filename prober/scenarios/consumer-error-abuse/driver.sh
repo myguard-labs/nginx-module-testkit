@@ -69,7 +69,7 @@ snapshot() {             # read one probe snapshot into SNAP_* globals
 # must run over the module's ORDINARY path, not its block/deny path, which
 # takes a different, shorter code route.
 one_request() {
-    local out="$1" extra="${2:-}" pid dl
+    local out="$1" extra="${2:-}" pid dl timed_out=0
     (
         exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
         printf 'GET / HTTP/1.1\r\nHost: prober\r\n' >&3
@@ -83,11 +83,18 @@ one_request() {
         if [ "$SECONDS" -ge "$dl" ]; then
             pkill -P "$pid" 2>/dev/null || true
             kill "$pid" 2>/dev/null || true
+            timed_out=1
             break
         fi
         sleep 0.05
     done
     wait "$pid" 2>/dev/null || true
+    # The deadline kill leaves the status line already in the capture, so the
+    # grep below cannot tell a completed response from one cut off mid-body.
+    # Without this the snapshot pair could straddle a request the worker still
+    # holds buffers for, and oracles 3-6 would compare against a reading taken
+    # mid-flight.
+    [ "$timed_out" -eq 0 ] || return 1
     grep -q '^HTTP/1.1 200' "$out"
 }
 
@@ -147,6 +154,14 @@ else
 fi
 
 # --- oracle-3..6 measurement: two QUIESCENT snapshots around one more request
+#
+# A silent probe endpoint is a BROKEN tree, not an unmet environmental
+# requirement: @PROBE@ is in this scenario's conf unconditionally and the
+# requires gate has already established the .so is loadable. If oracles 3-6
+# all SKIP, the only surviving oracles are 1, 2 and 7 -- none of which touch an
+# allocation metric -- so the scenario would exit 0 having asserted nothing
+# about the property in its own title. That is the vacuous green this whole
+# generator exists to avoid, so it reds instead.
 BASE_OK=1
 if ! snapshot; then
     BASE_OK=0
@@ -172,6 +187,17 @@ FINAL_MFDS="$(master_fds || true)"
 
 if [ "$STIM_OK" -ne 1 ]; then
     echo "# the extra measured request did not complete -- oracles 3-6 will SKIP rather than compare against a vacuous reading"
+fi
+
+# Oracles 3-6 are the only ones that assert allocation neutrality. If the probe
+# never answered, or the measured request never completed, every one of them
+# SKIPs and the run banks a green having proved nothing. Both causes are real
+# faults (broken tree / stalled request), not environmental gaps, so fail here
+# rather than let the SKIPs read as success. Oracle 6's OWN skip on an
+# unreadable /proc/<master>/fd stays a genuine SKIP -- that one is environmental.
+if [ "$BASE_OK" -eq 0 ] || [ "$STIM_OK" -eq 0 ] || [ "$FINAL_OK" -eq 0 ]; then
+    echo "# oracles 3-6 cannot be evaluated (base=$BASE_OK stim=$STIM_OK final=$FINAL_OK); failing rather than banking a green"
+    FAILED=$((FAILED + 1))
 fi
 
 # --- 3: cycle_used flat -------------------------------------------------------

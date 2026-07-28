@@ -214,7 +214,15 @@ EOF
 # exactly as run-scenario.sh passes them (with the same defaults).
 FLAVOR="\${2:-nginx}"
 VERSION="\${3:-1.31.3}"
-BUILD="\${PROBER_BUILD:-\${PROBER_ROOT:-.}/.build/\${FLAVOR}-\${VERSION}}"
+# The root fallback MUST match prober/lib.sh:77 exactly -- \$(cd ../.. && pwd),
+# evaluated from prober/, which is where run-scenario.sh has already cd'd by the
+# time this gate runs. That fallback is written for the VENDORED layout
+# (t/harness/prober/ -> the consumer's repo root); in a standalone checkout of
+# this repo it lands one level above the repo, so PROBER_ROOT has to be set
+# either way. Matching lib.sh is still the correct contract: a gate that
+# computes a DIFFERENT root than the engine can SKIP on a tree the engine would
+# have booted fine, and that SKIP reads as a pass.
+BUILD="\${PROBER_BUILD:-\${PROBER_ROOT:-\$(cd ../.. && pwd)}/.build/\${FLAVOR}-\${VERSION}}"
 
 if [ ! -f "\$BUILD/objs/$so" ]; then
     echo "$so not found in \$BUILD/objs -- nginx.conf load_modules it unconditionally, so this tree cannot run the scenario; build it as a dynamic module (tools/build-consumers.sh --stage \${FLAVOR}-\${VERSION}) to run this scenario"
@@ -240,7 +248,7 @@ EOF
 # with its own non-200 status. Only a COMPLETE response line is required;
 # oracle 2 then matches the module's signature against the captured bytes.
 trigger_request() {
-    local out="$1" extra="${2:-}" pid dl
+    local out="$1" extra="${2:-}" pid dl timed_out=0
     (
         exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
         printf 'GET / HTTP/1.1\r\nHost: prober\r\n' >&3
@@ -254,11 +262,16 @@ trigger_request() {
         if [ "$SECONDS" -ge "$dl" ]; then
             pkill -P "$pid" 2>/dev/null || true
             kill "$pid" 2>/dev/null || true
+            timed_out=1
             break
         fi
         sleep 0.05
     done
     wait "$pid" 2>/dev/null || true
+    # Same truncation gap as one_request: a deadline kill still leaves the
+    # status line in the capture, so oracle 2 would be matching the module's
+    # signature against a response that never finished arriving.
+    [ "$timed_out" -eq 0 ] || return 1
     grep -q '^HTTP/1.1 ' "$out"
 }
 TRIGEOF
@@ -392,7 +405,7 @@ snapshot() {             # read one probe snapshot into SNAP_* globals
 # must run over the module's ORDINARY path, not its block/deny path, which
 # takes a different, shorter code route.
 one_request() {
-    local out="\$1" extra="\${2:-}" pid dl
+    local out="\$1" extra="\${2:-}" pid dl timed_out=0
     (
         exec 3<>"/dev/tcp/\$HOST/\$PORT" || exit 1
         printf 'GET / HTTP/1.1\r\nHost: prober\r\n' >&3
@@ -406,11 +419,18 @@ one_request() {
         if [ "\$SECONDS" -ge "\$dl" ]; then
             pkill -P "\$pid" 2>/dev/null || true
             kill "\$pid" 2>/dev/null || true
+            timed_out=1
             break
         fi
         sleep 0.05
     done
     wait "\$pid" 2>/dev/null || true
+    # The deadline kill leaves the status line already in the capture, so the
+    # grep below cannot tell a completed response from one cut off mid-body.
+    # Without this the snapshot pair could straddle a request the worker still
+    # holds buffers for, and oracles 3-6 would compare against a reading taken
+    # mid-flight.
+    [ "\$timed_out" -eq 0 ] || return 1
     grep -q '^HTTP/1.1 200' "\$out"
 }
 
@@ -446,6 +466,14 @@ SIG_SEEN=0
 $av_block
 
 # --- oracle-3..6 measurement: two QUIESCENT snapshots around one more request
+#
+# A silent probe endpoint is a BROKEN tree, not an unmet environmental
+# requirement: @PROBE@ is in this scenario's conf unconditionally and the
+# requires gate has already established the .so is loadable. If oracles 3-6
+# all SKIP, the only surviving oracles are 1, 2 and 7 -- none of which touch an
+# allocation metric -- so the scenario would exit 0 having asserted nothing
+# about the property in its own title. That is the vacuous green this whole
+# generator exists to avoid, so it reds instead.
 BASE_OK=1
 if ! snapshot; then
     BASE_OK=0
@@ -471,6 +499,17 @@ FINAL_MFDS="\$(master_fds || true)"
 
 if [ "\$STIM_OK" -ne 1 ]; then
     echo "# the extra measured request did not complete -- oracles 3-6 will SKIP rather than compare against a vacuous reading"
+fi
+
+# Oracles 3-6 are the only ones that assert allocation neutrality. If the probe
+# never answered, or the measured request never completed, every one of them
+# SKIPs and the run banks a green having proved nothing. Both causes are real
+# faults (broken tree / stalled request), not environmental gaps, so fail here
+# rather than let the SKIPs read as success. Oracle 6's OWN skip on an
+# unreadable /proc/<master>/fd stays a genuine SKIP -- that one is environmental.
+if [ "\$BASE_OK" -eq 0 ] || [ "\$STIM_OK" -eq 0 ] || [ "\$FINAL_OK" -eq 0 ]; then
+    echo "# oracles 3-6 cannot be evaluated (base=\$BASE_OK stim=\$STIM_OK final=\$FINAL_OK); failing rather than banking a green"
+    FAILED=\$((FAILED + 1))
 fi
 
 # --- 3: cycle_used flat -------------------------------------------------------
