@@ -75,7 +75,13 @@ serves_ok() {   # a fresh connection is accepted and answers 200
         printf 'GET / HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' >&3
         cat <&3 2>/dev/null || true
     )" || return 1
-    printf '%s' "$out" | grep -q '^HTTP/1.1 200'
+    # Herestring, not a pipe: `grep -q` exits the moment it matches the
+    # status line -- which is line 1 -- and the writer can then hit a broken
+    # pipe with the rest of the response still unwritten. Observed on CI run
+    # 30347925258 (sanitizer leg): `printf: write error: Broken pipe`, and the
+    # scenario reds on a healthy 200. Size is NOT the trigger, so "the response
+    # is small" does not rule a site out; an early match does it on its own.
+    grep -q '^HTTP/1.1 200' <<<"$out"
 }
 
 read_pidfile() {   # $1 = pidfile path; echoes a live pid or nothing
