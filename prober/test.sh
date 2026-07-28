@@ -35,6 +35,12 @@ fi
 
 found=0
 failed=0
+# Names of the failing suites, accumulated so the summary can print them. A
+# suite can exit nonzero with EVERY assertion green -- a plan-count mismatch
+# ("ran 39 tests but the plan says 38") is the shape -- and then grepping the
+# output for `not ok`, which is the reflex, finds nothing at all. Reporting
+# only a COUNT sends the reader hunting for an assertion that does not exist.
+failed_names=""
 
 for src in *_test.c ../t/*_test.c; do
     [ -e "$src" ] || continue
@@ -52,6 +58,7 @@ for src in *_test.c ../t/*_test.c; do
     # and the aggregate exit status below is what the caller gates on.
     if ! "$bin"; then
         failed=$((failed + 1))
+        failed_names="$failed_names $bin"
         echo "# $bin FAILED"
     fi
 done
@@ -68,6 +75,7 @@ for sh_test in *_test.sh; do
 
     if ! "./$sh_test"; then
         failed=$((failed + 1))
+        failed_names="$failed_names ./$sh_test"
         echo "# ./$sh_test FAILED"
     fi
 done
@@ -81,7 +89,9 @@ if [ "$found" -eq 0 ]; then
 fi
 
 if [ "$failed" -gt 0 ]; then
-    echo "# $failed of $found self-test suites failed" >&2
+    echo "# $failed of $found self-test suites failed:$failed_names" >&2
+    echo "# a suite can fail with no \`not ok\` line (plan-count mismatch) --" >&2
+    echo "# re-run the named suite alone and read its exit code" >&2
     exit 1
 fi
 

@@ -27,11 +27,11 @@ cd "$(dirname "$0")"
 RULES=rules.c
 README=../README.md
 
-# 29 parser directives + 1 reverse sweep + 5 exclusion pairs + 3 self-checks.
+# 30 parser directives + 1 reverse sweep + 5 exclusion pairs + 4 self-checks.
 # The per-directive count is not hardcoded anywhere else on purpose (see
 # parser_directives), so a directive added without touching this number fails
 # the plan check at the bottom -- which is the intended nag, not a nuisance.
-PLANNED=38
+PLANNED=39
 tests_run=0
 failures=0
 
@@ -60,6 +60,26 @@ parser_directives() {
         | grep -oE '"[[:alnum:]_]+"' | tr -d '"' | sort -u
 }
 
+# The "Ideas and opportunities" section is the backlog: it PROPOSES directives
+# that do not exist yet, in the same backticked code voice the reference uses.
+# Matching it is how `concurrent` reported as documented while carrying no
+# syntax entry and no semantics -- the backlog entry that proposed it ("A
+# `concurrent N` directive that issues N requests in flight") satisfied the
+# gate on its own. Any directive discussed before it is built inherits the same
+# pre-satisfied gate, so the backlog is cut out before any matching happens.
+#
+# Cut by section rather than by tightening the pattern: the argument-syntax
+# form would also work for `concurrent` specifically, but directives here are
+# documented in several legitimate voices (`repeat <count> <text>`, a bare
+# `dechunk`, a fenced `send ...`) and demanding one of them fails against a
+# README that documents them, just differently.
+readme_reference() {
+    awk '
+        /^## / { in_backlog = ($0 ~ /^## Ideas and opportunities/) }
+        !in_backlog
+    ' "$1"
+}
+
 # A directive is "documented" when the README names it in code voice: inside
 # backticks, as the whole span or followed by its argument syntax. Prose
 # mentions do not count -- "a per-IP fault never fires" is about faults, not
@@ -71,14 +91,16 @@ parser_directives() {
 # `from` are taught in, and demanding a backticked mention of every one of them
 # would fail against a README that does document them, just differently.
 documented() {
-    local directive=$1 readme=$2
+    local directive=$1 reference=$2
 
-    grep -qE "\`$directive([ \`<]|\$)" "$readme" \
-        || grep -qE "^${directive}[[:space:]]+[^[:space:]]" "$readme"
+    grep -qE "\`$directive([ \`<]|\$)" <<<"$reference" \
+        || grep -qE "^${directive}[[:space:]]+[^[:space:]]" <<<"$reference"
 }
 
+REFERENCE=$(readme_reference "$README")
+
 for directive in $(parser_directives "$RULES"); do
-    if documented "$directive" "$README"; then
+    if documented "$directive" "$REFERENCE"; then
         ok 0 "\`$directive\` is accepted by the parser and documented"
     else
         ok 1 "\`$directive\` is accepted by the parser but $README never documents it"
@@ -303,6 +325,32 @@ if [ "$found" = "alpha beta_two " ]; then
     ok 0 "the extraction reads the strcmp ladder and nothing else"
 else
     ok 1 "the extraction misread the ladder (got: $found)"
+fi
+
+# The backlog cut, exercised through readme_reference + documented on a
+# synthetic README. Both directions are asserted from one fixture, because
+# only the pair is meaningful: a cut that removes everything makes the first
+# assertion pass while silently reporting all 29 real directives undocumented,
+# and a cut that removes nothing makes the second pass while restoring the
+# `concurrent` hole this exists to close.
+# shellcheck disable=SC2016  # the backticks are markdown code voice, not command substitution
+printf '%s\n' \
+    '## Rule reference' \
+    '- **`shipped <n>`** -- a directive that really exists.' \
+    '' \
+    '## Ideas and opportunities -- ways to break a module we do not yet try' \
+    '  A `proposed N` directive that issues N requests in flight.' \
+    '' \
+    '## Who maintains this' \
+    'Nothing to see here.' \
+    > "$tmpdir/README.md"
+
+synthetic=$(readme_reference "$tmpdir/README.md")
+
+if documented "shipped" "$synthetic" && ! documented "proposed" "$synthetic"; then
+    ok 0 "a backlog-only mention is not documentation, a reference entry is"
+else
+    ok 1 "the backlog cut is wrong (shipped=$(documented shipped "$synthetic" && echo y || echo n), proposed=$(documented proposed "$synthetic" && echo y || echo n))"
 fi
 
 # ...and the plan is not satisfied by an empty parser. If parser_directives
