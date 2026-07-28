@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  152
+#define PLANNED  153
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -161,6 +161,13 @@ typedef struct {
      * the response like close_reason above. The deterministic witness that a
      * requested rcvbuf reached the socket. */
     int     effective_rcvbuf;
+
+    /* How many read() calls the CLIENT needed to collect the response, lifted
+     * off the response like the fields above. This is recv_slow's deterministic
+     * witness: the chunk cap is what forces a response that would arrive in one
+     * read to be collected in several, and a read count cannot be inflated by a
+     * loaded box the way the elapsed-time floor beside it can. */
+    size_t  client_reads;
 } echo_result;
 
 
@@ -356,6 +363,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
     int            close_reason = HTTP_CLOSE_NONE;
     long           close_ms = 0;
     int            effective_rcvbuf = 0;
+    size_t         client_reads = 0;
 
     if (pipe(fds) != 0) {
         return -1;
@@ -376,6 +384,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
         close_reason = resp.close_reason;
         close_ms = resp.close_ms;
         effective_rcvbuf = resp.effective_rcvbuf;
+        client_reads = resp.reads;
         http_response_free(&resp);
     }
 
@@ -394,6 +403,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
     out->close_reason = close_reason;
     out->close_ms = close_ms;
     out->effective_rcvbuf = effective_rcvbuf;
+    out->client_reads = client_reads;
 
     return rc;
 }
@@ -1589,10 +1599,30 @@ main(void)
 
         ok(rc == 0, "a recv_slow request completes");
 
-        /* SPAWN_REPLY_LEN is 400 bytes; at 100 per read that is 4 reads and 3
+        /* SPAWN_REPLY is 418 bytes; at 100 per read that is 5 reads and 4
          * sleeps of 30 ms. */
         ok(rc == 0 && t1 - t0 >= 85,
            "recv_slow paces the reads apart in time");
+
+        /*
+         * The chunk cap's DETERMINISTIC witness, beside the timing floor above.
+         *
+         * The floor alone does not gate the cap: it is a wall-clock minimum, so
+         * a loaded runner can satisfy it out of scheduling overhead while the
+         * cap does nothing -- observed for real, as a mutation removing the cap
+         * surviving in CI while going red locally. A read count cannot be
+         * inflated that way. Without the cap this whole reply arrives in ONE
+         * read (the receive buffer is 8 KiB and nothing else bounds `want`), so
+         * requiring several is exactly the assertion the cap is answerable for.
+         *
+         * A floor rather than an equality: the peer may hand the bytes over in
+         * more segments than the cap forces, which adds reads. It can never
+         * subtract them -- the cap bounds every single read at 100 bytes, so
+         * collecting 418 needs at least ceil(418/100) of them however the wire
+         * delivered them.
+         */
+        ok(rc == 0 && er.client_reads >= (SPAWN_REPLY_LEN + 99) / 100,
+           "recv_slow bounds each read by the chunk, so the reply needs several");
 
         /* The negative control: the same exchange unpaced must NOT take that
          * long, or the assertion above would be measuring the fixture rather
