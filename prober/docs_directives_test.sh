@@ -27,11 +27,13 @@ cd "$(dirname "$0")"
 RULES=rules.c
 README=../README.md
 
-# 29 parser directives + 1 reverse sweep + 5 exclusion pairs + 3 self-checks.
+# 29 parser directives + 1 reverse sweep + 5 exclusion pairs + 5 self-checks
+# (ladder extraction, backlog cut, fenced backlog heading, locale letter range,
+# parser not empty).
 # The per-directive count is not hardcoded anywhere else on purpose (see
 # parser_directives), so a directive added without touching this number fails
 # the plan check at the bottom -- which is the intended nag, not a nuisance.
-PLANNED=38
+PLANNED=40
 tests_run=0
 failures=0
 
@@ -60,6 +62,40 @@ parser_directives() {
         | grep -oE '"[[:alnum:]_]+"' | tr -d '"' | sort -u
 }
 
+# The "Ideas and opportunities" section is the backlog: it PROPOSES directives
+# that do not exist yet, in the same backticked code voice the reference uses.
+# Matching it is how `concurrent` reported as documented while carrying no
+# syntax entry and no semantics -- the backlog entry that proposed it ("A
+# `concurrent N` directive that issues N requests in flight") satisfied the
+# gate on its own. Any directive discussed before it is built inherits the same
+# pre-satisfied gate, so the backlog is cut out before any matching happens.
+#
+# Cut by section rather than by tightening the pattern: the argument-syntax
+# form would also work for `concurrent` specifically, but directives here are
+# documented in several legitimate voices (`repeat <count> <text>`, a bare
+# `dechunk`, a fenced `send ...`) and demanding one of them fails against a
+# README that documents them, just differently.
+#
+# Fence state is tracked because a heading inside a fenced block is example
+# text, not a section boundary. Without it, a fenced line reading
+# "## Ideas and opportunities" turns the cut ON and nothing ever turns it off
+# -- the rest of the README vanishes from the gate and every directive below
+# that point reports as undocumented. No such fence exists today, but this
+# README does carry fenced markdown, and a gate whose failure mode is
+# "silently stop checking" is the shape this whole change exists to remove.
+#
+# Both CommonMark fence delimiters count. The README uses only backticks today
+# (76 of them, balanced; zero tildes), but ~~~ is equally valid and a tilde
+# fence would be invisible to a backtick-only tracker -- which puts us straight
+# back in the latching case above, for a delimiter nobody thinks about.
+readme_reference() {
+    awk '
+        /^(```|~~~)/ { fence = !fence }
+        !fence && /^## / { in_backlog = ($0 ~ /^## Ideas and opportunities/) }
+        !in_backlog
+    ' "$1"
+}
+
 # A directive is "documented" when the README names it in code voice: inside
 # backticks, as the whole span or followed by its argument syntax. Prose
 # mentions do not count -- "a per-IP fault never fires" is about faults, not
@@ -71,14 +107,16 @@ parser_directives() {
 # `from` are taught in, and demanding a backticked mention of every one of them
 # would fail against a README that does document them, just differently.
 documented() {
-    local directive=$1 readme=$2
+    local directive=$1 reference=$2
 
-    grep -qE "\`$directive([ \`<]|\$)" "$readme" \
-        || grep -qE "^${directive}[[:space:]]+[^[:space:]]" "$readme"
+    grep -qE "\`$directive([ \`<]|\$)" <<<"$reference" \
+        || grep -qE "^${directive}[[:space:]]+[^[:space:]]" <<<"$reference"
 }
 
+REFERENCE=$(readme_reference "$README")
+
 for directive in $(parser_directives "$RULES"); do
-    if documented "$directive" "$README"; then
+    if documented "$directive" "$REFERENCE"; then
         ok 0 "\`$directive\` is accepted by the parser and documented"
     else
         ok 1 "\`$directive\` is accepted by the parser but $README never documents it"
@@ -303,6 +341,72 @@ if [ "$found" = "alpha beta_two " ]; then
     ok 0 "the extraction reads the strcmp ladder and nothing else"
 else
     ok 1 "the extraction misread the ladder (got: $found)"
+fi
+
+# The backlog cut, exercised through readme_reference + documented on a
+# synthetic README. All three directions are asserted from one fixture, because
+# no one of them is meaningful alone:
+#
+#   * `shipped` (before the backlog) catches a cut that removes everything --
+#     which would otherwise satisfy the `proposed` half while silently
+#     reporting all 29 real directives undocumented;
+#   * `proposed` (inside the backlog) catches a cut that removes nothing, which
+#     restores the exact hole this check exists to close;
+#   * `after_backlog` (after the NEXT heading) catches a cut that latches on and
+#     never reopens. That mutant is invisible to the other two and to the real
+#     sweep, because every directive the README documents today sits ABOVE the
+#     backlog -- so a permanently-latched cut passes the live gate while
+#     silencing everything a future section might add.
+# shellcheck disable=SC2016  # the backticks are markdown code voice, not command substitution
+printf '%s\n' \
+    '## Rule reference' \
+    '- **`shipped <n>`** -- a directive that really exists.' \
+    '' \
+    '## Ideas and opportunities -- ways to break a module we do not yet try' \
+    '  A `proposed N` directive that issues N requests in flight.' \
+    '' \
+    '## Who maintains this' \
+    '- **`after_backlog <n>`** -- documented after the backlog section ends.' \
+    > "$tmpdir/README.md"
+
+synthetic=$(readme_reference "$tmpdir/README.md")
+
+if documented "shipped" "$synthetic" \
+   && ! documented "proposed" "$synthetic" \
+   && documented "after_backlog" "$synthetic"; then
+    ok 0 "a backlog-only mention is not documentation, a reference entry is"
+else
+    ok 1 "the backlog cut is wrong (shipped=$(documented shipped "$synthetic" && echo y || echo n), proposed=$(documented proposed "$synthetic" && echo y || echo n), after_backlog=$(documented after_backlog "$synthetic" && echo y || echo n))"
+fi
+
+# The same cut, against a backlog heading that appears as EXAMPLE TEXT inside a
+# fenced block. Without fence tracking the cut latches on at the fenced line and
+# never releases, so the directive documented below -- in an ordinary section --
+# reports undocumented, and so would every real directive after it.
+#
+# Both delimiters are exercised in one fixture. Asserting only the backtick case
+# would leave the ~~~ branch of the fence pattern untested, which is how a
+# half-covered guard passes while one of its arms does nothing.
+# shellcheck disable=SC2016  # markdown code voice, not command substitution
+printf '%s\n' \
+    '## Rule reference' \
+    'Sections in this file look like:' \
+    '```' \
+    '## Ideas and opportunities' \
+    '```' \
+    '- **`after_fence <n>`** -- documented after the backtick example.' \
+    '~~~' \
+    '## Ideas and opportunities' \
+    '~~~' \
+    '- **`after_tilde <n>`** -- documented after the tilde example.' \
+    > "$tmpdir/README-fence.md"
+
+fenced=$(readme_reference "$tmpdir/README-fence.md")
+
+if documented "after_fence" "$fenced" && documented "after_tilde" "$fenced"; then
+    ok 0 "a backlog heading inside a fence does not cut the rest of the README"
+else
+    ok 1 "a fenced backlog heading latched the cut (backtick=$(documented after_fence "$fenced" && echo y || echo n), tilde=$(documented after_tilde "$fenced" && echo y || echo n))"
 fi
 
 # ...and the plan is not satisfied by an empty parser. If parser_directives

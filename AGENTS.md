@@ -69,7 +69,7 @@ Working notes for this repo live OUTSIDE it, at
 
 ```
 cd prober && ./build.sh                 # the prober + its unit tests
-prober/test.sh                          # full local gate, 25 suites
+prober/test.sh                          # full local gate, 26 suites
 prober/verify-impact --explain          # what a diff selects (omit --base for the working tree)
 prober/pr-impact --budget 90            # actually run the selected fast lane
 ```
