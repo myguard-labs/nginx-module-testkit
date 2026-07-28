@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  157
+#define PLANNED  159
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -706,8 +706,14 @@ spawn_trickle(int *port, int step_ms)
  * around http_request(). A barrier can: if the driver ever reads leg 0's
  * response before writing leg 1's request, the reply to leg 0 does not exist
  * yet, nothing further is written, and the exchange dies on its deadline rather
- * than passing. The test that uses this is therefore a genuine negative control
- * for the write-all-before-read-any ordering.
+ * than passing.
+ *
+ * Note what this does and does not establish. It is a genuine negative control
+ * for the CLIENT-SIDE write-all-before-read-any ordering, which is the property
+ * the driver actually implements. It does not prove N request lifetimes overlap
+ * in a real server -- the overlap here exists because this fixture deliberately
+ * withholds every reply, i.e. the barrier supplies the server-side hold itself.
+ * A live nginx offers no such guarantee.
  *
  * `listen(srv, want)` because all `want` connects land before any accept: a
  * shorter backlog would drop the tail and deadlock the barrier for a reason
@@ -2562,8 +2568,13 @@ main(void)
         pid_t          pid;
         int            rc;
         char           errbuf[256];
-        http_response  resps[4];
         int            i;
+
+        /* Sized to the ceiling, not to the 4-leg fan below: the over-ceiling
+         * rejection case passes MAX_CONCURRENT + 1, and the driver initializes
+         * up to MAX_CONCURRENT slots before it validates n. A 4-element array
+         * would be written past by the very check being tested. */
+        http_response  resps[MAX_CONCURRENT];
 
         /* 1. The load-bearing one: four requests must be in flight together
          *    before ANY of them is answered. */
@@ -2629,6 +2640,25 @@ main(void)
                                       errbuf, sizeof(errbuf));
         ok(rc == -1 && strstr(errbuf, "floor is 2") != NULL,
            "a fan of 1 is refused by the driver, not silently run");
+
+        /* The rejection paths must still leave resps[] initialized, because the
+         * header tells callers they may free unconditionally -- and a rejection
+         * is exactly where a caller is least likely to have done it itself.
+         * Freeing here is the assertion: under the pre-fix code resps[0] held
+         * indeterminate stack, and this call would free a wild pointer. */
+        ok(resps[0].status == -1 && resps[0].raw == NULL,
+           "an argument rejection still initializes resps[], so the documented "
+           "unconditional free is safe");
+        http_response_free(&resps[0]);
+
+        /* The ceiling is enforced at the public entry point too, not only by the
+         * parser: a direct C caller never goes through load_rules(). */
+        rc = http_exchange_concurrent("127.0.0.1", 1, MAX_CONCURRENT + 1,
+                                      creq, creq_len, 1000, NULL, NULL, 0,
+                                      HTTP_SHUT_NONE, NULL, 0, 1, resps,
+                                      errbuf, sizeof(errbuf));
+        ok(rc == -1 && strstr(errbuf, "exceeds the ceiling") != NULL,
+           "a fan above MAX_CONCURRENT is refused by the driver, not opened");
 
         /* 3. A leg that cannot connect fails the whole case: N-1 overlapping
          *    requests are not the test the file asked for. Port 1 on loopback

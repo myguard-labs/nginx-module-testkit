@@ -262,16 +262,12 @@
 #define MAX_OPEN_CONNS  512
 
 /* Upper bound on the in-flight requests a case may issue (the `concurrent`
- * directive). Distinct from MAX_OPEN_CONNS: those are BARE parked connections
- * that never carry a request, while each of these writes the case's request and
- * reads a full response, so each costs one client fd plus a response buffer for
- * the whole exchange. The ceiling is far lower than MAX_OPEN_CONNS deliberately
- * -- the directive exists to overlap requests so a shared-state race has a
- * window to appear, and a race that needs more than 64 concurrent clients to
- * show up is a load test, which belongs in a scenario driver rather than in one
- * case. Keeping it small also bounds the poll() set and the peak memory a
- * single case can demand. */
-#define MAX_CONCURRENT  64
+ * directive) is MAX_CONCURRENT, defined in http.h beside the driver that
+ * enforces it. Deliberately NOT redefined here: the parser rejects an oversized
+ * count with a line number and the driver rejects it again at its public entry
+ * point, and two copies of that ceiling would eventually disagree -- at which
+ * point the parser would admit a fan the transport then refuses. See http.h for
+ * why the value is far below MAX_OPEN_CONNS. */
 
 /* Upper bound on a single `pause`, and on the sum of a case's pauses. A rule
  * file that pauses longer than the prober's own read timeout would report a

@@ -1499,6 +1499,40 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
         }
 
         /*
+         * Timing assertions cannot be trusted across a fan, because the drain
+         * is sequential and BLOCKING: leg i+1 is not read until leg i has been
+         * read to completion, while its `sent_at` clock has been running the
+         * whole time. Time spent draining an earlier leg is therefore charged
+         * to every later leg's whole-exchange deadline and close_ms.
+         *
+         * With `recv_slow` the effect is deterministic rather than incidental
+         * -- the pacing sleeps are deliberate, and http_read_response()
+         * discounts only the pacing performed while reading THAT leg. A prompt
+         * final leg can then be reported as a timeout or a late close purely
+         * because an earlier leg was slow, which is a false failure that also
+         * blames the wrong leg.
+         *
+         * Rejected rather than silently mismeasured. Fixing it properly means
+         * draining all N sockets through one poll() loop with per-leg
+         * nonblocking state, which is a real feature and a separate concern
+         * from this directive; until then the honest move is to refuse the
+         * combination instead of reporting a number that is wrong.
+         */
+        if (tc->concurrent > 0
+            && (tc->saw_close_within || tc->recv_opt.chunk > 0))
+        {
+            const char *which = tc->saw_close_within
+                                    ? "expect_close_within" : "recv_slow";
+
+            die("%s: case \"%s\" carries concurrent %d and %s; the fan drains "
+                "its legs in order, so an earlier leg's read time is charged "
+                "to every later leg's clock and the timing verdict would be "
+                "measured against the wrong interval", file,
+                tc->name != NULL ? tc->name : "(unnamed)", tc->concurrent,
+                which);
+        }
+
+        /*
          * Pipeline cases carry every per-exchange knob inside blocks[], so the
          * flat-field checks below are vacuous for them (all flat saw_ flags and
          * pauses are zero). Validate each block instead, then continue past the

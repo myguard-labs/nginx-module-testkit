@@ -1869,10 +1869,12 @@ http_request(const char *host, int port,
  *     about overlap -- the vacuous shape the parser's delta/probe requirement
  *     already rejects at load time. Here the parser's job is done and the
  *     driver's is to keep the remaining legs readable.
- *   - `send_slow`/`pause` pacing on every leg would serialize the write phase:
- *     leg 0 would still be dribbling while leg N-1 had not started, which is the
- *     opposite of overlap. Pacing the FIRST leg only keeps the slow request in
- *     flight while the rest pile in behind it, which is the interesting shape.
+ *   - `send_slow`/`pause` pacing on every leg would multiply the pre-fan delay
+ *     by N. The write loop is sequential, so leg 0's pauses elapse in full
+ *     before leg 1 is written regardless; pacing only the first leg bounds that
+ *     cost instead of paying it N times. Note this does NOT put a slow request
+ *     in flight while the others pile in behind it -- that would need the paced
+ *     write interleaved with the other legs' writes, which this does not do.
  *
  * `shut_how` is the exception and is applied to EVERY leg, because a half-close
  * is a modifier on the request rather than a substitute for the response: after
@@ -1906,6 +1908,23 @@ http_exchange_concurrent(const char *host, int port, int n,
     int         i, rc = 0;
     long long  *sent_at;
 
+    /*
+     * Initialize BEFORE validating, so the "resps[] is safe to free on every
+     * return path" contract holds for the rejection returns too. A caller that
+     * follows the header's instruction after an argument rejection would
+     * otherwise free indeterminate pointers -- the rejection path is exactly
+     * where a caller is least likely to have initialized them itself.
+     *
+     * Bounded by MAX_CONCURRENT rather than by n, because n is not yet known to
+     * be in range: an oversized n means the array is only guaranteed to hold
+     * what the ceiling allows, and touching n slots would be the overflow the
+     * check below exists to prevent.
+     */
+    for (i = 0; i < n && i < MAX_CONCURRENT; i++) {
+        memset(&resps[i], 0, sizeof(resps[i]));
+        resps[i].status = -1;
+    }
+
     if (n < 2) {
         snprintf(errbuf, errlen,
                  "concurrent fan of %d: the floor is 2 (one request in flight "
@@ -1913,9 +1932,15 @@ http_exchange_concurrent(const char *host, int port, int n,
         return -1;
     }
 
-    for (i = 0; i < n; i++) {
-        memset(&resps[i], 0, sizeof(resps[i]));
-        resps[i].status = -1;
+    /* The same ceiling the parser enforces with a line number. Repeated here
+     * because this is a public entry point: a direct C caller does not go
+     * through load_rules(), and without this it could demand an unbounded fd
+     * and buffer count that the rule-file path is protected from. */
+    if (n > MAX_CONCURRENT) {
+        snprintf(errbuf, errlen,
+                 "concurrent fan of %d exceeds the ceiling of %d", n,
+                 MAX_CONCURRENT);
+        return -1;
     }
 
     fds = malloc((size_t) n * sizeof(*fds));

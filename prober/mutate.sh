@@ -540,6 +540,16 @@ mutate "concurrent: non-reading directive guard removed" rules.c \
     '        if (tc->concurrent > 0 && (tc->saw_abort || tc->saw_hold' \
     '        if (0 && (tc->saw_abort || tc->saw_hold' rules_test
 
+# The timing guard. The fan drains in order and blocking, so without this a case
+# can pair `concurrent` with recv_slow or expect_close_within and get a timing
+# verdict measured against an interval that includes an earlier leg's read.
+mutate "concurrent: timing-assertion guard removed" rules.c \
+    '        if (tc->concurrent > 0
+            && (tc->saw_close_within || tc->recv_opt.chunk > 0))' \
+    '        if (tc->concurrent * 0 > 0
+            && (tc->saw_close_within || tc->recv_opt.chunk > 0))' \
+    rules_test
+
 # THE ordering mutant, and the reason the barrier fixture exists: read each leg's
 # response inside the write loop instead of after it. Every request is still sent
 # and every response still collected, so response-shape assertions alone cannot

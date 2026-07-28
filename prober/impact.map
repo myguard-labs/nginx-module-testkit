@@ -76,6 +76,26 @@ PRIMARY	prober/docs_directives_test.sh	docs_directives_test.sh	fast
 PRIMARY	prober/test.sh	runner_summary_test.sh	fast
 PRIMARY	prober/runner_summary_test.sh	runner_summary_test.sh	fast
 
+# The *_test.c sources own themselves, same rule as the *_test.sh suites above:
+# editing a test must select that test, or the selector fails closed on an
+# unmapped executable change. These had no rows until the `concurrent` PR, which
+# is the first change to touch a unit test's .c file and its LIB source in the
+# same diff -- every earlier one edited only the LIB side, so the PRIMARY rows
+# above covered it and the gap stayed invisible.
+PRIMARY	prober/http_test.c	http_test	fast
+PRIMARY	prober/rules_test.c	rules_test	fast
+
+# prober.c is the CLI driver: it links the LIB but no *_test.c links IT
+# (build.sh:58 excludes it), so no unit test can own it. The scenario suite is
+# what actually executes it -- every scenario boots a server and runs rule files
+# through this binary -- so a change here selects the scenarios rather than
+# silently mapping to a unit test that never runs the code.
+PRIMARY	prober/prober.c	scenarios	slow
+
+# mutate.sh is the mutation gate's own driver. A change to it must re-run the
+# gate, or an edit that drops or misanchors a mutant reads as "still 100 caught".
+PRIMARY	prober/mutate.sh	mutate	slow
+
 # --- FALLBACK: any LIB .c not caught above (or any LIB .c at all, as the
 # conservative catch-all every *_test.c binary links against) still selects
 # every unit test, because every *_test.c binary links the whole LIB and a
@@ -105,6 +125,8 @@ SEMANTIC	prober/http.c	mutate:recv_slow	fast
 SEMANTIC	prober/http.c	mutate:shutdown	fast
 SEMANTIC	prober/http.c	mutate:so_rcvbuf	fast
 SEMANTIC	prober/http.c	mutate:hold	fast
+SEMANTIC	prober/http.c	mutate:concurrent	fast
+SEMANTIC	prober/rules.c	mutate:concurrent	fast
 SEMANTIC	prober/rules.c	mutate:shutdown	fast
 SEMANTIC	prober/rules.c	mutate:abort	fast
 SEMANTIC	prober/rules.c	mutate:send_slow	fast

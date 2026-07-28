@@ -620,14 +620,34 @@ int http_exchange(int fd,
  * matching this codebase's naming of every lifecycle transition. */
 void http_close(int fd);
 
+/* Upper bound on the in-flight requests one `concurrent` fan may issue.
+ * Distinct from rules.h's MAX_OPEN_CONNS (512): those are BARE parked
+ * connections that never carry a request, while each fan leg writes the case's
+ * request and reads a full response, so each costs one client fd PLUS a
+ * response buffer for the whole exchange. The ceiling is deliberately far lower
+ * -- the directive exists to overlap requests so a shared-state race has a
+ * window to appear, and a race needing more than 64 simultaneous clients is a
+ * load test, which belongs in a scenario driver rather than in one case.
+ *
+ * Lives here rather than in rules.h because the driver below enforces it at a
+ * public entry point that a direct C caller reaches without going through the
+ * parser. The parser rejects an oversized count too, with a line number. */
+#define MAX_CONCURRENT  64
+
 /*
  * The `concurrent N` driver: open N connections, write the same request on ALL
  * of them, and only then read the N responses into resps[0..n-1].
  *
- * The write-all-before-read-any ordering is the entire directive -- it is the
- * only way to hold N requests outstanding in the worker at one instant, which is
- * the state a shared-state race needs to be reachable. http_request() in a loop
- * does NOT approximate this; it retires each request before starting the next.
+ * The write-all-before-read-any ordering is the entire directive: http_request()
+ * in a loop retires each request before starting the next, so a race needing two
+ * requests resident at once is unreachable through it.
+ *
+ * Precisely: this guarantees all N requests are WRITTEN before any response is
+ * CONSUMED. It does not guarantee N request lifetimes overlap inside the worker
+ * -- a fast handler may answer and finalize leg 0 while leg 1 is still being
+ * written, and an unread response sitting in the kernel buffer does not hold the
+ * server's request open. Overlap is made likely, not enforced; a caller needing a
+ * proven simultaneous peak must observe it from inside the module.
  *
  * Directive handling differs from http_exchange() by necessity and the rules are
  * spelled out at the definition in http.c: pacing (`pause`/`send_slow`) applies

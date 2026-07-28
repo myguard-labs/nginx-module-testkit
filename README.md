@@ -691,7 +691,17 @@ The before/after probe snapshots bracket the entire fan, so the case's existing
 `delta` oracles then assert that `N` overlapping requests leave the worker in the
 state `N` sequential ones would: no extra descriptor, no pool growth, no slab
 page. A leak or a double-free that only manifests under overlap shows up as a
-non-zero delta here and nowhere else in the suite. Every leg is also checked
+non-zero delta here and nowhere else in the suite.
+
+**What the directive guarantees, precisely:** all `N` requests are written before
+any response is *consumed*. That is a client-side ordering property, and it is
+what the self-tests prove. It is not the same as "`N` request lifetimes overlap
+inside the worker" — against a fast handler with a small response, nginx may
+process, answer and finalize leg 0 while the prober is still writing leg 1, and
+leaving that response unread in the kernel buffer does not hold the worker's
+request open. The overlap is *made likely*, not enforced. A case that needs a
+proven simultaneous peak has to observe it from inside the module (an
+active-request counter in the probe document), not infer it from this directive. Every leg is also checked
 against the case's own `expect` assertions, so a leg answered differently from
 the others is a finding even when the aggregate delta is clean; a failure names
 the leg (`concurrent leg 3/20: ...`).
@@ -714,17 +724,27 @@ Four combinations are rejected at load time rather than silently resolved:
 - **`abort`, `hold`, `expect_idle`** — each ends its connection *without ever
   reading a response*, so a fan carrying one would collect nothing to assert
   against.
+- **`expect_close_within`, `recv_slow`** — the fan drains its legs **in order and
+  blocking**, so an earlier leg's read time is charged to every later leg's
+  clock. A prompt final leg would be reported as a timeout or a late close purely
+  because an earlier leg was slow, and the verdict would blame the wrong leg.
+  Draining all `N` through one `poll()` loop with per-leg nonblocking state would
+  fix it properly; until then the honest move is to refuse the pair rather than
+  report a number measured against the wrong interval.
 
 `shutdown` is deliberately **not** in that list and combines freely: a half-close
 is a modifier on the request, not a substitute for the response. After `SHUT_WR`
 the peer still answers, and collecting that answer is the entire point.
 
-Pacing (`pause`, `send_slow`) applies to the **first leg only**. Pacing every leg
-would serialize the write phase — leg 0 still dribbling while leg `N-1` had not
-started — which is the opposite of overlap; pacing one leg keeps a slow request in
-flight while the rest pile in behind it, which is the interesting shape. A leg
-that fails to connect fails the whole case, because `N-1` overlapping requests are
-not the test the file asked for.
+Pacing (`pause`, `send_slow`) applies to the **first leg only**, which bounds the
+damage rather than exploiting it: the write loop is sequential, so leg 0's pauses
+all elapse before leg 1 is written either way. Pacing every leg would multiply
+that delay by `N` and push the fan further from overlap, so only the first leg
+carries it. If you want a slow request genuinely in flight while others pile in
+behind it, this directive does not currently give you that — it would need the
+paced leg's write to be interleaved with the other legs' rather than completed
+first. A leg that fails to connect fails the whole case, because `N-1` overlapping
+requests are not the test the file asked for.
 
 `dechunk` decodes a `Transfer-Encoding: chunked` response body before the body
 assertions run, so `body~`, `expect_not body~` and `body_sha256=` see the

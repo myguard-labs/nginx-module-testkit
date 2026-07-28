@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  272
+#define PLANNED  274
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1215,6 +1215,18 @@ main(void)
     ok(n == 1 && cases[0].concurrent == 4,
        "concurrent + shutdown loads -- a half-close still expects a response");
     free_all(n);
+
+    /* The fan drains its legs in order and blocking, so an earlier leg's read
+     * time lands on every later leg's clock. Refused rather than reported as a
+     * timing verdict measured against the wrong interval. */
+    expect_die("name t\nsend X\nconcurrent 4\nexpect_close_within 100\n"
+               "probe fds >= 0\n",
+               "concurrent + expect_close_within dies -- in-order drain skews "
+               "the later legs' clocks");
+    expect_die("name t\nsend X\nconcurrent 4\nrecv_slow 100 10\n"
+               "probe fds >= 0\n",
+               "concurrent + recv_slow dies -- deliberate pacing on one leg is "
+               "charged to the next");
 
     /* The load-bearing guard: held connections that no probe assertion reads
      * are a vacuous test, so the case is rejected at load time rather than
