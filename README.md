@@ -1769,10 +1769,17 @@ not a scenario:
   asserts the same zero deltas would open an entire bug class — this is
   probably the single highest-value item on this list.
 - **Fault injection during a lifecycle event.** The `fault_*` knobs and the
-  reload scenarios exist separately. Arming an allocation failure *during* a
-  reload, a binary upgrade or a worker shutdown attacks the teardown path,
-  which is exactly where unbalanced allocations become visible and where almost
-  nobody tests.
+  reload scenarios exist separately. Arming a failure *during* a reload, a
+  binary upgrade or a worker shutdown attacks the teardown path, which is
+  exactly where unbalanced allocations become visible and where almost nobody
+  tests. **Note which half is reachable today:** an *upstream* fault (fakesrv,
+  ordinal-keyed) needs no hook and runs on the stock ref-probe legs, so
+  "reload while a faulted request is in flight" is buildable now. An
+  *allocation* fault is not — `fault_slab=`/`fault_palloc=` arm through
+  `ngx_test_probe_arm()`, which returns `NGX_DECLINED` unless the module under
+  test registers a `fault_set` hook, and `t/module/` deliberately registers
+  none. That half needs a real module fault site plus a consumer `.so`, the
+  same boundary `fault-matrix` documents.
 
 **Coverage-driven work.** Run `prober/coverage-director.sh` and read the map for
 *unreached* lines in a consumer's module rather than in our own code. An
