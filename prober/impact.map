@@ -67,6 +67,15 @@ PRIMARY	prober/lib.sh	check_conf_test.sh	fast
 PRIMARY	prober/slope_check_test.sh	slope_check_test.sh	fast
 PRIMARY	prober/stale_so_test.sh	stale_so_test.sh	fast
 PRIMARY	prober/check_conf_test.sh	check_conf_test.sh	fast
+PRIMARY	prober/docs_directives_test.sh	docs_directives_test.sh	fast
+
+# test.sh is the RUNNER, not a suite: it discovers *_test.c and *_test.sh and
+# aggregates their exit codes. Nothing named test.sh can select "itself" the way
+# the rows above do, and it has no dedicated suite of its own -- so an edit to
+# the runner selects the docs suite, which is a real *_test.sh the runner must
+# still discover, execute, and report the exit code of. That exercises the
+# discovery glob and the aggregation path an edit here is most likely to break.
+PRIMARY	prober/test.sh	docs_directives_test.sh	fast
 
 # --- FALLBACK: any LIB .c not caught above (or any LIB .c at all, as the
 # conservative catch-all every *_test.c binary links against) still selects
