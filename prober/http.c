@@ -1860,15 +1860,16 @@ http_request(const char *host, int port,
  * request i+1 would collapse the fan back into N ordinary exchanges, so the two
  * loops below must stay separate no matter how tempting it looks to fuse them.
  *
- * Only ONE connection carries the case's directives; the other N-1 send the
- * request plain. Two reasons, both load-bearing:
+ * Only the FIRST leg carries the case's pacing; the other N-1 send the request
+ * plain. `shut_how` is the exception and applies to every leg -- see below.
+ * Two reasons, both load-bearing:
  *
- *   - `abort`, `hold` and `expect_idle` each end their connection WITHOUT
- *     reading (http_exchange returns before http_read_response). Arming them on
- *     every leg would mean no leg ever reads, so the fan would assert nothing
- *     about overlap -- the vacuous shape the parser's delta/probe requirement
- *     already rejects at load time. Here the parser's job is done and the
- *     driver's is to keep the remaining legs readable.
+ *   - `abort`, `hold` and `expect_idle` are not parameters of this function at
+ *     all. Each ends its connection WITHOUT reading (http_exchange returns
+ *     before http_read_response), so a fan carrying one would collect nothing
+ *     to assert against; they are refused at load time in load_rules_fp()
+ *     rather than handled here. Named only so nobody "restores" a knob that was
+ *     deliberately never plumbed through.
  *   - `send_slow`/`pause` pacing on every leg would multiply the pre-fan delay
  *     by N. The write loop is sequential, so leg 0's pauses elapse in full
  *     before leg 1 is written regardless; pacing only the first leg bounds that

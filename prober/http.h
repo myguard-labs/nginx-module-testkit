@@ -656,8 +656,12 @@ void http_close(int fd);
  * `abort`/`hold`/`expect_idle` are not accepted here at all, since each ends its
  * connection without reading and a fan that reads nothing asserts nothing.
  *
- * resps must have room for n entries and is fully initialized on every return
- * path, so the caller may http_response_free() all n unconditionally. `n` must
+ * resps must have room for at least min(n, MAX_CONCURRENT) entries. On every
+ * return path those entries are initialized, so the caller may
+ * http_response_free() them unconditionally -- including after an argument
+ * rejection. Note the bound: for an over-ceiling n the driver initializes only
+ * the first MAX_CONCURRENT slots before refusing, so freeing all n of an
+ * oversized array would touch memory this function never wrote. `n` must
  * be >= 2 (the parser enforces the same floor with a line number). Returns 0
  * when the fan completed, or -1 with errbuf set -- including when any single leg
  * fails to connect, since a narrower fan is not the case the file asked for.

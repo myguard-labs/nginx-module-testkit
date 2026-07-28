@@ -1519,7 +1519,7 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
          * combination instead of reporting a number that is wrong.
          */
         if (tc->concurrent > 0
-            && (tc->saw_close_within || tc->recv_opt.chunk > 0))
+            && (tc->saw_close_within || tc->saw_recv_slow))
         {
             const char *which = tc->saw_close_within
                                     ? "expect_close_within" : "recv_slow";

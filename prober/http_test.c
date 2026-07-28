@@ -2623,10 +2623,12 @@ main(void)
             ok(all_body, "each leg's response body is collected independently");
         }
 
-        if (rc == 0) {
-            for (i = 0; i < 4; i++) {
-                http_response_free(&resps[i]);
-            }
+        /* Unconditional, which is the contract this section tests: on a failed
+         * fan the earlier legs' buffers are already populated, so gating the
+         * free on rc == 0 would attach a leak report to any red assertion under
+         * SAN=1 and muddy the diagnosis. */
+        for (i = 0; i < 4; i++) {
+            http_response_free(&resps[i]);
         }
 
         kill(pid, SIGKILL);
