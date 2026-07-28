@@ -109,6 +109,18 @@ going away), not a new permanent CI leg.
 **Also not in scope:** valgrind on nginx, whole-server fuzzing, and performance
 benchmarking of nginx itself. Fuzzing our *own* parser is in scope and stays.
 
+**Do not add a test here that the Perl suite can already do.** A consuming
+module has `Test::Nginx::Socket` and its own `.t` files, and that is the right
+home for ordinary request/response behaviour: status codes, headers, body
+content, rewrites, `error_page`, config permutations. This harness exists for
+the assertions the Perl suite structurally *cannot* make — what the worker looks
+like from the inside, before and after: cycle-pool bytes, descriptor counts,
+slab pages, allocation neutrality across a request or a reload. If a proposed
+scenario could be written as a `.t` file with no probe snapshot, write it as a
+`.t` file. The overlap is not free: a second suite asserting the same thing is
+another place to update when behaviour changes, and it dilutes the signal this
+one exists to give.
+
 ### The test that decides it, for scenarios
 
 Booting or reloading nginx does **not** make a scenario out of scope. The
@@ -188,9 +200,69 @@ prober (standalone binary)          nginx/Angie worker (test build only)
   that a real daemon cannot be made to produce, plus a JSONL journal that makes
   connection reuse falsifiable. See [Fake upstream](#fake-upstream-proberfakesrv).
 
+## Start here: you probably do not need to write any C
+
+There are two ways in, and the cheap one is not obvious from the howto below.
+
+**Zero-hook (no module C at all).** Build your module as a dynamic module
+alongside this repo's reference probe (`t/module`), and point a scenario at
+both. The probe is a *separate* `.so`; your module does not have to host it, and
+you do not write a directive, a handler, or a hook. You still get worker pid,
+connection counts, `fds` and `fds_by_kind`, `smaps`, and the full cycle-pool
+accounting — which is enough to assert that a request produces no measurable
+growth in descriptor count or in cycle-pool and resident memory. Note what that
+does and does not say: these are counters and totals, so the oracle catches
+growth, not every conceivable leak. An allocation freed by something else in the
+same window, or a leak offset by a legitimate release, nets to zero and passes.
+It is still the assertion most consumers actually want, and it is the one the
+Perl suite cannot make at all.
+
+Ten of our own modules were wired this way in one pass, and eight of them
+produced a working allocation-neutrality scenario with zero lines of
+module-specific C. The worked reference is
+[`prober/scenarios/consumer-cache-turbo/`](prober/scenarios/consumer-cache-turbo/);
+the others in `prober/scenarios/consumer-*/` are generated from a table by
+[`tools/gen-consumer-scenarios.sh`](tools/gen-consumer-scenarios.sh).
+
+**Hooked (the Mini howto below).** You need this only when the generic document
+cannot answer your question — custom zone introspection (`zone_render`) or
+on-demand allocation-fault injection (`fault_set`). Both hooks are optional and
+independent. Reach for this when zero-hook has shown you nothing, not before.
+
+The rule of thumb: **start zero-hook, promote to a hook when an oracle you want
+is unexpressible.** Everything in the howto below still applies once you get
+there.
+
+### What zero-hook actually costs, measured
+
+Timed on the maintainer's box (2026-07-28), against an already-unpacked nginx
+source tree:
+
+| step | command | wall |
+|---|---|---|
+| build your module + the reference probe into one tree | `tools/build-consumers.sh --only <mod>` | **8 s** |
+| generate the scenario from the table | `tools/gen-consumer-scenarios.sh` | 0.05 s |
+| run it | `prober/run-scenario.sh scenarios/consumer-<mod> nginx <ver>` | **0.4 s** |
+
+The first run in a fresh checkout also downloads and unpacks the nginx tarball,
+which dominates everything above and depends on your link. Budget minutes for
+that once, then seconds forever after.
+
+Two configure flags are needed by particular modules, not by all of them, and
+neither module declares its own — so the failure arrives at build time with no
+hint of which module asked for it. `--with-http_ssl_module` is
+nginx-autocert-module's (its sources use `ngx_ssl_t`; without the flag the build
+dies with `field 'ssl' has incomplete type`, which reads like a module bug and
+is not one). `--with-stream` is nginx-label-autoconf-module's, for its stream
+half; without it that half silently does not build at all.
+`tools/build-consumers.sh` passes both unconditionally so a mixed build works,
+which costs nothing for the modules that need neither.
+
 ## Mini howto: from zero to a passing leak test
 
-Five steps. Step 2 is the only C you write, and most of it is copy-paste.
+This is the HOOKED path — read the section above first, because most modules do
+not need it. Five steps. Step 2 is the only C you write, and most of it is
+copy-paste.
 
 **1. Add the harness to your module repo as a submodule:**
 
@@ -1431,6 +1503,61 @@ instead — the reason the scenario asserts all three pool counters), and a
 descriptor opened per config load reds the worker `fds` comparison and the
 master descriptor count together.
 
+### `reload-mid-fault` — a reload landing on top of an already-failing request
+
+Every reload scenario above proves a reload absorbs *clean* work in flight
+(`backend-reload-inflight`, `hup-storm-mid-transfer`, `reload-compressing`);
+`fault-matrix` proves the upstream error branches clean up correctly, but only
+at an idle moment. Neither combination is tested: a reload landing while a
+request is *already failing* upstream, which is exactly where an unbalanced
+allocation or a leaked upstream descriptor becomes visible —
+`ngx_http_upstream_finalize_request`'s error-cleanup path and the reload's own
+worker-drain teardown now run concurrently on the same worker, instead of at
+two separate idle moments.
+
+The upstream fault is a `drip` paced slower than a pinned
+`memcached_read_timeout` (400 ms between 4-byte chunks against a 150 ms
+budget — `memcached_read_timeout` applies *between* successive reads, the
+same citation `fault-matrix`'s `nginx.conf` uses), so nginx's own upstream
+read genuinely times out mid-transfer: a real upstream failure, not a
+slow-but-clean transfer. `rst`/`truncate`/`lie_bytes` were considered and
+rejected — fakesrv's fault vocabulary applies exactly one action per get and
+none of those three can be dripped (each sends its reply in one shot), so
+none can hold a connection open long enough to genuinely straddle a `SIGHUP`.
+
+A single fixed get ordinal (`on=get:2`, after one clean warmup get settles the
+worker) arms the fault, so which fault fires never depends on timing or a
+random draw — only the read-timeout's real-time race is time-based, and it is
+sized with a 2.7x margin so no non-pathological host blurs the cross.
+
+Oracles: the held request must NOT complete as a clean 200 (proves the fault
+actually fired, the anti-vacuity check for this scenario's own failure mode);
+the reload must be absorbed while that failing request is in flight; the new
+worker's fds/cycle-pool counters must be allocation-neutral across an extra
+clean request taken after both the fault's cleanup and the reload's drain
+complete (two quiescent post-drain snapshots, `reload-compressing`'s technique
+— a direct pre-fault-vs-post-reload compare reads a reproducible ~3.5 KB
+`cycle_used` gap that is the same "first post-reload fork carries a one-off"
+artifact `hup-storm-mid-transfer` documents, not a leak); no worker died by
+signal; the upstream saw the held get exactly once (the timeout was finalized,
+not retried); and the reloaded worker serves a clean request afterwards.
+
+Negative control (documented in the driver header, run by hand): corrupting
+the first resource-neutrality reading by one byte (`FIRST_USED - 1`) reds the
+oracle by exactly the assertion it exists to prove — `not ok 4 - the new
+worker's resource state grew after an extra request` — restored and
+re-verified clean.
+
+Why the probe and not `t/*.t`: every fault and every reload here could be
+thrown at a plain Test::Nginx suite too, but a worker that leaks the upstream
+fd or a cycle-pool block *specifically* on the "reload landed while the
+read-timeout cleanup was running" branch still returns a plausible 502/504 and
+a plausible "worker process ... exiting" log line — nothing in a `.t` file's
+assertion surface can tell that apart from a worker that cleaned up correctly.
+The unique oracle is the in-worker fd count and cycle-pool footprint read from
+the probe after both the fault's cleanup and the reload's drain have
+completed.
+
 ### `reload-soak` — 100 reloads under concurrent traffic
 
 `reload-cycle` reloads an idle server 8 times; `reload-soak` reloads it **100
@@ -1706,10 +1833,18 @@ not a scenario:
   asserts the same zero deltas would open an entire bug class — this is
   probably the single highest-value item on this list.
 - **Fault injection during a lifecycle event.** The `fault_*` knobs and the
-  reload scenarios exist separately. Arming an allocation failure *during* a
-  reload, a binary upgrade or a worker shutdown attacks the teardown path,
-  which is exactly where unbalanced allocations become visible and where almost
-  nobody tests.
+  reload scenarios exist separately. Arming a failure *during* a reload, a
+  binary upgrade or a worker shutdown attacks the teardown path, which is
+  exactly where unbalanced allocations become visible and where almost nobody
+  tests. **Partially graduated:** `reload-mid-fault` covers the upstream half —
+  a reload landing on a request already failing upstream — using a fakesrv
+  ordinal-keyed fault, which needs no hook and runs on the stock ref-probe legs.
+  The *allocation* half is still open and is blocked on the fixture rather than
+  on effort: `fault_slab=`/`fault_palloc=`/`fault_tempfile=`/`fault_accept=` arm
+  through `ngx_test_probe_arm()`, which returns `NGX_DECLINED` unless the module
+  under test registers a `fault_set` hook, and `t/module/` deliberately
+  registers none. That half needs a real module fault site plus a consumer
+  `.so`, the same boundary `fault-matrix` documents.
 
 **Coverage-driven work.** Run `prober/coverage-director.sh` and read the map for
 *unreached* lines in a consumer's module rather than in our own code. An

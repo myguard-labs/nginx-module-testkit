@@ -33,6 +33,18 @@ whole-server fuzzing, no nginx benchmarking. Fuzzing our OWN parser stays in
 scope. Do not add a sanitizer job back without the user asking for it. Full
 rationale + the known cost → README "What this repo is — and what it is not".
 
+**DO NOT ADD A TEST HERE THAT THE PERL SUITE CAN ALREADY DO.** A consuming
+module has `Test::Nginx::Socket` and its own `.t` files, and that is the right
+home for ordinary request/response behaviour — status, headers, body, rewrites,
+`error_page`, config permutations. This harness is for what the Perl suite
+structurally CANNOT assert: the worker's insides before and after, i.e.
+cycle-pool bytes, descriptor counts, slab pages, allocation neutrality across a
+request or a reload. **Test to apply to any proposed scenario: could it be
+written as a `.t` file with no probe snapshot? Then write it as a `.t` file and
+reject it here.** Duplicating the Perl suite is not free — a second suite
+asserting the same thing is another place to update on every behaviour change,
+and it dilutes the signal this one exists to give.
+
 Superrepo root is `/opt/myguard` — see [/opt/myguard/AGENTS.md](../../AGENTS.md).
 Working notes for this repo live OUTSIDE it, at
 `/opt/myguard/memory/labs/nginx-test-harness/` (read `HANDOFF.md` first, then

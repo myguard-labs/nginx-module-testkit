@@ -19,10 +19,35 @@
 # plain graceful-exit fd close), so there is nothing for this leg to trip on
 # either way; the window scoping is belt-and-suspenders.
 
+# WHY THE fd ORACLE IS SPLIT BY KIND. This scenario's whole point is that the
+# draining worker FORCE-CLOSES the stalled connection when
+# worker_shutdown_timeout expires. That close is asynchronous with respect to
+# this rule, so it can land inside the probe window and drop the count by one --
+# `delta fds == 0` then reds on the very behaviour the scenario exists to prove.
+# It is the same class as backend-idle-close-reload (see that scenario's
+# post-reload.rule for the long form) with a different descriptor: there it is
+# the old worker's parked UPSTREAM socket, here it is the force-closed CLIENT
+# socket. Either way only the socket bucket can legitimately fall, so only it is
+# relaxed, and only downwards -- an INCREASE still reds, which is the shape a
+# leak takes. file/anon/other keep the original strict `== 0`.
+#
+# Filed as a flake since s126 and misdiagnosed then as a readiness wait being
+# too tight. It is not a timing-tolerance problem: CI run 30356435513
+# (`scenarios nginx 1.29.0 san`) reds with `delta fds: 13 -> 12 is -1`, the
+# byte-identical signature backend-idle-close-reload showed, on a diff that
+# does not touch this scenario.
+#
+# `delta` is `after - before`, so this rules out an UNOFFSET net socket
+# increase; a leak exactly coinciding with the force-close nets to zero and
+# passes. That blind spot is not introduced here -- `delta fds == 0` had it too.
+
 name    the reloaded worker serves cleanly after the stalled-upload force-close
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+delta   fds_by_kind.socket <= 0
+delta   fds_by_kind.file == 0
+delta   fds_by_kind.anon == 0
+delta   fds_by_kind.other == 0
 no_error_log  \[error\]
