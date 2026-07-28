@@ -190,12 +190,17 @@ EOF
 # \`nginx -t\` and red the scenario. Exiting nonzero here makes run-scenario.sh
 # emit "1..0 # SKIP <stdout>" instead.
 #
-# THE SKIP IS NOT FREE. A scenario that SKIPs on every leg forever proves
-# nothing while reading green -- build the consumers with
-# tools/build-consumers.sh and run against that tree, or the coverage is
-# imaginary. The PR gate builds only the reference probe, so these scenarios
-# SKIP there BY DESIGN; the dedicated consumers CI job is what actually
-# executes them, and that job fails if EVERY scenario skipped.
+# THE SKIP IS NOT FREE, AND CI NEVER LIFTS IT. \`consumers/\` is gitignored, so
+# no CI leg has the sources to build a consumer .so -- every consumer scenario
+# SKIPs on every remote leg, permanently, and a SKIP reads as a pass. These
+# scenarios are therefore a LOCAL instrument only:
+#
+#     tools/build-consumers.sh
+#     prober/test-scenarios.sh nginx 1.29.0-consumers
+#
+# Nothing in CI will tell you a consumer regressed. If you want that answer you
+# run it here, by hand, and read the output. Treating a green PR as evidence
+# about consumer modules is exactly the mistake this comment exists to prevent.
 #
 # THE GATE MUST CHECK THE TREE THAT WILL ACTUALLY BE BOOTED -- nothing else.
 # run-scenario.sh runs this gate BEFORE prober_resolve, so PROBER_RESOLVED_BUILD
