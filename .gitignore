@@ -9,6 +9,11 @@ prober/perf/cg_scale.bin
 *.o
 *.gcda
 *.gcno
+
+# Generated header-dependency files (PROBER_EMIT_DEPS=1 / verify-impact
+# --regen-deps). Build output that verify-impact regenerates on demand to compute
+# header fanout, so committing them would only ever go stale against the tree.
+*.d
 t/*_test
 /.build/
 prober/coverage-map.json

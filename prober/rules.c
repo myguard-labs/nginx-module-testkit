@@ -1468,6 +1468,37 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
         }
 
         /*
+         * `abort`, `hold` and `expect_idle` each end their connection WITHOUT
+         * ever reading a response -- in http_exchange() they return before the
+         * read half runs at all. A concurrent fan carrying one of them would
+         * open N connections, write N requests, read nothing, and then assert
+         * its delta against a fan whose responses were never collected: the
+         * overlap the directive pays for would be observed by nothing, which is
+         * the same vacuity the delta/probe rule above rejects.
+         *
+         * Rejected at load time with the offending directive named, rather than
+         * silently dropped in the driver, so a rule file cannot claim a
+         * concurrency test that reads no responses.
+         *
+         * `shutdown` is deliberately NOT in this list: a half-close is a
+         * modifier on the request, not a substitute for the response -- the peer
+         * still answers, and collecting that answer is the point. See
+         * http_exchange_concurrent()'s header in http.c.
+         */
+        if (tc->concurrent > 0 && (tc->saw_abort || tc->saw_hold
+                                   || tc->saw_idle))
+        {
+            const char *which = tc->saw_abort ? "abort"
+                                : (tc->saw_hold ? "hold" : "expect_idle");
+
+            die("%s: case \"%s\" carries concurrent %d and %s; %s ends its "
+                "connection without reading a response, so the fan would "
+                "collect nothing to assert against", file,
+                tc->name != NULL ? tc->name : "(unnamed)", tc->concurrent,
+                which, which);
+        }
+
+        /*
          * Pipeline cases carry every per-exchange knob inside blocks[], so the
          * flat-field checks below are vacuous for them (all flat saw_ flags and
          * pauses are zero). Validate each block instead, then continue past the

@@ -39,7 +39,13 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  153
+#define PLANNED  157
+
+/* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
+ * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
+ * forked child, and the tests below fan 4 legs. A `want` above this is a test
+ * bug, so the child exits non-zero rather than overflowing the array. */
+#define MAX_BARRIER  16
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -679,6 +685,111 @@ spawn_trickle(int *port, int step_ms)
         }
 
         close(c);
+        _exit(0);
+    }
+
+    close(srv);
+
+    return pid;
+}
+
+
+/*
+ * The overlap barrier: accept exactly `want` connections, read a request from
+ * each, and reply to NONE of them until all `want` are simultaneously connected
+ * and have sent their request.
+ *
+ * This fixture is the whole reason http_exchange_concurrent() can be tested at
+ * all. Every other assertion available to a concurrent fan -- N responses
+ * arrived, N are well-formed, the delta is clean -- is satisfied just as well by
+ * N sequential exchanges, so none of them can tell the directive from a loop
+ * around http_request(). A barrier can: if the driver ever reads leg 0's
+ * response before writing leg 1's request, the reply to leg 0 does not exist
+ * yet, nothing further is written, and the exchange dies on its deadline rather
+ * than passing. The test that uses this is therefore a genuine negative control
+ * for the write-all-before-read-any ordering.
+ *
+ * `listen(srv, want)` because all `want` connects land before any accept: a
+ * shorter backlog would drop the tail and deadlock the barrier for a reason
+ * unrelated to the code under test.
+ */
+static pid_t
+spawn_barrier(int *port, int want)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "http_test: socket: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, want) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        fprintf(stderr, "http_test: listen: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "http_test: fork: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    if (pid == 0) {
+        int   conns[MAX_BARRIER];
+        char  scratch[512];
+        int   i;
+
+        if (want > MAX_BARRIER) {
+            _exit(2);
+        }
+
+        /* Phase 1: collect all `want` connections and their requests. Nothing
+         * is written back here -- that is the barrier. */
+        for (i = 0; i < want; i++) {
+            conns[i] = accept(srv, NULL, NULL);
+
+            if (conns[i] < 0) {
+                _exit(2);
+            }
+
+            if (read(conns[i], scratch, sizeof(scratch)) < 0) {
+                _exit(2);
+            }
+        }
+
+        /* Phase 2: only now does anyone get an answer. A Content-Length reply
+         * so the client's reader has a framed end and never waits on EOF. */
+#define BARRIER_REPLY  "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"
+
+        for (i = 0; i < want; i++) {
+            /* Length from sizeof, never a hand-counted literal: a short count
+             * here truncates the body and the client reads a well-formed but
+             * WRONG response, which reads as a driver bug rather than a fixture
+             * typo. */
+            (void) send(conns[i], BARRIER_REPLY, sizeof(BARRIER_REPLY) - 1,
+                        MSG_NOSIGNAL);
+            close(conns[i]);
+        }
+
+#undef BARRIER_REPLY
+
         _exit(0);
     }
 
@@ -2432,6 +2543,107 @@ main(void)
 #undef KA_204
         }
 #undef KA_RESP
+    }
+
+    /* ---- http_exchange_concurrent ---------------------------------------
+     *
+     * The barrier fixture is what gives these assertions teeth: it answers
+     * nobody until all N requests have arrived, so a driver that read leg 0
+     * before writing leg 1 would hang until the deadline instead of passing.
+     * That makes the first case below a negative control for the ordering, not
+     * merely a check that N responses came back.
+     */
+    {
+        static const unsigned char  creq[] =
+            "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+        const size_t                creq_len = sizeof(creq) - 1;
+
+        int            port, st;
+        pid_t          pid;
+        int            rc;
+        char           errbuf[256];
+        http_response  resps[4];
+        int            i;
+
+        /* 1. The load-bearing one: four requests must be in flight together
+         *    before ANY of them is answered. */
+        pid = spawn_barrier(&port, 4);
+        rc = http_exchange_concurrent("127.0.0.1", port, 4, creq, creq_len,
+                                      2000, NULL, NULL, 0, HTTP_SHUT_NONE,
+                                      NULL, 0, 1, resps,
+                                      errbuf, sizeof(errbuf));
+
+        {
+            /*
+             * The ordering control, and it must assert the RESPONSES, not just
+             * the return code. Verified by mutation: a driver that reads leg i
+             * before writing leg i+1 still returns 0 here (its fused read fails
+             * softly and the loop runs on), so an `rc == 0` assertion passes
+             * with the ordering destroyed -- the exact overclaim shape of a test
+             * whose name promises more than its condition checks. Requiring all
+             * four legs to carry a real 200 is what the barrier can actually
+             * distinguish, since under a serialized fan the reply to leg 0 does
+             * not exist when leg 0 is read.
+             */
+            int all_200 = (rc == 0);
+
+            for (i = 0; rc == 0 && i < 4; i++) {
+                if (resps[i].status != 200) {
+                    all_200 = 0;
+                }
+            }
+
+            ok(all_200,
+               "a 4-way fan is written in full before any leg is read -- all 4 "
+               "get a 200 from a server that answers only once all 4 arrived");
+        }
+
+        {
+            int all_body = (rc == 0);
+
+            for (i = 0; rc == 0 && i < 4; i++) {
+                if (resps[i].body_len != 2
+                    || memcmp(resps[i].body, "hi", 2) != 0)
+                {
+                    all_body = 0;
+                }
+            }
+
+            ok(all_body, "each leg's response body is collected independently");
+        }
+
+        if (rc == 0) {
+            for (i = 0; i < 4; i++) {
+                http_response_free(&resps[i]);
+            }
+        }
+
+        kill(pid, SIGKILL);
+        waitpid(pid, &st, 0);
+
+        /* 2. The floor is enforced in the driver too, not only in the parser --
+         *    a caller reaching this directly must not get a one-leg "fan". */
+        rc = http_exchange_concurrent("127.0.0.1", 1, 1, creq, creq_len,
+                                      1000, NULL, NULL, 0, HTTP_SHUT_NONE,
+                                      NULL, 0, 1, resps,
+                                      errbuf, sizeof(errbuf));
+        ok(rc == -1 && strstr(errbuf, "floor is 2") != NULL,
+           "a fan of 1 is refused by the driver, not silently run");
+
+        /* 3. A leg that cannot connect fails the whole case: N-1 overlapping
+         *    requests are not the test the file asked for. Port 1 on loopback
+         *    is closed, so every leg refuses. resps[] must still be safe to
+         *    free after the failure. */
+        rc = http_exchange_concurrent("127.0.0.1", 1, 3, creq, creq_len,
+                                      1000, NULL, NULL, 0, HTTP_SHUT_NONE,
+                                      NULL, 0, 1, resps,
+                                      errbuf, sizeof(errbuf));
+        ok(rc == -1 && strstr(errbuf, "connect failed") != NULL,
+           "a leg that cannot connect fails the fan rather than narrowing it");
+
+        for (i = 0; i < 3; i++) {
+            http_response_free(&resps[i]);
+        }
     }
 
     if (tests_run != PLANNED) {

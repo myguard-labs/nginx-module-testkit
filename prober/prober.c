@@ -506,7 +506,76 @@ run_case(const test_case *tc, const json_value *baseline)
         return 0;
     }
 
-    if (tc->n_blocks == 0) {
+    if (tc->concurrent > 0) {
+        /*
+         * Concurrent fan -- N copies of this case's request held in flight at
+         * once. The parser guarantees a delta or probe assertion is present
+         * (otherwise the overlap would be observed by nothing) and rejects the
+         * directives that would make the fan read nothing, so this path only
+         * ever runs on a case whose snapshots actually bracket N collected
+         * responses.
+         *
+         * Every leg is evaluated against the case's own expectations: N
+         * overlapping requests must each be answered exactly as one sequential
+         * request is, so a leg that came back different is a finding even when
+         * the aggregate delta is clean. The leg number is carried into the
+         * label so a failure names which one.
+         */
+        http_response *resps;
+        int            leg;
+
+        resps = calloc((size_t) tc->concurrent, sizeof(*resps));
+
+        if (resps == NULL) {
+            printf("# concurrent: out of memory for %d responses\n",
+                   tc->concurrent);
+            json_free(before);
+            return 0;
+        }
+
+        if (http_exchange_concurrent(opt_host, opt_port, tc->concurrent,
+                                     tc->request, tc->request_len,
+                                     opt_timeout_ms, tc->source,
+                                     tc->pauses, tc->n_pauses, tc->shut_how,
+                                     &tc->recv_opt, tc->saw_close_within,
+                                     0, resps, errbuf, sizeof(errbuf)) != 0)
+        {
+            printf("# concurrent request failed: %s\n", errbuf);
+
+            for (leg = 0; leg < tc->concurrent; leg++) {
+                http_response_free(&resps[leg]);
+            }
+
+            free(resps);
+            json_free(before);
+            return 0;
+        }
+
+        for (leg = 0; leg < tc->concurrent; leg++) {
+            char  label[256];
+
+            snprintf(label, sizeof(label), "concurrent leg %d/%d: ",
+                     leg + 1, tc->concurrent);
+
+            if (opt_verbose) {
+                printf("# %s<- status %d, %zu body bytes\n",
+                       label, resps[leg].status, resps[leg].body_len);
+            }
+
+            if (!eval_exchange(label, tc->dechunk, tc->gunzip, tc->json_sort,
+                               tc->expects, tc->n_expects,
+                               tc->saw_close_within, tc->close_within_ms,
+                               tc->saw_idle, tc->idle_ms, &resps[leg]))
+            {
+                ok = 0;
+            }
+
+            http_response_free(&resps[leg]);
+        }
+
+        free(resps);
+
+    } else if (tc->n_blocks == 0) {
         /*
          * Legacy single-exchange path -- one connect/write/read/close, exactly
          * as before the `block` directive existed. http_request wraps

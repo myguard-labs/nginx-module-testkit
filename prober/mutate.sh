@@ -517,6 +517,41 @@ mutate "open_conns: probe-assertion guard removed" rules.c \
     '        if (tc->open_conns > 0 && tc->n_probes == 0) {' \
     '        if (0 && tc->n_probes == 0) {' rules_test
 
+# ---- concurrent -------------------------------------------------------------
+
+# The floor. `concurrent 1` is the ordinary single-request path wearing the
+# directive's name, so without this a rule file can claim a concurrency test that
+# holds nothing in flight and asserts nothing about overlap.
+mutate "concurrent: floor of 2 lowered to 1" rules.c \
+    '            if (count < 2 || count > MAX_CONCURRENT) {' \
+    '            if (count < 1 || count > MAX_CONCURRENT) {' rules_test
+
+# The observability guard. The probe snapshots bracketing the fan are the ONLY
+# thing that observes the overlap; without this a case pays for N connections and
+# asserts exactly what one request already asserted.
+mutate "concurrent: delta/probe requirement removed" rules.c \
+    '        if (tc->concurrent > 0 && tc->n_deltas == 0 && tc->n_probes == 0) {' \
+    '        if (0 && tc->n_deltas == 0 && tc->n_probes == 0) {' rules_test
+
+# abort/hold/expect_idle each return before the read half runs, so a fan carrying
+# one collects no responses at all. Without this guard that case loads and
+# reports green having read nothing.
+mutate "concurrent: non-reading directive guard removed" rules.c \
+    '        if (tc->concurrent > 0 && (tc->saw_abort || tc->saw_hold' \
+    '        if (0 && (tc->saw_abort || tc->saw_hold' rules_test
+
+# THE ordering mutant, and the reason the barrier fixture exists: read each leg's
+# response inside the write loop instead of after it. Every request is still sent
+# and every response still collected, so response-shape assertions alone cannot
+# tell the difference -- only a server that refuses to answer until all N have
+# arrived can, which is what spawn_barrier() does.
+mutate "concurrent: fan serialized (leg read before the next is written)" http.c \
+    '        sent_at[i] = now_ms();' \
+    '        sent_at[i] = now_ms();
+        { int mco = 0; (void) http_read_response(fds[i], timeout_ms, recv_opt,
+              want_close, framed, sent_at[i], &resps[i], &mco, errbuf, errlen); }' \
+    http_test
+
 # ---- CLI --------------------------------------------------------------------
 
 # The flag not taking effect is the failure that matters: --check would fall

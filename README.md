@@ -674,6 +674,58 @@ one listen-socket wakeup accepts the whole backlog at once, rather than one
 connection per event. Without it the count can lag the sockets this process has
 opened.
 
+`concurrent <N>` issues `N` copies of this case's request and holds them **all in
+flight at once**: every connection is opened and every request written before
+*any* response is read. That overlap is the whole directive — a sequential prober
+retires each request before starting the next, so a race that needs two requests
+inside the same worker at the same instant is simply unreachable without it:
+
+```text
+name        twenty overlapping requests leave the worker exactly as one does
+send        GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+concurrent  20
+delta       fds == 0
+```
+
+The before/after probe snapshots bracket the entire fan, so the case's existing
+`delta` oracles then assert that `N` overlapping requests leave the worker in the
+state `N` sequential ones would: no extra descriptor, no pool growth, no slab
+page. A leak or a double-free that only manifests under overlap shows up as a
+non-zero delta here and nowhere else in the suite. Every leg is also checked
+against the case's own `expect` assertions, so a leg answered differently from
+the others is a finding even when the aggregate delta is clean; a failure names
+the leg (`concurrent leg 3/20: ...`).
+
+Do not confuse it with `open_conns`, which is its opposite half: `open_conns`
+parks **bare** connections that never send anything, while `concurrent` sends the
+request on all of them and collects every response. A count must be `2..64`. The
+floor is **2, not 1** — `concurrent 1` is the ordinary path in costume, and
+accepting it would let a rule file claim a concurrency test that asserts nothing
+about overlap.
+
+Four combinations are rejected at load time rather than silently resolved:
+
+- **no `delta` or `probe`** — the snapshots are the only thing that observes the
+  overlap, so a fan without one pays for `N` connections and asserts exactly what
+  a single request already asserted.
+- **`block`** — a pipeline is an *ordered* sequence on *one* connection. "`N`
+  pipelines at once" is a coherent feature but a much larger one, so the pair is
+  refused rather than resolved toward either reading.
+- **`abort`, `hold`, `expect_idle`** — each ends its connection *without ever
+  reading a response*, so a fan carrying one would collect nothing to assert
+  against.
+
+`shutdown` is deliberately **not** in that list and combines freely: a half-close
+is a modifier on the request, not a substitute for the response. After `SHUT_WR`
+the peer still answers, and collecting that answer is the entire point.
+
+Pacing (`pause`, `send_slow`) applies to the **first leg only**. Pacing every leg
+would serialize the write phase — leg 0 still dribbling while leg `N-1` had not
+started — which is the opposite of overlap; pacing one leg keeps a slow request in
+flight while the rest pile in behind it, which is the interesting shape. A leg
+that fails to connect fails the whole case, because `N-1` overlapping requests are
+not the test the file asked for.
+
 `dechunk` decodes a `Transfer-Encoding: chunked` response body before the body
 assertions run, so `body~`, `expect_not body~` and `body_sha256=` see the
 payload rather than the chunk size lines:
@@ -1827,11 +1879,12 @@ not a scenario:
   than sent), to trickle a chunked body one byte per chunk, or to send an
   oversized `Content-Length` and stop. `backend-lying-length` does this to the
   *upstream*; nothing does it to the module's own request path.
-- **Concurrency as an attack.** Every scenario is sequential. A module with a
-  shared-memory or per-worker race is invisible to a one-request-at-a-time
-  prober. A `concurrent N` directive that issues N requests in flight and then
-  asserts the same zero deltas would open an entire bug class — this is
-  probably the single highest-value item on this list.
+- **Concurrency as an attack.** ~~Every scenario is sequential.~~ **GRADUATED:**
+  the `concurrent N` directive (documented above) issues N requests in flight and
+  asserts the same zero deltas, opening the shared-memory/per-worker race class to
+  the prober. What is still sequential is the *scenario* layer: a scenario cannot
+  yet overlap two *different* requests, only N copies of one, so a race that needs
+  request A and request B to interleave remains out of reach.
 - **Fault injection during a lifecycle event.** The `fault_*` knobs and the
   reload scenarios exist separately. Arming a failure *during* a reload, a
   binary upgrade or a worker shutdown attacks the teardown path, which is

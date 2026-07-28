@@ -620,6 +620,37 @@ int http_exchange(int fd,
  * matching this codebase's naming of every lifecycle transition. */
 void http_close(int fd);
 
+/*
+ * The `concurrent N` driver: open N connections, write the same request on ALL
+ * of them, and only then read the N responses into resps[0..n-1].
+ *
+ * The write-all-before-read-any ordering is the entire directive -- it is the
+ * only way to hold N requests outstanding in the worker at one instant, which is
+ * the state a shared-state race needs to be reachable. http_request() in a loop
+ * does NOT approximate this; it retires each request before starting the next.
+ *
+ * Directive handling differs from http_exchange() by necessity and the rules are
+ * spelled out at the definition in http.c: pacing (`pause`/`send_slow`) applies
+ * to the FIRST leg only, so the fan does not serialize itself; `shut_how`
+ * applies to EVERY leg, because a half-close still expects an answer; and
+ * `abort`/`hold`/`expect_idle` are not accepted here at all, since each ends its
+ * connection without reading and a fan that reads nothing asserts nothing.
+ *
+ * resps must have room for n entries and is fully initialized on every return
+ * path, so the caller may http_response_free() all n unconditionally. `n` must
+ * be >= 2 (the parser enforces the same floor with a line number). Returns 0
+ * when the fan completed, or -1 with errbuf set -- including when any single leg
+ * fails to connect, since a narrower fan is not the case the file asked for.
+ */
+int http_exchange_concurrent(const char *host, int port, int n,
+                             const unsigned char *req, size_t req_len,
+                             int timeout_ms, const char *source,
+                             const http_pause *pauses, size_t n_pauses,
+                             int shut_how, const http_recv *recv_opt,
+                             int want_close, int framed,
+                             http_response *resps,
+                             char *errbuf, size_t errlen);
+
 int http_request(const char *host, int port,
                  const unsigned char *req, size_t req_len,
                  int timeout_ms, const char *source,
