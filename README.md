@@ -49,6 +49,37 @@ going away), not a new permanent CI leg.
 **Also not in scope:** valgrind on nginx, whole-server fuzzing, and performance
 benchmarking of nginx itself. Fuzzing our *own* parser is in scope and stays.
 
+### The test that decides it, for scenarios
+
+Booting or reloading nginx does **not** make a scenario out of scope. The
+question is what the *oracle asserts*:
+
+- If it asserts that **our measurement stays correct** — cycle-pool counters
+  equal across a reload, fd accounting flat under pressure, the prober's reader
+  framing a pipelined response correctly — it is in scope. Reloads and signals
+  are precisely where module leaks surface, so most of the `reload-*` and
+  `usr2-*` scenarios are core tool coverage despite looking nginx-shaped.
+- If it asserts that **nginx does its own job** — resolves a location, serves an
+  `error_page`, runs a subrequest without corrupting the parent — that is
+  upstream's to prove. Removed 2026-07-28: `config-matrix`, `event-methods`,
+  `internal-redirect`, `subrequest`.
+
+Two that read as nginx-behaviour from their names are deliberately kept, because
+our own C names them as the thing that proves it. `keepalive-bleed` is the
+negative control for the prober's framing-aware reader — `prober/http.c` points
+at it for the conn-reuse split, and it is the shape `stateful-property-fuzz`
+builds its pipeline kind on. `clock-jump` LD_PRELOADs libfaketime on purpose, to
+prove `now_ms()` really is on `CLOCK_MONOTONIC` and cannot be walked backwards
+by a stepping wall clock.
+
+`zone-exhaustion` went on the same date for a worse reason. Its name promised
+zone exhaustion; its `nginx.conf` set `worker_connections 10`; its rule sent two
+sequential `Connection: close` requests and asserted `status=200`. Nothing ever
+approached the limit, and no `limit_conn` or `limit_req` existed anywhere in the
+tree. It would have passed with the mechanism it named entirely broken — and a
+gate that cannot fail is the precise defect the rest of this suite exists to
+catch, so it does not get to live in it.
+
 ## The problem, in plain terms
 
 Three gaps this closes, in the order they hurt:
@@ -977,7 +1008,7 @@ A scenario is a directory; every file is optional except that a scenario must
 end up with something to assert (rules or a driver):
 
 ```
-scenarios/zone-exhaustion/
+scenarios/conn-delta/
     nginx.conf    conf template, placeholders below  (default: $PROBER_CONF)
     *.rule        cases run by the prober            (default: $PROBER_RULES)
     env           sourced before boot: LD_PRELOAD, ulimit, PROBER_ALLOW_LOG
