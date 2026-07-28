@@ -1540,8 +1540,17 @@ http_exchange(int fd,
  *
  * This is a pure extraction: the body below is http_exchange()'s former tail
  * verbatim, and every path that used to skip it (abort's SO_LINGER reset,
- * shutdown, expect_idle) still returns before reaching this call rather than
- * entering and short-circuiting. `sent_at` is passed in because the whole-
+ * hold, expect_idle) still returns before reaching this call rather than
+ * entering and short-circuiting.
+ *
+ * `shutdown` is deliberately NOT in that list: a half-close is a modifier on
+ * the request, not a substitute for the response. It shuts the write side and
+ * then reads normally -- which is the entire point of SHUT_WR, since the peer
+ * has to answer the EOF for the case to prove anything. A concurrency driver
+ * must therefore treat shut_how as compatible with reading, not as a
+ * read-skipping mode.
+ *
+ * `sent_at` is passed in because the whole-
  * exchange deadline and every close_ms measure from the instant the request
  * finished going out, which only the writer knows; taking a fresh timestamp
  * here would silently restart the clock and hand a trickling server the budget
