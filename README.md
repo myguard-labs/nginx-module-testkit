@@ -11,6 +11,44 @@ and after each one, and asserts that the difference is exactly zero. If your
 module leaks an fd or a byte of long-lived memory per request, the delta is
 nonzero and the test goes red — in CI, not in production three weeks later.
 
+## What this repo is — and what it is not
+
+**This is a probe tool for nginx. It is not an nginx module, and it is not a
+test suite for nginx itself.**
+
+That distinction decides what belongs in CI here. The thing under test is *our
+own code* — the `prober` binary, its rule parser, the probe's JSON emitter, the
+shell plumbing that boots a server and diffs snapshots. nginx is the fixture we
+run our tool against, not the subject. When a scenario boots nginx, it is there
+to give the prober something real to talk to.
+
+Concretely:
+
+- **We test our test tool.** Does the parser accept the rules it should and
+  reject the ones it should not? Does a snapshot diff report the delta that is
+  actually there? Does a gate fail when its own control is broken? That is the
+  whole job.
+- **We do not test nginx's memory safety.** nginx upstream has its own
+  sanitizer and fuzzing coverage, and it is far better resourced than ours.
+  Instrumenting nginx core here spends our CI budget re-testing someone else's
+  code, and every finding it could produce is a finding for upstream, not for
+  this repo.
+- **No ASan/UBSan legs in this repo's CI.** Not on nginx, and not on our own
+  binary either. The sanitizer legs cost multi-minute wall-clock on a shared
+  builder and were a steady source of flakes; the selftest suites, the
+  mutation gates, and the scenario oracles are what actually prove this tool
+  works. Decided 2026-07-28.
+
+The known cost of that last rule, recorded so nobody has to rediscover it:
+`prober/rules.c` and `prober/json.c` are parsers, and dropping the sanitizer
+selftest legs removes the only automated check for an out-of-bounds read or a
+use-after-free inside them. If a parser bug is ever suspected, the move is a
+one-off local sanitizer build (`SAN=1 prober/test.sh` still works and is not
+going away), not a new permanent CI leg.
+
+**Also not in scope:** valgrind on nginx, whole-server fuzzing, and performance
+benchmarking of nginx itself. Fuzzing our *own* parser is in scope and stays.
+
 ## The problem, in plain terms
 
 Three gaps this closes, in the order they hurt:

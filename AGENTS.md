@@ -6,6 +6,16 @@ request/response suite: ordinary status/header/body behaviour belongs in
 upstream-journal and allocation-failure** evidence across signals, reloads and
 faults.
 
+**SCOPE — we develop a probe TOOL for nginx, not an nginx MODULE.** The thing
+under test is our own code: the prober binary, its rule parser, the probe's JSON
+emitter, the shell plumbing. nginx is the fixture, never the subject. So: no
+ASan/UBSan legs in this repo's CI — not on nginx, and not on our own binary
+either (decided 2026-07-28; `SAN=1 prober/test.sh` remains available for a
+one-off local run when a parser bug is suspected). No valgrind on nginx, no
+whole-server fuzzing, no nginx benchmarking. Fuzzing our OWN parser stays in
+scope. Do not add a sanitizer job back without the user asking for it. Full
+rationale + the known cost → README "What this repo is — and what it is not".
+
 Superrepo root is `/opt/myguard` — see [/opt/myguard/AGENTS.md](../../AGENTS.md).
 Working notes for this repo live OUTSIDE it, at
 `/opt/myguard/memory/labs/nginx-test-harness/` (read `HANDOFF.md` first, then
