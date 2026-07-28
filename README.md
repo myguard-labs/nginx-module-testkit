@@ -2069,11 +2069,61 @@ mutex, scans `/proc`, and exposes internal state unauthenticated. Before a
 release, `strings` your production `.so` for `ngx_test_probe` — it must not
 be there.
 
+## Who maintains this, and how modules consume it
+
+Built and maintained by **[MyGuard Labs](https://github.com/myguard-labs)**,
+which works on security-oriented nginx modules and hardening plugins. This
+repo is the CI-focused testing tool of that set: it validates nginx and Angie
+module behaviour by introspecting worker internals — open file descriptors,
+cycle-pool statistics, slab-page accounting, and shared-zone presence — rather
+than by guessing from the outside.
+
+**Consumed as a git submodule.** A module vendors this repo (conventionally at
+`t/harness/`) and compiles the probe **conditionally**, so it never reaches a
+production build. `nginx-http-shield-module` is the worked example: its
+`.gitmodules` points `t/harness` here, and its `config` compiles the probe
+sources only when `TEST_HARNESS=1` is exported at configure time, which also
+sets `-DNGX_TEST_HARNESS`. A packaged build sets neither, so the probe is not
+merely inert — it is not compiled at all.
+
+**Zero-hook mode.** A consumer does not have to implement anything. With no
+`ngx_test_probe_hooks_t` registered, the probe still reports the generic
+per-worker fields (pid, fds, cycle-pool, slab), which is enough to catch a
+per-request fd or memory leak. Hooks are what you add when you want the
+module's *own* zone rendered into the JSON or fault injection armed against it
+— see **Consumer contract** above. Every `prober/scenarios/consumer-*` scenario
+in this repo starts zero-hook for exactly that reason.
+
+**Probe endpoint.** The consumer names a directive and puts it in one throwaway
+location; the harness then drives that endpoint and gets JSON back, which it
+asserts against a rule set. `shield_probe` is the directive
+`nginx-http-shield-module` registers; the reference module in `t/module/` uses
+`test_ref_probe`. The name is the consumer's choice — `PROBER_DIRECTIVE` tells
+the prober what it is.
+
+**Multi-environment.** The suite runs across nginx and Angie, and across plain
+and sanitizer (ASan/UBSan) builds — see the `scenarios` matrix in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). A module path that
+behaves differently on Angie, or only faults under a sanitizer, is caught by a
+leg rather than by a user.
+
+**Where it is used.** `nginx-http-shield-module` and
+`nginx-cache-turbo-module` consume it for automated CI verification.
+`prober/scenarios/consumer-*/` here additionally exercises a wider set of
+MyGuard Labs modules — api-abuse, coraza-nginx, error-abuse, skeleton,
+strip-filter — as a local instrument; those scenarios SKIP in CI, because the
+sources they need are gitignored. `nginx-skeleton-module` is the template for
+new modules in the organization; it ships its own CI rather than vendoring this
+harness, so a new module opts in explicitly.
+
 ## See also
 
 - [nginx-http-shield-module](https://github.com/myguard-labs/nginx-http-shield-module)
   — first consumer; its `t/prober/` rules and probe-hooks file are a worked
   example.
+- [nginx-cache-turbo-module](https://github.com/myguard-labs/nginx-cache-turbo-module)
+  — second consumer; `prober/scenarios/consumer-cache-turbo/` here is the
+  hand-written reference the generated consumer scenarios are modelled on.
 - [Introduction article on deb.myguard.nl](https://deb.myguard.nl/articles/nginx-test-harness/)
   — the tour: what it catches, why sanitizers miss it, and the traps.
 - [Where to find us](https://deb.myguard.nl/where-to-find-us/) — all our repos,

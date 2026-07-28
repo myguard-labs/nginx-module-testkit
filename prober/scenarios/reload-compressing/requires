@@ -31,20 +31,20 @@ set -euo pipefail
 #   * else              -> PROBER_ROOT/.build/<flavor>-<version>; the gate has no
 #                          flavor/version, so it globs every tree under .build --
 #                          the module is either built for the box or it is not.
-found=0
-if [ -n "${PROBER_BUILD:-}" ]; then
-    # Direct build path: check exactly the objs/ the conf will load from.
-    [ -f "$PROBER_BUILD/objs/ngx_http_zstd_filter_module.so" ] && found=1
-    SEARCHED="$PROBER_BUILD/objs"
-else
-    BUILD_ROOT="${PROBER_ROOT:-.}/.build"
-    for so in "$BUILD_ROOT"/*/objs/ngx_http_zstd_filter_module.so; do
-        [ -f "$so" ] && { found=1; break; }
-    done
-    SEARCHED="$BUILD_ROOT/*/objs"
-fi
-if [ "$found" -eq 0 ]; then
-    echo "http-zstd filter .so not found in $SEARCHED -- nginx.conf load_modules ngx_http_zstd_filter_module.so unconditionally, so a statically-linked zstd does not satisfy it; build the filter as a dynamic module to run this scenario"
+# THE GATE MUST CHECK THE TREE THAT WILL ACTUALLY BE BOOTED -- nothing else.
+# The `else` branch here used to glob `.build/*/objs`, which finds the .so in
+# ANY staged tree. With the .so present in one tree and absent from the one
+# being booted, the gate passes and nginx then dies at `nginx -t` with a dlopen
+# failure -- a hard FAIL where the entire purpose of the gate is a clean SKIP.
+# run-scenario.sh runs this before prober_resolve, so PROBER_RESOLVED_BUILD does
+# not exist yet; recompute the same path lib.sh will, taking flavor/version from
+# argv ($2/$3, as run-scenario.sh passes them) with the same defaults.
+FLAVOR="${2:-nginx}"
+VERSION="${3:-1.31.3}"
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-.}/.build/${FLAVOR}-${VERSION}}"
+
+if [ ! -f "$BUILD/objs/ngx_http_zstd_filter_module.so" ]; then
+    echo "http-zstd filter .so not found in $BUILD/objs -- nginx.conf load_modules ngx_http_zstd_filter_module.so unconditionally, so this tree cannot run the scenario; build the filter as a dynamic module to run it"
     exit 1
 fi
 

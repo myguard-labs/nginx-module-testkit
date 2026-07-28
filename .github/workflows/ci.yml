@@ -802,6 +802,19 @@ jobs:
           shopt -s nullglob
           shellcheck -x --source-path=prober prober/*.sh prober/verify-impact prober/pr-impact prober/pr-memcheck prober/scenarios/*/driver.sh tools/*.sh
 
+      # The consumer-* scenarios listed in tools/gen-consumer-scenarios.sh are
+      # GENERATED from a table in that script. Hand-editing one works locally
+      # and is then silently reverted the next time anyone regenerates -- so the
+      # edit survives review, lands, and disappears later without a trace. This
+      # step regenerates into a temp dir and diffs, so a hand-edit fails here
+      # with the diff printed rather than rotting.
+      #
+      # It lives in the `shell` job, not the opt-in `consumers` job below,
+      # because it needs no nginx build: it is a pure text check and belongs on
+      # every PR.
+      - name: generated consumer scenarios are up to date
+        run: tools/gen-consumer-scenarios.sh --check
+
       # Downloaded and hash-checked, same as the server tarballs above: a
       # linter that gates the build is as much a supply-chain dependency as
       # the code it lints.

@@ -231,7 +231,8 @@ fi
 # each appear in the observed set, via any of the near-neighbours the header
 # documents. Missing any group, the trace is not of a served request; that is a
 # red, not a vacuous green.
-_witnessed() { printf '%s\n' "$OBSERVED" | grep -qxE "$1"; }
+# Herestring, not a pipe: -q exits on first match and can break the writer.
+_witnessed() { grep -qxE "$1" <<<"$OBSERVED"; }
 MISSING=""
 _witnessed 'accept4|accept'                     || MISSING="$MISSING accept"
 _witnessed 'recvfrom|recvmsg|recv|read'         || MISSING="$MISSING read"

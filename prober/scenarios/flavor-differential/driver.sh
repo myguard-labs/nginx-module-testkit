@@ -152,7 +152,9 @@ else
 fi
 
 # --- 3: no zone was configured, and both flavors must agree on that --------
-if printf '%s' "$BODY" | grep -q '"zone":{"present":false}'; then
+# Herestrings throughout: `grep -q` exits on its first match and can leave the
+# writer with a broken pipe regardless of payload size.
+if grep -q '"zone":{"present":false}' <<<"$BODY"; then
     echo "ok 3 - zone.present is false (no zone configured in this conf)"
 else
     echo "not ok 3 - zone.present is not false with no zone configured"
@@ -168,8 +170,8 @@ RESP="$(
     exit 0
 )"
 
-if printf '%s' "$RESP" | grep -q '^HTTP/1.1 200' \
-   && printf '%s' "$RESP" | grep -q '^OK$'; then
+if grep -q '^HTTP/1.1 200' <<<"$RESP" \
+   && grep -q '^OK$' <<<"$RESP"; then
     echo "ok 4 - the plain response is 200/OK on both flavors"
 else
     echo "not ok 4 - the plain response was not 200/OK"

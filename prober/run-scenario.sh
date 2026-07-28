@@ -62,8 +62,17 @@ SCENARIO="$(cd "$SCENARIO" && pwd)"
 # The requires gate runs before anything expensive and before the env file, so
 # a skip costs nothing and cannot be corrupted by a half-applied environment.
 # Skip-all is the whole point: an unmet requirement on this box is not a red.
+#
+# The gate is passed the SCENARIO DIR, FLAVOR and VERSION as $1/$2/$3 -- the
+# same flavor/version this script is about to hand prober_resolve. A gate whose
+# requirement is per-build (a consumer .so that exists in one staged tree and
+# not another) cannot answer correctly without them: prober_resolve has not run
+# yet, so PROBER_RESOLVED_BUILD does not exist at gate time, and a gate that
+# guesses by globbing .build/*/objs passes on a tree that is about to fail
+# `nginx -t`. Gates with environment-only requirements (a CLI, a locale, a
+# kernel feature) ignore the extra argv, so this is backward compatible.
 if [ -x "$SCENARIO/requires" ]; then
-    if ! REASON="$("$SCENARIO/requires" 2>&1)"; then
+    if ! REASON="$("$SCENARIO/requires" "$SCENARIO" "${2:-nginx}" "${3:-1.31.3}" 2>&1)"; then
         echo "1..0 # SKIP ${REASON:-$SCENARIO/requires gate not met}"
         exit 0
     fi

@@ -184,14 +184,32 @@ raw_request() {
     # line + the CRLF CRLF terminator). A truncated read that happened to exit
     # 0 -- or a candidate that closed the socket early -- has no blank-line
     # terminator and must not be hashed as if it were a whole response.
-    printf '%s' "$resp" | grep -q $'\r\n\r\n\|^\r\?$' || {
+    # HERESTRING, NOT `printf | grep -q`. `grep -q` exits on its first match
+    # without draining stdin, so the writer can hit a broken pipe. Observed on
+    # CI run 30346090176, which killed this scenario with no TAP at all:
+    #
+    #   driver.sh: line 187: printf: write error: Broken pipe
+    #   not ok 18 - deploy-canary
+    #
+    # Not reproduced on builder02 by hand (bash's printf builtin usually
+    # absorbs it and the pipeline still returns 0), so the exact trigger is
+    # environment-dependent -- which is precisely why it reads as a flake and
+    # why the fix is structural rather than conditional. THIRD instance of this
+    # class here: prober/lib.sh (s143, `find | head -1`) and
+    # prober/verify-impact (s145, measured rc=141 at 20k lines). A herestring
+    # is a temp file, not a pipe, so no writer exists to break.
+    # Verified equivalent to the old form on 200/404/no-body/no-terminator.
+    grep -q $'\r\n\r\n\|^\r\?$' <<<"$resp" || {
         echo "PROBE_UNREADABLE"; return 1
     }
 
     # Split status line, headers (up to the first blank line) and body. CRLF
     # terminated; the blank line is CRLF CRLF, so splitting on a literal CR
     # keeps this POSIX-shell-only, no perl/python dependency mid-scenario.
-    status="$(printf '%s' "$resp" | head -1 | awk '{print $2}')"
+    # `head -1` early-exits for the same reason grep -q does; herestring again.
+    # The awk/sed readers below drain their input to EOF and are safe as pipes,
+    # but they take a herestring too so every reader of "$resp" reads alike.
+    status="$(awk 'NR==1{print $2; exit}' <<<"$resp")"
     headers="$(printf '%s' "$resp" | awk 'NR==1{next} /^\r?$/{exit} {print}')"
     # Body: everything after the first blank line. sed prints from the line
     # after the first empty one to EOF; HEAD responses have no body and this

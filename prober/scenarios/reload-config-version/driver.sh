@@ -197,7 +197,8 @@ reload $r: the previous cycle's workers had not drained after 10 s"
     # THE VACUITY CHECK. The generation says a config was loaded; this says it
     # is the config we wrote.
     BODY="$(fetch_body || true)"
-    if printf '%s' "$BODY" | grep -q "marker=$MARK"; then
+    # Herestring, not a pipe -- `grep -q` early-exit can break the writer.
+    if grep -q "marker=$MARK" <<<"$BODY"; then
         MARKER_OK=$((MARKER_OK + 1))
     else
         DETAIL="$DETAIL
