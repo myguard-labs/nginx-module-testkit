@@ -42,7 +42,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 VERIFY_IMPACT="$PWD/verify-impact"
 
-PLANNED=12
+PLANNED=13
 tests_run=0
 failures=0
 
@@ -276,6 +276,35 @@ comment_exempt=1
 [ -z "$out" ] || comment_exempt=0
 ok "$((comment_exempt == 1 ? 0 : 1))" \
     "a whole-line // comment added to json.c IS exempt (selects nothing)"
+
+# ---- case 8: a LARGE executable diff must classify, not die of SIGPIPE -----
+# The exemption test reads the changed lines with `grep -qvE <<<"$changed"`.
+# It used to be `printf '%s\n' "$changed" | grep -qvE`, and `grep -q` exits on
+# its FIRST match without draining stdin -- so once the diff passes the 64KiB
+# pipe buffer the writing printf takes SIGPIPE and `set -o pipefail` turns
+# rc=141 into a failure of verify-impact itself. Measured: clean at 100 changed
+# lines, rc=141 at 20000. That is fail-CLOSED-by-accident on exactly the large
+# refactor a selector is most needed for, and it is invisible to every small
+# fixture above. Sibling of the `find ... | head -1` SIGPIPE fix in lib.sh.
+#
+# 40000 executable lines is ~600KiB, comfortably past the buffer. json.c is
+# already mapped in impact.map, so a correct run selects json_test and exits 0.
+git -C "$REPO" checkout -q -b case-bigdiff "$BASE_SHA"
+{
+    for i in $(seq 1 40000); do printf 'int json_big_%s(void) { return %s; }\n' "$i" "$i"; done
+} >"$REPO/prober/json.c"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "a very large executable change to json.c"
+set +e
+out="$(run_vi 2>"$WORK/vi_err_big")"
+s=$?
+set -e
+bigdiff_ok=1
+[ "$s" -eq 0 ] || bigdiff_ok=0
+printf '%s\n' "$out" | grep -q json_test || bigdiff_ok=0
+[ "$bigdiff_ok" -eq 1 ] || diag "large diff: exit=$s out=$(printf '%s' "$out" | head -c 200)"
+ok "$((bigdiff_ok == 1 ? 0 : 1))" \
+    "a 40k-line executable diff selects json_test instead of dying on SIGPIPE"
 
 # ---- plan reconciliation ----------------------------------------------------
 if [ "$tests_run" -ne "$PLANNED" ]; then

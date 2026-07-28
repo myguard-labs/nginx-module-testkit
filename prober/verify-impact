@@ -174,7 +174,14 @@ diff_is_comment_only() {
             re='^[[:space:]]*($|//|/\*|\*/|\*([^/]|$))'
             ;;
     esac
-    if printf '%s\n' "$changed" | grep -qvE "$re"; then
+    # Herestring, not `printf | grep -q`: `grep -q` exits on its FIRST match
+    # without draining stdin, so once "$changed" exceeds the 64KiB pipe buffer
+    # the writing printf takes SIGPIPE and `pipefail` promotes rc=141 into a
+    # failure of this function -- measured at 20k changed lines, clean at 100.
+    # A large executable diff would therefore kill the selector instead of
+    # classifying it. Same defect class as the `find ... | head -1` SIGPIPE fix
+    # in lib.sh (s143); a herestring has no writer process to signal.
+    if grep -qvE "$re" <<<"$changed"; then
         echo 0
     else
         echo 1
