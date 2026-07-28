@@ -16,25 +16,32 @@ concurrency:
 jobs:
   # The harness's own parsers and assertion evaluators, as pure functions. No
   # server involved, so this is fast and is the gate that actually blocks.
-  # Two legs, not four: gcc and clang, both with ASan+UBSan on. The sanitizer
-  # build RUNS the exact same *_test.c suite the plain-arch build would, plus
-  # the sanitizer instrumentation -- so a no-san leg's test coverage is a
-  # strict subset of its san sibling's. The only thing a bare `SAN=0` leg adds
-  # is a pure-miscompile / optimizer-divergence canary (a bug the sanitizers'
-  # instrumented codegen happens to hide), which the analyzers job
-  # (-fanalyzer / cppcheck / clang-tidy on uninstrumented source) and the
-  # reproducible-build + build-flags-canary legs already exercise on the plain
-  # toolchain. The two no-san legs were dropped 2026-07-26 to cut PR wall-clock
-  # and builder02 queue pressure; keeping both compilers under sanitizers
-  # preserves the cross-compiler + UB/leak coverage that actually finds bugs.
+  # Four legs: gcc and clang, each with and without ASan+UBSan.
+  #
+  # The two no-san legs were dropped 2026-07-26 on the argument that a plain
+  # leg's coverage is a strict subset of its sanitizer sibling's, since both
+  # run the same *_test.c suite. Restored 2026-07-28 (user decision) because
+  # that argument concedes the gap in its own next clause: what a bare `SAN=0`
+  # leg adds is a miscompile / optimizer-divergence canary -- a bug that only
+  # exists in the codegen the sanitizers do not produce. The jobs it was
+  # handed off to do not cover it. `analyzers` is static, so it never executes
+  # anything; `reproducible-build` compares two builds of the same flags to
+  # each other, which is silent about whether either one is correct; and
+  # `build-flags-canary` asserts the flags, not the behaviour of the binary
+  # they produce. Nothing else in this workflow RUNS the assertions against an
+  # uninstrumented build.
+  #
+  # The wall-clock premise behind the 2026-07-26 cut was also refuted: the CI
+  # waves are slot QUEUEING, not compute (s145), and these legs run in
+  # 0-3 min. Two more of them buys the canary back for close to nothing.
   selftest:
     runs-on: [self-hosted, builder02, lxc]
     strategy:
       fail-fast: false
       matrix:
         cc: [gcc, clang]
-        san: ["1"]
-    name: selftest (${{ matrix.cc }} +asan/ubsan)
+        san: ["0", "1"]
+    name: selftest (${{ matrix.cc }}${{ matrix.san == '1' && ' +asan/ubsan' || '' }})
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
