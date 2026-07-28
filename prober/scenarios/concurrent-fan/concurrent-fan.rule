@@ -1,0 +1,138 @@
+# Scenario: a fan of N concurrent requests leaves the worker exactly as N
+# sequential ones do, and every leg is answered identically.
+#
+# WHAT THIS ADDS OVER THE SELF-TESTS. `concurrent N` is proven at the unit level
+# against a fixture (`spawn_barrier` in prober/http_test.c), which withholds
+# every reply until all N requests have arrived and so pins the client-side
+# write ordering exactly. What no self-test does is run the directive against a
+# REAL worker: the fixture is a few hundred lines of C that answers on demand,
+# and it exercises none of nginx's accept path, connection slots, cycle pool or
+# descriptor accounting. This scenario is the directive's only live-worker
+# coverage.
+#
+# WHAT THIS SCENARIO ASSERTS, AND WHAT IT DELIBERATELY DOES NOT.
+# It asserts RESOURCE NEUTRALITY under a fan: N requests written before any
+# response is consumed leave no extra descriptor, no grown cycle pool and no
+# consumed connection slot behind. That is an honest reading of what the
+# before/after snapshots bracket.
+#
+# It does NOT assert that N request lifetimes overlapped inside the worker, and
+# no oracle here should be read as claiming so. `concurrent` guarantees only
+# that all N requests are WRITTEN before any response is CONSUMED -- a
+# client-side ordering property. Against a fast handler nginx may process,
+# answer and finalize leg 0 while the prober is still writing leg 1, and an
+# unread response sitting in the kernel receive buffer does not hold the
+# worker's request open. Overlap is made LIKELY, not enforced. Proving a
+# simultaneous peak requires the module under test to expose an active-request
+# counter in its probe document and the case to assert the observed peak reaches
+# N; that is a module-side capability, not something this directive or this
+# scenario can substitute for. Do not add an oracle here that assumes a
+# guaranteed peak -- it would pass for the wrong reason on a fast handler and
+# red spuriously on a slow one.
+#
+# WHY A FAN IS WORTH RUNNING AT ALL GIVEN THAT LIMIT. Even without a guaranteed
+# peak, the fan drives the accept path with a burst instead of a trickle, and
+# every leg's response is left unread in the kernel buffer while the remaining
+# legs are written. Both are shapes the sequential suite never produces. A
+# module that allocates per accepted connection and frees per retired REQUEST,
+# or that keys state on a connection it assumes is the only live one, drifts
+# here and nowhere else.
+#
+# WHY connections.free AND NOT connections.total -- same reasoning as
+# conn-delta: total is the configured ceiling and never moves, so asserting on
+# it is vacuous. free is what a leaked connection actually consumes.
+
+name    baseline before the fan
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   connections.free >= 1
+probe   fds >= 1
+
+# The fan itself. Every leg is checked against this case's `expect` lines, so a
+# leg answered differently from the others is a finding even when the aggregate
+# deltas are clean; a failure names the leg.
+#
+# The deltas bracket the ENTIRE fan -- one before-snapshot, one after -- so
+# unlike a per-request delta they would catch a leak of one descriptor per leg
+# as a delta of 8 rather than absorbing it into per-case teardown.
+name        eight concurrent requests are each answered identically
+send        GET / HTTP/1.1\r\n
+send        Host: prober\r\nConnection: close\r\n\r\n
+concurrent  8
+expect      status=200
+expect      body_sha256=a12b7cb43c9d9134b5bb1b35e9096b66775d9e92e7611d1cc92b02edd6782a87
+delta       fds == 0
+delta       connections.free == 0
+delta       pool.cycle_used == 0
+
+# A second fan, immediately after, at a different width.
+#
+# WHAT THE SECOND FAN DOES AND DOES NOT BUY. It doubles the per-leg evidence
+# (16 more legs each asserted) and it exercises the driver at a second width,
+# which is worth having: an off-by-one in the fan's own bookkeeping that only
+# bites at one N would otherwise need a second scenario.
+#
+# It does NOT make the closing floor a detector for a leak of a fixed amount
+# per FAN CALL. Do the subtraction: one slot leaked per fan, across two fans,
+# is 2 slots -- 61 healthy down to 59, against a floor of 50. It sails through.
+# Raising the floor to catch it would put it at 60, one slot under the healthy
+# reading, which reds on any consumer module holding a connection of its own --
+# the opposite mistake, and the one the sizing note below is written to
+# prevent. A per-fan-call leak needs an absolute comparison against a
+# scenario-origin snapshot, which is `probe_baseline`, not a case-local delta.
+#
+# The per-LEG leak is what this scenario's floor actually detects, and the
+# arithmetic for that is in the closing case.
+name        a wider fan, back to back
+send        GET / HTTP/1.1\r\n
+send        Host: prober\r\nConnection: close\r\n\r\n
+concurrent  16
+expect      status=200
+expect      body_sha256=a12b7cb43c9d9134b5bb1b35e9096b66775d9e92e7611d1cc92b02edd6782a87
+delta       fds == 0
+delta       connections.free == 0
+delta       pool.cycle_used == 0
+
+# The closing case. Its `delta` lines are case-local like all the others; the
+# ABSOLUTE floor is what this case exists for.
+#
+# WHAT THE FLOOR ADDS OVER THE FAN DELTAS, precisely. A per-leg leak is NOT
+# invisible to those deltas -- eight slots lost during the first fan read as
+# `delta connections.free == -8` on that case, and it reds there. The floor is
+# the coarser, later guard: it catches drift the case-local deltas can miss
+# because both of a case's snapshots already contain it -- a slot released a
+# case late, or a drift that accrues outside any single case's brackets. The
+# two overlap deliberately, and neither subsumes the other.
+#
+# SIZING THE FLOOR. An absolute floor detects nothing unless the defect it hunts
+# can actually cross it, so the number is derived from a MEASURED healthy
+# reading, not from arithmetic on worker_connections.
+#
+# MEASURED on this conf (nginx 1.29.0), both fans complete and no leak: **61
+# free of 64**. Not the 63 that subtracting one in-flight connection would
+# predict, because the server holds three of its own -- listen socket, epoll,
+# error_log -- the same three conn-delta measured against a pool of 16. The
+# arithmetic guess would have been wrong in the same direction there.
+#
+# Floor 50 is 11 slots under the healthy reading, so a consumer module holding
+# a few connections of its own still passes. The defect it hunts is a slot
+# leaked PER LEG: 24 fanned legs have run by this case, so that lands at 37 --
+# far below 50 and caught. A floor set just under 61 would have been the
+# opposite mistake, red on any consumer that holds anything.
+#
+# A leak of a fixed amount per FAN CALL is explicitly NOT covered by this floor
+# -- two fans leaking one slot each land at 59 and pass. See the note on the
+# second fan above for why widening the floor is the wrong fix and what would
+# actually catch it.
+#
+# Re-measure before changing the pool or the fan widths: the three the server
+# holds for itself is not a constant to rely on.
+name    connections stay above the floor after both fans
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   connections.free >= 50
+delta   fds == 0
+delta   connections.free == 0
+delta   pool.cycle_used == 0
