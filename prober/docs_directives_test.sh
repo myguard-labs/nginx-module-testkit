@@ -27,7 +27,9 @@ cd "$(dirname "$0")"
 RULES=rules.c
 README=../README.md
 
-# 29 parser directives + 1 reverse sweep + 5 exclusion pairs + 5 self-checks.
+# 29 parser directives + 1 reverse sweep + 5 exclusion pairs + 5 self-checks
+# (ladder extraction, backlog cut, fenced backlog heading, locale letter range,
+# parser not empty).
 # The per-directive count is not hardcoded anywhere else on purpose (see
 # parser_directives), so a directive added without touching this number fails
 # the plan check at the bottom -- which is the intended nag, not a nuisance.
@@ -81,9 +83,14 @@ parser_directives() {
 # that point reports as undocumented. No such fence exists today, but this
 # README does carry fenced markdown, and a gate whose failure mode is
 # "silently stop checking" is the shape this whole change exists to remove.
+#
+# Both CommonMark fence delimiters count. The README uses only backticks today
+# (76 of them, balanced; zero tildes), but ~~~ is equally valid and a tilde
+# fence would be invisible to a backtick-only tracker -- which puts us straight
+# back in the latching case above, for a delimiter nobody thinks about.
 readme_reference() {
     awk '
-        /^```/ { fence = !fence }
+        /^(```|~~~)/ { fence = !fence }
         !fence && /^## / { in_backlog = ($0 ~ /^## Ideas and opportunities/) }
         !in_backlog
     ' "$1"
@@ -364,8 +371,12 @@ fi
 
 # The same cut, against a backlog heading that appears as EXAMPLE TEXT inside a
 # fenced block. Without fence tracking the cut latches on at the fenced line and
-# never releases, so `after_fence` -- documented in an ordinary section below --
+# never releases, so the directive documented below -- in an ordinary section --
 # reports undocumented, and so would every real directive after it.
+#
+# Both delimiters are exercised in one fixture. Asserting only the backtick case
+# would leave the ~~~ branch of the fence pattern untested, which is how a
+# half-covered guard passes while one of its arms does nothing.
 # shellcheck disable=SC2016  # markdown code voice, not command substitution
 printf '%s\n' \
     '## Rule reference' \
@@ -373,15 +384,19 @@ printf '%s\n' \
     '```' \
     '## Ideas and opportunities' \
     '```' \
-    '- **`after_fence <n>`** -- documented after the fenced example.' \
+    '- **`after_fence <n>`** -- documented after the backtick example.' \
+    '~~~' \
+    '## Ideas and opportunities' \
+    '~~~' \
+    '- **`after_tilde <n>`** -- documented after the tilde example.' \
     > "$tmpdir/README-fence.md"
 
 fenced=$(readme_reference "$tmpdir/README-fence.md")
 
-if documented "after_fence" "$fenced"; then
+if documented "after_fence" "$fenced" && documented "after_tilde" "$fenced"; then
     ok 0 "a backlog heading inside a fence does not cut the rest of the README"
 else
-    ok 1 "a fenced backlog heading latched the cut and hid the rest of the README"
+    ok 1 "a fenced backlog heading latched the cut (backtick=$(documented after_fence "$fenced" && echo y || echo n), tilde=$(documented after_tilde "$fenced" && echo y || echo n))"
 fi
 
 # ...and the plan is not satisfied by an empty parser. If parser_directives
