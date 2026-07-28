@@ -344,11 +344,19 @@ else
 fi
 
 # The backlog cut, exercised through readme_reference + documented on a
-# synthetic README. Both directions are asserted from one fixture, because
-# only the pair is meaningful: a cut that removes everything makes the first
-# assertion pass while silently reporting all 29 real directives undocumented,
-# and a cut that removes nothing makes the second pass while restoring the
-# `concurrent` hole this exists to close.
+# synthetic README. All three directions are asserted from one fixture, because
+# no one of them is meaningful alone:
+#
+#   * `shipped` (before the backlog) catches a cut that removes everything --
+#     which would otherwise satisfy the `proposed` half while silently
+#     reporting all 29 real directives undocumented;
+#   * `proposed` (inside the backlog) catches a cut that removes nothing, which
+#     restores the exact hole this check exists to close;
+#   * `after_backlog` (after the NEXT heading) catches a cut that latches on and
+#     never reopens. That mutant is invisible to the other two and to the real
+#     sweep, because every directive the README documents today sits ABOVE the
+#     backlog -- so a permanently-latched cut passes the live gate while
+#     silencing everything a future section might add.
 # shellcheck disable=SC2016  # the backticks are markdown code voice, not command substitution
 printf '%s\n' \
     '## Rule reference' \
@@ -358,15 +366,17 @@ printf '%s\n' \
     '  A `proposed N` directive that issues N requests in flight.' \
     '' \
     '## Who maintains this' \
-    'Nothing to see here.' \
+    '- **`after_backlog <n>`** -- documented after the backlog section ends.' \
     > "$tmpdir/README.md"
 
 synthetic=$(readme_reference "$tmpdir/README.md")
 
-if documented "shipped" "$synthetic" && ! documented "proposed" "$synthetic"; then
+if documented "shipped" "$synthetic" \
+   && ! documented "proposed" "$synthetic" \
+   && documented "after_backlog" "$synthetic"; then
     ok 0 "a backlog-only mention is not documentation, a reference entry is"
 else
-    ok 1 "the backlog cut is wrong (shipped=$(documented shipped "$synthetic" && echo y || echo n), proposed=$(documented proposed "$synthetic" && echo y || echo n))"
+    ok 1 "the backlog cut is wrong (shipped=$(documented shipped "$synthetic" && echo y || echo n), proposed=$(documented proposed "$synthetic" && echo y || echo n), after_backlog=$(documented after_backlog "$synthetic" && echo y || echo n))"
 fi
 
 # The same cut, against a backlog heading that appears as EXAMPLE TEXT inside a
