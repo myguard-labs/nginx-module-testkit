@@ -11,11 +11,40 @@
 # the directive would be a vacuous no-op and is deliberately omitted. The
 # reconnect-and-reload survival claims are the driver's assertions, not this
 # file's.
+#
+# WHY `delta fds_by_kind.*` SPLIT INSTEAD OF A PLAIN `delta fds == 0`. This
+# scenario is the harness's most frequent flake (see driver.sh's settle-loop
+# comment): the old worker's parked upstream connection is reaped
+# ASYNCHRONOUSLY after the reload, so the fd table can still be draining a
+# moment after a stable pid answers two consecutive probes -- a settle proves
+# quiescence at time T, this assertion runs at T+n, and no settle variant can
+# close that gap (two were tried and both failed). `delta fds == 0` sees the
+# aggregate count drop by one and reds on a closing descriptor, not a leaked
+# one.
+#
+# The draining descriptor is specifically the dying worker's parked upstream
+# SOCKET (backend.c's memcached keepalive connection) -- never a file, an
+# anon (eventfd/timerfd/signalfd) or "other" descriptor, none of which this
+# scenario's reload path touches. So the assertion is split by kind
+# (ngx_test_probe_fd_kinds(), ngx_test_probe.c): the three kinds that cannot
+# legitimately move here stay at the original strict `== 0`, and only the
+# socket bucket is relaxed to `<= 0` -- it tolerates the known asynchronous
+# DECREASE (a descriptor closing) but still reds hard on any INCREASE, which
+# is exactly the shape a real socket leak takes (open one, never close it).
+# A leaked socket therefore still fails this rule: `<= 0` rejects a positive
+# delta exactly as `== 0` would. This is narrower than tolerating "any
+# negative delta on the aggregate `fds`" (rejected option (a) in this
+# scenario's history) because it cannot also swallow a leaked file/anon/other
+# descriptor riding alongside a legitimate socket close -- those three keep
+# the original zero-tolerance oracle.
 
 name    the reloaded worker serves cleanly after the idle-close and reload
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+delta   fds_by_kind.socket <= 0
+delta   fds_by_kind.file == 0
+delta   fds_by_kind.anon == 0
+delta   fds_by_kind.other == 0
 no_error_log  \[error\]
