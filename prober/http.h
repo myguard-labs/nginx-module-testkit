@@ -70,6 +70,32 @@ typedef struct {
      * number of reads regardless of the receive window. 0 if unreadable. */
     int     effective_rcvbuf;
 
+    /* Milliseconds this client deliberately slept between reads to honour
+     * `recv_slow`, summed over the collection of this response. 0 whenever the
+     * caller passed no pacing.
+     *
+     * The sleep half of what `recv_slow` promises. `reads` above already covers
+     * the chunk cap, and covers ONLY the cap: a mechanism that bounded every
+     * read and slept for none of them satisfies the read count in full, which
+     * left the sleep resting on a wall clock alone.
+     *
+     * A wall clock is the wrong unit for it. An elapsed-time bound degrades in a
+     * DIRECTION depending on which way it points: a floor decays into passing
+     * vacuously (scheduling overhead alone satisfies it while the sleep does
+     * nothing), a ceiling into failing spuriously on a loaded runner. Both have
+     * been observed here on diffs containing no C.
+     *
+     * ACCUMULATED FROM sleep_ms()'s RETURN VALUE, and that detail is the whole
+     * point rather than a style choice. A counter incremented by `recv_opt->ms`
+     * beside the call would record what the code INTENDED; gut the sleep to a
+     * no-op and the counter still reports a full set of sleeps that never
+     * happened, so an assertion built on it would certify precisely the
+     * regression it exists to catch. Crediting the return couples the number to
+     * the operation. Distinct from `effective_rcvbuf` above, which is stronger
+     * still -- getsockopt() reads back independent kernel state, whereas this
+     * remains this process's own account of its own behaviour. */
+    long long  paced_sleep_ms;
+
     /* How the read loop ended, and how long after the request went out.
      *
      * `close_ms` is measured from the moment the last request byte is written

@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  160
+#define PLANNED  163
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -174,6 +174,12 @@ typedef struct {
      * read to be collected in several, and a read count cannot be inflated by a
      * loaded box the way the elapsed-time floor beside it can. */
     size_t  client_reads;
+
+    /* Milliseconds the CLIENT deliberately slept between reads, lifted off the
+     * response like the fields above. recv_slow's other deterministic witness:
+     * client_reads gates the chunk cap, this gates the SLEEP the cap paces the
+     * reads apart with. Neither can be moved by a loaded box. */
+    long long  paced_sleep_ms;
 } echo_result;
 
 
@@ -370,6 +376,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
     long           close_ms = 0;
     int            effective_rcvbuf = 0;
     size_t         client_reads = 0;
+    long long      paced_sleep_ms = 0;
 
     if (pipe(fds) != 0) {
         return -1;
@@ -391,6 +398,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
         close_ms = resp.close_ms;
         effective_rcvbuf = resp.effective_rcvbuf;
         client_reads = resp.reads;
+        paced_sleep_ms = resp.paced_sleep_ms;
         http_response_free(&resp);
     }
 
@@ -410,6 +418,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
     out->close_ms = close_ms;
     out->effective_rcvbuf = effective_rcvbuf;
     out->client_reads = client_reads;
+    out->paced_sleep_ms = paced_sleep_ms;
 
     return rc;
 }
@@ -1743,6 +1752,35 @@ main(void)
            "recv_slow bounds each read by the chunk, so the reply needs several");
 
         /*
+         * The SLEEP's witness, and the half the assertion above does not reach.
+         * `client_reads` gates the chunk cap; a mechanism that capped every read
+         * and slept for none of them satisfies it in full, which left the sleep
+         * standing on the wall clock alone.
+         *
+         * An EQUALITY, and the count is MEASURED rather than derived: 5 reads
+         * and 120 ms, stable across 8 consecutive runs on loopback. The
+         * arithmetic agrees (418 bytes at a 100-byte cap is 5 reads, and
+         * `paced_full` sleeps only before a read the loop expects to fill, so
+         * the final short read is unpaced -- 4 sleeps of 30 ms), but the
+         * measurement is what this assertion rests on.
+         *
+         * It was briefly `>= 3 * rv.ms`, hedged one sleep low against a peer
+         * handing the bytes over in more segments than the cap forces. That
+         * hedge was wrong twice over: the fragmentation does not occur here, and
+         * a floor one under the real count ADMITS the single-sleep regression it
+         * was supposed to be tolerant of -- a mutant sleeping 3 times of 4
+         * passed the entire suite. If loopback ever does fragment this reply the
+         * assertion reds, and that is the correct outcome: fix the fixture, not
+         * the bound. Widening it back to a floor re-opens the hole.
+         *
+         * The value is credited from `sleep_ms()`'s return rather than from
+         * `recv_opt->ms` beside the call, so gutting the sleep to a no-op zeroes
+         * this counter instead of leaving it reporting sleeps that never
+         * happened. See the field comment in http.h.
+         */
+        ok(rc == 0 && er.paced_sleep_ms == 4 * rv.ms,
+           "recv_slow actually sleeps between the reads it paces");
+        /*
          * The negative control: the same exchange unpaced must NOT cost what
          * the paced one did, or the assertions above would be measuring the
          * fixture rather than the pacing.
@@ -1787,6 +1825,52 @@ main(void)
          */
         ok(rc == 0 && er.client_reads == 1,
            "without recv_slow the whole reply arrives in a single uncapped read");
+
+        /*
+         * The sleep mirror of the control, and an EQUALITY because zero is the
+         * only defensible value: with no `recv_slow` the pacing branch is never
+         * entered, so any nonzero total means the client slept for a reason
+         * nothing asked it to.
+         *
+         * This is what upgrades the elapsed-time control above from load-
+         * TOLERANT to load-IMMUNE. `(t1 - t0) * 2 < paced_ms` compares two wall
+         * clocks, so a stall landing on the PACED run inflates `paced_ms` and
+         * makes the comparison EASIER -- a pacing mechanism broken in exactly
+         * the way it exists to catch could ride that inflation through. Pairing
+         * it with a counter the machine cannot move closes that direction:
+         * together they say the paced run slept and the unpaced one did not,
+         * with neither claim resting on how busy the box was.
+         */
+        ok(rc == 0 && er.paced_sleep_ms == 0,
+           "without recv_slow the client never sleeps between reads");
+
+        /*
+         * A pacing request nanosleep() cannot honour must credit NOTHING.
+         *
+         * `chunk` is set, so the cap engages and the reply is collected in
+         * several reads exactly as above -- only the duration is unusable. A
+         * negative `tv_nsec` is EINVAL, so nothing sleeps; the question is
+         * whether the counter says so. Returning the requested `ms` on a failed
+         * sleep would rebuild the defect the return value exists to prevent one
+         * layer down: the account would show four sleeps of a duration that was
+         * never waited.
+         *
+         * Reachable only from C. The rule parser clamps recv_slow's ms to
+         * 1..MAX_PAUSE_MS (rules.c), and this drives the transport directly, so
+         * the guard is here rather than left to the caller -- http_exchange()
+         * is a public entry point and the parser is not the only way in.
+         */
+        memset(&rv, 0, sizeof(rv));
+        rv.chunk = 100;
+        rv.ms = -1;
+
+        rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0,
+                           HTTP_IDLE_NONE, &er);
+
+        ok(rc == 0 && er.client_reads >= (SPAWN_REPLY_LEN + 99) / 100
+           && er.paced_sleep_ms == 0,
+           "a pacing delay nanosleep cannot honour credits no sleep at all");
 
         /* A chunk larger than the whole response is one read and no sleep --
          * the read-side mirror of send_slow's large-chunk case. */

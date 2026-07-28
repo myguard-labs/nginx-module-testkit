@@ -994,18 +994,45 @@ http_framed_state(const char *buf, size_t len, size_t *resp_len)
  * Sleep `ms`, resuming across signals rather than returning early: a pause cut
  * short by a stray signal would silently write the rest of the request sooner
  * than the rule file asked for, turning a timing test into a flaky one.
+ *
+ * RETURNS the milliseconds actually slept, which is `ms` on every path that
+ * reaches the end of the loop. The return value exists so a caller accounting
+ * for its own pacing can credit the sleep that HAPPENED rather than the one it
+ * intended: a caller that increments a counter beside the call site is writing
+ * down its intent, and that counter stays truthful even if this function is
+ * later gutted to a no-op. Feeding the result back is what couples the two, so
+ * removing the sleep necessarily removes the credit.
  */
-static void
+static long
 sleep_ms(long ms)
 {
     struct timespec  ts;
 
+    /* A non-positive duration is not a short sleep, it is no sleep. Returning
+     * `ms` for it would credit a caller's pacing account for time that never
+     * passed, and nanosleep() rejects a negative tv_nsec with EINVAL anyway. */
+    if (ms <= 0) {
+        return 0;
+    }
+
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (ms % 1000) * 1000000L;
 
-    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
-        /* ts now holds the remaining time; go again. */
+    while (nanosleep(&ts, &ts) != 0) {
+        /* EINTR is the resumable case: ts now holds the remaining time, so go
+         * again rather than returning early. A pause cut short by a stray
+         * signal would silently write the rest of the request sooner than the
+         * rule file asked for, turning a timing test into a flaky one. */
+        if (errno != EINTR) {
+            /* EINVAL or EFAULT: nothing was slept, and the whole point of this
+             * return value is that it cannot report a sleep that did not
+             * happen. Crediting `ms` here would rebuild the exact defect the
+             * return exists to prevent, one layer down. */
+            return 0;
+        }
     }
+
+    return ms;
 }
 
 
@@ -1575,7 +1602,11 @@ http_read_response(int fd, int timeout_ms,
     char       *buf;
     size_t      cap = 8192, len = 0, want;
     int         paced_full = 0;
-    long        paced_sleep_ms = 0;   /* intentional recv pacing, AUD-07 */
+    /* Intentional recv pacing, AUD-07. Kept as a local because the deadline
+     * check below reads it on every iteration of the read loop; it is published
+     * to resp->paced_sleep_ms at the point it grows, so the caller gets the
+     * sleep's only witness that is not a wall clock. */
+    long long   paced_sleep_ms = 0;
 
     buf = malloc(cap);
     if (buf == NULL) {
@@ -1667,13 +1698,20 @@ http_read_response(int fd, int timeout_ms,
             }
 
             if (paced_full) {
-                sleep_ms(recv_opt->ms);
                 /* AUD-07: this sleep is the harness's OWN deliberate pacing, not
                  * the server being slow, so it must not count against the
                  * whole-exchange deadline -- otherwise a legitimately paced
                  * recv_slow case that needs many chunks would trip the trickle
-                 * guard despite the server making continuous progress. */
-                paced_sleep_ms += recv_opt->ms;
+                 * guard despite the server making continuous progress.
+                 *
+                 * Credited from sleep_ms()'s RETURN, never from recv_opt->ms
+                 * directly. Incrementing by the configured value beside the call
+                 * would record what this code meant to do, so gutting the sleep
+                 * to a no-op would leave the counter reporting a full set of
+                 * sleeps that never happened -- and the assertion built on it
+                 * would certify the mechanism it exists to catch. */
+                paced_sleep_ms += sleep_ms(recv_opt->ms);
+                resp->paced_sleep_ms = paced_sleep_ms;
             }
         }
 
