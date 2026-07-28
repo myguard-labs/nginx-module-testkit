@@ -724,6 +724,107 @@ jobs:
 
           cp /tmp/rule.orig "$RULE"
 
+  # OPT-IN CONSUMER JOB -- the only place the consumer-* scenarios actually
+  # EXECUTE. Everywhere else they SKIP, and that is not a detail to gloss over:
+  # the `scenarios` job above builds ONLY t/module, so every consumer scenario's
+  # ./requires gate finds no .so and emits `1..0 # SKIP`. A SKIP is reported as
+  # a pass. Left at that, these scenarios would read green forever while proving
+  # nothing -- the same vacuous shape `zone-exhaustion` was deleted for.
+  #
+  # WHY OPT-IN (workflow_dispatch / a `run-consumers` label) RATHER THAN ON
+  # EVERY PR: it configures and builds a full nginx with nine third-party
+  # modules linked in. That is minutes of build for a signal about OTHER repos'
+  # code, which does not change when this repo's PR changes. The PR gate stays
+  # fast; this runs when someone wants the answer.
+  #
+  # WHAT A RED HERE MEANS: a consumer module leaked on its per-request path, or
+  # stopped building. Per the repo's mission, that is a RESULT about that module
+  # -- it gets filed in that module's own memory mirror, NOT patched here. This
+  # repo reports on consumers; it does not fix them.
+  consumers:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-consumers')
+    runs-on: [self-hosted, builder02, lxc]
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      # consumers/ is gitignored (it is 190M of other repos' sources), so it is
+      # absent from a fresh checkout and has to be repopulated from the sibling
+      # checkouts under /opt/myguard. That path exists because every job in this
+      # workflow runs on the self-hosted builder02 runner, which is the box that
+      # holds those checkouts -- on a hosted runner this step would find nothing
+      # and the build below would have no modules to add. sync-consumers.sh
+      # prints `MISSING <path>` for a checkout it cannot find, so a moved or
+      # un-cloned module is visible in the log rather than silently dropped.
+      - name: populate consumers/ from the sibling checkouts
+        run: tools/sync-consumers.sh
+
+      # One configure + make with the reference probe AND every consumer. The
+      # module list is bound at configure time, so this cannot be split into
+      # per-module builds without paying the nginx build cost N times.
+      #
+      # `|| true`: the script exits 2 when a module produces no .so, and that is
+      # exactly the finding this job exists to surface -- it must be reported by
+      # the scenario SKIPs and the summary below, not swallowed as a job-level
+      # failure that hides which of the other eight passed. A module that fails
+      # to BUILD is listed in the step's own table.
+      - name: build the consumers + the reference probe
+        run: tools/build-consumers.sh --stage nginx-1.29.0-consumers || true
+
+      - name: build the prober
+        run: prober/build.sh
+
+      # Run ONLY the consumer scenarios. The rest of the tree is the `scenarios`
+      # job's business and re-running it here would duplicate minutes of work to
+      # learn nothing new.
+      #
+      # A SKIP is tolerated (a module that did not build cannot be probed) but
+      # is COUNTED and printed, because "everything skipped" and "everything
+      # passed" are both all-green to a naive reader and mean opposite things.
+      - name: run the consumer scenarios
+        env:
+          PROBER_ROOT: ${{ github.workspace }}
+          PROBER_MODULE: ngx_http_test_ref_module.so
+          PROBER_DIRECTIVE: test_ref_probe
+          PROBER_PROBE: "test_ref_probe;"
+        run: |
+          fail=0 skip=0 pass=0
+          for d in prober/scenarios/consumer-*/; do
+              name="$(basename "$d")"
+              # ABSOLUTE path: run-scenario.sh cd's into prober/ before
+              # resolving its argument, so a repo-root-relative path resolves
+              # against the wrong directory and dies with "Not a directory".
+              abs="$GITHUB_WORKSPACE/$d"
+              port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
+              echo "::group::$name"
+              if PROBER_PORT="$port" \
+                 prober/run-scenario.sh "$abs" nginx 1.29.0-consumers >/tmp/"$name".tap 2>&1; then
+                  if grep -q '^1\.\.0 # SKIP' /tmp/"$name".tap; then
+                      skip=$((skip + 1)); echo "SKIP $name"
+                  else
+                      pass=$((pass + 1)); echo "PASS $name"
+                  fi
+              else
+                  fail=$((fail + 1)); echo "FAIL $name"
+              fi
+              cat /tmp/"$name".tap
+              echo "::endgroup::"
+          done
+
+          echo "consumer scenarios: $pass passed, $skip skipped, $fail failed"
+
+          # A wholly-skipped run is NOT a success. It means no consumer .so was
+          # built, so this job proved nothing -- fail loudly rather than let an
+          # all-SKIP run bank a green tick.
+          if [ "$pass" -eq 0 ]; then
+              echo "no consumer scenario actually executed -- the build produced no usable .so, so this job proved nothing" >&2
+              exit 1
+          fi
+          [ "$fail" -eq 0 ]
+
   header-self-sufficiency:
     runs-on: [self-hosted, builder02, lxc]
     steps:
@@ -801,6 +902,19 @@ jobs:
           # one.
           shopt -s nullglob
           shellcheck -x --source-path=prober prober/*.sh prober/verify-impact prober/pr-impact prober/pr-memcheck prober/scenarios/*/driver.sh tools/*.sh
+
+      # The consumer-* scenarios listed in tools/gen-consumer-scenarios.sh are
+      # GENERATED from a table in that script. Hand-editing one works locally
+      # and is then silently reverted the next time anyone regenerates -- so the
+      # edit survives review, lands, and disappears later without a trace. This
+      # step regenerates into a temp dir and diffs, so a hand-edit fails here
+      # with the diff printed rather than rotting.
+      #
+      # It lives in the `shell` job, not the opt-in `consumers` job below,
+      # because it needs no nginx build: it is a pure text check and belongs on
+      # every PR.
+      - name: generated consumer scenarios are up to date
+        run: tools/gen-consumer-scenarios.sh --check
 
       # Downloaded and hash-checked, same as the server tarballs above: a
       # linter that gates the build is as much a supply-chain dependency as

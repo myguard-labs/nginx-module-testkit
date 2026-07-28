@@ -13,19 +13,20 @@
 # python3): the oracle reads the probe's own JSON fields and an HTTP response
 # header, both already-established harness idioms (prober_probe_field, plain
 # curl-less /dev/tcp reads). So the ONLY gate is the .so itself.
-found=0
-if [ -n "${PROBER_BUILD:-}" ]; then
-    [ -f "$PROBER_BUILD/objs/ngx_http_cache_turbo_module.so" ] && found=1
-    SEARCHED="$PROBER_BUILD/objs"
-else
-    BUILD_ROOT="${PROBER_ROOT:-.}/.build"
-    for so in "$BUILD_ROOT"/*/objs/ngx_http_cache_turbo_module.so; do
-        [ -f "$so" ] && { found=1; break; }
-    done
-    SEARCHED="$BUILD_ROOT/*/objs"
-fi
-if [ "$found" -eq 0 ]; then
-    echo "cache_turbo module .so not found in $SEARCHED -- nginx.conf load_modules ngx_http_cache_turbo_module.so unconditionally, so a statically-linked build does not satisfy it; build the module as a dynamic module to run this scenario"
+# THE GATE MUST CHECK THE TREE THAT WILL ACTUALLY BE BOOTED -- nothing else.
+# This gate used to glob `.build/*/objs` for the .so, which finds it in ANY
+# staged tree. With the .so present in one tree and absent from the one being
+# booted, the gate passed and nginx then died at `nginx -t` with a dlopen
+# failure -- a hard FAIL where the entire purpose of the gate is a clean SKIP.
+# run-scenario.sh runs this before prober_resolve, so PROBER_RESOLVED_BUILD does
+# not exist yet; recompute the same path lib.sh will, taking flavor/version from
+# argv ($2/$3, as run-scenario.sh passes them) with the same defaults.
+FLAVOR="${2:-nginx}"
+VERSION="${3:-1.31.3}"
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-.}/.build/${FLAVOR}-${VERSION}}"
+
+if [ ! -f "$BUILD/objs/ngx_http_cache_turbo_module.so" ]; then
+    echo "cache_turbo module .so not found in $BUILD/objs -- nginx.conf load_modules ngx_http_cache_turbo_module.so unconditionally, so this tree cannot run the scenario; build it as a dynamic module (tools/build-consumers.sh --stage ${FLAVOR}-${VERSION}) to run this scenario"
     exit 1
 fi
 

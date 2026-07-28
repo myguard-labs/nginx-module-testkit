@@ -59,7 +59,14 @@ TARGETS=(
     labs/nginx-autocert-module
     labs/nginx-cache-turbo-module
     labs/nginx-error-abuse-module
-    labs/nginx-http-sentinel-module
+    # nginx-http-sentinel-module is DELIBERATELY ABSENT, not forgotten. It does
+    # not compile against nginx 1.29.0: src/sentinel_pow.c:221 calls
+    # ngx_http_parse_cookie_lines, which exists in no nginx core release (core
+    # has ngx_http_parse_set_cookie_lines, a different function with a
+    # different signature). That is a bug in the module, filed in its own
+    # memory mirror -- this repo does not fix consumers, it reports on them.
+    # Re-add the row once that module builds; syncing it before then only
+    # copies 30M of sources that can never produce a .so.
     labs/nginx-http-shield-module
     labs/nginx-label-autoconf-module
     labs/nginx-skeleton-module
