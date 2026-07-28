@@ -3,7 +3,14 @@ name: ci
 # PR-only. A push trigger would double every run and, on merge, re-run the exact
 # commit that just passed as a PR -- see the merge-gate note in the README.
 on:
+  # `labeled` is here for the opt-in `consumers` job, which gates on the
+  # `run-consumers` label. The default activity set for `pull_request` is
+  # opened/synchronize/reopened only, so without this the label applies
+  # silently and nothing runs -- the job would appear simply not to exist.
+  # Listing the defaults explicitly is required: naming any type replaces the
+  # default set rather than adding to it.
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 permissions:
