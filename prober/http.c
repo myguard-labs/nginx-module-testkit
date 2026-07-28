@@ -1575,7 +1575,11 @@ http_read_response(int fd, int timeout_ms,
     char       *buf;
     size_t      cap = 8192, len = 0, want;
     int         paced_full = 0;
-    long        paced_sleep_ms = 0;   /* intentional recv pacing, AUD-07 */
+    /* Intentional recv pacing, AUD-07. Kept as a local because the deadline
+     * check below reads it on every iteration of the read loop; it is published
+     * to resp->paced_sleep_ms at the point it grows, so the caller gets the
+     * sleep's only witness that is not a wall clock. */
+    long        paced_sleep_ms = 0;
 
     buf = malloc(cap);
     if (buf == NULL) {
@@ -1674,6 +1678,7 @@ http_read_response(int fd, int timeout_ms,
                  * recv_slow case that needs many chunks would trip the trickle
                  * guard despite the server making continuous progress. */
                 paced_sleep_ms += recv_opt->ms;
+                resp->paced_sleep_ms = paced_sleep_ms;
             }
         }
 

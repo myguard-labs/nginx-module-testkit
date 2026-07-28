@@ -70,6 +70,25 @@ typedef struct {
      * number of reads regardless of the receive window. 0 if unreadable. */
     int     effective_rcvbuf;
 
+    /* Milliseconds this client deliberately slept between reads to honour
+     * `recv_slow`, summed over the collection of this response. 0 whenever the
+     * caller passed no pacing.
+     *
+     * The DETERMINISTIC witness that the pacing sleep actually ran, and the
+     * sleep half of what `recv_slow` promises -- `reads` above already covers
+     * the chunk cap, but a mechanism that capped every read and never slept
+     * would satisfy the cap witness completely.
+     *
+     * Needed because the alternative is a wall clock. An elapsed-time bound
+     * degrades in a DIRECTION depending on which way it points: a floor decays
+     * into passing vacuously (scheduling overhead alone satisfies it while the
+     * sleep does nothing), a ceiling into failing spuriously on a loaded
+     * runner. Both have been observed here on diffs containing no C. This
+     * counter is the mechanism's own output rather than a measurement of the
+     * machine, so no amount of load moves it. Same role `effective_rcvbuf`
+     * plays for SO_RCVBUF and for the same reason. */
+    long    paced_sleep_ms;
+
     /* How the read loop ended, and how long after the request went out.
      *
      * `close_ms` is measured from the moment the last request byte is written

@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  160
+#define PLANNED  162
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -174,6 +174,12 @@ typedef struct {
      * read to be collected in several, and a read count cannot be inflated by a
      * loaded box the way the elapsed-time floor beside it can. */
     size_t  client_reads;
+
+    /* Milliseconds the CLIENT deliberately slept between reads, lifted off the
+     * response like the fields above. recv_slow's other deterministic witness:
+     * client_reads gates the chunk cap, this gates the SLEEP the cap paces the
+     * reads apart with. Neither can be moved by a loaded box. */
+    long    paced_sleep_ms;
 } echo_result;
 
 
@@ -370,6 +376,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
     long           close_ms = 0;
     int            effective_rcvbuf = 0;
     size_t         client_reads = 0;
+    long           paced_sleep_ms = 0;
 
     if (pipe(fds) != 0) {
         return -1;
@@ -391,6 +398,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
         close_ms = resp.close_ms;
         effective_rcvbuf = resp.effective_rcvbuf;
         client_reads = resp.reads;
+        paced_sleep_ms = resp.paced_sleep_ms;
         http_response_free(&resp);
     }
 
@@ -410,6 +418,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
     out->close_ms = close_ms;
     out->effective_rcvbuf = effective_rcvbuf;
     out->client_reads = client_reads;
+    out->paced_sleep_ms = paced_sleep_ms;
 
     return rc;
 }
@@ -1743,6 +1752,25 @@ main(void)
            "recv_slow bounds each read by the chunk, so the reply needs several");
 
         /*
+         * The SLEEP's deterministic witness, and the half the assertion above
+         * does not reach. `client_reads` gates the chunk cap; a mechanism that
+         * capped every read and slept for none of them satisfies it in full.
+         * The timing floor is the only other thing standing behind the sleep,
+         * and a floor decays into passing vacuously.
+         *
+         * A floor rather than an equality, and deliberately one sleep short of
+         * the arithmetic. 418 bytes at 100 per read is 5 reads, and the loop
+         * sleeps only BEFORE a read it expects to fill (`paced_full`), so the
+         * final short read is not paced: 4 sleeps of 30 ms. Stated as `>= 90`
+         * -- three sleeps -- because a peer free to hand the bytes over in more
+         * segments than the cap forces can add unpaced short reads, which
+         * subtract sleeps without the pacing being broken. Three still cannot
+         * be reached by a mechanism that never sleeps, and that is the claim.
+         */
+        ok(rc == 0 && er.paced_sleep_ms >= 3 * rv.ms,
+           "recv_slow actually sleeps between the reads it paces");
+
+        /*
          * The negative control: the same exchange unpaced must NOT cost what
          * the paced one did, or the assertions above would be measuring the
          * fixture rather than the pacing.
@@ -1787,6 +1815,24 @@ main(void)
          */
         ok(rc == 0 && er.client_reads == 1,
            "without recv_slow the whole reply arrives in a single uncapped read");
+
+        /*
+         * The sleep mirror of the control, and an EQUALITY because zero is the
+         * only defensible value: with no `recv_slow` the pacing branch is never
+         * entered, so any nonzero total means the client slept for a reason
+         * nothing asked it to.
+         *
+         * This is what upgrades the elapsed-time control above from load-
+         * TOLERANT to load-IMMUNE. `(t1 - t0) * 2 < paced_ms` compares two wall
+         * clocks, so a stall landing on the PACED run inflates `paced_ms` and
+         * makes the comparison EASIER -- a pacing mechanism broken in exactly
+         * the way it exists to catch could ride that inflation through. Pairing
+         * it with a counter the machine cannot move closes that direction:
+         * together they say the paced run slept and the unpaced one did not,
+         * with neither claim resting on how busy the box was.
+         */
+        ok(rc == 0 && er.paced_sleep_ms == 0,
+           "without recv_slow the client never sleeps between reads");
 
         /* A chunk larger than the whole response is one read and no sleep --
          * the read-side mirror of send_slow's large-chunk case. */
