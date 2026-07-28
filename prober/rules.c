@@ -1294,6 +1294,42 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
 
             cases[n - 1].open_conns = (int) count;
 
+        } else if (strcmp(directive, "concurrent") == 0) {
+            char   *count_s = trim(arg);
+            char   *stop;
+            long    count;
+
+            if (*count_s == '\0') {
+                die("%s:%d: concurrent needs <count>", file, lineno);
+            }
+
+            count = strtol(count_s, &stop, 10);
+
+            /* Whole-argument check, same reasoning as open_conns above: a case
+             * that silently runs a different number of requests than the file
+             * spells is a test whose subject changed without anyone noticing. */
+            if (stop == count_s || *stop != '\0') {
+                die("%s:%d: concurrent count \"%s\" is not a number",
+                    file, lineno, count_s);
+            }
+
+            /* Floor is 2, not 1. `concurrent 1` is exactly the ordinary path
+             * with extra machinery, so accepting it would let a rule file claim
+             * a concurrency test while asserting nothing about overlap -- the
+             * vacuous-gate shape this harness exists to catch. Reject it at
+             * parse time with a line number instead. */
+            if (count < 2 || count > MAX_CONCURRENT) {
+                die("%s:%d: concurrent %ld out of range (2..%d)",
+                    file, lineno, count, MAX_CONCURRENT);
+            }
+
+            if (cases[n - 1].concurrent != 0) {
+                die("%s:%d: concurrent already set for this case",
+                    file, lineno);
+            }
+
+            cases[n - 1].concurrent = (int) count;
+
         } else if (strcmp(directive, "xfail") == 0) {
             if (cases[n - 1].xfail) {
                 die("%s:%d: xfail already set for this case", file, lineno);
@@ -1396,6 +1432,104 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
             die("%s: case \"%s\" carries open_conns %d but no probe assertion; "
                 "the held connections would be observed by nothing", file,
                 tc->name != NULL ? tc->name : "(unnamed)", tc->open_conns);
+        }
+
+        /*
+         * `concurrent` and `block` describe incompatible wire shapes: a
+         * pipeline is an ORDERED sequence on ONE connection, and the whole
+         * point of concurrent is N connections with no ordering between them.
+         * "N pipelines at once" is a coherent feature but a much larger one
+         * (per-connection block cursors, per-connection failure attribution),
+         * and silently picking either interpretation would run something other
+         * than what the file spells. Reject the pair with a line-free but
+         * case-named error, the same shape as the open_conns rule above.
+         */
+        if (tc->concurrent > 0 && tc->n_blocks > 0) {
+            die("%s: case \"%s\" carries both concurrent %d and %zu block(s); "
+                "a pipeline is ordered on one connection and cannot also be "
+                "issued concurrently", file,
+                tc->name != NULL ? tc->name : "(unnamed)",
+                tc->concurrent, tc->n_blocks);
+        }
+
+        /*
+         * A concurrent fan whose results nothing compares is a vacuous test in
+         * the same way open_conns without a probe is: the directive's entire
+         * value is that the before/after snapshots bracket N OVERLAPPING
+         * requests, so without a delta or probe assertion the case pays for N
+         * connections and asserts only what a single request already asserted.
+         * Requiring one of the two snapshot oracles is what makes the overlap
+         * observable.
+         */
+        if (tc->concurrent > 0 && tc->n_deltas == 0 && tc->n_probes == 0) {
+            die("%s: case \"%s\" carries concurrent %d but no delta or probe "
+                "assertion; the overlap would be observed by nothing", file,
+                tc->name != NULL ? tc->name : "(unnamed)", tc->concurrent);
+        }
+
+        /*
+         * `abort`, `hold` and `expect_idle` each end their connection WITHOUT
+         * ever reading a response -- in http_exchange() they return before the
+         * read half runs at all. A concurrent fan carrying one of them would
+         * open N connections, write N requests, read nothing, and then assert
+         * its delta against a fan whose responses were never collected: the
+         * overlap the directive pays for would be observed by nothing, which is
+         * the same vacuity the delta/probe rule above rejects.
+         *
+         * Rejected at load time with the offending directive named, rather than
+         * silently dropped in the driver, so a rule file cannot claim a
+         * concurrency test that reads no responses.
+         *
+         * `shutdown` is deliberately NOT in this list: a half-close is a
+         * modifier on the request, not a substitute for the response -- the peer
+         * still answers, and collecting that answer is the point. See
+         * http_exchange_concurrent()'s header in http.c.
+         */
+        if (tc->concurrent > 0 && (tc->saw_abort || tc->saw_hold
+                                   || tc->saw_idle))
+        {
+            const char *which = tc->saw_abort ? "abort"
+                                : (tc->saw_hold ? "hold" : "expect_idle");
+
+            die("%s: case \"%s\" carries concurrent %d and %s; %s ends its "
+                "connection without reading a response, so the fan would "
+                "collect nothing to assert against", file,
+                tc->name != NULL ? tc->name : "(unnamed)", tc->concurrent,
+                which, which);
+        }
+
+        /*
+         * Timing assertions cannot be trusted across a fan, because the drain
+         * is sequential and BLOCKING: leg i+1 is not read until leg i has been
+         * read to completion, while its `sent_at` clock has been running the
+         * whole time. Time spent draining an earlier leg is therefore charged
+         * to every later leg's whole-exchange deadline and close_ms.
+         *
+         * With `recv_slow` the effect is deterministic rather than incidental
+         * -- the pacing sleeps are deliberate, and http_read_response()
+         * discounts only the pacing performed while reading THAT leg. A prompt
+         * final leg can then be reported as a timeout or a late close purely
+         * because an earlier leg was slow, which is a false failure that also
+         * blames the wrong leg.
+         *
+         * Rejected rather than silently mismeasured. Fixing it properly means
+         * draining all N sockets through one poll() loop with per-leg
+         * nonblocking state, which is a real feature and a separate concern
+         * from this directive; until then the honest move is to refuse the
+         * combination instead of reporting a number that is wrong.
+         */
+        if (tc->concurrent > 0
+            && (tc->saw_close_within || tc->saw_recv_slow))
+        {
+            const char *which = tc->saw_close_within
+                                    ? "expect_close_within" : "recv_slow";
+
+            die("%s: case \"%s\" carries concurrent %d and %s; the fan drains "
+                "its legs in order, so an earlier leg's read time is charged "
+                "to every later leg's clock and the timing verdict would be "
+                "measured against the wrong interval", file,
+                tc->name != NULL ? tc->name : "(unnamed)", tc->concurrent,
+                which);
         }
 
         /*

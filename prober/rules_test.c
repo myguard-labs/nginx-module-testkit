@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  253
+#define PLANNED  274
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1136,6 +1136,97 @@ main(void)
                "open_conns with no argument dies");
     expect_die("name t\nsend X\nopen_conns 5\nopen_conns 6\nprobe fds >= 0\n",
                "a repeated open_conns dies");
+
+    /* ---- concurrent ----------------------------------------------------- */
+
+    n = load_str("name t\nsend GET / HTTP/1.0\\r\\n\\r\\n\n"
+                 "concurrent 8\nprobe connections.free >= 0\n");
+    ok(n == 1 && cases[0].concurrent == 8,
+       "concurrent stores the in-flight count");
+    free_all(n);
+
+    n = load_str("name t\nsend GET / HTTP/1.0\\r\\n\\r\\n\n");
+    ok(n == 1 && cases[0].concurrent == 0,
+       "a case without concurrent runs the ordinary single-request path");
+    free_all(n);
+
+    n = load_str("name a\nsend X\nconcurrent 4\nprobe connections.free >= 0\n"
+                 "\nname b\nsend Y\n");
+    ok(n == 2 && cases[0].concurrent == 4 && cases[1].concurrent == 0,
+       "concurrent does not leak into the following case");
+    free_all(n);
+
+    /* The floor is 2, not 1: `concurrent 1` is the ordinary path in costume, so
+     * accepting it would let a file claim a concurrency test that asserts
+     * nothing about overlap. */
+    n = load_str("name t\nsend X\nconcurrent 2\nprobe fds >= 0\n");
+    ok(n == 1 && cases[0].concurrent == 2, "concurrent 2 is the floor and loads");
+    free_all(n);
+
+    expect_die("name t\nsend X\nconcurrent 1\nprobe fds >= 0\n",
+               "concurrent 1 dies -- one in flight is the ordinary path");
+    expect_die("name t\nsend X\nconcurrent 0\nprobe fds >= 0\n",
+               "concurrent 0 dies");
+    expect_die("name t\nsend X\nconcurrent -1\nprobe fds >= 0\n",
+               "a negative concurrent dies");
+    expect_die("name t\nsend X\nconcurrent 65\nprobe fds >= 0\n",
+               "a concurrent over MAX_CONCURRENT dies");
+    expect_die("name t\nsend X\nconcurrent 4junk\nprobe fds >= 0\n",
+               "a concurrent count with trailing junk dies");
+    expect_die("name t\nsend X\nconcurrent 4 8\nprobe fds >= 0\n",
+               "a concurrent count with a trailing token dies");
+    expect_die("name t\nsend X\nconcurrent\nprobe fds >= 0\n",
+               "concurrent with no argument dies");
+    expect_die("name t\nsend X\nconcurrent 4\nconcurrent 8\nprobe fds >= 0\n",
+               "a repeated concurrent dies");
+
+    /* A fan whose results nothing compares is vacuous in exactly the way
+     * open_conns without a probe is: the snapshots are the only thing that
+     * observes the overlap. */
+    expect_die("name t\nsend X\nconcurrent 4\n",
+               "concurrent with no delta or probe assertion dies");
+
+    n = load_str("name t\nsend X\nconcurrent 4\ndelta fds == 0\n");
+    ok(n == 1 && cases[0].concurrent == 4,
+       "a delta assertion satisfies concurrent's observability requirement");
+    free_all(n);
+
+    /* A pipeline is ORDERED on one connection; "N pipelines at once" is a
+     * different and much larger feature, so the pair is rejected rather than
+     * silently resolved toward either reading. */
+    expect_die("name t\nblock a\nsend GET /a HTTP/1.1\\r\\n\\r\\n\n"
+               "concurrent 4\nprobe fds >= 0\n",
+               "concurrent on a pipeline case dies");
+
+    /* abort/hold/expect_idle each end their connection WITHOUT reading, so a fan
+     * carrying one would collect no responses at all -- the same vacuity the
+     * delta/probe rule rejects, reached by a different route. */
+    expect_die("name t\nsend X\nconcurrent 4\nabort 3\nprobe fds >= 0\n",
+               "concurrent + abort dies -- abort never reads a response");
+    expect_die("name t\nsend X\nconcurrent 4\nhold 50\nprobe fds >= 0\n",
+               "concurrent + hold dies -- hold never reads a response");
+    expect_die("name t\nsend X\nconcurrent 4\nexpect_idle 50\nprobe fds >= 0\n",
+               "concurrent + expect_idle dies -- idle never reads a response");
+
+    /* shutdown is deliberately NOT in that list: a half-close is a modifier on
+     * the request, and the peer's answer to it is the whole point. */
+    n = load_str("name t\nsend X\nconcurrent 4\nshutdown 1\n"
+                 "probe fds >= 0\n");
+    ok(n == 1 && cases[0].concurrent == 4,
+       "concurrent + shutdown loads -- a half-close still expects a response");
+    free_all(n);
+
+    /* The fan drains its legs in order and blocking, so an earlier leg's read
+     * time lands on every later leg's clock. Refused rather than reported as a
+     * timing verdict measured against the wrong interval. */
+    expect_die("name t\nsend X\nconcurrent 4\nexpect_close_within 100\n"
+               "probe fds >= 0\n",
+               "concurrent + expect_close_within dies -- in-order drain skews "
+               "the later legs' clocks");
+    expect_die("name t\nsend X\nconcurrent 4\nrecv_slow 100 10\n"
+               "probe fds >= 0\n",
+               "concurrent + recv_slow dies -- deliberate pacing on one leg is "
+               "charged to the next");
 
     /* The load-bearing guard: held connections that no probe assertion reads
      * are a vacuous test, so the case is rejected at load time rather than

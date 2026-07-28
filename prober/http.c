@@ -1850,6 +1850,211 @@ http_request(const char *host, int port,
 
 
 /*
+ * The `concurrent N` driver: open N connections, write the SAME request on all
+ * of them before reading ANY response, then drain the N responses.
+ *
+ * The write-all-then-read-all ordering IS the directive. A sequential prober
+ * cannot construct the state this exists to reach: every request must be
+ * outstanding in the worker at the same instant for a shared-memory or
+ * per-worker race to have a window at all. Reading response i before writing
+ * request i+1 would collapse the fan back into N ordinary exchanges, so the two
+ * loops below must stay separate no matter how tempting it looks to fuse them.
+ *
+ * Only the FIRST leg carries the case's pacing; the other N-1 send the request
+ * plain. `shut_how` is the exception and applies to every leg -- see below.
+ * Two reasons, both load-bearing:
+ *
+ *   - `abort`, `hold` and `expect_idle` are not parameters of this function at
+ *     all. Each ends its connection WITHOUT reading (http_exchange returns
+ *     before http_read_response), so a fan carrying one would collect nothing
+ *     to assert against; they are refused at load time in load_rules_fp()
+ *     rather than handled here. Named only so nobody "restores" a knob that was
+ *     deliberately never plumbed through.
+ *   - `send_slow`/`pause` pacing on every leg would multiply the pre-fan delay
+ *     by N. The write loop is sequential, so leg 0's pauses elapse in full
+ *     before leg 1 is written regardless; pacing only the first leg bounds that
+ *     cost instead of paying it N times. Note this does NOT put a slow request
+ *     in flight while the others pile in behind it -- that would need the paced
+ *     write interleaved with the other legs' writes, which this does not do.
+ *
+ * `shut_how` is the exception and is applied to EVERY leg, because a half-close
+ * is a modifier on the request rather than a substitute for the response: after
+ * SHUT_WR the peer still answers, and the answer is the point. Treating it as
+ * read-skipping would silently drop every response the directive exists to
+ * provoke.
+ *
+ * Responses land in resps[0..n-1] positionally, so an assertion layer can name
+ * the leg that misbehaved. resps[] is fully initialized on every return path,
+ * including the error ones, so a caller may http_response_free() the whole array
+ * unconditionally.
+ *
+ * Return is 0 when the fan completed (each leg's verdict belongs to the
+ * assertion layer) or -1 with errbuf set on a harness-side failure. A leg that
+ * fails to connect is a harness failure of the whole case: N-1 overlapping
+ * requests are not the test the file asked for, and reporting a pass on a
+ * narrower fan than the file spells is the silent-scope-change this harness
+ * exists to rule out.
+ */
+int
+http_exchange_concurrent(const char *host, int port, int n,
+                         const unsigned char *req, size_t req_len,
+                         int timeout_ms, const char *source,
+                         const http_pause *pauses, size_t n_pauses,
+                         int shut_how, const http_recv *recv_opt,
+                         int want_close, int framed,
+                         http_response *resps,
+                         char *errbuf, size_t errlen)
+{
+    int        *fds;
+    int         i, rc = 0;
+    long long  *sent_at;
+
+    /*
+     * Initialize BEFORE validating, so the "resps[] is safe to free on every
+     * return path" contract holds for the rejection returns too. A caller that
+     * follows the header's instruction after an argument rejection would
+     * otherwise free indeterminate pointers -- the rejection path is exactly
+     * where a caller is least likely to have initialized them itself.
+     *
+     * Bounded by MAX_CONCURRENT rather than by n, because n is not yet known to
+     * be in range: an oversized n means the array is only guaranteed to hold
+     * what the ceiling allows, and touching n slots would be the overflow the
+     * check below exists to prevent.
+     */
+    for (i = 0; i < n && i < MAX_CONCURRENT; i++) {
+        memset(&resps[i], 0, sizeof(resps[i]));
+        resps[i].status = -1;
+    }
+
+    if (n < 2) {
+        snprintf(errbuf, errlen,
+                 "concurrent fan of %d: the floor is 2 (one request in flight "
+                 "is the ordinary path)", n);
+        return -1;
+    }
+
+    /* The same ceiling the parser enforces with a line number. Repeated here
+     * because this is a public entry point: a direct C caller does not go
+     * through load_rules(), and without this it could demand an unbounded fd
+     * and buffer count that the rule-file path is protected from. */
+    if (n > MAX_CONCURRENT) {
+        snprintf(errbuf, errlen,
+                 "concurrent fan of %d exceeds the ceiling of %d", n,
+                 MAX_CONCURRENT);
+        return -1;
+    }
+
+    fds = malloc((size_t) n * sizeof(*fds));
+    sent_at = malloc((size_t) n * sizeof(*sent_at));
+
+    if (fds == NULL || sent_at == NULL) {
+        free(fds);
+        free(sent_at);
+        snprintf(errbuf, errlen, "out of memory for a %d-way concurrent fan", n);
+        return -1;
+    }
+
+    for (i = 0; i < n; i++) {
+        fds[i] = -1;
+        sent_at[i] = 0;
+    }
+
+    /*
+     * Phase 1: connect every leg. Done before any write so the write phase is
+     * not interleaved with connect latency -- a connect that blocks would
+     * otherwise let an already-written request be answered and retired before
+     * the last leg had even opened, shrinking the real overlap below N.
+     */
+    for (i = 0; i < n; i++) {
+        fds[i] = http_connect(host, port, timeout_ms, source, recv_opt,
+                              errbuf, errlen);
+
+        if (fds[i] < 0) {
+            char  detail[256];
+
+            snprintf(detail, sizeof(detail), "%s", errbuf);
+            snprintf(errbuf, errlen,
+                     "concurrent leg %d/%d: connect failed: %s", i + 1, n,
+                     detail);
+            rc = -1;
+            goto done;
+        }
+    }
+
+    /*
+     * Phase 2: write every request. Nothing is read here, so when this loop
+     * ends all N requests are outstanding in the server at once -- the state the
+     * whole directive exists to construct.
+     */
+    for (i = 0; i < n; i++) {
+        const http_pause  *leg_pauses = (i == 0) ? pauses : NULL;
+        size_t             leg_n_pauses = (i == 0) ? n_pauses : 0;
+
+        if (write_request(fds[i], req, req_len,
+                          leg_pauses, leg_n_pauses) != 0)
+        {
+            snprintf(errbuf, errlen, "concurrent leg %d/%d: write: %s",
+                     i + 1, n, strerror(errno));
+            rc = -1;
+            goto done;
+        }
+
+        /* Per-leg, for the same reason http_exchange() takes it at the end of
+         * its own write: every deadline and close_ms measures from the instant
+         * THIS request finished going out. A single shared timestamp would bill
+         * leg 0's pacing to leg N-1's server response time. */
+        sent_at[i] = now_ms();
+
+        /* Applied to every leg -- see the header comment: SHUT_WR is a request
+         * modifier, and the peer's answer to it is what the case reads. */
+        if (shut_how != HTTP_SHUT_NONE) {
+            (void) shutdown(fds[i], shut_how);
+        }
+    }
+
+    /*
+     * Phase 3: drain. Each leg's read is charged against its own sent_at, so a
+     * server that answers leg 0 promptly and stalls leg N-1 is reported as a
+     * stall on leg N-1 rather than being absorbed by leg 0's headroom.
+     *
+     * Legs are read in order rather than by poll() readiness. The responses are
+     * collected in full either way and each carries its own timing, so readiness
+     * ordering would change which leg is read first without changing any
+     * assertion -- and an in-order drain keeps the failure attribution simple
+     * enough to trust. The overlap has already happened by the time this loop
+     * starts; nothing here can undo it.
+     */
+    for (i = 0; i < n; i++) {
+        int  conn_open = 0;
+
+        if (http_read_response(fds[i], timeout_ms, recv_opt, want_close, framed,
+                               sent_at[i], &resps[i], &conn_open,
+                               errbuf, errlen) != 0)
+        {
+            char  detail[256];
+
+            snprintf(detail, sizeof(detail), "%s", errbuf);
+            snprintf(errbuf, errlen, "concurrent leg %d/%d: %s",
+                     i + 1, n, detail);
+            rc = -1;
+            goto done;
+        }
+    }
+
+done:
+
+    for (i = 0; i < n; i++) {
+        http_close(fds[i]);
+    }
+
+    free(fds);
+    free(sent_at);
+
+    return rc;
+}
+
+
+/*
  * ASCII-only case fold, deliberately NOT tolower()/strncasecmp().
  *
  * Measured under LC_ALL=tr_TR.UTF-8 (locale-hostility CI leg,

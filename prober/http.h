@@ -620,6 +620,61 @@ int http_exchange(int fd,
  * matching this codebase's naming of every lifecycle transition. */
 void http_close(int fd);
 
+/* Upper bound on the in-flight requests one `concurrent` fan may issue.
+ * Distinct from rules.h's MAX_OPEN_CONNS (512): those are BARE parked
+ * connections that never carry a request, while each fan leg writes the case's
+ * request and reads a full response, so each costs one client fd PLUS a
+ * response buffer for the whole exchange. The ceiling is deliberately far lower
+ * -- the directive exists to overlap requests so a shared-state race has a
+ * window to appear, and a race needing more than 64 simultaneous clients is a
+ * load test, which belongs in a scenario driver rather than in one case.
+ *
+ * Lives here rather than in rules.h because the driver below enforces it at a
+ * public entry point that a direct C caller reaches without going through the
+ * parser. The parser rejects an oversized count too, with a line number. */
+#define MAX_CONCURRENT  64
+
+/*
+ * The `concurrent N` driver: open N connections, write the same request on ALL
+ * of them, and only then read the N responses into resps[0..n-1].
+ *
+ * The write-all-before-read-any ordering is the entire directive: http_request()
+ * in a loop retires each request before starting the next, so a race needing two
+ * requests resident at once is unreachable through it.
+ *
+ * Precisely: this guarantees all N requests are WRITTEN before any response is
+ * CONSUMED. It does not guarantee N request lifetimes overlap inside the worker
+ * -- a fast handler may answer and finalize leg 0 while leg 1 is still being
+ * written, and an unread response sitting in the kernel buffer does not hold the
+ * server's request open. Overlap is made likely, not enforced; a caller needing a
+ * proven simultaneous peak must observe it from inside the module.
+ *
+ * Directive handling differs from http_exchange() by necessity and the rules are
+ * spelled out at the definition in http.c: pacing (`pause`/`send_slow`) applies
+ * to the FIRST leg only, so the fan does not serialize itself; `shut_how`
+ * applies to EVERY leg, because a half-close still expects an answer; and
+ * `abort`/`hold`/`expect_idle` are not accepted here at all, since each ends its
+ * connection without reading and a fan that reads nothing asserts nothing.
+ *
+ * resps must have room for at least min(n, MAX_CONCURRENT) entries. On every
+ * return path those entries are initialized, so the caller may
+ * http_response_free() them unconditionally -- including after an argument
+ * rejection. Note the bound: for an over-ceiling n the driver initializes only
+ * the first MAX_CONCURRENT slots before refusing, so freeing all n of an
+ * oversized array would touch memory this function never wrote. `n` must
+ * be >= 2 (the parser enforces the same floor with a line number). Returns 0
+ * when the fan completed, or -1 with errbuf set -- including when any single leg
+ * fails to connect, since a narrower fan is not the case the file asked for.
+ */
+int http_exchange_concurrent(const char *host, int port, int n,
+                             const unsigned char *req, size_t req_len,
+                             int timeout_ms, const char *source,
+                             const http_pause *pauses, size_t n_pauses,
+                             int shut_how, const http_recv *recv_opt,
+                             int want_close, int framed,
+                             http_response *resps,
+                             char *errbuf, size_t errlen);
+
 int http_request(const char *host, int port,
                  const unsigned char *req, size_t req_len,
                  int timeout_ms, const char *source,
