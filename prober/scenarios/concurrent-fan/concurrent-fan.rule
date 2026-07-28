@@ -1,5 +1,5 @@
-# Scenario: a fan of N overlapping requests leaves the worker exactly as N
-# sequential ones do.
+# Scenario: a fan of N concurrent requests leaves the worker exactly as N
+# sequential ones do, and every leg is answered identically.
 #
 # WHAT THIS ADDS OVER THE SELF-TESTS. `concurrent N` is proven at the unit level
 # against a fixture (`spawn_barrier` in prober/http_test.c), which withholds
@@ -56,7 +56,7 @@ probe   fds >= 1
 # The deltas bracket the ENTIRE fan -- one before-snapshot, one after -- so
 # unlike a per-request delta they would catch a leak of one descriptor per leg
 # as a delta of 8 rather than absorbing it into per-case teardown.
-name        eight overlapping requests are each answered identically
+name        eight concurrent requests are each answered identically
 send        GET / HTTP/1.1\r\n
 send        Host: prober\r\nConnection: close\r\n\r\n
 concurrent  8
@@ -94,11 +94,16 @@ delta       fds == 0
 delta       connections.free == 0
 delta       pool.cycle_used == 0
 
-# The closing case. Its `delta` lines are case-local like all the others and add
-# nothing the fans did not already say; the ABSOLUTE floor is what this case
-# exists for. Twenty-four fanned requests have run by now, so a worker bleeding
-# a connection slot per leg sits far below where it started -- invisible to
-# every delta above, and caught here.
+# The closing case. Its `delta` lines are case-local like all the others; the
+# ABSOLUTE floor is what this case exists for.
+#
+# WHAT THE FLOOR ADDS OVER THE FAN DELTAS, precisely. A per-leg leak is NOT
+# invisible to those deltas -- eight slots lost during the first fan read as
+# `delta connections.free == -8` on that case, and it reds there. The floor is
+# the coarser, later guard: it catches drift the case-local deltas can miss
+# because both of a case's snapshots already contain it -- a slot released a
+# case late, or a drift that accrues outside any single case's brackets. The
+# two overlap deliberately, and neither subsumes the other.
 #
 # SIZING THE FLOOR. An absolute floor detects nothing unless the defect it hunts
 # can actually cross it, so the number is derived from a MEASURED healthy
@@ -123,7 +128,7 @@ delta       pool.cycle_used == 0
 #
 # Re-measure before changing the pool or the fan widths: the three the server
 # holds for itself is not a constant to rely on.
-name    connections returned to baseline after both fans
+name    connections stay above the floor after both fans
 send    GET /__probe HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
