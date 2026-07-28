@@ -188,9 +188,60 @@ prober (standalone binary)          nginx/Angie worker (test build only)
   that a real daemon cannot be made to produce, plus a JSONL journal that makes
   connection reuse falsifiable. See [Fake upstream](#fake-upstream-proberfakesrv).
 
+## Start here: you probably do not need to write any C
+
+There are two ways in, and the cheap one is not obvious from the howto below.
+
+**Zero-hook (no module C at all).** Build your module as a dynamic module
+alongside this repo's reference probe (`t/module`), and point a scenario at
+both. The probe is a *separate* `.so`; your module does not have to host it, and
+you do not write a directive, a handler, or a hook. You still get worker pid,
+connection counts, `fds` and `fds_by_kind`, `smaps`, and the full cycle-pool
+accounting — which is enough to assert that a request leaks no descriptor and no
+long-lived byte. That is the assertion most consumers actually want.
+
+Ten of our own modules were wired this way in one pass, and eight of them
+produced a working allocation-neutrality scenario with zero lines of
+module-specific C. The worked reference is
+[`prober/scenarios/consumer-cache-turbo/`](prober/scenarios/consumer-cache-turbo/);
+the others in `prober/scenarios/consumer-*/` are generated from a table by
+[`tools/gen-consumer-scenarios.sh`](tools/gen-consumer-scenarios.sh).
+
+**Hooked (the Mini howto below).** You need this only when the generic document
+cannot answer your question — custom zone introspection (`zone_render`) or
+on-demand allocation-fault injection (`fault_set`). Both hooks are optional and
+independent. Reach for this when zero-hook has shown you nothing, not before.
+
+The rule of thumb: **start zero-hook, promote to a hook when an oracle you want
+is unexpressible.** Everything in the howto below still applies once you get
+there.
+
+### What zero-hook actually costs, measured
+
+Timed on the maintainer's box (2026-07-28), against an already-unpacked nginx
+source tree:
+
+| step | command | wall |
+|---|---|---|
+| build your module + the reference probe into one tree | `tools/build-consumers.sh --only <mod>` | **8 s** |
+| generate the scenario from the table | `tools/gen-consumer-scenarios.sh` | 0.05 s |
+| run it | `prober/run-scenario.sh scenarios/consumer-<mod> nginx <ver>` | **0.4 s** |
+
+The first run in a fresh checkout also downloads and unpacks the nginx tarball,
+which dominates everything above and depends on your link. Budget minutes for
+that once, then seconds forever after.
+
+Both flags are required at configure time and neither module declares them in
+its own `config`: `--with-http_ssl_module` (anything touching `ngx_ssl_t` fails
+with `field 'ssl' has incomplete type` without it, which reads like a module bug
+and is not one) and `--with-stream` (a stream half silently does not build).
+`tools/build-consumers.sh` passes both for you.
+
 ## Mini howto: from zero to a passing leak test
 
-Five steps. Step 2 is the only C you write, and most of it is copy-paste.
+This is the HOOKED path — read the section above first, because most modules do
+not need it. Five steps. Step 2 is the only C you write, and most of it is
+copy-paste.
 
 **1. Add the harness to your module repo as a submodule:**
 
