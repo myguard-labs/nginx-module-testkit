@@ -12,3 +12,9 @@ prober/perf/cg_scale.bin
 t/*_test
 /.build/
 prober/coverage-map.json
+
+# Landing dir for the consumer-wiring exercise: copies of our own modules are
+# built and probed here, never committed. See
+# memory/labs/nginx-test-harness/plan-wire-own-modules.md -- the copies are a
+# measurement fixture, and the modules' own repos are the source of truth.
+/consumers/
