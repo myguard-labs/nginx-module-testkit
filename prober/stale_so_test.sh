@@ -112,9 +112,9 @@ new "$SO"
 ok "$s" "a .so newer than every probe source passes"
 
 # ---- a .h newer than the .so is also stale ----------------------------------
-# The s108/s140 incidents spanned the .c and the .h, so the gate compares
-# against the newest of BOTH. Pinning one filename would catch one incident and
-# miss the other; this asserts the glob really covers the header.
+# The s108/s140 incidents spanned the .c and the .h, so the gate's glob covers
+# BOTH. Pinning one filename would catch one incident and miss the other; this
+# asserts the glob really covers the header.
 #
 # The .c must be made OLD for this to mean anything. Leaving it new lets it
 # satisfy the bail on its own, and the assertion passes whether or not the glob

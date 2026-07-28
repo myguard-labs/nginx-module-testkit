@@ -1707,8 +1707,11 @@ That has cost a full session twice (a `.so` predating `ppid`; an angie `.so`
 predating `smaps`/`fds_by_kind`), and CI never reproduces it, because CI
 rebuilds every flavor from source on every run.
 
-The check compares the artifact's mtime against the newest
-`src/ngx_test_probe*.{c,h}` and names both paths in the bail. **Adding a probe
+The check bails when the artifact is older than any
+`src/ngx_test_probe*.{c,h}`, and names that source plus the artifact in the
+bail. It reports the first such source it finds rather than the newest one —
+the question is only whether the `.so` is out of date, and every match answers
+it the same way. **Adding a probe
 field means rebuilding the reference module for every flavor you run locally**,
 or that field's own scenario skips itself green. A tree with no `src/` — a
 consumer repo vendoring this harness and building its own module — has nothing

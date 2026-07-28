@@ -128,12 +128,21 @@ prober_stale_so_check() {
         return 0
     fi
 
-    local src_dir newest
+    local src_dir stale_src
     src_dir="$PROBER_RESOLVED_ROOT/src"
     [ -d "$src_dir" ] || return 0
 
-    # First probe source newer than the artifact. -maxdepth 1: src/ is flat, and
-    # a consumer tree underneath it must not vote on this harness's artifact.
+    # ANY probe source newer than the artifact -- this is an existence test, not
+    # a max-search. `-newer` already encodes the whole question ("is the .so out
+    # of date?"), so the first hit settles it and the bail is identical whichever
+    # match wins the traversal. Deliberately NOT sorted by mtime: naming the
+    # single newest source would cost a full traversal plus a sort to change one
+    # path in a diagnostic, and the multi-write pipeline that needs is the exact
+    # SIGPIPE shape the -quit note below exists to avoid. The message says "is
+    # older than <this source>", which is true of whichever one is reported.
+    #
+    # -maxdepth 1: src/ is flat, and a consumer tree underneath it must not vote
+    # on this harness's artifact.
     #
     # `-print -quit`, NOT `-print | head -1`: every caller runs `set -euo
     # pipefail`, and `head -1` closes the pipe as soon as it has its line, so a
@@ -142,12 +151,12 @@ prober_stale_so_check() {
     # function exists to print never appears -- a guard that kills the run
     # silently instead of naming the stale artifact. -quit makes find stop after
     # the first hit itself, so nothing is ever written into a closed pipe.
-    newest="$(find "$src_dir" -maxdepth 1 -name 'ngx_test_probe*.[ch]' \
+    stale_src="$(find "$src_dir" -maxdepth 1 -name 'ngx_test_probe*.[ch]' \
               -newer "$PROBER_MODULE_PATH" -print -quit 2>/dev/null)"
 
-    if [ -n "$newest" ]; then
+    if [ -n "$stale_src" ]; then
         echo "Bail out! stale module artifact --" \
-             "$PROBER_MODULE_PATH is older than $newest;" \
+             "$PROBER_MODULE_PATH is older than $stale_src;" \
              "rebuild the reference module for $PROBER_FLAVOR $PROBER_VERSION" \
              "(a stale .so reports the absent-field sentinel and fails an oracle" \
              "closed, which reads as a flavor-specific bug in your diff)." \
