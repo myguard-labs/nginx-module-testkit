@@ -509,7 +509,7 @@ run_case(const test_case *tc, const json_value *baseline)
     if (tc->n_blocks == 0) {
         /*
          * Legacy single-exchange path -- one connect/write/read/close, exactly
-         * as before the pipeline directive existed. http_request wraps
+         * as before the `block` directive existed. http_request wraps
          * http_connect/http_exchange/http_close and always closes.
          */
         if (http_request(opt_host, opt_port, tc->request, tc->request_len,

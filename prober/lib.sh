@@ -96,6 +96,75 @@ prober_resolve() {
     fi
 }
 
+# prober_stale_so_check
+#
+# Bails when $PROBER_MODULE_PATH is older than any probe source under src/.
+#
+# Reads: PROBER_MODULE_PATH, PROBER_RESOLVED_ROOT, PROBER_ALLOW_STALE_SO.
+#
+# The comparison is mtime against the NEWEST src/ngx_test_probe*.{c,h}, not
+# against one named file: the two s108/s140 incidents were a field added in
+# ngx_test_probe.c and a pair added across the .c and .h, so pinning a single
+# filename would have caught one and missed the other.
+#
+# PROBER_ALLOW_STALE_SO=1 lifts exactly this bail, for the deliberate case of
+# driving a known-old artifact on purpose. Scoped to the literal value 1 -- one
+# named gate, never a blanket off-switch, so a stray =0 cannot disable it.
+#
+# UNLIKE PROBER_ALLOW_LOG and PROBER_ALLOW_MULTIWORKER, this one must come from
+# the CALLER'S environment, not a scenario `env` file. Those two are read by
+# prober_check_conf and prober_scrape_log, which run AFTER run-scenario.sh
+# sources the scenario env; this runs from prober_detect_load, which is several
+# steps BEFORE it -- the load decision has to be made before anything is
+# rendered or booted. A scenario cannot opt itself in, and should not want to:
+# a stale artifact is a property of the developer's build tree, not of a
+# scenario's requirements.
+#
+# Missing src/ is NOT a bail: a CONSUMER repo vendors this harness and builds
+# its own module, so there is no probe source to compare against and nothing
+# stale to detect. Silence there is correct, not a hole.
+prober_stale_so_check() {
+    if [ "${PROBER_ALLOW_STALE_SO:-0}" = "1" ]; then
+        return 0
+    fi
+
+    local src_dir stale_src
+    src_dir="$PROBER_RESOLVED_ROOT/src"
+    [ -d "$src_dir" ] || return 0
+
+    # ANY probe source newer than the artifact -- this is an existence test, not
+    # a max-search. `-newer` already encodes the whole question ("is the .so out
+    # of date?"), so the first hit settles it and the bail is identical whichever
+    # match wins the traversal. Deliberately NOT sorted by mtime: naming the
+    # single newest source would cost a full traversal plus a sort to change one
+    # path in a diagnostic, and the multi-write pipeline that needs is the exact
+    # SIGPIPE shape the -quit note below exists to avoid. The message says "is
+    # older than <this source>", which is true of whichever one is reported.
+    #
+    # -maxdepth 1: src/ is flat, and a consumer tree underneath it must not vote
+    # on this harness's artifact.
+    #
+    # `-print -quit`, NOT `-print | head -1`: every caller runs `set -euo
+    # pipefail`, and `head -1` closes the pipe as soon as it has its line, so a
+    # find with more matches still to write dies of SIGPIPE (141). pipefail
+    # propagates that and `set -e` aborts the scenario, so the bail this
+    # function exists to print never appears -- a guard that kills the run
+    # silently instead of naming the stale artifact. -quit makes find stop after
+    # the first hit itself, so nothing is ever written into a closed pipe.
+    stale_src="$(find "$src_dir" -maxdepth 1 -name 'ngx_test_probe*.[ch]' \
+              -newer "$PROBER_MODULE_PATH" -print -quit 2>/dev/null)"
+
+    if [ -n "$stale_src" ]; then
+        echo "Bail out! stale module artifact --" \
+             "$PROBER_MODULE_PATH is older than $stale_src;" \
+             "rebuild the reference module for $PROBER_FLAVOR $PROBER_VERSION" \
+             "(a stale .so reports the absent-field sentinel and fails an oracle" \
+             "closed, which reads as a flavor-specific bug in your diff)." \
+             "Set PROBER_ALLOW_STALE_SO=1 to drive it anyway."
+        exit 1
+    fi
+}
+
 # prober_detect_load
 #
 # Sets: PROBER_LOAD -- the load_module line for the conf template, or empty.
@@ -107,10 +176,22 @@ prober_resolve() {
 # Decide by looking inside the BINARY, not by whether a .so exists: switching
 # build modes leaves the previous mode's .so behind in objs/, so a file-exists
 # test picks the stale artifact and emits load_module for a static build.
+#
+# A .so that is present and carries the directive can still be STALE -- built
+# before a probe field the scenario now asserts. That failure is silent and
+# expensive: the probe emits the absent-field sentinel, the oracle fails closed,
+# and the red lands on whichever flavor happens to hold the older artifact, so
+# it reads as a flavor-specific bug in the diff under test. It cost a full
+# session twice (s108: multi-worker on a .so predating `ppid`; s140:
+# deploy-canary on an angie .so predating `smaps`/`fds_by_kind`), and CI never
+# reproduces it -- CI rebuilds every flavor from source on every run.
+# prober_stale_so_check closes that: only the DYNAMIC path needs it, because the
+# static branch above reads the freshly-linked binary and never consults objs/.
 prober_detect_load() {
     if grep -qa "$PROBER_DIRECTIVE" "$PROBER_SERVER_BIN"; then
         PROBER_LOAD=""                            # statically linked (asan/coverage)
     elif [ -f "$PROBER_MODULE_PATH" ] && grep -qa "$PROBER_DIRECTIVE" "$PROBER_MODULE_PATH"; then
+        prober_stale_so_check
         PROBER_LOAD="load_module $PROBER_MODULE_PATH;"   # dynamic (debug/module)
     else
         echo "Bail out! neither $PROBER_SERVER_BIN nor $PROBER_MODULE_PATH carries" \

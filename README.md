@@ -1695,6 +1695,43 @@ every case reproduces the wall of false pid failures the bail exists to
 prevent, so it is a per-scenario opt-in, never a run default. The `multi-worker`
 scenario is the reference user.
 
+**`PROBER_ALLOW_STALE_SO` (environment variable, optional)**
+
+Set to `1` to drive a reference module `.so` that is older than the probe
+sources under `src/`. By default the harness bails: a `.so` built before a probe
+field was added still loads, still carries the directive, and still boots — it
+simply omits that field, so the oracle reading it sees the absent-field sentinel
+and fails closed. The red then lands on whichever *flavor* happens to hold the
+older artifact, which reads as a flavor-specific bug in the diff under test.
+That has cost a full session twice (a `.so` predating `ppid`; an angie `.so`
+predating `smaps`/`fds_by_kind`), and CI never reproduces it, because CI
+rebuilds every flavor from source on every run.
+
+The check bails when the artifact is older than any
+`src/ngx_test_probe*.{c,h}`, and names that source plus the artifact in the
+bail. It reports the first such source it finds rather than the newest one —
+the question is only whether the `.so` is out of date, and every match answers
+it the same way. **Adding a probe
+field means rebuilding the reference module for every flavor you run locally**,
+or that field's own scenario skips itself green. A tree with no `src/` — a
+consumer repo vendoring this harness and building its own module — has nothing
+to compare against and is passed silently.
+
+Set it in the environment of the command you run:
+
+```
+PROBER_ALLOW_STALE_SO=1 prober/run-scenario.sh scenarios/<name> nginx 1.29.0
+```
+
+Unlike `PROBER_ALLOW_LOG` and `PROBER_ALLOW_MULTIWORKER`, **a scenario's `env`
+file cannot set this one**. Those are read by `prober_check_conf` and
+`prober_scrape_log`, which run after `run-scenario.sh` sources the scenario
+`env`; this is read by `prober_detect_load`, several steps earlier, because the
+load decision precedes rendering and boot. That asymmetry is deliberate: a stale
+artifact is a property of your build tree, not of a scenario's requirements. The
+opt-in is honoured only for the exact value `1`, so a stray `=0` cannot quietly
+disable it.
+
 **`PROBER_DAEMON_MODE` (environment variable, optional)**
 
 Set to `on` (in a scenario's `env` file) to run the server with `daemon on;`
