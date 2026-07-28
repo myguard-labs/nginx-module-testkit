@@ -109,6 +109,18 @@ going away), not a new permanent CI leg.
 **Also not in scope:** valgrind on nginx, whole-server fuzzing, and performance
 benchmarking of nginx itself. Fuzzing our *own* parser is in scope and stays.
 
+**Do not add a test here that the Perl suite can already do.** A consuming
+module has `Test::Nginx::Socket` and its own `.t` files, and that is the right
+home for ordinary request/response behaviour: status codes, headers, body
+content, rewrites, `error_page`, config permutations. This harness exists for
+the assertions the Perl suite structurally *cannot* make — what the worker looks
+like from the inside, before and after: cycle-pool bytes, descriptor counts,
+slab pages, allocation neutrality across a request or a reload. If a proposed
+scenario could be written as a `.t` file with no probe snapshot, write it as a
+`.t` file. The overlap is not free: a second suite asserting the same thing is
+another place to update when behaviour changes, and it dilutes the signal this
+one exists to give.
+
 ### The test that decides it, for scenarios
 
 Booting or reloading nginx does **not** make a scenario out of scope. The
