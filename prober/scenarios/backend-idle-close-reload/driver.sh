@@ -180,15 +180,51 @@ fi
 # iterations, never a wall-clock diff (prober_wait_listen discipline). This is a
 # settle, not a relaxed oracle: the case still demands one unchanging worker, it
 # just does not begin until the reload has stopped moving.
+#
+# The pid alone is NOT a sufficient settle, and waiting on it only is what made
+# this scenario the most frequent flake in the suite (3 of 4 scenario legs on one
+# 2026-07-28 CI wave, both flavors). The red was never a pid change -- driver
+# oracles 1-7 all passed and the prober leg reported
+#   delta fds: 13 -> 12 is -1, want == 0 (unchanged over 8 re-reads)
+# A NEGATIVE delta means a descriptor closed INSIDE the probe window: after the
+# reload the old worker's parked upstream connection is reaped asynchronously, so
+# a stable pid coexists with an fd table that is still draining. post-reload.rule
+# asserts `delta fds == 0`, so the settle must cover the quantity that oracle
+# reads. Require pid AND fd count identical on two consecutive probes.
+#
+# Both are read from ONE snapshot per iteration, not two: probing twice per turn
+# would let the pid come from a different snapshot than the fd count and settle
+# on a pair that never coexisted.
 prev_pid=""
+prev_fds=""
+settled=0
 for ((i = 0; i < 100; i++)); do            # 100 * 50 ms = 5 s ceiling
-    cur_pid=$(prober_probe_pid "$HOST" "$PORT" || true)
-    if [ -n "$cur_pid" ] && [ "$cur_pid" = "$prev_pid" ]; then
+    body=$(prober_probe_body "$HOST" "$PORT" || true)
+    cur_pid=""
+    cur_fds=""
+    if [ -n "$body" ]; then
+        cur_pid=$(prober_probe_field "$body" pid || true)
+        cur_fds=$(prober_probe_field "$body" fds || true)
+    fi
+    if [ -n "$cur_pid" ] && [ -n "$cur_fds" ] \
+       && [ "$cur_pid" = "$prev_pid" ] && [ "$cur_fds" = "$prev_fds" ]; then
+        settled=1
         break
     fi
     prev_pid="$cur_pid"
+    prev_fds="$cur_fds"
     sleep 0.05
 done
+
+# Exhausting the loop without settling used to fall through SILENTLY into the
+# strict oracle, which then failed for a reason the log never named. Say so.
+# Not a hard exit: the strict leg below is still the real oracle and may well
+# pass -- but if it fails, this line is the difference between "known settle
+# timeout" and half an hour of diagnosis.
+if [ "$settled" -ne 1 ]; then
+    echo "# settle: worker pid+fds still moving after 100 probes" \
+         "(pid=$cur_pid fds=$cur_fds); running the strict leg anyway"
+fi
 
 # --- post-reload coherence (prober, folded in as diagnostics) --------------
 # A plain strict case AFTER the reload: the reloaded worker serves a correct 200
