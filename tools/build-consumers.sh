@@ -21,7 +21,9 @@
 #
 #   --flavor NAME     nginx | angie          (default: nginx)
 #   --version VER     upstream version       (default: 1.29.0)
-#   --stage NAME      .build/<NAME>/objs dir (default: <flavor>-<version>-multi)
+#   --stage NAME      .build/<NAME>/objs dir (default: <flavor>-<version>-consumers,
+#                     which is what you pass run-scenario.sh as its VERSION arg;
+#                     NOT <flavor>-<version>, which is the ref-probe-only tree)
 #   --only A,B,C      build only these consumers (dir names under consumers/)
 #   --skip A,B,C      build everything except these
 #   --src DIR         reuse an already-unpacked source tree instead of fetching
@@ -95,7 +97,18 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ -n "$STAGE" ] || STAGE="${FLAVOR}-${VERSION}-multi"
+# The stage name is what run-scenario.sh must be given as its VERSION argument
+# (lib.sh:78 composes .build/<flavor>-<version> and the generated requires gates
+# recompute the same string), so the default has to be a name a scenario run can
+# actually name. "-multi" was not: nothing passes `1.29.0-multi` as a version, so
+# a bare run staged ten modules where no scenario would ever look.
+#
+# "-consumers" rather than a plain "<flavor>-<version>": the plain name is the
+# ref-probe-only tree the ordinary scenarios boot, and this script wipes objs/
+# before building. Defaulting there would silently destroy that tree on a bare
+# run. Drive the result with:
+#     prober/test-scenarios.sh nginx 1.29.0-consumers
+[ -n "$STAGE" ] || STAGE="${FLAVOR}-${VERSION}-consumers"
 
 case "$FLAVOR" in
     nginx) URL="https://nginx.org/download/nginx-${VERSION}.tar.gz" ;;
@@ -216,7 +229,11 @@ else
     BUILDDIR="$TMP/src"
     mkdir -p "$BUILDDIR"
     echo "==> fetching $URL"
-    curl -fsSL -o "$TMP/srv.tar.gz" "$URL" || die "download failed: $URL"
+    # Bound the fetch: this script goes on to burn a lot of CPU, and a mirror
+    # that accepts the connection and then stalls would otherwise hold the slot
+    # open indefinitely rather than failing and freeing it.
+    curl -fsSL --connect-timeout 15 --max-time 300 -o "$TMP/srv.tar.gz" "$URL" \
+        || die "download failed: $URL"
     want="$(sha_for "${FLAVOR}-${VERSION}")"
     if [ -n "$want" ]; then
         echo "$want  $TMP/srv.tar.gz" | sha256sum -c - >/dev/null \
@@ -306,10 +323,16 @@ fi
 # run-scenario.sh boots objs/nginx. Assert it explicitly: without this the only
 # symptom is every scenario bailing "no server binary", one layer away from the
 # cause.
-if [ -f "$DEST/objs/nginx" ]; then
-    printf '%-32s %-12s %s\n' '(server binary)' yes objs/nginx
+# angie names its server binary objs/angie, nginx names it objs/nginx -- the
+# same split lib.sh:80-81 makes when it picks PROBER_SERVER_BIN. Hardcoding
+# objs/nginx here reported a missing binary on every --flavor angie build,
+# however well it had gone.
+SRVBIN=nginx
+[ "$FLAVOR" = angie ] && SRVBIN=angie
+if [ -f "$DEST/objs/$SRVBIN" ]; then
+    printf '%-32s %-12s %s\n' '(server binary)' yes "objs/$SRVBIN"
 else
-    echo "!!! objs/nginx is MISSING -- run-scenario.sh cannot boot this tree" >&2
+    echo "!!! objs/$SRVBIN is MISSING -- run-scenario.sh cannot boot this tree" >&2
     missing=$((missing + 1))
 fi
 
