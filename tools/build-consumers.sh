@@ -191,6 +191,26 @@ if [ -n "$SRC" ]; then
     [ -f "$SRC/configure" ] || die "--src '$SRC' has no ./configure"
     BUILDDIR="$SRC"
     echo "==> reusing source tree $BUILDDIR"
+
+    # WIPE objs/ FIRST. nginx's ./configure does NOT clear it -- the only
+    # `rm -rf $NGX_OBJS` in auto/init is the TEXT of the Makefile's `clean:`
+    # target being written out, not a command configure runs. So a reused tree
+    # keeps every .so from its previous build, and this script stages objs/
+    # wholesale (`cp -r` below).
+    #
+    # The failure that makes this mandatory: run once with all nine consumers,
+    # then again with `--src <that tree> --only coraza`. The second configure
+    # binds only t/module + coraza, make rebuilds only those, and the staging
+    # copy carries the other eight STALE .so into .build/<stage>/objs. Every
+    # consumer scenario's `requires` gate then finds its .so, passes, and the
+    # scenario probes a module that was never rebuilt -- possibly against a
+    # different nginx version. That is exactly
+    # [[feedback-stale-so-fakes-negative-control]], the bug class this script's
+    # own header cites as its reason to exist.
+    if [ -d "$BUILDDIR/objs" ]; then
+        echo "==> wiping $BUILDDIR/objs (a reused tree's old .so would be staged as if fresh)"
+        rm -rf "$BUILDDIR/objs"
+    fi
 else
     TMP="$(mktemp -d "${TMPDIR:-/tmp}/build-consumers.XXXXXX")"
     BUILDDIR="$TMP/src"
@@ -249,6 +269,7 @@ echo "==> staged $DEST/objs"
 # fine as NO -- which is worse than a build failure, because it sends the next
 # session hunting a compile bug that does not exist.
 missing=0
+ACCOUNTED=()
 echo
 printf '%-32s %-12s %s\n' MODULE BUILT SO
 printf '%-32s %-12s %s\n' ------ ----- --
@@ -262,6 +283,9 @@ for n in "${CONSUMERS[@]}"; do
     got=""
     for nm in "${names[@]}"; do
         [ -f "$DEST/objs/${nm}.so" ] && got="$got ${nm}.so"
+        # Record it as accounted-for whether or not it exists, so the
+        # unattributable sweep below only reports genuinely foreign artifacts.
+        ACCOUNTED+=("${nm}.so")
     done
     if [ -n "$got" ]; then
         printf '%-32s %-12s%s\n' "$n" yes "$got"
@@ -286,6 +310,34 @@ if [ -f "$DEST/objs/nginx" ]; then
     printf '%-32s %-12s %s\n' '(server binary)' yes objs/nginx
 else
     echo "!!! objs/nginx is MISSING -- run-scenario.sh cannot boot this tree" >&2
+    missing=$((missing + 1))
+fi
+
+# UNATTRIBUTABLE .so SWEEP. The table above walks the REQUESTED consumers, so on
+# its own it is silent about a .so that is present in the staged tree but owned
+# by nothing in this run -- which is precisely what a stale artifact looks like.
+# The objs/ wipe above should make this impossible; this is the check that says
+# so out loud rather than assuming it. A scenario's `requires` gate only asks
+# "does the .so exist", so an unowned one is fully loadable and would be probed
+# as if it were fresh.
+ACCOUNTED+=(ngx_http_test_ref_module.so)
+unattributed=()
+for so in "$DEST"/objs/*.so; do
+    [ -e "$so" ] || continue
+    base="$(basename "$so")"
+    known=0
+    for a in "${ACCOUNTED[@]}"; do
+        [ "$base" = "$a" ] && { known=1; break; }
+    done
+    [ "$known" -eq 0 ] && unattributed+=("$base")
+done
+if [ "${#unattributed[@]}" -gt 0 ]; then
+    echo
+    echo "!!! ${#unattributed[@]} .so in $DEST/objs belong to no module in this run:" >&2
+    printf '        %s\n' "${unattributed[@]}" >&2
+    echo "    These were NOT built now. A scenario loading one probes a stale" >&2
+    echo "    artifact and reports on code that was never rebuilt -- delete the" >&2
+    echo "    stage dir and rebuild, or re-run without --only/--skip." >&2
     missing=$((missing + 1))
 fi
 

@@ -560,6 +560,30 @@ if [ "$CHECK" -eq 1 ]; then
             rc=1
         fi
     done < <(names)
+
+    # ORPHAN SWEEP. The loop above is driven by the TABLE, so on its own it can
+    # never notice a committed consumer-* directory that no row owns. Delete a
+    # row and the scenario dir stays behind: test-scenarios.sh keeps collecting
+    # it, nobody regenerates it again, and --check reports everything up to
+    # date. Compare the other direction too.
+    #
+    # consumer-cache-turbo is exempt BY DESIGN -- it is hand-written, predates
+    # the generator, and carries a HIT-path rationale worth keeping. It is the
+    # only exemption; a second one wants a comment saying why.
+    if [ -z "$ONLY" ]; then
+        owned=" $(names | tr '\n' ' ') cache-turbo "
+        for d in prober/scenarios/consumer-*/; do
+            [ -d "$d" ] || continue
+            n="$(basename "$d")"; n="${n#consumer-}"
+            case "$owned" in
+                *" $n "*) ;;
+                *)  echo "ORPHAN: prober/scenarios/consumer-$n is committed but no table row owns it" >&2
+                    echo "        -- delete the directory, or add its row back to TABLE" >&2
+                    rc=1 ;;
+            esac
+        done
+    fi
+
     if [ "$rc" -ne 0 ]; then
         echo "consumer scenarios are OUT OF DATE -- rerun tools/gen-consumer-scenarios.sh" >&2
         exit 1
