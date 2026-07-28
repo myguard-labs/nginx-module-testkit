@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  159
+#define PLANNED  160
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -1702,7 +1702,7 @@ main(void)
         echo_result                 er;
         http_recv                   rv;
         int                         rc;
-        long long                   t0, t1;
+        long long                   t0, t1, paced_ms;
 
         memset(&rv, 0, sizeof(rv));
         rv.chunk = 100;
@@ -1713,6 +1713,7 @@ main(void)
                            HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0,
                            HTTP_IDLE_NONE, &er);
         t1 = now_ms();
+        paced_ms = t1 - t0;
 
         ok(rc == 0, "a recv_slow request completes");
 
@@ -1741,17 +1742,37 @@ main(void)
         ok(rc == 0 && er.client_reads >= (SPAWN_REPLY_LEN + 99) / 100,
            "recv_slow bounds each read by the chunk, so the reply needs several");
 
-        /* The negative control: the same exchange unpaced must NOT take that
-         * long, or the assertion above would be measuring the fixture rather
-         * than the pacing. */
+        /*
+         * The negative control: the same exchange unpaced must NOT cost what
+         * the paced one did, or the assertions above would be measuring the
+         * fixture rather than the pacing.
+         *
+         * Stated RELATIVE to the paced run measured in this same execution, not
+         * against a constant. A fixed wall-clock ceiling reds on a sanitizer
+         * build or a contended runner with nothing wrong -- observed for real
+         * on a scenario-only diff that touches no C. Halving the paced elapsed
+         * is the same claim ("the sleeps dominate") expressed in a unit that
+         * scales with whatever the machine is doing: the four 30 ms sleeps are
+         * the bulk of `paced_ms`, so an unpaced run that reaches half of it did
+         * not skip them. The sibling floor at the top of this block already
+         * uses a derived bound for exactly this reason.
+         */
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
                            HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, 0,
                            HTTP_IDLE_NONE, &er);
         t1 = now_ms();
 
-        ok(rc == 0 && t1 - t0 < 85,
-           "without recv_slow the same response is collected promptly");
+        ok(rc == 0 && (t1 - t0) * 2 < paced_ms,
+           "without recv_slow the same response costs well under the paced run");
+
+        /* The read-count mirror of the control, and the half of it no load
+         * condition can move: unpaced, nothing bounds `want` below the 8 KiB
+         * receive buffer, so the whole 418-byte reply arrives in ONE read. This
+         * is what proves the count floor above is the cap's witness rather than
+         * a property the exchange has anyway. */
+        ok(rc == 0 && er.client_reads < (SPAWN_REPLY_LEN + 99) / 100,
+           "without recv_slow the reply is not split into capped reads");
 
         /* A chunk larger than the whole response is one read and no sleep --
          * the read-side mirror of send_slow's large-chunk case. */
