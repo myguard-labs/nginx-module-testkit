@@ -6,6 +6,33 @@ request/response suite: ordinary status/header/body behaviour belongs in
 upstream-journal and allocation-failure** evidence across signals, reloads and
 faults.
 
+**MISSION — this is an ADVERSARIAL tool. Its purpose is to break the module
+under test, by any means available.** Hostile and malformed input, allocation-
+failure injection (`fault_slab=`/`fault_palloc=`/`fault_tempfile=`/
+`fault_accept=`), resource exhaustion, lifecycle attacks (reload, binary
+upgrade, worker death, signal storms), environmental hostility (clock jumps,
+locale). If you think of another way to break a module, it belongs here — see
+README "Ideas and opportunities" for the ones already identified and not yet
+built. **Coverage goal is 100% of the code under test**, understood as a
+direction of travel, not a promise: chase the uncovered lines, never the
+percentage, and there is deliberately NO coverage-% merge gate (moving that
+number with non-asserting tests is the vacuous-gate failure this repo hunts).
+`prober/coverage-director.sh` is the reachability generator — use it to find
+what is NOT reached.
+
+**SCOPE (a narrower question — what THIS repo's own CI spends budget on).** The
+mission above is what the tool does to a consumer's module; the rule below is
+what our CI proves about our own code. We develop a probe TOOL for nginx, not an
+nginx MODULE. The thing
+under test is our own code: the prober binary, its rule parser, the probe's JSON
+emitter, the shell plumbing. nginx is the fixture, never the subject. So: no
+ASan/UBSan legs in this repo's CI — not on nginx, and not on our own binary
+either (decided 2026-07-28; `SAN=1 prober/test.sh` remains available for a
+one-off local run when a parser bug is suspected). No valgrind on nginx, no
+whole-server fuzzing, no nginx benchmarking. Fuzzing our OWN parser stays in
+scope. Do not add a sanitizer job back without the user asking for it. Full
+rationale + the known cost → README "What this repo is — and what it is not".
+
 Superrepo root is `/opt/myguard` — see [/opt/myguard/AGENTS.md](../../AGENTS.md).
 Working notes for this repo live OUTSIDE it, at
 `/opt/myguard/memory/labs/nginx-test-harness/` (read `HANDOFF.md` first, then
