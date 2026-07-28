@@ -1766,13 +1766,27 @@ main(void)
         ok(rc == 0 && (t1 - t0) * 2 < paced_ms,
            "without recv_slow the same response costs well under the paced run");
 
-        /* The read-count mirror of the control, and the half of it no load
-         * condition can move: unpaced, nothing bounds `want` below the 8 KiB
-         * receive buffer, so the whole 418-byte reply arrives in ONE read. This
-         * is what proves the count floor above is the cap's witness rather than
-         * a property the exchange has anyway. */
-        ok(rc == 0 && er.client_reads < (SPAWN_REPLY_LEN + 99) / 100,
-           "without recv_slow the reply is not split into capped reads");
+        /*
+         * The read-count mirror of the control, and the half of it no load
+         * condition can move.
+         *
+         * An EQUALITY, not a bound. The fixture writes SPAWN_REPLY in a single
+         * send() and nothing below the 8 KiB receive buffer bounds `want`, so
+         * unpaced this is exactly one read. Stated as
+         * `< (SPAWN_REPLY_LEN + 99) / 100` it would also admit a cap of 200 or
+         * 256 -- 418 bytes splits into 3 or 2 reads, both under that floor --
+         * so it would prove only that the 100-byte cap specifically is absent,
+         * not that the read path is uncapped. The strict form is what makes
+         * this the counterpart to the floor above rather than a weaker
+         * restatement of it.
+         *
+         * If the loopback ever hands these bytes over in more than one segment
+         * this reds, and that is intended: an assertion widened to accommodate
+         * fragmentation starts admitting exactly the caps it exists to exclude.
+         * Fix the fixture, not the bound.
+         */
+        ok(rc == 0 && er.client_reads == 1,
+           "without recv_slow the whole reply arrives in a single uncapped read");
 
         /* A chunk larger than the whole response is one read and no sleep --
          * the read-side mirror of send_slow's large-chunk case. */
