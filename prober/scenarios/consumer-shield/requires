@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#
+# CONSUMER-SCENARIO GATE, shield equivalent of consumer-cache-turbo's ./requires
+# (grind item "wire own modules" / plan-wire-own-modules.md step A). This
+# scenario's nginx.conf ALWAYS loads @BUILD_OBJS@/ngx_http_shield_module.so
+# unconditionally, so CI (which builds only the ref probe module) SKIPs
+# cleanly rather than failing on a guaranteed `nginx -t` error.
+#
+# nonzero exit  => run-scenario.sh emits "1..0 # SKIP <stdout of this gate>"
+found=0
+if [ -n "${PROBER_BUILD:-}" ]; then
+    [ -f "$PROBER_BUILD/objs/ngx_http_shield_module.so" ] && found=1
+    SEARCHED="$PROBER_BUILD/objs"
+else
+    BUILD_ROOT="${PROBER_ROOT:-.}/.build"
+    for so in "$BUILD_ROOT"/*/objs/ngx_http_shield_module.so; do
+        [ -f "$so" ] && { found=1; break; }
+    done
+    SEARCHED="$BUILD_ROOT/*/objs"
+fi
+if [ "$found" -eq 0 ]; then
+    echo "shield module .so not found in $SEARCHED -- nginx.conf load_modules ngx_http_shield_module.so unconditionally, so a statically-linked build does not satisfy it; build the module as a dynamic module to run this scenario"
+    exit 1
+fi
+
+exit 0
