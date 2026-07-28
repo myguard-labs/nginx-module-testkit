@@ -66,10 +66,24 @@ delta       fds == 0
 delta       connections.free == 0
 delta       pool.cycle_used == 0
 
-# A second fan, immediately after, at a different width. A defect that leaks
-# per FAN rather than per leg is invisible to a single fan's delta (both
-# snapshots would already include the drift) and shows up only in repetition --
-# the same aggregate-versus-per-case reasoning conn-delta is built on.
+# A second fan, immediately after, at a different width.
+#
+# WHAT THE SECOND FAN DOES AND DOES NOT BUY. It doubles the per-leg evidence
+# (16 more legs each asserted) and it exercises the driver at a second width,
+# which is worth having: an off-by-one in the fan's own bookkeeping that only
+# bites at one N would otherwise need a second scenario.
+#
+# It does NOT make the closing floor a detector for a leak of a fixed amount
+# per FAN CALL. Do the subtraction: one slot leaked per fan, across two fans,
+# is 2 slots -- 61 healthy down to 59, against a floor of 50. It sails through.
+# Raising the floor to catch it would put it at 60, one slot under the healthy
+# reading, which reds on any consumer module holding a connection of its own --
+# the opposite mistake, and the one the sizing note below is written to
+# prevent. A per-fan-call leak needs an absolute comparison against a
+# scenario-origin snapshot, which is `probe_baseline`, not a case-local delta.
+#
+# The per-LEG leak is what this scenario's floor actually detects, and the
+# arithmetic for that is in the closing case.
 name        a wider fan, back to back
 send        GET / HTTP/1.1\r\n
 send        Host: prober\r\nConnection: close\r\n\r\n
@@ -98,9 +112,14 @@ delta       pool.cycle_used == 0
 #
 # Floor 50 is 11 slots under the healthy reading, so a consumer module holding
 # a few connections of its own still passes. The defect it hunts is a slot
-# leaked per leg: 24 fanned legs have run by this case, so that lands at 37 --
+# leaked PER LEG: 24 fanned legs have run by this case, so that lands at 37 --
 # far below 50 and caught. A floor set just under 61 would have been the
 # opposite mistake, red on any consumer that holds anything.
+#
+# A leak of a fixed amount per FAN CALL is explicitly NOT covered by this floor
+# -- two fans leaking one slot each land at 59 and pass. See the note on the
+# second fan above for why widening the floor is the wrong fix and what would
+# actually catch it.
 #
 # Re-measure before changing the pool or the fan widths: the three the server
 # holds for itself is not a constant to rely on.
