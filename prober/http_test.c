@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  162
+#define PLANNED  163
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -1843,6 +1843,34 @@ main(void)
          */
         ok(rc == 0 && er.paced_sleep_ms == 0,
            "without recv_slow the client never sleeps between reads");
+
+        /*
+         * A pacing request nanosleep() cannot honour must credit NOTHING.
+         *
+         * `chunk` is set, so the cap engages and the reply is collected in
+         * several reads exactly as above -- only the duration is unusable. A
+         * negative `tv_nsec` is EINVAL, so nothing sleeps; the question is
+         * whether the counter says so. Returning the requested `ms` on a failed
+         * sleep would rebuild the defect the return value exists to prevent one
+         * layer down: the account would show four sleeps of a duration that was
+         * never waited.
+         *
+         * Reachable only from C. The rule parser clamps recv_slow's ms to
+         * 1..MAX_PAUSE_MS (rules.c), and this drives the transport directly, so
+         * the guard is here rather than left to the caller -- http_exchange()
+         * is a public entry point and the parser is not the only way in.
+         */
+        memset(&rv, 0, sizeof(rv));
+        rv.chunk = 100;
+        rv.ms = -1;
+
+        rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0,
+                           HTTP_IDLE_NONE, &er);
+
+        ok(rc == 0 && er.client_reads >= (SPAWN_REPLY_LEN + 99) / 100
+           && er.paced_sleep_ms == 0,
+           "a pacing delay nanosleep cannot honour credits no sleep at all");
 
         /* A chunk larger than the whole response is one read and no sleep --
          * the read-side mirror of send_slow's large-chunk case. */

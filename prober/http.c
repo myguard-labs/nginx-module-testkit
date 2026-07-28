@@ -1008,11 +1008,28 @@ sleep_ms(long ms)
 {
     struct timespec  ts;
 
+    /* A non-positive duration is not a short sleep, it is no sleep. Returning
+     * `ms` for it would credit a caller's pacing account for time that never
+     * passed, and nanosleep() rejects a negative tv_nsec with EINVAL anyway. */
+    if (ms <= 0) {
+        return 0;
+    }
+
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (ms % 1000) * 1000000L;
 
-    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
-        /* ts now holds the remaining time; go again. */
+    while (nanosleep(&ts, &ts) != 0) {
+        /* EINTR is the resumable case: ts now holds the remaining time, so go
+         * again rather than returning early. A pause cut short by a stray
+         * signal would silently write the rest of the request sooner than the
+         * rule file asked for, turning a timing test into a flaky one. */
+        if (errno != EINTR) {
+            /* EINVAL or EFAULT: nothing was slept, and the whole point of this
+             * return value is that it cannot report a sleep that did not
+             * happen. Crediting `ms` here would rebuild the exact defect the
+             * return exists to prevent, one layer down. */
+            return 0;
+        }
     }
 
     return ms;
