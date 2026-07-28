@@ -11,7 +11,67 @@ and after each one, and asserts that the difference is exactly zero. If your
 module leaks an fd or a byte of long-lived memory per request, the delta is
 nonzero and the test goes red — in CI, not in production three weeks later.
 
-## What this repo is — and what it is not
+## What this tool is for
+
+**This is an adversarial tool. Its purpose is to break the module under test,
+by any means available.**
+
+A consumer points it at their nginx/Angie module and the harness goes looking
+for the failure they have not found yet. Not "does the happy path return 200" —
+that is `nginx.pm`'s job. This tool exists to find the leak, the corruption, the
+descriptor that never closes, the allocation that is never checked, the state
+that survives a reload it should not have survived.
+
+The attack surface it works, and the machinery already here for each:
+
+- **Hostile and malformed input** — `property-fuzz` and `stateful-property-fuzz`
+  generate request shapes the module's author did not think of, including
+  pipelined and split-framing cases (`keepalive-bleed` is the negative control
+  for the reader that makes those honest).
+- **Allocation-failure injection** — `fault_slab=`, `fault_palloc=`,
+  `fault_tempfile=`, `fault_accept=` (`src/ngx_test_probe_arm.c`) make the
+  allocator fail on demand, on the Nth call. Most module bugs live on the error
+  path that nobody exercises, because in a healthy test the allocator never
+  fails. `fault-matrix` drives these.
+- **Resource exhaustion and leak pressure** — repeated-operation deltas on
+  cycle-pool bytes, file descriptors and slab accounting. A leak of one
+  descriptor per request is invisible in a functional test and fatal in
+  production; `rss-slope` and the `delta` oracles pin total growth, not a
+  per-operation average that truncates to zero.
+- **Lifecycle attacks** — reload, binary upgrade, worker death, signal storms
+  mid-transfer (`reload-*`, `usr2-*`, `hup-storm-mid-transfer`,
+  `worker-death`). Reloads are where module leaks surface, because that is when
+  a cycle is torn down and every unbalanced allocation becomes visible.
+- **Environmental hostility** — `clock-jump` walks the clock with libfaketime,
+  `locale-hostility` attacks locale-dependent parsing, `syscall-allowlist`
+  traces what the worker actually does rather than what it claims.
+
+If you can think of another way to break a module, it belongs here. New attack
+ideas are welcome as scenarios; see "Ideas and opportunities" below for the
+current list of ones worth building.
+
+### Coverage
+
+**The goal is 100% coverage of the code under test.** We will very likely never
+get there, and that is fine — the number is a direction of travel, not a
+promise. What matters is that every uncovered line is *known* and either gets a
+real adversarial test or an honest note saying why it is unreachable.
+
+`prober/coverage-director.sh` generates the per-test reachability map (opt-in;
+it feeds the impact selector). Use it to find what is **not** reached — that is
+its value here, as a generator of work.
+
+There is deliberately **no coverage-percent merge gate**, and adding one would
+be a mistake: the fastest way to move a coverage number is a test that executes
+lines without asserting anything, which is precisely the vacuous gate this repo
+has already shipped by accident several times and now hunts on purpose. A
+mutation-proven test that covers one line beats a suite that touches every line
+and cannot fail. Chase the coverage, never the percentage.
+
+## What this repo's own CI is for — and what it is not
+
+The section above is what the tool does to a *consumer's* module. This one is a
+narrower question: what does **this repo's own CI** spend its budget proving?
 
 **This is a probe tool for nginx. It is not an nginx module, and it is not a
 test suite for nginx itself.**
@@ -1605,6 +1665,69 @@ parent's temp-file descriptor into each short-lived child, which `--track-fds`
 would report as a leak in every one. `prober/pr_memcheck_test.sh` proves the
 memcheck verdict, the refusal (with a blanked-oracle negative control), the
 budget refusal and the empty-selection path are all non-vacuous.
+
+## Ideas and opportunities — ways to break a module we do not yet try
+
+The mission at the top of this file says the tool should break the module under
+test by any means available. This is the running list of means we do **not** yet
+have, kept here rather than in a private note so a consumer can see the shape of
+what is coming and argue for what they need.
+
+Each entry says what it would attack and what is missing today. None is
+committed work; a row graduates by becoming a scenario with a mutation-proven
+oracle. Ordered roughly by attack value per unit of effort.
+
+**Protocol surface we never exercise.** Every scenario speaks HTTP/1.1 cleartext.
+A module that touches request bodies, headers or connection state behaves
+differently under other protocols, and none of those paths are attacked:
+
+- **TLS.** No scenario configures `ssl_`. A module doing anything at the
+  connection layer has an entirely untested path, and the SSL handshake is a
+  rich source of allocation-failure and lifecycle bugs. Needs a self-signed
+  fixture cert and a TLS-capable client leg in the prober.
+- **HTTP/2 and HTTP/3.** Different framing, different body delivery, different
+  connection lifecycle. A module correct on HTTP/1.1 can leak per-stream state
+  on h2. Larger effort (the prober's reader is HTTP/1.1-framed), but this is
+  where real production bugs live for anything stream-aware.
+- **`stream{}` (raw TCP/UDP).** Already parked pending a consumer that targets
+  stream; the trigger to unpark is a stream-shaped module asking.
+
+**Attack shapes the rule language cannot express yet.** These need a directive,
+not a scenario:
+
+- **Body-boundary hostility.** `send_slow` splits the send, but there is no
+  directive to send a body that lies in the other direction (declared shorter
+  than sent), to trickle a chunked body one byte per chunk, or to send an
+  oversized `Content-Length` and stop. `backend-lying-length` does this to the
+  *upstream*; nothing does it to the module's own request path.
+- **Concurrency as an attack.** Every scenario is sequential. A module with a
+  shared-memory or per-worker race is invisible to a one-request-at-a-time
+  prober. A `concurrent N` directive that issues N requests in flight and then
+  asserts the same zero deltas would open an entire bug class — this is
+  probably the single highest-value item on this list.
+- **Fault injection during a lifecycle event.** The `fault_*` knobs and the
+  reload scenarios exist separately. Arming an allocation failure *during* a
+  reload, a binary upgrade or a worker shutdown attacks the teardown path,
+  which is exactly where unbalanced allocations become visible and where almost
+  nobody tests.
+
+**Coverage-driven work.** Run `prober/coverage-director.sh` and read the map for
+*unreached* lines in a consumer's module rather than in our own code. An
+unreached line in error handling is a line no test has ever forced to run, and
+the `fault_*` knobs exist precisely to force them. This turns the coverage goal
+into a generator of concrete adversarial scenarios instead of a number to chase.
+
+**Sharper oracles on what we already do.**
+
+- `syscall-allowlist` observes syscalls; it does not yet assert a *budget*
+  (this operation must not exceed N `openat` calls), which would catch a
+  module that works but does so via a per-request file open.
+- The `delta` oracles pin fds, pool bytes and slab. A module can still leak in
+  places nothing snapshots — timers, cleanup handlers, resolver state. Each is
+  a probe field somebody has to add before an oracle can assert on it.
+
+If you have a way to break a module that is not on this list, that is the most
+useful thing you can contribute.
 
 ## Fake upstream (`prober/fakesrv`)
 
