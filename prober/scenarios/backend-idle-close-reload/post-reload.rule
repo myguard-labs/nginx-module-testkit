@@ -31,6 +31,17 @@
 # socket bucket is relaxed to `<= 0` -- it tolerates the known asynchronous
 # DECREASE (a descriptor closing) but still reds hard on any INCREASE, which
 # is exactly the shape a real socket leak takes (open one, never close it).
+# WHAT THIS PREDICATE DOES AND DOES NOT CATCH. `delta` is `after - before`, so
+# the socket bucket rules out an UNOFFSET net increase. A leaked socket on its
+# own reds (4 -> 5 is +1). A leaked socket that happens to coincide with the
+# legitimate parked-upstream close nets to 0 and passes. That blind spot is NOT
+# introduced here -- the `delta fds == 0` this replaces had exactly the same
+# one, since +1 and -1 also sum to zero against an equality test -- but it is
+# worth stating rather than leaving the reader to infer a stronger guarantee
+# than the arithmetic gives. Closing it needs an oracle that identifies
+# descriptors rather than counting them (fd identity, or per-kind counts keyed
+# to the owning worker), which is a probe-side change and not this scenario's.
+#
 # A leaked socket therefore still fails this rule: `<= 0` rejects a positive
 # delta exactly as `== 0` would. This is narrower than tolerating "any
 # negative delta on the aggregate `fds`" (rejected option (a) in this

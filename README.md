@@ -209,8 +209,13 @@ alongside this repo's reference probe (`t/module`), and point a scenario at
 both. The probe is a *separate* `.so`; your module does not have to host it, and
 you do not write a directive, a handler, or a hook. You still get worker pid,
 connection counts, `fds` and `fds_by_kind`, `smaps`, and the full cycle-pool
-accounting — which is enough to assert that a request leaks no descriptor and no
-long-lived byte. That is the assertion most consumers actually want.
+accounting — which is enough to assert that a request produces no measurable
+growth in descriptor count or in cycle-pool and resident memory. Note what that
+does and does not say: these are counters and totals, so the oracle catches
+growth, not every conceivable leak. An allocation freed by something else in the
+same window, or a leak offset by a legitimate release, nets to zero and passes.
+It is still the assertion most consumers actually want, and it is the one the
+Perl suite cannot make at all.
 
 Ten of our own modules were wired this way in one pass, and eight of them
 produced a working allocation-neutrality scenario with zero lines of
@@ -243,11 +248,15 @@ The first run in a fresh checkout also downloads and unpacks the nginx tarball,
 which dominates everything above and depends on your link. Budget minutes for
 that once, then seconds forever after.
 
-Both flags are required at configure time and neither module declares them in
-its own `config`: `--with-http_ssl_module` (anything touching `ngx_ssl_t` fails
-with `field 'ssl' has incomplete type` without it, which reads like a module bug
-and is not one) and `--with-stream` (a stream half silently does not build).
-`tools/build-consumers.sh` passes both for you.
+Two configure flags are needed by particular modules, not by all of them, and
+neither module declares its own — so the failure arrives at build time with no
+hint of which module asked for it. `--with-http_ssl_module` is
+nginx-autocert-module's (its sources use `ngx_ssl_t`; without the flag the build
+dies with `field 'ssl' has incomplete type`, which reads like a module bug and
+is not one). `--with-stream` is nginx-label-autoconf-module's, for its stream
+half; without it that half silently does not build at all.
+`tools/build-consumers.sh` passes both unconditionally so a mixed build works,
+which costs nothing for the modules that need neither.
 
 ## Mini howto: from zero to a passing leak test
 
