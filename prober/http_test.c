@@ -179,7 +179,7 @@ typedef struct {
      * response like the fields above. recv_slow's other deterministic witness:
      * client_reads gates the chunk cap, this gates the SLEEP the cap paces the
      * reads apart with. Neither can be moved by a loaded box. */
-    long    paced_sleep_ms;
+    long long  paced_sleep_ms;
 } echo_result;
 
 
@@ -376,7 +376,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
     long           close_ms = 0;
     int            effective_rcvbuf = 0;
     size_t         client_reads = 0;
-    long           paced_sleep_ms = 0;
+    long long      paced_sleep_ms = 0;
 
     if (pipe(fds) != 0) {
         return -1;
@@ -1752,24 +1752,34 @@ main(void)
            "recv_slow bounds each read by the chunk, so the reply needs several");
 
         /*
-         * The SLEEP's deterministic witness, and the half the assertion above
-         * does not reach. `client_reads` gates the chunk cap; a mechanism that
-         * capped every read and slept for none of them satisfies it in full.
-         * The timing floor is the only other thing standing behind the sleep,
-         * and a floor decays into passing vacuously.
+         * The SLEEP's witness, and the half the assertion above does not reach.
+         * `client_reads` gates the chunk cap; a mechanism that capped every read
+         * and slept for none of them satisfies it in full, which left the sleep
+         * standing on the wall clock alone.
          *
-         * A floor rather than an equality, and deliberately one sleep short of
-         * the arithmetic. 418 bytes at 100 per read is 5 reads, and the loop
-         * sleeps only BEFORE a read it expects to fill (`paced_full`), so the
-         * final short read is not paced: 4 sleeps of 30 ms. Stated as `>= 90`
-         * -- three sleeps -- because a peer free to hand the bytes over in more
-         * segments than the cap forces can add unpaced short reads, which
-         * subtract sleeps without the pacing being broken. Three still cannot
-         * be reached by a mechanism that never sleeps, and that is the claim.
+         * An EQUALITY, and the count is MEASURED rather than derived: 5 reads
+         * and 120 ms, stable across 8 consecutive runs on loopback. The
+         * arithmetic agrees (418 bytes at a 100-byte cap is 5 reads, and
+         * `paced_full` sleeps only before a read the loop expects to fill, so
+         * the final short read is unpaced -- 4 sleeps of 30 ms), but the
+         * measurement is what this assertion rests on.
+         *
+         * It was briefly `>= 3 * rv.ms`, hedged one sleep low against a peer
+         * handing the bytes over in more segments than the cap forces. That
+         * hedge was wrong twice over: the fragmentation does not occur here, and
+         * a floor one under the real count ADMITS the single-sleep regression it
+         * was supposed to be tolerant of -- a mutant sleeping 3 times of 4
+         * passed the entire suite. If loopback ever does fragment this reply the
+         * assertion reds, and that is the correct outcome: fix the fixture, not
+         * the bound. Widening it back to a floor re-opens the hole.
+         *
+         * The value is credited from `sleep_ms()`'s return rather than from
+         * `recv_opt->ms` beside the call, so gutting the sleep to a no-op zeroes
+         * this counter instead of leaving it reporting sleeps that never
+         * happened. See the field comment in http.h.
          */
-        ok(rc == 0 && er.paced_sleep_ms >= 3 * rv.ms,
+        ok(rc == 0 && er.paced_sleep_ms == 4 * rv.ms,
            "recv_slow actually sleeps between the reads it paces");
-
         /*
          * The negative control: the same exchange unpaced must NOT cost what
          * the paced one did, or the assertions above would be measuring the
