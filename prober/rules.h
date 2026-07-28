@@ -261,6 +261,18 @@
  * driver, not a single case. */
 #define MAX_OPEN_CONNS  512
 
+/* Upper bound on the in-flight requests a case may issue (the `concurrent`
+ * directive). Distinct from MAX_OPEN_CONNS: those are BARE parked connections
+ * that never carry a request, while each of these writes the case's request and
+ * reads a full response, so each costs one client fd plus a response buffer for
+ * the whole exchange. The ceiling is far lower than MAX_OPEN_CONNS deliberately
+ * -- the directive exists to overlap requests so a shared-state race has a
+ * window to appear, and a race that needs more than 64 concurrent clients to
+ * show up is a load test, which belongs in a scenario driver rather than in one
+ * case. Keeping it small also bounds the poll() set and the peak memory a
+ * single case can demand. */
+#define MAX_CONCURRENT  64
+
 /* Upper bound on a single `pause`, and on the sum of a case's pauses. A rule
  * file that pauses longer than the prober's own read timeout would report a
  * harness timeout rather than the server behaviour under test, so the ceiling
@@ -495,6 +507,32 @@ typedef struct {
      * MAX_OPEN_CONNS. Requires at least one `probe` assertion (load-time check)
      * -- held connections nothing observes are a vacuous test. */
     int             open_conns;
+
+    /* Number of copies of this case's request to hold IN FLIGHT at once, or 0
+     * for the ordinary one-request-at-a-time path. Set by `concurrent <N>`
+     * (case-level, never per-block).
+     *
+     * The distinction from open_conns is the whole point of the directive.
+     * open_conns parks bare connections that never send anything; concurrent
+     * opens N connections, writes the case's request on ALL of them before
+     * reading ANY response, and then drains the N responses with poll(). So
+     * every request is genuinely outstanding in the worker at the same moment,
+     * which is the only state in which a shared-memory or per-worker race can
+     * be reached at all -- a sequential prober cannot construct it no matter how
+     * many requests it sends.
+     *
+     * The before/after probe snapshots bracket the whole fan, so the case's
+     * existing `delta` oracles then assert that N overlapping requests leave the
+     * worker exactly as N sequential ones would: no extra descriptor, no pool
+     * growth, no slab page. A leak that only manifests under overlap shows up as
+     * a non-zero delta here and nowhere else in the suite.
+     *
+     * Mutually exclusive with `block` (a pipeline is by definition ordered on
+     * one connection, so "N of them concurrently" would be a different and much
+     * larger feature) -- the parser rejects the combination rather than picking
+     * a winner. Zero is the off value and doubles as the duplicate guard, since
+     * a valid count is >= 2. Capped at MAX_CONCURRENT. */
+    int             concurrent;
 
     /* Receive-side pacing and the client's SO_RCVBUF. Both zero by default,
      * which is "read as fast as the peer sends, system-default buffer" -- the

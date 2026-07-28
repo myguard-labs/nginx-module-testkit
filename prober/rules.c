@@ -1294,6 +1294,42 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
 
             cases[n - 1].open_conns = (int) count;
 
+        } else if (strcmp(directive, "concurrent") == 0) {
+            char   *count_s = trim(arg);
+            char   *stop;
+            long    count;
+
+            if (*count_s == '\0') {
+                die("%s:%d: concurrent needs <count>", file, lineno);
+            }
+
+            count = strtol(count_s, &stop, 10);
+
+            /* Whole-argument check, same reasoning as open_conns above: a case
+             * that silently runs a different number of requests than the file
+             * spells is a test whose subject changed without anyone noticing. */
+            if (stop == count_s || *stop != '\0') {
+                die("%s:%d: concurrent count \"%s\" is not a number",
+                    file, lineno, count_s);
+            }
+
+            /* Floor is 2, not 1. `concurrent 1` is exactly the ordinary path
+             * with extra machinery, so accepting it would let a rule file claim
+             * a concurrency test while asserting nothing about overlap -- the
+             * vacuous-gate shape this harness exists to catch. Reject it at
+             * parse time with a line number instead. */
+            if (count < 2 || count > MAX_CONCURRENT) {
+                die("%s:%d: concurrent %ld out of range (2..%d)",
+                    file, lineno, count, MAX_CONCURRENT);
+            }
+
+            if (cases[n - 1].concurrent != 0) {
+                die("%s:%d: concurrent already set for this case",
+                    file, lineno);
+            }
+
+            cases[n - 1].concurrent = (int) count;
+
         } else if (strcmp(directive, "xfail") == 0) {
             if (cases[n - 1].xfail) {
                 die("%s:%d: xfail already set for this case", file, lineno);
@@ -1396,6 +1432,39 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
             die("%s: case \"%s\" carries open_conns %d but no probe assertion; "
                 "the held connections would be observed by nothing", file,
                 tc->name != NULL ? tc->name : "(unnamed)", tc->open_conns);
+        }
+
+        /*
+         * `concurrent` and `block` describe incompatible wire shapes: a
+         * pipeline is an ORDERED sequence on ONE connection, and the whole
+         * point of concurrent is N connections with no ordering between them.
+         * "N pipelines at once" is a coherent feature but a much larger one
+         * (per-connection block cursors, per-connection failure attribution),
+         * and silently picking either interpretation would run something other
+         * than what the file spells. Reject the pair with a line-free but
+         * case-named error, the same shape as the open_conns rule above.
+         */
+        if (tc->concurrent > 0 && tc->n_blocks > 0) {
+            die("%s: case \"%s\" carries both concurrent %d and %zu block(s); "
+                "a pipeline is ordered on one connection and cannot also be "
+                "issued concurrently", file,
+                tc->name != NULL ? tc->name : "(unnamed)",
+                tc->concurrent, tc->n_blocks);
+        }
+
+        /*
+         * A concurrent fan whose results nothing compares is a vacuous test in
+         * the same way open_conns without a probe is: the directive's entire
+         * value is that the before/after snapshots bracket N OVERLAPPING
+         * requests, so without a delta or probe assertion the case pays for N
+         * connections and asserts only what a single request already asserted.
+         * Requiring one of the two snapshot oracles is what makes the overlap
+         * observable.
+         */
+        if (tc->concurrent > 0 && tc->n_deltas == 0 && tc->n_probes == 0) {
+            die("%s: case \"%s\" carries concurrent %d but no delta or probe "
+                "assertion; the overlap would be observed by nothing", file,
+                tc->name != NULL ? tc->name : "(unnamed)", tc->concurrent);
         }
 
         /*
