@@ -27,11 +27,11 @@ cd "$(dirname "$0")"
 RULES=rules.c
 README=../README.md
 
-# 30 parser directives + 1 reverse sweep + 5 exclusion pairs + 4 self-checks.
+# 29 parser directives + 1 reverse sweep + 5 exclusion pairs + 5 self-checks.
 # The per-directive count is not hardcoded anywhere else on purpose (see
 # parser_directives), so a directive added without touching this number fails
 # the plan check at the bottom -- which is the intended nag, not a nuisance.
-PLANNED=39
+PLANNED=40
 tests_run=0
 failures=0
 
@@ -73,9 +73,18 @@ parser_directives() {
 # documented in several legitimate voices (`repeat <count> <text>`, a bare
 # `dechunk`, a fenced `send ...`) and demanding one of them fails against a
 # README that documents them, just differently.
+#
+# Fence state is tracked because a heading inside a fenced block is example
+# text, not a section boundary. Without it, a fenced line reading
+# "## Ideas and opportunities" turns the cut ON and nothing ever turns it off
+# -- the rest of the README vanishes from the gate and every directive below
+# that point reports as undocumented. No such fence exists today, but this
+# README does carry fenced markdown, and a gate whose failure mode is
+# "silently stop checking" is the shape this whole change exists to remove.
 readme_reference() {
     awk '
-        /^## / { in_backlog = ($0 ~ /^## Ideas and opportunities/) }
+        /^```/ { fence = !fence }
+        !fence && /^## / { in_backlog = ($0 ~ /^## Ideas and opportunities/) }
         !in_backlog
     ' "$1"
 }
@@ -351,6 +360,28 @@ if documented "shipped" "$synthetic" && ! documented "proposed" "$synthetic"; th
     ok 0 "a backlog-only mention is not documentation, a reference entry is"
 else
     ok 1 "the backlog cut is wrong (shipped=$(documented shipped "$synthetic" && echo y || echo n), proposed=$(documented proposed "$synthetic" && echo y || echo n))"
+fi
+
+# The same cut, against a backlog heading that appears as EXAMPLE TEXT inside a
+# fenced block. Without fence tracking the cut latches on at the fenced line and
+# never releases, so `after_fence` -- documented in an ordinary section below --
+# reports undocumented, and so would every real directive after it.
+# shellcheck disable=SC2016  # markdown code voice, not command substitution
+printf '%s\n' \
+    '## Rule reference' \
+    'Sections in this file look like:' \
+    '```' \
+    '## Ideas and opportunities' \
+    '```' \
+    '- **`after_fence <n>`** -- documented after the fenced example.' \
+    > "$tmpdir/README-fence.md"
+
+fenced=$(readme_reference "$tmpdir/README-fence.md")
+
+if documented "after_fence" "$fenced"; then
+    ok 0 "a backlog heading inside a fence does not cut the rest of the README"
+else
+    ok 1 "a fenced backlog heading latched the cut and hid the rest of the README"
 fi
 
 # ...and the plan is not satisfied by an empty parser. If parser_directives
