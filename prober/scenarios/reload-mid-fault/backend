@@ -1,0 +1,39 @@
+# A-2 (fault injection during a lifecycle event): the upstream drips its reply
+# back so slowly -- one 4-byte piece every 400 ms -- that the GAP between two
+# consecutive pieces is deterministically LONGER than the
+# memcached_read_timeout pinned in ./nginx.conf (150 ms). nginx's own upstream
+# module therefore times out mid-transfer: this is a genuine UPSTREAM FAULT
+# (ngx_http_upstream_finalize_request's read-timeout error branch), not a
+# clean-but-slow transfer -- the fault-matrix technique (drip ms vs
+# memcached_read_timeout) applied here to force the error branch to run WHILE
+# a reload is also landing on the same worker, instead of at an idle moment.
+#
+# Sizing: 400 ms > 150 ms with generous headroom (2.7x), so the timing is not
+# marginal on a loaded runner -- a host slow enough to blur that gap would have
+# to be pathologically starved, and the drip is deterministic (fixed bytes/ms,
+# no $RANDOM, no wall-clock fault SELECTION) so the sequence is byte-identical
+# regardless of machine speed; only the real-time READ-TIMEOUT race is
+# time-based, which is the thing under test, not the injection itself.
+#
+# get-ordinal accounting (fault-matrix's discipline: a fixed, documented
+# WARMUP count so a fault never fires on the wrong get): the driver issues
+# ONE clean warmup get first (post-reload.rule's "clean"-keyed GET, reused
+# verbatim to settle the worker before the resource-neutrality baseline is
+# taken -- see driver.sh), consuming get ordinal 1. The fault therefore sits
+# at ordinal 2, the held "slow"-keyed request; the post-reload coherence leg's
+# own "clean"-keyed get (ordinal 3) runs after the reload, at full speed, and
+# is not itself what spans the reload. A drift between this file's ordinal,
+# driver.sh's warmup call and the actual get sequence would fire the fault on
+# the warmup or the coherence leg instead -- both of which would fail loudly
+# (a faulted warmup errors before baseline is even taken; a faulted coherence
+# leg reds the post-reload prober assertion) rather than silently passing on
+# an unfaulted "slow" get.
+#
+# Gated by backend-smoke like every other fake upstream: an adversarially-timed
+# reply proves nothing unless the same fake is first proven correct when told
+# to behave normally.
+proto   memcached
+seed    slow    0123456789abcdefghijklmnopqrstuvwxyzABCD
+seed    clean   post-reload-coherence-value
+
+fault   on=get:2    action=drip    bytes=4    ms=400

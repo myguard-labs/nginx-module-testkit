@@ -1,0 +1,39 @@
+# The post-reload coherence case, run by the driver AFTER prober_signal_wait
+# has confirmed a new worker is answering and the faulted request has finished
+# erroring out. It proves the reloaded worker came back HEALTHY: a fresh,
+# unfaulted request against the same memcached backend serves a correct 200,
+# leaks no descriptor, and logs nothing new on the error path in the window
+# around THIS request (the read-timeout from the faulted request necessarily
+# logged an [error] earlier in the run; that is asserted and expected by the
+# driver itself, not by this file -- see driver.sh's no_error_log discussion).
+#
+# The pid oracle is STRICT (no pid_may_change): by the time this runs, a
+# single post-reload worker is serving, so both of this case's probe snapshots
+# see the SAME worker and "same worker pid" is the correct, stronger assertion
+# -- same reasoning as every sibling reload-*/post-reload.rule.
+
+# SPLIT BY DESCRIPTOR KIND, not `delta fds == 0`. This scenario has exactly the
+# profile that produces an intermittent NEGATIVE fd delta: it reloads a worker
+# that is holding an upstream connection, and the old worker's socket is reaped
+# asynchronously afterwards. A close landing inside the probe window drops the
+# aggregate count by one, and `delta fds == 0` then reds on a descriptor
+# CLOSING -- the opposite of the leak it exists to catch. Two sibling scenarios
+# (backend-idle-close-reload, reload-worker-shutdown-timeout) were flaky for
+# many sessions before that was understood; this one is written with the fix
+# rather than waiting to earn it on CI.
+#
+# Only the socket bucket can legitimately fall here, so only it is relaxed, and
+# only downwards -- an INCREASE still reds, which is the shape a leak takes.
+# `delta` is `after - before`, so this rules out an UNOFFSET net increase; a
+# leak exactly coinciding with the close nets to zero and passes, the same
+# blind spot `delta fds == 0` has.
+
+name    the reloaded worker serves a clean request after the mid-transfer fault
+from    127.0.0.1
+send    GET /mc?key=clean HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds_by_kind.socket <= 0
+delta   fds_by_kind.file == 0
+delta   fds_by_kind.anon == 0
+delta   fds_by_kind.other == 0

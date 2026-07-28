@@ -1503,6 +1503,61 @@ instead — the reason the scenario asserts all three pool counters), and a
 descriptor opened per config load reds the worker `fds` comparison and the
 master descriptor count together.
 
+### `reload-mid-fault` — a reload landing on top of an already-failing request
+
+Every reload scenario above proves a reload absorbs *clean* work in flight
+(`backend-reload-inflight`, `hup-storm-mid-transfer`, `reload-compressing`);
+`fault-matrix` proves the upstream error branches clean up correctly, but only
+at an idle moment. Neither combination is tested: a reload landing while a
+request is *already failing* upstream, which is exactly where an unbalanced
+allocation or a leaked upstream descriptor becomes visible —
+`ngx_http_upstream_finalize_request`'s error-cleanup path and the reload's own
+worker-drain teardown now run concurrently on the same worker, instead of at
+two separate idle moments.
+
+The upstream fault is a `drip` paced slower than a pinned
+`memcached_read_timeout` (400 ms between 4-byte chunks against a 150 ms
+budget — `memcached_read_timeout` applies *between* successive reads, the
+same citation `fault-matrix`'s `nginx.conf` uses), so nginx's own upstream
+read genuinely times out mid-transfer: a real upstream failure, not a
+slow-but-clean transfer. `rst`/`truncate`/`lie_bytes` were considered and
+rejected — fakesrv's fault vocabulary applies exactly one action per get and
+none of those three can be dripped (each sends its reply in one shot), so
+none can hold a connection open long enough to genuinely straddle a `SIGHUP`.
+
+A single fixed get ordinal (`on=get:2`, after one clean warmup get settles the
+worker) arms the fault, so which fault fires never depends on timing or a
+random draw — only the read-timeout's real-time race is time-based, and it is
+sized with a 2.7x margin so no non-pathological host blurs the cross.
+
+Oracles: the held request must NOT complete as a clean 200 (proves the fault
+actually fired, the anti-vacuity check for this scenario's own failure mode);
+the reload must be absorbed while that failing request is in flight; the new
+worker's fds/cycle-pool counters must be allocation-neutral across an extra
+clean request taken after both the fault's cleanup and the reload's drain
+complete (two quiescent post-drain snapshots, `reload-compressing`'s technique
+— a direct pre-fault-vs-post-reload compare reads a reproducible ~3.5 KB
+`cycle_used` gap that is the same "first post-reload fork carries a one-off"
+artifact `hup-storm-mid-transfer` documents, not a leak); no worker died by
+signal; the upstream saw the held get exactly once (the timeout was finalized,
+not retried); and the reloaded worker serves a clean request afterwards.
+
+Negative control (documented in the driver header, run by hand): corrupting
+the first resource-neutrality reading by one byte (`FIRST_USED - 1`) reds the
+oracle by exactly the assertion it exists to prove — `not ok 4 - the new
+worker's resource state grew after an extra request` — restored and
+re-verified clean.
+
+Why the probe and not `t/*.t`: every fault and every reload here could be
+thrown at a plain Test::Nginx suite too, but a worker that leaks the upstream
+fd or a cycle-pool block *specifically* on the "reload landed while the
+read-timeout cleanup was running" branch still returns a plausible 502/504 and
+a plausible "worker process ... exiting" log line — nothing in a `.t` file's
+assertion surface can tell that apart from a worker that cleaned up correctly.
+The unique oracle is the in-worker fd count and cycle-pool footprint read from
+the probe after both the fault's cleanup and the reload's drain have
+completed.
+
 ### `reload-soak` — 100 reloads under concurrent traffic
 
 `reload-cycle` reloads an idle server 8 times; `reload-soak` reloads it **100
@@ -1781,14 +1836,15 @@ not a scenario:
   reload scenarios exist separately. Arming a failure *during* a reload, a
   binary upgrade or a worker shutdown attacks the teardown path, which is
   exactly where unbalanced allocations become visible and where almost nobody
-  tests. **Note which half is reachable today:** an *upstream* fault (fakesrv,
-  ordinal-keyed) needs no hook and runs on the stock ref-probe legs, so
-  "reload while a faulted request is in flight" is buildable now. An
-  *allocation* fault is not — `fault_slab=`/`fault_palloc=` arm through
-  `ngx_test_probe_arm()`, which returns `NGX_DECLINED` unless the module under
-  test registers a `fault_set` hook, and `t/module/` deliberately registers
-  none. That half needs a real module fault site plus a consumer `.so`, the
-  same boundary `fault-matrix` documents.
+  tests. **Partially graduated:** `reload-mid-fault` covers the upstream half —
+  a reload landing on a request already failing upstream — using a fakesrv
+  ordinal-keyed fault, which needs no hook and runs on the stock ref-probe legs.
+  The *allocation* half is still open and is blocked on the fixture rather than
+  on effort: `fault_slab=`/`fault_palloc=`/`fault_tempfile=`/`fault_accept=` arm
+  through `ngx_test_probe_arm()`, which returns `NGX_DECLINED` unless the module
+  under test registers a `fault_set` hook, and `t/module/` deliberately
+  registers none. That half needs a real module fault site plus a consumer
+  `.so`, the same boundary `fault-matrix` documents.
 
 **Coverage-driven work.** Run `prober/coverage-director.sh` and read the map for
 *unreached* lines in a consumer's module rather than in our own code. An
