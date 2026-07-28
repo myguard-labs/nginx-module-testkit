@@ -81,6 +81,15 @@ http_response_free(http_response *resp)
  * ascii_fold()'s comment for the tr_TR breakage that motivated it). */
 static int ascii_case_eq(const char *a, const char *b, size_t len);
 
+/* Defined immediately after http_exchange(), which is its only caller. Declared
+ * here rather than moved above it so the file still reads in exchange order --
+ * write, then read -- matching the order the two halves actually run in. */
+static int http_read_response(int fd, int timeout_ms,
+                              const http_recv *recv_opt, int want_close,
+                              int framed, long long sent_at,
+                              http_response *resp, int *conn_open,
+                              char *errbuf, size_t errlen);
+
 
 static int
 parse_chunk_size(const char *p, const char *end, size_t *size, const char **next)
@@ -1260,11 +1269,7 @@ http_exchange(int fd,
               http_response *resp, int *conn_open,
               char *errbuf, size_t errlen)
 {
-    char               *buf = NULL;
-    size_t              cap = 8192, len = 0, want;
-    int                 paced_full = 0;
     long long           sent_at;
-    long                paced_sleep_ms = 0;   /* intentional recv pacing, AUD-07 */
 
     memset(resp, 0, sizeof(*resp));
     resp->status = -1;
@@ -1521,6 +1526,56 @@ http_exchange(int fd,
     if (shut_how != HTTP_SHUT_NONE) {
         (void) shutdown(fd, shut_how);
     }
+
+    return http_read_response(fd, timeout_ms, recv_opt, want_close, framed,
+                              sent_at, resp, conn_open, errbuf, errlen);
+}
+
+
+/*
+ * The response-reading half of an exchange, split out of http_exchange() so a
+ * concurrent driver can write N requests before reading ANY response -- that
+ * overlap is the whole point of concurrency, and it is unreachable while the
+ * read loop is welded to the write that preceded it.
+ *
+ * This is a pure extraction: the body below is http_exchange()'s former tail
+ * verbatim, and every path that used to skip it (abort's SO_LINGER reset,
+ * hold, expect_idle) still returns before reaching this call rather than
+ * entering and short-circuiting.
+ *
+ * `shutdown` is deliberately NOT in that list: a half-close is a modifier on
+ * the request, not a substitute for the response. It shuts the write side and
+ * then reads normally -- which is the entire point of SHUT_WR, since the peer
+ * has to answer the EOF for the case to prove anything. A concurrency driver
+ * must therefore treat shut_how as compatible with reading, not as a
+ * read-skipping mode.
+ *
+ * `sent_at` is passed in because the whole-
+ * exchange deadline and every close_ms measure from the instant the request
+ * finished going out, which only the writer knows; taking a fresh timestamp
+ * here would silently restart the clock and hand a trickling server the budget
+ * twice over.
+ *
+ * The response buffer is allocated, grown, and either freed or transferred to
+ * resp->raw entirely within this function -- no allocation crosses the seam,
+ * which is what makes the split safe to review as a move rather than a
+ * lifetime change.
+ *
+ * Return and errbuf semantics are http_exchange()'s: 0 when the exchange
+ * completed (the verdict belongs to the assertion layer), -1 with errbuf set
+ * on a harness-side failure.
+ */
+static int
+http_read_response(int fd, int timeout_ms,
+                   const http_recv *recv_opt, int want_close, int framed,
+                   long long sent_at,
+                   http_response *resp, int *conn_open,
+                   char *errbuf, size_t errlen)
+{
+    char       *buf;
+    size_t      cap = 8192, len = 0, want;
+    int         paced_full = 0;
+    long        paced_sleep_ms = 0;   /* intentional recv pacing, AUD-07 */
 
     buf = malloc(cap);
     if (buf == NULL) {
