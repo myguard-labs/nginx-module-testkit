@@ -793,7 +793,14 @@ jobs:
           # pick them up -- list them explicitly rather than rename them and
           # lose the intended invocation form (`prober/pr-impact`, not
           # `prober/pr-impact.sh`).
-          shellcheck -x --source-path=prober prober/*.sh prober/verify-impact prober/pr-impact prober/pr-memcheck prober/scenarios/*/driver.sh
+          # tools/*.sh is globbed for the same reason as prober/*.sh: it is a
+          # script directory, and a directory that is linted only by an explicit
+          # list is a directory that stops being linted the moment someone adds
+          # to it. Nullglob so an empty tools/ is not a shellcheck argument
+          # error -- the job should go red for a bad script, not for an absent
+          # one.
+          shopt -s nullglob
+          shellcheck -x --source-path=prober prober/*.sh prober/verify-impact prober/pr-impact prober/pr-memcheck prober/scenarios/*/driver.sh tools/*.sh
 
       # Downloaded and hash-checked, same as the server tarballs above: a
       # linter that gates the build is as much a supply-chain dependency as
