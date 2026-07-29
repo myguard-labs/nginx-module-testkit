@@ -1163,6 +1163,82 @@ write_paced(int fd, const unsigned char *buf, size_t len,
 
 
 /*
+ * Write `len` bytes one CHUNKED-FRAMING UNIT at a time, sleeping `ms` between
+ * units. A unit is a complete `<hex>[;ext]\r\n<data>\r\n` -- size line, data,
+ * and the data's trailing CRLF go out in ONE write, so the peer never sees a
+ * partial chunk header. As in write_paced(), the sleep goes BETWEEN units only.
+ *
+ * Framing is located with parse_chunk_size(), the same strict parser the
+ * response decoder uses, over the span the caller is pacing. Two consequences,
+ * both deliberate:
+ *
+ *   * The terminating 0-chunk is a unit like any other; its trailing CRLF and
+ *     any trailers after it are whatever remains, flushed as the final write.
+ *   * Framing this parser rejects -- a bare-LF size line, a lying length, a
+ *     truncated tail -- is NOT an error here. The remainder from the first
+ *     unparseable byte is written in a single write_all() and the pacing simply
+ *     stops. This harness exists to put malformed framing on the wire, so
+ *     refusing to send it would remove the only interesting case; and the
+ *     alternative -- guessing where the next unit starts -- means slicing at an
+ *     offset the framing does not have, which is what the byte-count pacer
+ *     already does. The bytes are always identical to an unpaced write; only
+ *     the timing of the tail changes.
+ */
+static int
+write_paced_units(int fd, const unsigned char *buf, size_t len, long ms)
+{
+    size_t  off = 0;
+
+    while (off < len) {
+        const char  *start = (const char *) buf + off;
+        const char  *end = (const char *) buf + len;
+        const char  *data;
+        size_t       size, unit, avail;
+
+        if (parse_chunk_size(start, end, &size, &data) != HTTP_DECHUNK_OK) {
+            break;
+        }
+
+        /* size line + data + the data's CRLF. Bounded against the span rather
+         * than trusted: a size line may declare more data than was actually
+         * written, and this walk must not read past the request buffer to
+         * honour it. Written as a subtraction on the REMAINING length so a
+         * declared size near SIZE_MAX cannot wrap the comparison -- the same
+         * reason parse_chunk_size() checks its accumulator before each shift. */
+        avail = (size_t) (end - data);
+
+        if (size > avail || avail - size < 2) {
+            break;
+        }
+
+        unit = (size_t) (data - start) + size;
+
+        if (start[unit] != '\r' || start[unit + 1] != '\n') {
+            break;
+        }
+
+        unit += 2;
+
+        if (write_all(fd, buf + off, unit) != 0) {
+            return -1;
+        }
+
+        off += unit;
+
+        if (off < len) {
+            sleep_ms(ms);
+        }
+    }
+
+    if (off < len) {
+        return write_all(fd, buf + off, len - off);
+    }
+
+    return 0;
+}
+
+
+/*
  * Write the request, stalling at each pause offset. With no pauses this is a
  * single write_all() of the whole buffer -- byte-identical to what this
  * function did before pauses existed.
@@ -1187,12 +1263,13 @@ write_request(int fd, const unsigned char *req, size_t req_len,
             off = upto;
         }
 
-        if (pauses[i].chunk > 0) {
+        if (pauses[i].unit || pauses[i].chunk > 0) {
             /* Paced entry: dribble from here to the next entry's offset (or
              * the end), rather than stalling once. The leading sleep keeps a
              * paced entry's `ms` meaning the same "hold off, then act" as a
              * plain pause, so the two read alike in a rule file. */
             size_t  upto_next = req_len;
+            int     rc;
 
             if (i + 1 < n_pauses && pauses[i + 1].offset < upto_next) {
                 upto_next = pauses[i + 1].offset;
@@ -1204,9 +1281,19 @@ write_request(int fd, const unsigned char *req, size_t req_len,
 
             sleep_ms(pauses[i].ms);
 
-            if (write_paced(fd, req + off, upto_next - off,
-                            pauses[i].chunk, pauses[i].ms) != 0)
-            {
+            /* `unit` first, so an entry carrying both paces by framing rather
+             * than silently by byte count -- the same precedence http.h
+             * documents, kept in one place. rules.c rejects the combination, so
+             * this only decides what http_test.c and any future caller get. */
+            if (pauses[i].unit) {
+                rc = write_paced_units(fd, req + off, upto_next - off,
+                                       pauses[i].ms);
+            } else {
+                rc = write_paced(fd, req + off, upto_next - off,
+                                 pauses[i].chunk, pauses[i].ms);
+            }
+
+            if (rc != 0) {
                 return -1;
             }
 

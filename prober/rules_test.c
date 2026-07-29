@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  275
+#define PLANNED  288
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -357,6 +357,83 @@ main(void)
     expect_die("name t\nsend_slow 4 0\n", "a zero send_slow duration dies");
     expect_die("name t\nsend_slow 4 10001\n",
                "a send_slow duration over the ceiling dies");
+
+    /* ---- send_slow_chunks ---------------------------------------------- */
+
+    n = load_str("name t\nsend AB\nsend_slow_chunks 5\nsend 1\\r\\nX\\r\\n\n");
+    ok(n == 1 && cases[0].n_pauses == 1
+       && cases[0].pauses[0].offset == 2
+       && cases[0].pauses[0].ms == 5
+       && cases[0].pauses[0].unit == 1
+       && cases[0].pauses[0].chunk == 0,
+       "send_slow_chunks records offset and duration, and paces by unit "
+       "rather than by byte count");
+    free_all(n);
+
+    /* The two pacing modes must stay distinguishable in the parsed case, not
+     * merely in the directive name: write_request() picks the pacer off these
+     * two fields, so a send_slow that set `unit` (or the reverse) would silently
+     * pace by the other mode while the rule file still read correctly. */
+    n = load_str("name t\nsend AB\nsend_slow 4 5\n");
+    ok(n == 1 && cases[0].n_pauses == 1 && cases[0].pauses[0].unit == 0,
+       "send_slow records a zero unit flag");
+    free_all(n);
+
+    n = load_str("name t\nsend AB\npause 5\n");
+    ok(n == 1 && cases[0].n_pauses == 1 && cases[0].pauses[0].unit == 0,
+       "a plain pause records a zero unit flag");
+    free_all(n);
+
+    n = load_str("name t\nsend_slow_chunks 3\nsend 1\\r\\nX\\r\\n\n");
+    ok(n == 1 && cases[0].n_pauses == 1 && cases[0].pauses[0].offset == 0,
+       "send_slow_chunks before any send paces from offset 0");
+    free_all(n);
+
+    n = load_str("name t\nsend_slow_chunks 3\nsend 1\\r\\nX\\r\\n0\\r\\n\\r\\n\n");
+    ok(n == 1 && cases[0].request_len == 11
+       && memcmp(cases[0].request, "1\r\nX\r\n0\r\n\r\n", 11) == 0,
+       "send_slow_chunks does not change the bytes of the request");
+    free_all(n);
+
+    expect_die("name t\nsend_slow_chunks\n",
+               "send_slow_chunks with no argument dies");
+    expect_die("name t\nsend_slow_chunks x\n",
+               "a non-numeric send_slow_chunks duration dies");
+    expect_die("name t\nsend_slow_chunks 5junk\n",
+               "a send_slow_chunks duration with trailing junk dies");
+    expect_die("name t\nsend_slow_chunks 0\n",
+               "a zero send_slow_chunks duration dies");
+    expect_die("name t\nsend_slow_chunks -1\n",
+               "a negative send_slow_chunks duration dies");
+    expect_die("name t\nsend_slow_chunks 10001\n",
+               "a send_slow_chunks duration over the ceiling dies");
+
+    /* The ceiling check at close, costed at MIN_CHUNK_UNIT_BYTES: 120 bytes of
+     * body is 20 smallest-possible units, and 20 * 600 ms is 12000 -- over the
+     * 10000 ceiling. This is the assertion that makes the unit-aware branch of
+     * pause_cost_ms() load-bearing: costed as a plain stall the same case is
+     * 600 ms and loads fine. */
+    expect_die("name t\nsend_slow_chunks 600\n"
+               "send 1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n"
+               "1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n"
+               "1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n"
+               "1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n"
+               "1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n",
+               "a send_slow_chunks whose unit dribble exceeds the ceiling dies "
+               "at close");
+
+    /* The positive control for the line above: the same 20 units at a duration
+     * that DOES fit. Without it, a mutant that made every send_slow_chunks case
+     * die would still pass the expect_die. */
+    n = load_str("name t\nsend_slow_chunks 400\n"
+                 "send 1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n"
+                 "1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n"
+                 "1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n"
+                 "1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n"
+                 "1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n");
+    ok(n == 1 && cases[0].n_pauses == 1 && cases[0].pauses[0].unit == 1,
+       "the same 20 units at a duration inside the ceiling still load");
+    free_all(n);
 
     /* ---- shutdown ------------------------------------------------------ */
 

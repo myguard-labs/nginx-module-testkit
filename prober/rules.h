@@ -281,6 +281,18 @@
  * silently degrading a pacing test into one plain write that still reports ok. */
 #define MAX_SEND_SLOW_CHUNK  4096
 
+/* Smallest possible chunked-framing unit on the wire: `1\r\nX\r\n` -- one hex
+ * digit, CRLF, one data byte, CRLF. Used to
+ * cost `send_slow_chunks` against the pause ceiling at LOAD time, where the unit
+ * count is not knowable -- the framing lives in bytes a later `send` may still
+ * append, and a size line can carry an extension of any length. Charging the
+ * span as if every unit were this small overestimates the unit count for any
+ * real body, which is the only safe direction: the ceiling exists so a rule file
+ * cannot declare a dribble longer than the prober's read timeout and then report
+ * a harness timeout as a server verdict. Being strict here rejects a case that
+ * would in fact have fit; being lenient ships one that reports the wrong thing. */
+#define MIN_CHUNK_UNIT_BYTES  6
+
 /* Bounds on `recv_slow <chunk> <ms>`. The chunk shares send_slow's cap for the
  * same reason -- a chunk larger than the response is merely one read -- and the
  * stall shares the pause ceiling, since a receive-side stall spends the

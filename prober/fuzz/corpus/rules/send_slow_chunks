@@ -1,0 +1,5 @@
+name chunk unit pacing
+send POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n
+send_slow_chunks 5
+send 1\r\nX\r\n3\r\nYYY\r\n0\r\n\r\n
+expect status=200
