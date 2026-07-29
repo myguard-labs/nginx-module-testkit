@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  288
+#define PLANNED  290
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -433,6 +433,34 @@ main(void)
                  "1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n1\\r\\nX\\r\\n");
     ok(n == 1 && cases[0].n_pauses == 1 && cases[0].pauses[0].unit == 1,
        "the same 20 units at a duration inside the ceiling still load");
+    free_all(n);
+
+    /* MIN_CHUNK_UNIT_BYTES must be the TRUE floor, and the floor is the
+     * zero-sized chunk `0\r\n\r\n` (5 bytes), not `1\r\nX\r\n` (6). The two
+     * cases above cannot tell 5 from 6 -- 120 bytes is over the ceiling at both
+     * -- so this is the case that pins the constant.
+     *
+     * 60 bytes as twelve real `0\r\n\r\n` units at 850 ms is 10200 ms, over the
+     * 10000 ceiling, and must die. Costed at 6 the same span is ten units and
+     * 8500 ms, which loads fine and lets a rule file outrun the read timeout by
+     * ~20% while reporting the resulting harness timeout as a server verdict.
+     * Restoring MIN_CHUNK_UNIT_BYTES to 6 reds exactly this assertion. */
+    expect_die("name t\nsend_slow_chunks 850\n"
+               "send 0\\r\\n\\r\\n0\\r\\n\\r\\n0\\r\\n\\r\\n0\\r\\n\\r\\n"
+               "0\\r\\n\\r\\n0\\r\\n\\r\\n0\\r\\n\\r\\n0\\r\\n\\r\\n"
+               "0\\r\\n\\r\\n0\\r\\n\\r\\n0\\r\\n\\r\\n0\\r\\n\\r\\n",
+               "a dribble of zero-sized chunks is costed at the true 5-byte "
+               "floor, not 6");
+
+    /* Positive control, same body one step under: twelve units at 800 ms is
+     * 9600 ms and fits. Without it the assertion above passes for a mutant that
+     * rejects every zero-chunk body outright. */
+    n = load_str("name t\nsend_slow_chunks 800\n"
+                 "send 0\\r\\n\\r\\n0\\r\\n\\r\\n0\\r\\n\\r\\n0\\r\\n\\r\\n"
+                 "0\\r\\n\\r\\n0\\r\\n\\r\\n0\\r\\n\\r\\n0\\r\\n\\r\\n"
+                 "0\\r\\n\\r\\n0\\r\\n\\r\\n0\\r\\n\\r\\n0\\r\\n\\r\\n");
+    ok(n == 1 && cases[0].n_pauses == 1 && cases[0].pauses[0].unit == 1,
+       "the same zero-sized-chunk dribble one step under the ceiling loads");
     free_all(n);
 
     /* ---- shutdown ------------------------------------------------------ */

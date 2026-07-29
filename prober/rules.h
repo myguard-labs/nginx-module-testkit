@@ -281,17 +281,25 @@
  * silently degrading a pacing test into one plain write that still reports ok. */
 #define MAX_SEND_SLOW_CHUNK  4096
 
-/* Smallest possible chunked-framing unit on the wire: `1\r\nX\r\n` -- one hex
- * digit, CRLF, one data byte, CRLF. Used to
- * cost `send_slow_chunks` against the pause ceiling at LOAD time, where the unit
- * count is not knowable -- the framing lives in bytes a later `send` may still
- * append, and a size line can carry an extension of any length. Charging the
- * span as if every unit were this small overestimates the unit count for any
- * real body, which is the only safe direction: the ceiling exists so a rule file
- * cannot declare a dribble longer than the prober's read timeout and then report
- * a harness timeout as a server verdict. Being strict here rejects a case that
- * would in fact have fit; being lenient ships one that reports the wrong thing. */
-#define MIN_CHUNK_UNIT_BYTES  6
+/* Smallest possible chunked-framing unit on the wire: `0\r\n\r\n` -- one hex
+ * digit, CRLF, ZERO data bytes, CRLF. Not `1\r\nX\r\n` (6): a zero-sized chunk
+ * needs no data byte, and neither parse_chunk_size() nor write_paced_units()
+ * restricts how many may appear in sequence, so a span made entirely of them
+ * really does pace one unit per 5 bytes. Used to cost `send_slow_chunks` against
+ * the pause ceiling at LOAD time, where the unit count is not knowable -- the
+ * framing lives in bytes a later `send` may still append, and a size line can
+ * carry an extension of any length.
+ *
+ * The constant must be the true floor, not merely a small number. Costing the
+ * span as `span / MIN_CHUNK_UNIT_BYTES` units OVERESTIMATES the unit count for
+ * any larger unit, which is the safe direction: the ceiling exists so a rule
+ * file cannot declare a dribble longer than the prober's read timeout and then
+ * report a harness timeout as a server verdict. Being strict rejects a case that
+ * would in fact have fit; being lenient ships one that reports the wrong thing.
+ * A value ABOVE the floor inverts that -- at 6 a span of zero-sized chunks costs
+ * (span/5)*ms in reality against a (span/6)*ms budget, ~20% under, which is
+ * precisely the failure this paragraph warns about. */
+#define MIN_CHUNK_UNIT_BYTES  5
 
 /* Bounds on `recv_slow <chunk> <ms>`. The chunk shares send_slow's cap for the
  * same reason -- a chunk larger than the response is merely one read -- and the

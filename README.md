@@ -522,11 +522,13 @@ what this harness is for, and the alternative (guessing where the next unit
 begins) is the mid-header slicing the directive exists to avoid.
 
 Cost against the 10000 ms ceiling is charged as if every unit were the smallest
-the wire allows (`1\r\nX\r\n`, 6 bytes), because the real unit count is not
-knowable at load time — a later `send` may still append framing, and a size line
-may carry an extension of any length. The overestimate is the safe direction:
-being strict rejects a case that would have fit, being lenient ships one that
-reports a harness timeout as a server verdict.
+the wire allows — a zero-sized chunk, `0\r\n\r\n`, 5 bytes — because the real
+unit count is not knowable at load time: a later `send` may still append framing,
+and a size line may carry an extension of any length. Nothing stops a body from
+being made entirely of zero-sized chunks, so 5 is a real floor rather than a
+theoretical one. Costing at the floor overestimates the unit count for any larger
+unit, which is the safe direction: being strict rejects a case that would have
+fit, being lenient ships one that reports a harness timeout as a server verdict.
 
 `shutdown 0|1|2` calls `shutdown(2)` once the request is on the wire — `0` =
 SHUT_RD, `1` = SHUT_WR, `2` = SHUT_RDWR. One per case:
