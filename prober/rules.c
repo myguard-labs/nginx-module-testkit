@@ -1515,11 +1515,50 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
          * than a sleep, so a paced leg no longer withholds the others, and the
          * pacing credit is discounted from that leg's deadline only.
          *
-         * Deliberately NOT replaced by a narrower gate. There is no remaining
-         * combination of these directives whose verdict the drain mismeasures;
-         * a gate kept "just in case" would reject cases that now work, and the
-         * mutation corpus would have nothing to prove it with.
+         * ONE combination is still mismeasured, and it is gated below rather
+         * than allowed: all three of concurrent + recv_slow +
+         * expect_close_within together.
          */
+
+        /*
+         * The paced close-deadline triple stays REJECTED, for a reason the
+         * poll() drain does not touch.
+         *
+         * Every close path records close_ms as a raw elapsed_since(sent_at)
+         * (http.c) and subtracts no pacing. That is correct for the deadline's
+         * documented meaning -- README defines it as when the SERVER ended the
+         * connection -- only while the client is draining as fast as it can.
+         * recv_slow breaks exactly that: the client withholds reads on purpose,
+         * so it cannot observe EOF until after its own gates have elapsed, and
+         * a server that closed promptly is reported as closing late. A prompt
+         * response spanning four 50 ms gates fails expect_close_within 100 as a
+         * 200+ ms close.
+         *
+         * This is NOT the drain defect the lift above fixed. Serialization
+         * charged one leg's time to another leg's clock, and per-leg state
+         * fixed it; this charges the CLIENT's deliberate delay to the SERVER's
+         * number, on one leg, with no other leg involved.
+         *
+         * Subtracting paced_sleep_ms from close_ms would not be a fix either:
+         * it would produce a plausible number that is still not the remote
+         * FIN's timestamp, since the FIN may have arrived at any point during a
+         * gate. Measuring a server close independently of unread queued data is
+         * what this needs, and until the harness can do that, refusing the case
+         * is more honest than reporting a quantity known to be wrong.
+         *
+         * Deliberately narrow: concurrent + recv_slow alone is fine (nothing
+         * asserts on close timing), and concurrent + expect_close_within alone
+         * is fine (nothing withholds reads). Only the three together are
+         * unmeasurable.
+         */
+        if (tc->concurrent > 0 && tc->saw_recv_slow && tc->saw_close_within) {
+            die("%s: case \"%s\" carries concurrent %d with both recv_slow and "
+                "expect_close_within; recv_slow makes the client withhold "
+                "reads, so the observed close time includes the client's own "
+                "pacing and no longer describes when the server closed. Drop "
+                "one of the two", file,
+                tc->name != NULL ? tc->name : "(unnamed)", tc->concurrent);
+        }
 
         /*
          * Pipeline cases carry every per-exchange knob inside blocks[], so the

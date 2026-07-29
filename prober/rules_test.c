@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  274
+#define PLANNED  275
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1242,6 +1242,25 @@ main(void)
        "concurrent + recv_slow loads -- a paced leg gates itself without "
        "withholding the others");
     free_all(n);
+
+    /*
+     * ...but the two together with concurrent are still rejected, and this is
+     * the case the lift's own tests did not cover.
+     *
+     * The pair tests above pass because each is genuinely fine: recv_slow
+     * alone asserts nothing about close timing, and expect_close_within alone
+     * withholds no reads. All three together is the one combination the drain
+     * does NOT fix -- close_ms is a raw elapsed_since(sent_at) everywhere in
+     * http.c, so the client's own pacing gates land inside the number that is
+     * documented as the server's close time. A test asserting only the two
+     * pairs load would let the unmeasurable triple through unnoticed, which is
+     * exactly what it did.
+     */
+    expect_die("name t\nsend X\nconcurrent 4\nrecv_slow 100 10\n"
+               "expect_close_within 100\nprobe fds >= 0\n",
+               "concurrent + recv_slow + expect_close_within dies -- paced "
+               "reads make the observed close time the client's, not the "
+               "server's");
 
     /* The load-bearing guard: held connections that no probe assertion reads
      * are a vacuous test, so the case is rejected at load time rather than

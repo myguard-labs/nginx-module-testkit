@@ -726,13 +726,26 @@ Three combinations are rejected at load time rather than silently resolved:
   against.
 
 `expect_close_within` and `recv_slow` **used to be a fourth rejection and are now
-allowed.** The fan drained its legs in index order with a blocking read each, so
-an earlier leg's read time was charged to every later leg's clock and a prompt
-final leg could be reported as a timeout purely because an earlier leg was slow.
-The drain is now a single `poll()` loop over per-leg state: legs advance
-independently, each leg's timing is measured against its own clock, and pacing is
-a per-leg gate that excludes that leg from the poll set rather than a sleep that
-would withhold every other leg.
+allowed individually.** The fan drained its legs in index order with a blocking
+read each, so an earlier leg's read time was charged to every later leg's clock
+and a prompt final leg could be reported as a timeout purely because an earlier
+leg was slow. The drain is now a single `poll()` loop over per-leg state: legs
+advance independently, each leg's timing is measured against its own clock, and
+pacing is a per-leg gate that excludes that leg from the poll set rather than a
+sleep that would withhold every other leg.
+
+- **`concurrent` + `recv_slow` + `expect_close_within` (all three)** remains
+  rejected, and the poll drain does not fix it. `close_ms` is measured from the
+  moment the request finished going out to the moment the client observes the
+  connection end, and `recv_slow` makes the client withhold reads on purpose —
+  so a server that closed promptly is not *seen* to have closed until the
+  client's own pacing gates have elapsed. A prompt response spanning four 50 ms
+  gates fails `expect_close_within 100` as a 200+ ms close, blaming the server
+  by name for the client's delay. Each *pair* is fine: `recv_slow` alone asserts
+  nothing about close timing, and `expect_close_within` alone withholds no
+  reads. Subtracting the pacing would only produce a plausible number that is
+  still not the remote FIN's timestamp, so the case is refused rather than
+  answered with a quantity known to be wrong.
 
 `shutdown` is deliberately **not** in that list and combines freely: a half-close
 is a modifier on the request, not a substitute for the response. After `SHUT_WR`
