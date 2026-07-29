@@ -1700,7 +1700,8 @@ http_read_state_init(http_read_state *st, int fd, int timeout_ms,
 /*
  * Release a leg's buffer if it is still owned by the state.
  *
- * This is the enforcement point for the ownership invariant stated in http.h:
+ * This is the enforcement point for the OWNERSHIP INVARIANT stated on the
+ * http_read_state struct above:
  * a terminal leg has already either freed `buf` or transferred it to
  * resp->raw, and both paths NULL it here, so calling this on any leg -- live,
  * terminal, or never started -- is safe and idempotent. That is what lets the
@@ -1720,7 +1721,8 @@ http_read_state_free(http_read_state *st)
  *
  * A leg gated by recv pacing is deliberately NOT polled: its `not_before` is in
  * the future and readiness is irrelevant until then. This is what keeps pacing
- * from blocking the other legs -- see the pacing note in http.h.
+ * from blocking the other legs -- see the not_before/gate_start field comments
+ * on http_read_state above, and the credit rule in http_read_state_step().
  */
 static int
 http_read_state_pollable(const http_read_state *st, long long now)
