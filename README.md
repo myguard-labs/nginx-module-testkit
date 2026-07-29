@@ -1909,11 +1909,25 @@ differently under other protocols, and none of those paths are attacked:
 **Attack shapes the rule language cannot express yet.** These need a directive,
 not a scenario:
 
-- **Body-boundary hostility.** `send_slow` splits the send, but there is no
-  directive to send a body that lies in the other direction (declared shorter
-  than sent), to trickle a chunked body one byte per chunk, or to send an
-  oversized `Content-Length` and stop. `backend-lying-length` does this to the
-  *upstream*; nothing does it to the module's own request path.
+- **Body-boundary hostility.** `send_slow` splits the send, but the rule
+  language could not (until now) send a body that lies in the other direction
+  (declared shorter than sent), trickle a chunked body one byte per chunk, or
+  send an oversized `Content-Length` and stop. `backend-lying-length` does
+  this to the *upstream*; the three sub-attacks below are the module's own
+  request path.
+  ~~declared shorter than sent, then stop~~ **GRADUATED:**
+  `rules/stock/short-body.rule` sends fewer body bytes than the declared
+  Content-Length, half-closes with `shutdown 1`, and asserts
+  `expect_close_within` -- no new directive needed, `send` already puts
+  arbitrary mismatched bytes on the wire.
+  ~~oversized Content-Length and stop~~ **ALREADY GRADUATED:**
+  `rules/stock/huge-content-length.rule` (predates this row) sends Content-Length
+  values at and past every integer boundary nginx has, with no body at all;
+  this backlog line was stale against the tree.
+  Trickling a chunked body one byte per chunk is still open: `send_slow`
+  paces raw bytes irrespective of chunk framing, so pacing at chunk-unit
+  granularity (one `<size>\r\n<data>\r\n` unit per pause, not one arbitrary
+  byte-count slice) needs a directive, tracked separately.
 - **Concurrency as an attack.** ~~Every scenario is sequential.~~ **GRADUATED:**
   the `concurrent N` directive (documented above) issues N requests in flight and
   asserts the same zero deltas, opening the shared-memory/per-worker race class to
