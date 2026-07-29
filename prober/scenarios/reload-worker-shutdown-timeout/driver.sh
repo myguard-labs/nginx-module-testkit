@@ -222,7 +222,16 @@ case "$WST_NUM" in
         exit 1
         ;;
 esac
-WST_MS=$(( WST_NUM * WST_MUL ))
+# `10#` forces base 10. Without it bash reads a leading-zero literal as OCTAL,
+# and nginx accepts both spellings -- verified with `nginx -t`, so each of these
+# reaches this line through a conf the harness booted happily:
+#   `08s` / `09s` -> "value too great for base", killing the driver under
+#                    `set -e` with no TAP output at all;
+#   `010s`        -> WORSE, because it does not error: nginx reads 10 seconds,
+#                    this would read 8, and every window below would derive
+#                    from a number the server never used.
+# The digit-only check above cannot catch either -- both are digit-only.
+WST_MS=$(( 10#$WST_NUM * WST_MUL ))
 PRE_ITERS=$(( WST_MS / 2 / STEP_MS ))
 if [ "$PRE_ITERS" -lt 1 ]; then
     echo "Bail out! worker_shutdown_timeout ($WST) is too short to poll at" \
