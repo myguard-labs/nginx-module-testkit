@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# clock-jump needs libfaketime: the whole scenario is "step the WALL clock under
+# a running worker and prove the timers did not notice". Without the library
+# there is no way to step it, and a scenario that cannot perform its own attack
+# must SKIP VISIBLY rather than run four requests that assert nothing -- which
+# is exactly what this scenario did until 2026-07-29 (see driver.sh's header).
+#
+# Debian/Ubuntu: the `faketime` package ships the .so; the path is
+# multiarch-qualified, so glob rather than hardcode x86_64.
+set -eu
+
+for so in /usr/lib/*/faketime/libfaketime.so.1 /usr/lib/faketime/libfaketime.so.1; do
+    [ -r "$so" ] && exit 0
+done
+
+echo "libfaketime.so.1 not found (install the 'faketime' package)" >&2
+exit 1
