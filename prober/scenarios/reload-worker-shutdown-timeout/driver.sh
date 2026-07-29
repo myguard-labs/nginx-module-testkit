@@ -5,7 +5,8 @@
 # (SIGHUP) is delivered while that request is stalled mid-body. The draining
 # OLD worker cannot finish reading a body that never completes, so it cannot
 # produce a response either -- it can only wait, bounded by
-# `worker_shutdown_timeout` (set SHORT in nginx.conf: 2s). When that timer
+# `worker_shutdown_timeout` (set SHORT in nginx.conf: 2s -- the driver READS
+# that value rather than assuming it, see the window derivation below). When that timer
 # expires, the draining worker FORCE-closes the stalled connection so it can
 # finish exiting.
 #
@@ -160,16 +161,75 @@ start_stalled_upload() {
 # prober_signal_wait / prober_wait_listen). STEP is the same for every wait
 # below so windows expressed in "N * STEP" are directly comparable.
 STEP=0.1
-# worker_shutdown_timeout is 2s (nginx.conf). PRE_ITERS times STEP must be
-# comfortably SHORTER than 2s (assertion 4: proves the close is not instant).
-PRE_ITERS=10          # 10 * 0.1s = 1.0s  (< 2s worker_shutdown_timeout)
-# POST_ITERS times STEP must be comfortably LONGER than 2s so the force-close
-# has time to actually fire (assertion 5's ceiling).
-POST_ITERS=50         # 50 * 0.1s = 5.0s  (> 2s worker_shutdown_timeout)
+# The same value in milliseconds. Every window below is computed in ms and
+# divided by this, so STEP and its integer form cannot drift apart -- change
+# both together or neither.
+STEP_MS=100
+
+# --- the two windows below are DIFFERENT KINDS OF BUDGET -------------------
+# They were one constant (PRE_ITERS=10) until s163, and conflating them is why
+# this scenario flaked three times in CI (issues.md). Only ONE of them is
+# actually bounded by worker_shutdown_timeout:
+#
+#   READY_ITERS  a SETUP readiness poll -- "has the stalled upload established
+#                and reached mid-body yet". Pure process-start + connect +
+#                partial-write latency. worker_shutdown_timeout does not bound
+#                it in either direction, because no reload has happened yet.
+#                Waiting LONGER here can only ever make the scenario more
+#                reliable: the loop breaks the instant the marker appears, so
+#                a bigger ceiling costs nothing on a healthy box and is not an
+#                assertion about the server. This is the one that flaked --
+#                1.0s for fork + connect + write is thin under ASan on a shared
+#                runner, and its failure reads as "never established in time",
+#                which is a false RED about the harness, not a finding.
+#   PRE_ITERS    the post-reload SURVIVAL window (assertion 4). This one IS an
+#                oracle: it must stay strictly SHORTER than
+#                worker_shutdown_timeout, or "survived the window" stops
+#                proving the close was not instant. Raising it would silently
+#                weaken assertion 4 -- so it is DERIVED from the conf below
+#                rather than hand-tuned next to it.
+#
+# Raising the old shared constant would have fixed the flake by weakening the
+# oracle. Splitting them fixes the flake and leaves the oracle exactly as
+# tight as it was.
+READY_MS=5000
+READY_ITERS=$(( READY_MS / STEP_MS ))   # 5.0s, setup only -- NOT an oracle bound
+
+# PRE_ITERS is derived from the conf's worker_shutdown_timeout so the
+# invariant `PRE_ITERS * STEP < worker_shutdown_timeout` is held by ARITHMETIC
+# instead of by a comment that a later edit to nginx.conf would silently
+# falsify. Half the timeout, floored to whole STEPs: comfortably inside the
+# window with room for the poll's own granularity.
+WST="$(sed -n 's/^[[:space:]]*worker_shutdown_timeout[[:space:]]\+\([^;]*\);.*/\1/p' \
+    "$PROBER_SCENARIO/nginx.conf" | tail -n 1 | tr -d '[:space:]')"
+case "$WST" in
+    *ms) WST_MS="${WST%ms}" ;;
+    *s)  WST_MS=$(( ${WST%s} * 1000 )) ;;
+    ''|*[!0-9]*)
+        echo "Bail out! could not parse worker_shutdown_timeout out of" \
+             "$PROBER_SCENARIO/nginx.conf (got \"$WST\") -- assertion 4's" \
+             "window is derived from it and cannot be defaulted safely"
+        exit 1
+        ;;
+    *)   WST_MS=$(( WST * 1000 )) ;;   # bare number is seconds in nginx
+esac
+PRE_ITERS=$(( WST_MS / 2 / STEP_MS ))
+if [ "$PRE_ITERS" -lt 1 ]; then
+    echo "Bail out! worker_shutdown_timeout ($WST) is too short to poll at" \
+         "${STEP}s granularity -- assertion 4 would have no window at all"
+    exit 1
+fi
+
+# POST_ITERS times STEP must be comfortably LONGER than worker_shutdown_timeout
+# so the force-close has time to actually fire (assertion 5's ceiling). Derived
+# from the same source for the same reason, at 2.5x the timeout.
+POST_ITERS=$(( WST_MS * 25 / 10 / STEP_MS ))
 # The negative control needs to run at least as long as PRE_ITERS+POST_ITERS
 # combined would, to be a fair comparison against the full post-reload
 # window the real run is judged across.
-CONTROL_ITERS=$((PRE_ITERS + POST_ITERS))   # 6.0s total, no reload
+# (both are derived from worker_shutdown_timeout above, so this tracks it
+# automatically; at the shipped 2s that is 10 + 50 iters = 6.0s, no reload.)
+CONTROL_ITERS=$((PRE_ITERS + POST_ITERS))
 
 # --- assertion 1: NEGATIVE CONTROL -- a stalled body must NOT close itself -
 # Runs FIRST, fully reaped before the real conn is opened (mirrors
@@ -184,7 +244,7 @@ CONTROL_CLOSED="$PROBER_PREFIX/control.closed"
 start_stalled_upload "$CONTROL_MARKER" CONTROL_PID "$CONTROL_CLOSED"
 
 control_ready=0
-for ((i = 0; i < PRE_ITERS; i++)); do
+for ((i = 0; i < READY_ITERS; i++)); do
     if [ -e "$CONTROL_MARKER" ]; then
         control_ready=1
         break
@@ -232,7 +292,7 @@ start_stalled_upload "$REAL_MARKER" REAL_PID "$REAL_CLOSED"
 
 # --- assertion 2: established and mid-body BEFORE signalling ---------------
 marker_seen=0
-for ((i = 0; i < PRE_ITERS; i++)); do
+for ((i = 0; i < READY_ITERS; i++)); do
     if [ -e "$REAL_MARKER" ]; then
         marker_seen=1
         break
@@ -337,7 +397,7 @@ elif [ "$closed" -eq 1 ]; then
     echo "not ok 5 - the stalled conn's reader exited without a clean EOF (read error, not a graceful force-close)"
     FAILED=$((FAILED + 1))
 else
-    echo "not ok 5 - the stalled conn was still open $((POST_ITERS * 100 + PRE_ITERS * 100))ms after the reload (worker_shutdown_timeout never fired)"
+    echo "not ok 5 - the stalled conn was still open $(( (POST_ITERS + PRE_ITERS) * STEP_MS ))ms after the reload (worker_shutdown_timeout $WST never fired)"
     pkill -P "$REAL_PID" 2>/dev/null || true
     kill "$REAL_PID" 2>/dev/null || true
     wait "$REAL_PID" 2>/dev/null || true
