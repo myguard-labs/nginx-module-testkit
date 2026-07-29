@@ -1937,6 +1937,22 @@ http_read_state_step(http_read_state *st, int readable,
                  * the deadline, which is a fact about the server. Keep the
                  * bytes that did arrive and let the assertion layer judge --
                  * see want_close in http.h for why this cannot be an error.
+                 *
+                 * S-4: this branch is now RARELY reached and is kept as a
+                 * backstop, not as the mechanism. The drain waits for readiness
+                 * in poll() before stepping a leg, so a read that would have
+                 * blocked until SO_RCVTIMEO expired generally does not happen;
+                 * the whole-exchange deadline above is what produces the
+                 * want_close timeout verdict now (proven by mutation -- it reds
+                 * assertions 120-122, while mutating THIS branch survives
+                 * because nothing reaches it).
+                 *
+                 * Kept because the sockets are still blocking and SO_RCVTIMEO
+                 * is still set: a read that begins after poll() reported
+                 * readiness can still time out if the peer sends a partial
+                 * segment and stalls. Deleting it would turn that case into the
+                 * generic read-error path below, which reports HTTP_CLOSE_NONE
+                 * and would blame the server for a close it never made.
                  */
                 if (st->want_close) {
                     st->resp->close_reason = HTTP_CLOSE_TIMEOUT;

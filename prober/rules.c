@@ -1499,38 +1499,27 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
         }
 
         /*
-         * Timing assertions cannot be trusted across a fan, because the drain
-         * is sequential and BLOCKING: leg i+1 is not read until leg i has been
-         * read to completion, while its `sent_at` clock has been running the
-         * whole time. Time spent draining an earlier leg is therefore charged
-         * to every later leg's whole-exchange deadline and close_ms.
+         * `concurrent` + `recv_slow` / `expect_close_within` used to be
+         * REJECTED here, and the rejection was lifted by S-4.
          *
-         * With `recv_slow` the effect is deterministic rather than incidental
-         * -- the pacing sleeps are deliberate, and http_read_response()
-         * discounts only the pacing performed while reading THAT leg. A prompt
-         * final leg can then be reported as a timeout or a late close purely
-         * because an earlier leg was slow, which is a false failure that also
-         * blames the wrong leg.
+         * The reason it existed: the fan drained its legs in index order with a
+         * blocking read each, so time spent draining leg i elapsed against every
+         * later leg's sent_at clock. A prompt final leg could be reported as a
+         * timeout purely because an earlier leg was slow -- a false failure that
+         * also blamed the wrong leg -- so refusing the combination was more
+         * honest than reporting a number known to be wrong.
          *
-         * Rejected rather than silently mismeasured. Fixing it properly means
-         * draining all N sockets through one poll() loop with per-leg
-         * nonblocking state, which is a real feature and a separate concern
-         * from this directive; until then the honest move is to refuse the
-         * combination instead of reporting a number that is wrong.
+         * What changed: the drain is now one poll() loop over per-leg state
+         * (http.c), so legs advance independently and each leg's timing is
+         * measured against its own clock alone. Pacing is a per-leg gate rather
+         * than a sleep, so a paced leg no longer withholds the others, and the
+         * pacing credit is discounted from that leg's deadline only.
+         *
+         * Deliberately NOT replaced by a narrower gate. There is no remaining
+         * combination of these directives whose verdict the drain mismeasures;
+         * a gate kept "just in case" would reject cases that now work, and the
+         * mutation corpus would have nothing to prove it with.
          */
-        if (tc->concurrent > 0
-            && (tc->saw_close_within || tc->saw_recv_slow))
-        {
-            const char *which = tc->saw_close_within
-                                    ? "expect_close_within" : "recv_slow";
-
-            die("%s: case \"%s\" carries concurrent %d and %s; the fan drains "
-                "its legs in order, so an earlier leg's read time is charged "
-                "to every later leg's clock and the timing verdict would be "
-                "measured against the wrong interval", file,
-                tc->name != NULL ? tc->name : "(unnamed)", tc->concurrent,
-                which);
-        }
 
         /*
          * Pipeline cases carry every per-exchange knob inside blocks[], so the

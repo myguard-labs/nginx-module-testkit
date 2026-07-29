@@ -1216,17 +1216,32 @@ main(void)
        "concurrent + shutdown loads -- a half-close still expects a response");
     free_all(n);
 
-    /* The fan drains its legs in order and blocking, so an earlier leg's read
-     * time lands on every later leg's clock. Refused rather than reported as a
-     * timing verdict measured against the wrong interval. */
-    expect_die("name t\nsend X\nconcurrent 4\nexpect_close_within 100\n"
-               "probe fds >= 0\n",
-               "concurrent + expect_close_within dies -- in-order drain skews "
-               "the later legs' clocks");
-    expect_die("name t\nsend X\nconcurrent 4\nrecv_slow 100 10\n"
-               "probe fds >= 0\n",
-               "concurrent + recv_slow dies -- deliberate pacing on one leg is "
-               "charged to the next");
+    /*
+     * Both of these used to DIE, and S-4 lifted the rejection. The fan drained
+     * its legs in index order with a blocking read each, so an earlier leg's
+     * read time landed on every later leg's clock and any timing verdict was
+     * measured against the wrong interval; refusing was more honest than
+     * reporting a number known to be wrong. The drain is now one poll() loop
+     * over per-leg state, so each leg's timing is its own, and pacing is a
+     * per-leg gate that does not withhold the other legs.
+     *
+     * These are the mirror of the two expect_die() cases they replace: a lifted
+     * gate whose test still asserted the old behaviour would have kept the
+     * combination unusable no matter what the drain did.
+     */
+    n = load_str("name t\nsend X\nconcurrent 4\nexpect_close_within 100\n"
+                 "probe fds >= 0\n");
+    ok(n == 1 && cases[0].concurrent == 4 && cases[0].saw_close_within,
+       "concurrent + expect_close_within loads -- the poll() drain measures "
+       "each leg's close against its own clock");
+    free_all(n);
+
+    n = load_str("name t\nsend X\nconcurrent 4\nrecv_slow 100 10\n"
+                 "probe fds >= 0\n");
+    ok(n == 1 && cases[0].concurrent == 4 && cases[0].saw_recv_slow,
+       "concurrent + recv_slow loads -- a paced leg gates itself without "
+       "withholding the others");
+    free_all(n);
 
     /* The load-bearing guard: held connections that no probe assertion reads
      * are a vacuous test, so the case is rejected at load time rather than
