@@ -659,10 +659,53 @@ mutate "idle timeout: clock refreshed every step (sibling postpones it)" http.c 
 # The pacing gate must not be cancelled by readiness. Polling a gated leg lets
 # data arriving early satisfy the poll and step the leg before its delay has
 # elapsed, which is recv_slow silently not pacing -- the defect S-5 exists to
-# catch, rebuilt in the drain. Caught by assertion 104's exact equality.
+# catch, rebuilt in the drain. Reds assertion 104 (N=1) and 169 (the fan).
 mutate "concurrent: paced leg polled anyway (gate cancelled by readiness)" http.c \
     '    return !st->done && now >= st->not_before;' \
     '    return !st->done && now * 0 >= st->not_before * 0;' \
+    http_test
+
+# The FAN-ONLY half of the pacing gate, and the reason spawn_fan_paced() exists.
+#
+# The mutant above breaks the predicate itself, so it reds the N=1 pacing case
+# too -- which is how it was being caught before there was any concurrent
+# recv_slow fixture at all, making it a false control for the fan (PR #151 F4).
+# This one disables the gate ONLY at the fan's pollfd-selection site, leaving
+# http_read_response()'s N=1 path untouched. A gated leg then re-enters the
+# pollfd set and a sibling's readiness steps it before its delay elapsed.
+#
+# VERIFIED to red assertion 169 ALONE, with 102/104/105 (the N=1 pacing case)
+# staying GREEN -- which is exactly the isolation the single mutant above could
+# not provide. Before spawn_fan_paced() existed this mutation SURVIVED the whole
+# suite.
+mutate "concurrent: fan re-polls a gated leg (fan-only pacing gate)" http.c \
+    '                if (!http_read_state_pollable(&sts[i], now)) {' \
+    '                if (0 && !http_read_state_pollable(&sts[i], now)) {' \
+    http_test
+
+# Failure attribution, half one: FIRST BY INDEX. Dropping the break lets each
+# later failing index overwrite the verdict, so the HIGHEST failing index is
+# reported instead of the lowest. Deterministic, not a timing race -- the
+# attribution loop scans terminal legs in ascending index order -- but it
+# inverts the documented rule, and the reported leg then depends on which
+# legs happen to fail rather than on the contract. Needs two legs failing in
+# ONE iteration to be visible at all, which is what spawn_fan_two_bad()
+# supplies; before it existed this mutation SURVIVED. Reds 170 and 171.
+mutate "concurrent: fan blames the last failing leg, not the first by index" http.c \
+    '                rc = -1;
+                break;' \
+    '                rc = -1;' \
+    http_test
+
+# Failure attribution, half two: the blamed leg's OWN error slot. The leg NUMBER
+# and the quoted TEXT come from different places (the index from the loop, the
+# text from errs + i * HTTP_LEG_ERRLEN), so a slot-indexing drift names the right
+# leg and quotes a sibling's failure -- exactly what the per-leg slots replaced a
+# shared buffer to prevent. VERIFIED to red assertion 171 ALONE with 170 green,
+# which is why the two assertions are separate rather than one combined check.
+mutate "concurrent: fan quotes a sibling's error slot for the blamed leg" http.c \
+    '                         i + 1, n, errs + (size_t) i * HTTP_LEG_ERRLEN);' \
+    '                         i + 1, n, errs + (size_t) (i + 1) * HTTP_LEG_ERRLEN);' \
     http_test
 
 # THE ordering mutant, and the reason the barrier fixture exists: read each leg's
