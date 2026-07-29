@@ -105,6 +105,12 @@ static int ascii_case_eq(const char *a, const char *b, size_t len);
  * first failing leg with every earlier leg already terminal, so there was never
  * a live buffer to leak. Under poll() there is.
  */
+/* Per-leg error-text width for the concurrent drain. Sized to the same 256 the
+ * driver's existing `detail` buffers use, so a leg's message survives being
+ * re-rendered into the caller's errbuf without a second truncation. */
+#define HTTP_LEG_ERRLEN  256
+
+
 typedef struct {
     int               fd;
     int               timeout_ms;
@@ -2356,30 +2362,213 @@ http_exchange_concurrent(const char *host, int port, int n,
     }
 
     /*
-     * Phase 3: drain. Each leg's read is charged against its own sent_at, so a
-     * server that answers leg 0 promptly and stalls leg N-1 is reported as a
-     * stall on leg N-1 rather than being absorbed by leg 0's headroom.
+     * Phase 3: drain every leg through ONE poll() loop, S-4.
      *
-     * Legs are read in order rather than by poll() readiness. The responses are
-     * collected in full either way and each carries its own timing, so readiness
-     * ordering would change which leg is read first without changing any
-     * assertion -- and an in-order drain keeps the failure attribution simple
-     * enough to trust. The overlap has already happened by the time this loop
-     * starts; nothing here can undo it.
+     * Each leg's read is charged against its own sent_at, so a server that
+     * answers leg 0 promptly and stalls leg N-1 is reported as a stall on leg
+     * N-1 rather than being absorbed by leg 0's headroom.
+     *
+     * This used to read the legs in index order with a blocking read per leg.
+     * That was not merely a timing-attribution flaw: leg i+1 was not read at
+     * all until leg i finished or timed out, so the fan could not observe its
+     * legs out of index order under ANY circumstance -- a server answering leg
+     * 5 first and leg 0 last was indistinguishable from one answering strictly
+     * in order, and time spent draining an earlier leg was charged to every
+     * later leg's clock. Polling all live legs together removes both.
+     *
+     * FAILURE ATTRIBUTION IS FIRST-BY-INDEX, not first-by-time. Several legs
+     * can now fail within one poll() iteration, so the rule has to be stated
+     * rather than left emergent from loop order. Index order preserves the
+     * existing "concurrent leg %d/%d" message and, more importantly, is
+     * reproducible: first-by-time is the more truthful account of what the
+     * server did, but it makes the reported leg depend on scheduling, and a
+     * harness whose failure text moves between runs is one nobody can bisect.
      */
-    for (i = 0; i < n; i++) {
-        int  conn_open = 0;
+    {
+        http_read_state  *sts;
+        struct pollfd    *pfds;
+        int              *pidx;
+        char             *errs;
+        int               live;
 
-        if (http_read_response(fds[i], timeout_ms, recv_opt, want_close, framed,
-                               sent_at[i], &resps[i], &conn_open,
-                               errbuf, errlen) != 0)
-        {
-            char  detail[256];
+        sts = calloc((size_t) n, sizeof(*sts));
+        pfds = calloc((size_t) n, sizeof(*pfds));
+        pidx = calloc((size_t) n, sizeof(*pidx));
 
-            snprintf(detail, sizeof(detail), "%s", errbuf);
-            snprintf(errbuf, errlen, "concurrent leg %d/%d: %s",
-                     i + 1, n, detail);
+        /* Per-leg error text. A single shared errbuf cannot serve first-by-
+         * index attribution: the step function writes errbuf on every failure,
+         * so a later leg failing in the same iteration overwrites the message
+         * belonging to the leg that will actually be reported. Each leg gets
+         * its own slot and the winner's is copied out at the end. */
+        errs = calloc((size_t) n, HTTP_LEG_ERRLEN);
+
+        if (sts == NULL || pfds == NULL || pidx == NULL || errs == NULL) {
+            free(sts);
+            free(pfds);
+            free(pidx);
+            free(errs);
+            snprintf(errbuf, errlen,
+                     "out of memory draining a %d-way concurrent fan", n);
             rc = -1;
+            goto done;
+        }
+
+        /* Arm every leg BEFORE polling any of them: a leg whose buffer was not
+         * allocated cannot be in the pollfd set, and allocating lazily on first
+         * readiness would make the failure path depend on arrival order. */
+        for (i = 0; i < n; i++) {
+            /*
+             * NULL, not the address of a local. The state outlives this
+             * iteration, so storing a pointer to a per-iteration `conn_open`
+             * would leave every leg holding a dangling pointer that the framed
+             * exit later writes through -- caught by ASan as a
+             * stack-use-after-scope, and invisible in the plain build.
+             *
+             * NULL is also the correct VALUE here, not merely a safe one: the
+             * fan closes every leg in its `done` block, so there is no reusable
+             * connection to report and http_read_state_step() already treats a
+             * NULL conn_open as "nobody is asking".
+             */
+            if (http_read_state_init(&sts[i], fds[i], timeout_ms, recv_opt,
+                                     want_close, framed, sent_at[i], &resps[i],
+                                     NULL, errbuf, errlen) != 0)
+            {
+                char  detail[256];
+                int   j;
+
+                snprintf(detail, sizeof(detail), "%s", errbuf);
+                snprintf(errbuf, errlen, "concurrent leg %d/%d: %s",
+                         i + 1, n, detail);
+
+                for (j = 0; j <= i; j++) {
+                    http_read_state_free(&sts[j]);
+                }
+
+                free(sts);
+                free(pfds);
+                free(pidx);
+                free(errs);
+                rc = -1;
+                goto done;
+            }
+        }
+
+        for ( ;; ) {
+            long long  now;
+            long       timeout = -1;
+            int        nfds = 0;
+            int        pr;
+
+            live = 0;
+            now = now_ms();
+
+            for (i = 0; i < n; i++) {
+                long  wake;
+
+                if (sts[i].done) {
+                    continue;
+                }
+
+                live++;
+
+                wake = http_read_state_next_wakeup(&sts[i], now);
+                if (timeout < 0 || wake < timeout) {
+                    timeout = wake;
+                }
+
+                /* A leg held by its pacing gate stays OUT of the set: it has
+                 * nothing to wait for on the socket, and including it would let
+                 * data readiness cancel a delay the case asked for. The timeout
+                 * above still accounts for it, so it is stepped when the gate
+                 * opens. */
+                if (!http_read_state_pollable(&sts[i], now)) {
+                    continue;
+                }
+
+                pfds[nfds].fd = sts[i].fd;
+                pfds[nfds].events = POLLIN;
+                pfds[nfds].revents = 0;
+                pidx[nfds] = i;
+                nfds++;
+            }
+
+            if (live == 0) {
+                break;
+            }
+
+            pr = poll(nfds > 0 ? pfds : NULL, (nfds_t) nfds, (int) timeout);
+
+            if (pr < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+
+                snprintf(errbuf, errlen, "concurrent drain: poll: %s",
+                         strerror(errno));
+
+                for (i = 0; i < n; i++) {
+                    http_read_state_free(&sts[i]);
+                }
+
+                free(sts);
+                free(pfds);
+                free(pidx);
+                free(errs);
+                rc = -1;
+                goto done;
+            }
+
+            /*
+             * Step every leg that is ready, then sweep the rest. The sweep is
+             * not optional: a leg whose deadline expired or whose pacing gate
+             * opened has no readiness event to announce it, and would otherwise
+             * sit un-stepped for as long as its siblings kept the loop busy.
+             */
+            for (i = 0; i < nfds; i++) {
+                if (pfds[i].revents != 0) {
+                    (void) http_read_state_step(&sts[pidx[i]], 1,
+                                                errs + (size_t) pidx[i]
+                                                       * HTTP_LEG_ERRLEN,
+                                                HTTP_LEG_ERRLEN);
+                }
+            }
+
+            for (i = 0; i < n; i++) {
+                if (!sts[i].done) {
+                    (void) http_read_state_step(&sts[i], 0,
+                                                errs + (size_t) i
+                                                       * HTTP_LEG_ERRLEN,
+                                                HTTP_LEG_ERRLEN);
+                }
+            }
+        }
+
+        /* First-by-index, as documented above, reading the winning leg's OWN
+         * error slot rather than the shared buffer -- which by now holds
+         * whichever leg wrote to it last. */
+        for (i = 0; i < n; i++) {
+            if (sts[i].rc != 0) {
+                snprintf(errbuf, errlen, "concurrent leg %d/%d: %s",
+                         i + 1, n, errs + (size_t) i * HTTP_LEG_ERRLEN);
+                rc = -1;
+                break;
+            }
+        }
+
+        /* Unconditional, per the ownership invariant on http_read_state: a
+         * terminal leg has already released or transferred its buffer and a
+         * non-terminal one still owns it, so this is correct for both and is
+         * what makes abandoning a drain leak-free. */
+        for (i = 0; i < n; i++) {
+            http_read_state_free(&sts[i]);
+        }
+
+        free(sts);
+        free(pfds);
+        free(pidx);
+        free(errs);
+
+        if (rc != 0) {
             goto done;
         }
     }

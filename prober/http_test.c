@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  163
+#define PLANNED  164
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -804,6 +804,170 @@ spawn_barrier(int *port, int want)
         }
 
 #undef BARRIER_REPLY
+
+        _exit(0);
+    }
+
+    close(srv);
+
+    return pid;
+}
+
+
+/*
+ * The out-of-order fixture, S-4. Accept `want` connections, then make answering
+ * leg 0 DEPEND on the client having drained the last leg.
+ *
+ * >> WHY THE OBVIOUS FIXTURE DOES NOT WORK, because it was tried first and it
+ * passed against the very drain it was written to catch.
+ *
+ * The intuitive version simply answers the legs in reverse order and stalls
+ * before leg 0. It does not discriminate: while the in-order drain blocks in
+ * leg 0's read(), the kernel is receiving legs 1..N-1 concurrently into their
+ * socket buffers, so once leg 0 finally answers the remaining legs are already
+ * complete and are collected instantly. Both drains finish at
+ * max(answer_time) -- measured at 401 ms against a 400 ms stall for BOTH. Any
+ * fixture whose server answers on its own schedule is therefore blind to drain
+ * order, and an elapsed-time bound over it is vacuous in the S-3 sense.
+ *
+ * What an in-order drain genuinely cannot do is REACT to a later leg before an
+ * earlier one completes. So the dependency has to run through the client: this
+ * server sends a body on the last leg that is far larger than the socket
+ * buffer, so its own send() blocks partway until the client drains it, and only
+ * once that send completes does it answer leg 0.
+ *
+ *   - poll() drain: legs 1..N-1 are readable, so the client drains the big
+ *     body, the server's send() completes, leg 0 is answered, the fan finishes.
+ *   - in-order drain: the client is blocked in leg 0's read(); it never drains
+ *     the big body; the server stays blocked in send() and never answers leg 0.
+ *     Deadlock, broken only by the whole-exchange deadline -- a hard failure,
+ *     not a slow pass.
+ *
+ * That makes this a true negative control: the property under test is the only
+ * thing standing between the fan and a timeout.
+ */
+static pid_t
+spawn_readback(int *port, int want, size_t big_len)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "http_test: socket: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, want) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        fprintf(stderr, "http_test: listen: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "http_test: fork: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    if (pid == 0) {
+        int   conns[MAX_BARRIER];
+        char  scratch[512];
+        int   i;
+
+        if (want > MAX_BARRIER) {
+            _exit(2);
+        }
+
+        /* Collect every connection and its request first, exactly as the
+         * barrier does: the reversal must be in the ANSWERING order, not in
+         * which connections exist. */
+        for (i = 0; i < want; i++) {
+            conns[i] = accept(srv, NULL, NULL);
+
+            if (conns[i] < 0) {
+                _exit(2);
+            }
+
+            if (read(conns[i], scratch, sizeof(scratch)) < 0) {
+                _exit(2);
+            }
+        }
+
+#define SMALL_REPLY  "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"
+
+        /* Middle legs: small, immediate, closed. Nothing depends on them; they
+         * exist so the fan is genuinely N-way rather than a special-cased 2. */
+        for (i = 1; i < want - 1; i++) {
+            (void) send(conns[i], SMALL_REPLY, sizeof(SMALL_REPLY) - 1,
+                        MSG_NOSIGNAL);
+            close(conns[i]);
+        }
+
+        /*
+         * The LAST leg carries a body far larger than the socket buffer, so
+         * this send() cannot complete until the client reads most of it. This
+         * is the dependency the whole fixture turns on -- see the header.
+         */
+        {
+            char   *hdr;
+            char   *body;
+            size_t  off;
+
+            hdr = malloc(128);
+            body = malloc(big_len);
+
+            if (hdr == NULL || body == NULL) {
+                _exit(2);
+            }
+
+            memset(body, 'x', big_len);
+            snprintf(hdr, 128,
+                     "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", big_len);
+
+            (void) send(conns[want - 1], hdr, strlen(hdr), MSG_NOSIGNAL);
+
+            off = 0;
+            while (off < big_len) {
+                ssize_t w = send(conns[want - 1], body + off, big_len - off,
+                                 MSG_NOSIGNAL);
+
+                if (w <= 0) {
+                    /* The client gave up (in-order drain deadlocked and the
+                     * case timed out). Leave leg 0 unanswered: that is the
+                     * failure the assertion is there to see. */
+                    _exit(0);
+                }
+
+                off += (size_t) w;
+            }
+
+            close(conns[want - 1]);
+            free(hdr);
+            free(body);
+        }
+
+        /* Only now -- the big body is fully handed over, which proves the
+         * client drained a LATER leg while leg 0 was still outstanding. */
+        (void) send(conns[0], SMALL_REPLY, sizeof(SMALL_REPLY) - 1,
+                    MSG_NOSIGNAL);
+        close(conns[0]);
+
+#undef SMALL_REPLY
 
         _exit(0);
     }
@@ -2794,6 +2958,80 @@ main(void)
 
         for (i = 0; i < 3; i++) {
             http_response_free(&resps[i]);
+        }
+
+        /*
+         * 4. S-4: the fan collects its legs OUT OF INDEX ORDER.
+         *
+         * This is the assertion the poll() drain exists for, and the one no
+         * other case in this file can make. The barrier above proves the fan
+         * writes all N before reading any -- a property of the WRITE phase.
+         * Nothing there constrains the drain, because the barrier releases
+         * every leg simultaneously and an in-order drain collects them all.
+         *
+         * spawn_readback() makes leg 0's answer DEPEND on the client having
+         * drained the last leg: that leg carries a body far larger than the
+         * socket buffer, so the server blocks in send() until the client reads
+         * it, and only then answers leg 0. An in-order drain is blocked in leg
+         * 0's read and never drains the big body, so neither side can proceed
+         * and the fan dies on its deadline.
+         *
+         * >> THE FIRST VERSION OF THIS FIXTURE WAS VACUOUS AND THE MUTANT IS
+         * THE ONLY REASON THAT IS KNOWN. It answered the legs in reverse order
+         * and stalled before leg 0, then asserted an elapsed-time bound. It
+         * PASSED against a restored in-order drain -- 401 ms for BOTH
+         * implementations against a 400 ms stall -- because while the in-order
+         * drain blocks on leg 0 the kernel is buffering the other legs
+         * concurrently, so they are already complete when it reaches them. Any
+         * fixture whose server answers on its own schedule cannot see drain
+         * order at all, and an elapsed-time bound over it is vacuous in the S-3
+         * sense. The dependency has to run through the CLIENT, which is what
+         * this one does.
+         *
+         * VERIFIED AS A CONTROL: with phase 3 reverted to the in-order
+         * `for (i...) http_read_response(...)` loop, this case fails BY THIS
+         * ASSERTION while the barrier case above still passes -- the barrier
+         * being exactly what an in-order drain satisfies.
+         *
+         * Asserted on completion, not on elapsed time. Under the poll() drain
+         * every leg carries its response; under the in-order drain leg 0 never
+         * arrives and the fan returns a harness error. There is no tolerance to
+         * choose and nothing for load to inflate.
+         */
+        {
+            int            port2, st2, k;
+            pid_t          pid2;
+            int            all_ok;
+
+            /* 4 MiB: far above any socket buffer this test could meet (loopback
+             * autotuning tops out in the low hundreds of KiB), so the server's
+             * send() is guaranteed to block partway rather than being absorbed
+             * whole -- which is what creates the dependency. Well under
+             * HTTP_MAX_RESPONSE, so the ceiling is not what is being tested. */
+            pid2 = spawn_readback(&port2, 4, 4 * 1024 * 1024);
+
+            rc = http_exchange_concurrent("127.0.0.1", port2, 4, creq, creq_len,
+                                          1000, NULL, NULL, 0, HTTP_SHUT_NONE,
+                                          NULL, 0, 1, resps,
+                                          errbuf, sizeof(errbuf));
+
+            all_ok = (rc == 0);
+            for (k = 0; rc == 0 && k < 4; k++) {
+                if (resps[k].status != 200) {
+                    all_ok = 0;
+                }
+            }
+
+            ok(all_ok,
+               "the fan drains legs by readiness, so a leg whose answer depends "
+               "on a LATER leg being read still completes");
+
+            for (k = 0; k < 4; k++) {
+                http_response_free(&resps[k]);
+            }
+
+            kill(pid2, SIGKILL);
+            waitpid(pid2, &st2, 0);
         }
     }
 
