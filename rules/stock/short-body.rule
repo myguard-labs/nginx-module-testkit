@@ -1,0 +1,69 @@
+# Stock: a request body that lies SHORT of its declared Content-Length.
+#
+# Module-agnostic: every consumer has /__probe, and a client that declares a
+# body larger than it actually sends is a plain protocol violation any server
+# must survive without hanging or leaking, whatever module is loaded.
+#
+# THE ATTACK. `send` puts fewer body bytes on the wire than the Content-Length
+# header promises, then `shutdown 1` half-closes the write side -- the same
+# "client is done sending" signal a real HTTP/1.1 client gives when it thinks
+# its request is complete but miscounted the body (or a hostile client that
+# undercounts on purpose to probe how the server reacts to a body that never
+# arrives in full). The server is still owed 35 bytes it will never receive.
+#
+# WHY expect_close_within IS THE ASSERTION, NOT status=. A body read that never
+# completes has no HTTP response to judge -- there is no status line, no
+# headers, nothing `expect` can match against. The only observable outcome is
+# how the CONNECTION ends: within a bounded time the server must give up and
+# close, rather than holding the half-closed socket (and whatever pool/fd it
+# took for the request) forever. `expect_close_within` is built exactly for
+# this: it turns "the read timed out" from a harness failure into a successful
+# return the assertion layer can judge (see prober/http.h and README ch. on
+# expect_close_within).
+#
+# WHY `shutdown 1`, NOT `hold` OR `abort`. `hold` sleeps without ever entering
+# the read loop, so it cannot carry a close assertion at all (the harness
+# rejects the combination at load time). `abort` destroys the connection with
+# a reset, which is the client-vanishes attack `abort.rule` already owns --
+# that tests ECONNRESET cleanup, not "client says done, but wasn't". `shutdown
+# 1` (SHUT_WR) is the one primitive that models a real half-close: the TCP
+# session stays up, the server's next read sees a clean EOF mid-body, and
+# nginx has to decide what a truncated body means on its own, with no reset to
+# blame it on.
+#
+# THE NEGATIVE CONTROL, proven by hand (not committed, but reproducible): drop
+# the `shutdown 1` line from a copy of this rule and rerun it against the same
+# module. Without the half-close the client never signals it is done, so the
+# server is legitimately still waiting for the rest of a body that was
+# declared and might still arrive -- `expect_close_within 2000` then reds with
+# "server closed after Nms, wanted a close within 2000ms" (N > 2000, bounded by
+# the prober's read timeout). That failure is what proves this rule's
+# expect_close_within is not vacuous: remove the very byte-truncation signal
+# the case is built to send, and the same assertion catches the removal.
+#
+# CONFIG DEPENDENCE. The location must read the request body for the timeout
+# to be meaningful (a GET-only /__probe answers with a method rejection before
+# the body is ever touched, which would pass this case for the wrong reason on
+# a location that isn't proxy_pass/return-after-body). Point this file at a
+# body-reading location for the strong assertion; on /__probe itself it is
+# still evidence the harness's OWN read loop against a truncated peer behaves,
+# which is the module-agnostic floor this file promises.
+
+name    a body shorter than its declared Content-Length is not held forever
+send    POST /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    Content-Length: 40\r\n
+send    Connection: close\r\n\r\n
+send    short
+shutdown 1
+expect_close_within 2000
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+name    worker survives the short-body battery
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   zone.present == true
+delta   fds == 0
+delta   pool.cycle_used == 0
