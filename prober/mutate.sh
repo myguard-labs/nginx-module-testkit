@@ -683,12 +683,14 @@ mutate "concurrent: fan re-polls a gated leg (fan-only pacing gate)" http.c \
     '                if (0 && !http_read_state_pollable(&sts[i], now)) {' \
     http_test
 
-# Failure attribution, half one: FIRST BY INDEX. Dropping the break lets the
-# LAST failing leg overwrite the verdict, which is "first by time" in disguise --
-# reproducible-and-bisectable becomes arrival-order-dependent, so the same broken
-# server blames a different leg from run to run. Needs two legs failing in ONE
-# iteration to be visible at all, which is what spawn_fan_two_bad() supplies;
-# before it existed this mutation SURVIVED. Reds assertions 170 and 171.
+# Failure attribution, half one: FIRST BY INDEX. Dropping the break lets each
+# later failing index overwrite the verdict, so the HIGHEST failing index is
+# reported instead of the lowest. Deterministic, not a timing race -- the
+# attribution loop scans terminal legs in ascending index order -- but it
+# inverts the documented rule, and the reported leg then depends on which
+# legs happen to fail rather than on the contract. Needs two legs failing in
+# ONE iteration to be visible at all, which is what spawn_fan_two_bad()
+# supplies; before it existed this mutation SURVIVED. Reds 170 and 171.
 mutate "concurrent: fan blames the last failing leg, not the first by index" http.c \
     '                rc = -1;
                 break;' \

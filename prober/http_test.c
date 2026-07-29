@@ -1265,8 +1265,13 @@ spawn_readback(int *port, int want, size_t big_len)
      *
      * Set on the LISTENING socket because accepted sockets inherit it, and it
      * must be set before listen() for the value to be carried into the
-     * handshake's advertised window. This is the client-visible receive side;
-     * the matching SO_SNDBUF is set on the big-body connection in the child.
+     * handshake's advertised window. This bounds the SERVER's receive side --
+     * the ~40-byte request -- and is NOT by itself what blocks the big send().
+     * The load-bearing half is the SO_SNDBUF on the big-body connection in the
+     * child, which cannot absorb `big_len` whatever the client's own (untouched)
+     * receive window turns out to be. Both ends are pinned so neither is
+     * inherited from the host's tuning; do not drop the SO_SNDBUF believing
+     * this call already covered the client side.
      *
      * Advisory, and deliberately unchecked: Linux doubles the request for
      * bookkeeping and enforces a floor, so the effective size is larger than
@@ -3699,6 +3704,16 @@ main(void)
          * prefix were right and the quoted error came from leg 3's slot, which
          * is precisely the shared-buffer bug the per-leg slots exist to
          * prevent. Both are checked, so the assertion reds if either drifts.
+         *
+         * Both substrings are lifted from http.c, not paraphrased -- the
+         * UNFRAMEABLE text at http.c:2163 and the MALFORMED text at
+         * http.c:2171. That matters most for the NEGATIVE clause: if the
+         * MALFORMED message did not literally contain "malformed
+         * Content-Length", the clause would be true whichever slot was quoted
+         * and the wrong-slot regression would walk straight through it.
+         * MUTATION-PROVEN rather than argued: the slot-index mutant
+         * ("fan quotes a sibling's error slot") reds THIS assertion alone,
+         * with 170 green.
          */
         {
             int    port5, st5, k;
