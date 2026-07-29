@@ -1911,11 +1911,12 @@ not a scenario:
 
 - **Body-boundary hostility.** `send_slow` splits the send, but the rule
   language could not (until now) send a body that lies in the other direction
-  (declared shorter than sent), trickle a chunked body one byte per chunk, or
+  (declared longer than sent, so the body arrives truncated), trickle a chunked
+  body one byte per chunk, or
   send an oversized `Content-Length` and stop. `backend-lying-length` does
   this to the *upstream*; the three sub-attacks below are the module's own
   request path.
-  ~~declared shorter than sent, then stop~~ **GRADUATED:**
+  ~~declared longer than sent, then stop~~ **GRADUATED:**
   `rules/stock/short-body.rule` sends fewer body bytes than the declared
   Content-Length, half-closes with `shutdown 1`, and asserts
   `expect_close_within` -- no new directive needed, `send` already puts

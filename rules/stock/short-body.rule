@@ -64,5 +64,6 @@ name    worker survives the short-body battery
 send    GET /__probe HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
+probe   zone.present == true
 delta   fds == 0
 delta   pool.cycle_used == 0
