@@ -202,17 +202,27 @@ READY_ITERS=$(( READY_MS / STEP_MS ))   # 5.0s, setup only -- NOT an oracle boun
 # window with room for the poll's own granularity.
 WST="$(sed -n 's/^[[:space:]]*worker_shutdown_timeout[[:space:]]\+\([^;]*\);.*/\1/p' \
     "$PROBER_SCENARIO/nginx.conf" | tail -n 1 | tr -d '[:space:]')"
+# Strip the unit FIRST, then validate what is left is a bare integer. Doing it
+# the other way round (a `''|*[!0-9]*` arm after the unit arms) does not work:
+# `case` takes the FIRST match, so `*s)` swallows "abcs" and `*ms)` swallows
+# "xms" before any validation arm is reached -- "abcs" would silently become 0
+# and a fractional "2.5s", which nginx accepts, would kill the driver with an
+# arithmetic syntax error and emit no TAP at all. Only integer s/ms is
+# supported here, deliberately: this scenario wants a whole number of STEPs.
 case "$WST" in
-    *ms) WST_MS="${WST%ms}" ;;
-    *s)  WST_MS=$(( ${WST%s} * 1000 )) ;;
+    *ms) WST_NUM="${WST%ms}" ; WST_MUL=1 ;;
+    *s)  WST_NUM="${WST%s}"  ; WST_MUL=1000 ;;
+    *)   WST_NUM="$WST"      ; WST_MUL=1000 ;;   # bare number is seconds in nginx
+esac
+case "$WST_NUM" in
     ''|*[!0-9]*)
         echo "Bail out! could not parse worker_shutdown_timeout out of" \
              "$PROBER_SCENARIO/nginx.conf (got \"$WST\") -- assertion 4's" \
              "window is derived from it and cannot be defaulted safely"
         exit 1
         ;;
-    *)   WST_MS=$(( WST * 1000 )) ;;   # bare number is seconds in nginx
 esac
+WST_MS=$(( WST_NUM * WST_MUL ))
 PRE_ITERS=$(( WST_MS / 2 / STEP_MS ))
 if [ "$PRE_ITERS" -lt 1 ]; then
     echo "Bail out! worker_shutdown_timeout ($WST) is too short to poll at" \
