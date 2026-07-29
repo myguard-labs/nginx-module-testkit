@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  173
+#define PLANNED  177
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -937,6 +937,271 @@ spawn_barrier(int *port, int want)
 
 
 /*
+ * Paced-fan fixture: accept `want` connections and answer EVERY one of them
+ * immediately with the same read-to-EOF body, then close.
+ *
+ * This exists because `recv_slow` had no concurrent runtime fixture at all, so
+ * the fan-pacing mutant ("concurrent: paced leg polled anyway") was killed by
+ * the N=1 pacing assertion instead of by anything that exercises a fan. That
+ * made the mutant a false control: it proved the gate is consulted SOMEWHERE,
+ * not that a fan honours one gate per leg.
+ *
+ * The mistakes it has to discriminate are all fan-only, and all invisible at
+ * N=1 because one leg cannot be confused with its siblings:
+ *
+ *   - one leg's closed gate blocking the whole poll loop (pacing back to being
+ *     a sleep, which is the serialization S-4 exists to remove);
+ *   - a gated fd left in the pollfd set, so a sibling's readiness cancels a
+ *     delay the case asked for;
+ *   - per-leg pacing state shared or aliased across legs, so the fan sleeps
+ *     once rather than once per leg.
+ *
+ * Every leg gets the SAME reply and the same gate schedule, so each leg's own
+ * `paced_sleep_ms` is an independent witness and the assertion is an equality
+ * per leg rather than an aggregate. An aggregate would not discriminate: a fan
+ * that slept once for the whole fan and one that slept per leg are told apart
+ * only by asking each leg what IT slept. This is the same per-leg-witness rule
+ * the idle-deadline fan case had to learn -- see the note at that loop.
+ *
+ * Answering immediately and closing (rather than stalling like the readback
+ * fixture) is deliberate: the quantity under test is the CLIENT's withheld
+ * read, so the server must contribute no delay of its own for the counter to
+ * mean what it says.
+ */
+static pid_t
+spawn_fan_paced(int *port, int want)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "http_test: socket: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, want) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        fprintf(stderr, "http_test: listen: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "http_test: fork: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    if (pid == 0) {
+        int   conns[MAX_CONCURRENT];
+        char  scratch[512];
+        int   i;
+
+        /* Same bound-check the sibling fan fixtures carry: `want` indexes a
+         * fixed array in the FORKED CHILD, so an oversized fan corrupts memory
+         * over there and surfaces as an ASan report with no visible link to the
+         * caller. */
+        if (want > MAX_CONCURRENT) {
+            _exit(2);
+        }
+
+        /* Every accept before any reply, as the other fan fixtures do: the
+         * client opens all N legs before draining any, so answering lazily
+         * would deadlock against its own fan. */
+        for (i = 0; i < want; i++) {
+            conns[i] = accept(srv, NULL, NULL);
+
+            if (conns[i] < 0) {
+                _exit(2);
+            }
+
+            if (read(conns[i], scratch, sizeof(scratch)) < 0) {
+                _exit(2);
+            }
+        }
+
+        for (i = 0; i < want; i++) {
+            (void) send(conns[i], SPAWN_REPLY, SPAWN_REPLY_LEN, MSG_NOSIGNAL);
+            close(conns[i]);
+        }
+
+        _exit(0);
+    }
+
+    close(srv);
+
+    return pid;
+}
+
+
+/*
+ * Two-legs-fail fixture: accept `want` connections and answer them so that
+ * legs 1 and 2 fail in the SAME drain iteration with DISTINGUISHABLE errors,
+ * while legs 0 and 3 succeed.
+ *
+ * The fan's failure contract is first-by-index (http.c, the loop after the
+ * drain): when several legs failed, the reported error is the lowest-indexed
+ * failing leg's, read out of that leg's OWN error slot. Both halves were
+ * unpinned -- no test made two legs fail at once, so nothing distinguished
+ * first-by-index from last-to-fail, and nothing caught the slot bookkeeping
+ * reading whichever leg wrote to the shared buffer last (PR #151 F4).
+ *
+ * The two failures are deliberately made in framed mode and given different
+ * shapes so the MESSAGE identifies which leg was blamed:
+ *
+ *   leg 1: a 200 with no Content-Length, no chunked coding and a body -- its
+ *          end is unknowable, so the framed reader calls it UNFRAMEABLE;
+ *   leg 2: a Content-Length that is not a number -- MALFORMED framing.
+ *
+ * Both are terminal on the first read, so both legs fail within one iteration
+ * of the drain loop rather than one failing several polls after the other.
+ * That simultaneity is the point: it is what makes "first by INDEX" a
+ * different prediction from "first by TIME", which is the whole reason the
+ * driver documents the index rule (index is reproducible across runs and can
+ * be bisected; arrival order moves).
+ *
+ * Legs 0 and 3 answer correctly so the case cannot pass by the fan simply
+ * collapsing -- a driver that failed every leg would satisfy an assertion that
+ * only looked for "leg 2" in the message.
+ */
+static pid_t
+spawn_fan_two_bad(int *port, int want)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "http_test: socket: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, want) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        fprintf(stderr, "http_test: listen: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "http_test: fork: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    if (pid == 0) {
+        int   conns[MAX_CONCURRENT];
+        char  scratch[512];
+        int   i;
+
+        /* The forked-child bound check the sibling fan fixtures carry. This
+         * fixture additionally REQUIRES want == 4: the reply chosen per leg is
+         * indexed below, so a different width would silently give some leg a
+         * reply the assertions do not model. */
+        if (want != 4 || want > MAX_CONCURRENT) {
+            _exit(2);
+        }
+
+        for (i = 0; i < want; i++) {
+            conns[i] = accept(srv, NULL, NULL);
+
+            if (conns[i] < 0) {
+                _exit(2);
+            }
+
+            if (read(conns[i], scratch, sizeof(scratch)) < 0) {
+                _exit(2);
+            }
+        }
+
+/* Framed and correct: legs 0 and 3. */
+#define TWOBAD_GOOD    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"
+/* No Content-Length, no chunking, but a body: end unknowable -> UNFRAMEABLE. */
+#define TWOBAD_UNFRAM  "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhi"
+/* A Content-Length that is not a number -> MALFORMED. */
+#define TWOBAD_MALF    "HTTP/1.1 200 OK\r\nContent-Length: xx\r\n\r\nhi"
+
+        for (i = 0; i < want; i++) {
+            const char  *reply;
+            size_t       len;
+
+            if (i == 1) {
+                reply = TWOBAD_UNFRAM;
+                len = sizeof(TWOBAD_UNFRAM) - 1;
+
+            } else if (i == 2) {
+                reply = TWOBAD_MALF;
+                len = sizeof(TWOBAD_MALF) - 1;
+
+            } else {
+                reply = TWOBAD_GOOD;
+                len = sizeof(TWOBAD_GOOD) - 1;
+            }
+
+            /* Length from sizeof, never hand-counted: a short count truncates
+             * the reply and the client sees a well-formed but WRONG response,
+             * which reads as a driver bug rather than a fixture typo. */
+            (void) send(conns[i], reply, len, MSG_NOSIGNAL);
+        }
+
+#undef TWOBAD_GOOD
+#undef TWOBAD_UNFRAM
+#undef TWOBAD_MALF
+
+        /*
+         * Hold every connection OPEN. The unframeable leg is only unframeable
+         * while the connection stays up -- closing it would supply an EOF that
+         * frames the body after all, and leg 1 would succeed. The parent kills
+         * this child once the case is done.
+         */
+        {
+            struct timespec  ts;
+
+            ts.tv_sec = 30;
+            ts.tv_nsec = 0;
+
+            while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+                /* held open until the parent kills us */
+            }
+        }
+
+        _exit(0);
+    }
+
+    close(srv);
+
+    return pid;
+}
+
+
+/*
  * The out-of-order fixture, S-4. Accept `want` connections, then make answering
  * leg 0 DEPEND on the client having drained the last leg.
  *
@@ -983,6 +1248,37 @@ spawn_readback(int *port, int want, size_t big_len)
     }
 
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    /*
+     * FORCE the small receive window this fixture's dependency rests on,
+     * rather than assuming the platform's default is smaller than `big_len`.
+     *
+     * The dependency exists only while the server's send() cannot be absorbed
+     * whole: the body has to sit unsent until the CLIENT drains it. The
+     * original fixture argued that from a comment -- "4 MiB is far above any
+     * socket buffer this test could meet" -- which is an assumption about
+     * loopback autotuning, not a precondition the test establishes (PR #151
+     * F4). If a kernel, container or future tuning ever buffered 4 MiB, the
+     * send() would complete immediately, leg 0 would be answered without the
+     * client having read anything, and the case would pass against the very
+     * in-order drain it exists to catch: vacuous, and still green.
+     *
+     * Set on the LISTENING socket because accepted sockets inherit it, and it
+     * must be set before listen() for the value to be carried into the
+     * handshake's advertised window. This is the client-visible receive side;
+     * the matching SO_SNDBUF is set on the big-body connection in the child.
+     *
+     * Advisory, and deliberately unchecked: Linux doubles the request for
+     * bookkeeping and enforces a floor, so the effective size is larger than
+     * asked but still three orders of magnitude below `big_len`. A kernel that
+     * refuses the hint outright leaves the autotuned behaviour this fixture
+     * used to rely on, so the hint can only improve the precondition.
+     */
+    {
+        int  small = 16 * 1024;
+
+        (void) setsockopt(srv, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+    }
 
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
@@ -1049,6 +1345,14 @@ spawn_readback(int *port, int want, size_t big_len)
             char   *hdr;
             char   *body;
             size_t  off;
+            int     small = 16 * 1024;
+
+            /* The send side of the same precondition -- see the note at the
+             * listening socket. Bounding BOTH buffers is what makes "this
+             * send() blocks partway" a property the fixture establishes rather
+             * than one it inherits from the host's tuning. */
+            (void) setsockopt(conns[want - 1], SOL_SOCKET, SO_SNDBUF,
+                              &small, sizeof(small));
 
             hdr = malloc(128);
             body = malloc(big_len);
@@ -3150,12 +3454,31 @@ main(void)
             pid_t          pid2;
             int            all_ok;
 
-            /* 4 MiB: far above any socket buffer this test could meet (loopback
-             * autotuning tops out in the low hundreds of KiB), so the server's
+            /*
+             * 1 MiB against the 16 KiB SO_RCVBUF/SO_SNDBUF the fixture now
+             * FORCES on both ends (see spawn_readback()), so the server's
              * send() is guaranteed to block partway rather than being absorbed
-             * whole -- which is what creates the dependency. Well under
-             * HTTP_MAX_RESPONSE, so the ceiling is not what is being tested. */
-            pid2 = spawn_readback(&port2, 4, 4 * 1024 * 1024);
+             * whole -- which is what creates the dependency. The margin is
+             * ~64x the forced window even after the kernel's doubling, and it
+             * no longer rests on loopback autotuning happening to be smaller
+             * than the body.
+             *
+             * SMALLER than the 4 MiB it replaces, and that is a consequence of
+             * forcing the buffers rather than an unrelated tuning change. The
+             * old size was chosen to beat an UNKNOWN, possibly-large autotuned
+             * window; with the window pinned at 16 KiB the precondition is
+             * established with far less data. It has to be less: a 16 KiB
+             * receive window also throttles how fast the client can drain the
+             * body, and 4 MiB through it does not complete inside the case's
+             * 1000 ms deadline -- the assertion reddened against CORRECT code
+             * when the buffers were first forced without shrinking the body.
+             * Widening the deadline would have been the wrong fix; the body
+             * size is what the buffer change actually invalidated.
+             *
+             * Still well under HTTP_MAX_RESPONSE, so the ceiling is not what is
+             * being tested.
+             */
+            pid2 = spawn_readback(&port2, 4, 1024 * 1024);
 
             rc = http_exchange_concurrent("127.0.0.1", port2, 4, creq, creq_len,
                                           1000, NULL, NULL, 0, HTTP_SHUT_NONE,
@@ -3266,6 +3589,162 @@ main(void)
 
             kill(pid3, SIGKILL);
             waitpid(pid3, &st3, 0);
+        }
+
+        /*
+         * `recv_slow` paces EVERY leg of a fan, independently, and one leg's
+         * gate does not stand in for its siblings'.
+         *
+         * This is the fan half of the pacing witness, and until it existed the
+         * fan-pacing mutant was killed by assertion 104 -- the N=1 case. That
+         * made the mutant a false control in the F4 sense: it proved the gate is
+         * consulted somewhere, not that a fan consults one per leg. The three
+         * fan-only mistakes it now discriminates are listed at spawn_fan_paced().
+         *
+         * The witness is per leg and an EQUALITY, for the same reason the N=1
+         * case uses one: `paced_sleep_ms` is credited from sleep_ms()'s RETURN,
+         * so gutting the sleep zeroes it rather than leaving it reporting sleeps
+         * that never happened. The count is the same 4 the N=1 case measures and
+         * rests on the same two facts -- the 418-byte reply at a 100-byte cap is
+         * 5 reads, and `paced_full` paces only before a read the loop expects to
+         * fill, so the final short read is unpaced.
+         *
+         * Deliberately NOT an aggregate over the fan. A fan that slept once for
+         * all four legs and one that sleeps four times each are indistinguishable
+         * by any sum, floor or total; only asking each leg what IT slept
+         * separates them. Same rule the idle-deadline case above had to learn
+         * from a first cut that was red against correct code.
+         *
+         * No wall-clock bound appears here at all. Under a correct drain the
+         * four legs pace CONCURRENTLY, so fan elapsed time is about one leg's
+         * pacing rather than four legs' worth -- but that is a property of the
+         * scheduler as much as of the drain, and pinning it would re-introduce
+         * exactly the load-sensitive assertion the s155 fix removed. The per-leg
+         * counters say what the pacing did without asking the clock.
+         */
+        {
+            int         port4, st4, k;
+            pid_t       pid4;
+            http_recv   rv4;
+            int         paced_each = 1;
+            int         all_answered;
+
+            memset(&rv4, 0, sizeof(rv4));
+            rv4.chunk = 100;
+            rv4.ms = 30;
+
+            pid4 = spawn_fan_paced(&port4, 4);
+
+            memset(resps, 0, sizeof(resps));
+            rc = http_exchange_concurrent("127.0.0.1", port4, 4, creq, creq_len,
+                                          2000, NULL, NULL, 0, HTTP_SHUT_NONE,
+                                          &rv4, 0, 0, resps,
+                                          errbuf, sizeof(errbuf));
+
+            all_answered = (rc == 0);
+
+            for (k = 0; rc == 0 && k < 4; k++) {
+                if (resps[k].status != 200) {
+                    all_answered = 0;
+                }
+
+                if (resps[k].paced_sleep_ms != 4 * rv4.ms) {
+                    paced_each = 0;
+                }
+            }
+
+            ok(all_answered,
+               "a fan carrying recv_slow still collects every leg's response");
+
+            ok(rc == 0 && paced_each,
+               "recv_slow paces every leg of a fan on its own gate, not once "
+               "for the fan");
+
+            /* Unconditional, per http_exchange_concurrent()'s contract and for
+             * the reason spelled out at the sibling fan above: this fan returns
+             * non-zero exactly when the behaviour under test regresses, so a
+             * success-gated free would pin an LSan report to the red assertion
+             * that matters. */
+            for (k = 0; k < 4; k++) {
+                http_response_free(&resps[k]);
+            }
+
+            kill(pid4, SIGKILL);
+            waitpid(pid4, &st4, 0);
+        }
+
+        /*
+         * When two legs fail in one iteration, the fan blames the FIRST BY
+         * INDEX and quotes THAT leg's own error.
+         *
+         * Both halves of this were unpinned: no case in this file made two legs
+         * fail at once, so nothing separated first-by-index from last-to-fail,
+         * and nothing caught the error being read out of the wrong slot (PR
+         * #151 F4). The driver documents index order specifically because it is
+         * reproducible and bisectable where arrival order is not, so an
+         * undetected drift to "whoever failed last" would quietly make fan
+         * diagnostics non-deterministic -- the failure mode where the harness
+         * blames a different leg on each run of the same broken server.
+         *
+         * The fixture fails leg 1 as UNFRAMEABLE and leg 2 as MALFORMED, both
+         * terminal on their first read, so they land in the same drain
+         * iteration with messages that name which one was blamed. Legs 0 and 3
+         * answer correctly, so a driver that failed the whole fan cannot pass
+         * this by accident.
+         *
+         * Asserted on the message TEXT rather than on a leg number alone
+         * because the leg number and the error string come from different
+         * places -- the index from the loop, the text from `errs + i *
+         * HTTP_LEG_ERRLEN`. Checking only "leg 2/4" would still pass if the
+         * prefix were right and the quoted error came from leg 3's slot, which
+         * is precisely the shared-buffer bug the per-leg slots exist to
+         * prevent. Both are checked, so the assertion reds if either drifts.
+         */
+        {
+            int    port5, st5, k;
+            pid_t  pid5;
+            int    blamed_leg_2;
+            int    quoted_its_own_error;
+
+            pid5 = spawn_fan_two_bad(&port5, 4);
+
+            memset(resps, 0, sizeof(resps));
+            errbuf[0] = '\0';
+
+            /* framed = 1: the framing verdict is what makes these two legs
+             * fail, and with distinguishable reasons. */
+            rc = http_exchange_concurrent("127.0.0.1", port5, 4, creq, creq_len,
+                                          1000, NULL, NULL, 0, HTTP_SHUT_NONE,
+                                          NULL, 0, 1, resps,
+                                          errbuf, sizeof(errbuf));
+
+            /* Leg 1 of 4 in the driver's 1-based reporting is index 1, i.e.
+             * "leg 2/4" -- the lower-indexed of the two failing legs. */
+            blamed_leg_2 = (strstr(errbuf, "concurrent leg 2/4:") != NULL);
+
+            /* Leg 1's own failure is the UNFRAMEABLE one. Seeing the MALFORMED
+             * text here would mean the right leg was named but leg 2's slot was
+             * quoted. */
+            quoted_its_own_error =
+                (strstr(errbuf, "no Content-Length") != NULL
+                 && strstr(errbuf, "malformed Content-Length") == NULL);
+
+            ok(rc == -1 && blamed_leg_2,
+               "two legs failing at once are attributed to the first BY INDEX");
+
+            ok(rc == -1 && quoted_its_own_error,
+               "the blamed leg's error comes from its OWN slot, not a "
+               "sibling's");
+
+            /* Unconditional, per the contract and for the reason given at the
+             * sibling fan blocks -- and it matters most here, where rc == -1 is
+             * the EXPECTED outcome rather than a failure. */
+            for (k = 0; k < 4; k++) {
+                http_response_free(&resps[k]);
+            }
+
+            kill(pid5, SIGKILL);
+            waitpid(pid5, &st5, 0);
         }
     }
 
