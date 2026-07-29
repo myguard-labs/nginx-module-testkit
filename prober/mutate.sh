@@ -241,18 +241,22 @@ mutate "abort: offset ignored" http.c \
 
 # ---- transport: receive-side pacing ----------------------------------------
 
-mutate "recv_slow: pacing sleep zeroed" http.c \
-    'sleep_ms(recv_opt->ms);' 'sleep_ms(recv_opt->ms * 0);' http_test
+# S-4: pacing is a per-leg gate, not a sleep, so the anchor is the gate width.
+# A zero-width gate withholds nothing AND credits nothing -- both halves of the
+# S-5 witness must red, not just the wall clock.
+mutate "recv_slow: pacing gate zeroed" http.c \
+    '                    st->not_before = now + st->recv_opt->ms;' \
+    '                    st->not_before = now + st->recv_opt->ms * 0;' http_test
 
 mutate "recv_slow: chunk cap ignored" http.c \
-    'if (want > recv_opt->chunk) {
-                want = recv_opt->chunk;
+    'if (want > st->recv_opt->chunk) {
+                want = st->recv_opt->chunk;
             }' 'if (0) {
-                want = recv_opt->chunk;
+                want = st->recv_opt->chunk;
             }' http_test
 
-mutate "recv_slow: sleeps before the EOF read" http.c \
-    'if (paced_full) {' 'if (paced_full || 1) {' http_test
+mutate "recv_slow: gates before the EOF read" http.c \
+    'if (st->paced_full) {' 'if (st->paced_full || 1) {' http_test
 
 mutate "so_rcvbuf: setsockopt dropped" http.c \
     'if (recv_opt != NULL && recv_opt->rcvbuf > 0) {' \
@@ -319,8 +323,19 @@ mutate "hold: ceiling not counted toward the stall budget" rules.c \
 # header, hit for real on two successive drafts. `< 0` keeps the parameter used
 # AND the expression boolean, while never being true for any value the callers
 # pass (0 or 1).
+# S-4 re-anchored, and the move is the point. This mutant used to hit the EAGAIN
+# branch, where SO_RCVTIMEO expiring meant "the server held the connection open".
+# The drain now waits for readiness in poll() BEFORE reading, so that branch is
+# effectively unreachable and mutating it SURVIVED -- correctly, since nothing
+# reaches it. The behaviour did not become untested; it moved. The
+# whole-exchange deadline is what produces the timeout verdict now, so the
+# mutant anchors there: it reds assertions 120-122 (verdict, bytes kept, time
+# measured).
 mutate "close_within: want_close ignored" http.c \
-    '                if (want_close) {' '                if (want_close < 0) {' http_test
+    '                > HTTP_MAX_EXCHANGE_MS(st->timeout_ms)) {
+            if (st->want_close) {' \
+    '                > HTTP_MAX_EXCHANGE_MS(st->timeout_ms)) {
+            if (st->want_close < 0) {' http_test
 
 # The comparison itself, in both directions. `>=` passes a close that missed the
 # deadline by exactly nothing; inverting it fails every prompt close.
@@ -380,11 +395,11 @@ mutate "close_within: unobserved close treated as a pass" assert.c \
 # deadline no matter how long the server actually took.
 mutate "close_within: FIN time not measured" http.c \
     '        if (n == 0) {
-            resp->close_reason = HTTP_CLOSE_FIN;
-            resp->close_ms = elapsed_since(sent_at);' \
+            st->resp->close_reason = HTTP_CLOSE_FIN;
+            st->resp->close_ms = elapsed_since(st->sent_at);' \
     '        if (n == 0) {
-            resp->close_reason = HTTP_CLOSE_FIN;
-            resp->close_ms = elapsed_since(sent_at) * 0;' http_test
+            st->resp->close_reason = HTTP_CLOSE_FIN;
+            st->resp->close_ms = elapsed_since(st->sent_at) * 0;' http_test
 
 # The ceiling. A deadline past the read timeout can never be missed, so without
 # this bound the directive accepts values at which it cannot go red.
@@ -547,15 +562,108 @@ mutate "concurrent: block exclusion removed" rules.c \
     '        if (tc->concurrent > 0 && tc->n_blocks > 0) {' \
     '        if (0 && tc->n_blocks > 0) {' rules_test
 
-# The timing guard. The fan drains in order and blocking, so without this a case
-# can pair `concurrent` with recv_slow or expect_close_within and get a timing
-# verdict measured against an interval that includes an earlier leg's read.
-mutate "concurrent: timing-assertion guard removed" rules.c \
-    '        if (tc->concurrent > 0
-            && (tc->saw_close_within || tc->saw_recv_slow))' \
-    '        if (tc->concurrent * 0 > 0
-            && (tc->saw_close_within || tc->saw_recv_slow))' \
+# The timing guard that used to live here (`concurrent` + recv_slow /
+# expect_close_within rejected at load time) was LIFTED by S-4, and its mutant
+# was removed with it rather than left behind: a gate that no longer exists
+# cannot be broken, so the mutant would have passed unconditionally and reported
+# a false green. What follows are the two mutants that guard the drain behaviour
+# the lift depends on.
+
+# The drain. Restoring the in-order blocking read is the exact regression the
+# lift would be unsafe under: it is what charged an earlier leg's read time to
+# every later leg's clock. Caught by the readback fixture, which makes leg 0's
+# answer depend on the client having drained a LATER leg -- a dependency an
+# in-order drain deadlocks on. Note a reverse-answering fixture does NOT catch
+# it (the kernel buffers the other legs while the drain blocks on leg 0), which
+# is why the fixture is built the way it is.
+#
+# It must be a TRUE in-order drain, and getting this wrong once already
+# produced a false green. The obvious `if (i > 0) continue` is NOT this
+# control: it drops legs 1..N-1 from the pollfd set permanently, so they are
+# never read even after leg 0 finishes. That breaks the fan far more broadly
+# than the claim -- the earlier barrier assertion reds simply because N-1
+# replies are never collected -- and it therefore proves nothing about whether
+# assertion 165's later-leg readback dependency is pinned.
+#
+# What follows advances the LOWEST-INDEX non-terminal leg only, which is
+# exactly the pre-S-4 semantics: leg i+1 is not read until leg i is terminal.
+# Every leg is still eventually read, so a fan whose legs are independent still
+# completes and the barrier assertion stays green; only a fan whose earlier leg
+# depends on a LATER leg being drained deadlocks, which is assertion 165 and
+# nothing else.
+mutate "concurrent: drain serialized (legs read in index order, blocking)" http.c \
+    '            if (!http_read_state_pollable(&sts[i], now)) {
+                    continue;
+                }' \
+    '            if (!http_read_state_pollable(&sts[i], now) || nfds > 0) {
+                    continue;
+                }' \
+    http_test
+
+# The paced close-deadline triple must stay rejected. Dropping the gate lets a
+# case load whose close_ms includes the client's own recv_slow gates while the
+# README defines that number as the server's close time -- a prompt server
+# reported as late, blamed by name. Narrow on purpose: the mutant only has to
+# make the triple load, since each PAIR loading is correct and is asserted
+# separately.
+mutate "concurrent: paced close-deadline triple accepted (unmeasurable)" rules.c \
+    '        if (tc->concurrent > 0 && tc->saw_recv_slow && tc->saw_close_within) {' \
+    '        if (tc->concurrent < 0 && tc->saw_recv_slow && tc->saw_close_within) {' \
     rules_test
+
+# The poll() timeout clamp. Removing it restores the raw narrowing the S-4
+# drain shipped: the 8x whole-exchange budget of a large accepted -t exceeds
+# INT_MAX, narrows to a negative int, and poll() reads that as "wait forever" --
+# the harness hangs silently instead of timing out. Caught by the boundary
+# assertions, which are the only way to reach these values (a real exchange
+# would need weeks of wall time).
+mutate "poll timeout: oversized wait not clamped (negative = infinite poll)" http.c \
+    '    if (wait > INT_MAX) {
+        return INT_MAX;
+    }' \
+    '    if (wait > INT_MAX && wait < 0) {
+        return INT_MAX;
+    }' \
+    http_test
+
+# The per-read idle deadline, in the wakeup calculation. Dropping it there is
+# the F1 regression exactly as it shipped: the deadline still exists and is
+# still checked, but poll() never wakes for it, so a silent peer sleeps until
+# the 8x whole-exchange budget instead of timeout_ms. Measured at 2401 ms
+# against a 300 ms timeout where the pre-S-4 blocking reader took 316 ms.
+# Caught by the N=1 ceiling, which is the assertion that names WHICH deadline
+# ended the read -- the pre-existing floor-only assertions stayed green through
+# the entire regression and are why it shipped.
+mutate "idle timeout: dropped from the poll wakeup (8x inflation)" http.c \
+    '    } else if (st->idle_deadline > 0 && st->idle_deadline < wake) {
+        wake = st->idle_deadline;
+    }' \
+    '    }' \
+    http_test
+
+# The idle deadline must be held PER LEG, not recomputed from timeout_ms
+# whenever the leg is stepped. Refreshing it on every step means any reason the
+# shared poll() loop wakes -- including a chatty sibling's traffic -- postpones
+# a silent leg's deadline forever. This is invisible at N=1, where there is no
+# sibling to do the postponing, so the N=1 ceiling does NOT catch it; the fan
+# fixture with one talkative leg and three silent ones is what does.
+mutate "idle timeout: clock refreshed every step (sibling postpones it)" http.c \
+    '    if (st->not_before != 0 && now >= st->not_before) {
+        st->paced_sleep_ms += st->not_before - st->gate_start;' \
+    '    st->idle_deadline = now + st->timeout_ms;
+
+    if (st->not_before != 0 && now >= st->not_before) {
+        st->paced_sleep_ms += st->not_before - st->gate_start;' \
+    http_test
+
+# The pacing gate must not be cancelled by readiness. Polling a gated leg lets
+# data arriving early satisfy the poll and step the leg before its delay has
+# elapsed, which is recv_slow silently not pacing -- the defect S-5 exists to
+# catch, rebuilt in the drain. Caught by assertion 104's exact equality.
+mutate "concurrent: paced leg polled anyway (gate cancelled by readiness)" http.c \
+    '    return !st->done && now >= st->not_before;' \
+    '    return !st->done && now * 0 >= st->not_before * 0;' \
+    http_test
 
 # THE ordering mutant, and the reason the barrier fixture exists: read each leg's
 # response inside the write loop instead of after it. Every request is still sent
@@ -986,16 +1094,18 @@ mutate "backend: the empty-seed marker stores its quotes" backend.c \
 # whole-exchange deadline, so the test that expects a prompt HTTP_CLOSE_FRAMED
 # hangs until the per-mutant timeout. A framed reader that does not stop is the
 # defect this whole item exists to prevent.
-mutate "framed: completion break removed" http.c \
-    '                resp->close_ms = elapsed_since(sent_at);
-                if (conn_open != NULL) {
-                    *conn_open = 1;
+# S-4: the loop's `break` is now `goto finish` -- the terminal that transfers
+# buf to resp->raw. Removing it makes a framed response never terminate.
+mutate "framed: completion exit removed" http.c \
+    '                st->resp->close_ms = elapsed_since(st->sent_at);
+                if (st->conn_open != NULL) {
+                    *st->conn_open = 1;
                 }
-                break;
+                goto finish;
             }' \
-    '                resp->close_ms = elapsed_since(sent_at);
-                if (conn_open != NULL) {
-                    *conn_open = 1;
+    '                st->resp->close_ms = elapsed_since(st->sent_at);
+                if (st->conn_open != NULL) {
+                    *st->conn_open = 1;
                 }
             }' http_test
 

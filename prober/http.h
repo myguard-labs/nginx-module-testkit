@@ -711,6 +711,19 @@ int http_request(const char *host, int port,
                  http_response *resp,
                  char *errbuf, size_t errlen);
 
+/*
+ * Narrow a millisecond wait to poll()'s int timeout, clamping instead of
+ * letting an oversized value become a negative one (which poll() reads as "wait
+ * forever" -- a silent hang rather than a bounded timeout).
+ *
+ * Exposed so http_test.c can drive the boundaries directly. `-t` accepts up to
+ * INT_MAX and the whole-exchange budget multiplies it by 8, so the inputs that
+ * matter here are around and above INT_MAX -- values a live exchange would take
+ * literal weeks to reach, which is exactly why they cannot be tested through a
+ * socket and had gone untested.
+ */
+int http_poll_timeout_ms(long wait);
+
 void http_response_free(http_response *resp);
 
 /*

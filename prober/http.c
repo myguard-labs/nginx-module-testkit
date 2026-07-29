@@ -81,6 +81,87 @@ http_response_free(http_response *resp)
  * ascii_fold()'s comment for the tr_TR breakage that motivated it). */
 static int ascii_case_eq(const char *a, const char *b, size_t len);
 
+/*
+ * One leg's response-read state, S-4.
+ *
+ * The read loop used to be a blocking for(;;) over a single fd. The concurrent
+ * fan drained its legs by running that loop once per leg IN INDEX ORDER, which
+ * meant leg i+1 was not read at all until leg i completed or timed out: a fan
+ * could not observe its legs out of index order under any circumstance, so a
+ * server answering leg 5 first was indistinguishable from one answering in
+ * order. Fixing that requires every leg to be advanceable independently, which
+ * requires the loop's locals to become addressable state -- this struct.
+ *
+ * OWNERSHIP INVARIANT, and it replaces #144's weaker one. #144 could say "no
+ * allocation crosses the seam" because the buffer was born and died inside one
+ * call; a state machine breaks that by construction, since `buf` now lives
+ * across returns. The replacement, enforced by http_read_state_free():
+ *
+ *   Every terminal state either frees `buf` or transfers it to resp->raw, and
+ *   NULLs st->buf either way. A leg left non-terminal still owns its buffer, so
+ *   a caller abandoning the drain frees every leg unconditionally.
+ *
+ * That last clause is new with the fan: the old blocking drain returned on the
+ * first failing leg with every earlier leg already terminal, so there was never
+ * a live buffer to leak. Under poll() there is.
+ */
+/* Per-leg error-text width for the concurrent drain. Sized to the same 256 the
+ * driver's existing `detail` buffers use, so a leg's message survives being
+ * re-rendered into the caller's errbuf without a second truncation. */
+#define HTTP_LEG_ERRLEN  256
+
+
+typedef struct {
+    int               fd;
+    int               timeout_ms;
+    const http_recv  *recv_opt;
+    int               want_close;
+    int               framed;
+    long long         sent_at;
+    http_response    *resp;
+    int              *conn_open;
+
+    char             *buf;
+    size_t            cap;
+    size_t            len;
+
+    /* Whether the previous read filled its chunk, deciding if the next one
+     * paces; see the gate in http_read_state_step(). */
+    int               paced_full;
+
+    /* Deliberate recv pacing, discounted from the whole-exchange deadline.
+     * not_before is the gate: while it is in the future the leg is excluded
+     * from the pollfd set instead of sleeping, so pacing one leg does not
+     * stall the others. gate_start is stamped when the gate is set so the
+     * credit can be the interval actually withheld rather than the intended
+     * one -- the distinction S-5 exists to preserve. */
+    long long         paced_sleep_ms;
+    long long         not_before;
+    long long         gate_start;
+
+    /* The per-read idle deadline: the instant this leg gives up waiting for the
+     * NEXT byte. Restamped after every read that delivered data, so it bounds
+     * silence between reads rather than the exchange as a whole.
+     *
+     * This exists because the S-4 drain stopped bounding that silence. The
+     * pre-S-4 reader sat in a blocking read() and SO_RCVTIMEO=timeout_ms cut it
+     * off; the drain waits in poll() instead, where SO_RCVTIMEO does not apply,
+     * so the only remaining server-side boundary was the 8x whole-exchange
+     * budget -- an 8x inflation of every silent-peer case, measured at 2401 ms
+     * against a 300 ms timeout where the old reader took 316 ms. That
+     * contradicts want_close's contract in http.h, which promises a
+     * non-closing server is answered after timeout_ms.
+     *
+     * Held per leg, never recomputed from a fresh timeout_ms on each poll
+     * iteration: the fan polls all legs together, so a chatty sibling waking
+     * the loop must not postpone a silent leg's own deadline. */
+    long long         idle_deadline;
+
+    int               done;
+    int               rc;
+} http_read_state;
+
+
 /* Defined immediately after http_exchange(), which is its only caller. Declared
  * here rather than moved above it so the file still reads in exchange order --
  * write, then read -- matching the order the two halves actually run in. */
@@ -89,6 +170,18 @@ static int http_read_response(int fd, int timeout_ms,
                               int framed, long long sent_at,
                               http_response *resp, int *conn_open,
                               char *errbuf, size_t errlen);
+
+static int http_read_state_init(http_read_state *st, int fd, int timeout_ms,
+                                const http_recv *recv_opt, int want_close,
+                                int framed, long long sent_at,
+                                http_response *resp, int *conn_open,
+                                char *errbuf, size_t errlen);
+static void http_read_state_free(http_read_state *st);
+static int http_read_state_pollable(const http_read_state *st, long long now);
+static long http_read_state_next_wakeup(const http_read_state *st,
+                                        long long now);
+static int http_read_state_step(http_read_state *st, int readable,
+                                char *errbuf, size_t errlen);
 
 
 static int
@@ -1560,63 +1653,228 @@ http_exchange(int fd,
 
 
 /*
- * The response-reading half of an exchange, split out of http_exchange() so a
- * concurrent driver can write N requests before reading ANY response -- that
- * overlap is the whole point of concurrency, and it is unreachable while the
- * read loop is welded to the write that preceded it.
+ * Initialize one leg's read state. Separated from the step function because a
+ * fan must be able to arm every leg BEFORE polling any of them: a leg whose
+ * buffer was not yet allocated cannot be in the pollfd set, and allocating
+ * lazily on first readiness would make the failure path depend on arrival
+ * order.
  *
- * This is a pure extraction: the body below is http_exchange()'s former tail
- * verbatim, and every path that used to skip it (abort's SO_LINGER reset,
- * hold, expect_idle) still returns before reaching this call rather than
- * entering and short-circuiting.
- *
- * `shutdown` is deliberately NOT in that list: a half-close is a modifier on
- * the request, not a substitute for the response. It shuts the write side and
- * then reads normally -- which is the entire point of SHUT_WR, since the peer
- * has to answer the EOF for the case to prove anything. A concurrency driver
- * must therefore treat shut_how as compatible with reading, not as a
- * read-skipping mode.
- *
- * `sent_at` is passed in because the whole-
- * exchange deadline and every close_ms measure from the instant the request
- * finished going out, which only the writer knows; taking a fresh timestamp
- * here would silently restart the clock and hand a trickling server the budget
- * twice over.
- *
- * The response buffer is allocated, grown, and either freed or transferred to
- * resp->raw entirely within this function -- no allocation crosses the seam,
- * which is what makes the split safe to review as a move rather than a
- * lifetime change.
- *
- * Return and errbuf semantics are http_exchange()'s: 0 when the exchange
- * completed (the verdict belongs to the assertion layer), -1 with errbuf set
- * on a harness-side failure.
+ * Returns 0, or -1 with errbuf set when the initial allocation fails. On -1 the
+ * state is left safe to pass to http_read_state_free() (buf is NULL).
  */
 static int
-http_read_response(int fd, int timeout_ms,
-                   const http_recv *recv_opt, int want_close, int framed,
-                   long long sent_at,
-                   http_response *resp, int *conn_open,
-                   char *errbuf, size_t errlen)
+http_read_state_init(http_read_state *st, int fd, int timeout_ms,
+                     const http_recv *recv_opt, int want_close, int framed,
+                     long long sent_at, http_response *resp, int *conn_open,
+                     char *errbuf, size_t errlen)
 {
-    char       *buf;
-    size_t      cap = 8192, len = 0, want;
-    int         paced_full = 0;
-    /* Intentional recv pacing, AUD-07. Kept as a local because the deadline
-     * check below reads it on every iteration of the read loop; it is published
-     * to resp->paced_sleep_ms at the point it grows, so the caller gets the
-     * sleep's only witness that is not a wall clock. */
-    long long   paced_sleep_ms = 0;
+    memset(st, 0, sizeof(*st));
 
-    buf = malloc(cap);
-    if (buf == NULL) {
+    st->fd = fd;
+    st->timeout_ms = timeout_ms;
+    st->recv_opt = recv_opt;
+    st->want_close = want_close;
+    st->framed = framed;
+    st->sent_at = sent_at;
+    st->resp = resp;
+    st->conn_open = conn_open;
+    st->cap = 8192;
+
+    /* Armed here rather than on first step: the wait for the FIRST byte is
+     * exactly as much a per-read idle wait as the wait for any later one, and
+     * it is the one a silent peer exercises. */
+    st->idle_deadline = now_ms() + timeout_ms;
+
+    st->buf = malloc(st->cap);
+    if (st->buf == NULL) {
         snprintf(errbuf, errlen, "out of memory");
+        st->done = 1;
+        st->rc = -1;
         return -1;
     }
 
-    for ( ;; ) {
-        ssize_t n;
+    return 0;
+}
 
+
+/*
+ * Release a leg's buffer if it is still owned by the state.
+ *
+ * This is the enforcement point for the OWNERSHIP INVARIANT stated on the
+ * http_read_state struct above:
+ * a terminal leg has already either freed `buf` or transferred it to
+ * resp->raw, and both paths NULL it here, so calling this on any leg -- live,
+ * terminal, or never started -- is safe and idempotent. That is what lets the
+ * fan free every leg unconditionally when it abandons a drain, without
+ * tracking which legs had reached a terminal state.
+ */
+static void
+http_read_state_free(http_read_state *st)
+{
+    free(st->buf);
+    st->buf = NULL;
+}
+
+
+/*
+ * Whether this leg wants to be in the pollfd set right now.
+ *
+ * A leg gated by recv pacing is deliberately NOT polled: its `not_before` is in
+ * the future and readiness is irrelevant until then. This is what keeps pacing
+ * from blocking the other legs -- see the not_before/gate_start field comments
+ * on http_read_state above, and the credit rule in http_read_state_step().
+ */
+static int
+http_read_state_pollable(const http_read_state *st, long long now)
+{
+    return !st->done && now >= st->not_before;
+}
+
+
+/*
+ * How long, in ms, until this leg next needs attention: its pacing gate opens,
+ * its per-read idle deadline expires, or its whole-exchange deadline expires.
+ * The drain loop takes the minimum across live legs as its poll() timeout, so
+ * no leg oversleeps its own deadline because another leg had nothing to say.
+ *
+ * The idle deadline is in this minimum, not merely checked after poll() returns:
+ * a silent peer produces no readiness event, so a wakeup that ignored it would
+ * sleep until the 8x whole-exchange budget and the idle bound would never fire.
+ * That omission IS the F1 regression this restores.
+ *
+ * A gate that is open (`not_before` in the past) is excluded, and so is an idle
+ * deadline while a gate is closed: a leg deliberately withheld by pacing is not
+ * idle, and charging the client's own sip interval to the server's silence
+ * budget would fail a paced case that the server was answering promptly.
+ *
+ * Never negative: a leg already past any boundary wants an immediate wakeup.
+ */
+static long
+http_read_state_next_wakeup(const http_read_state *st, long long now)
+{
+    long long  deadline_at, wake;
+
+    deadline_at = st->sent_at + st->paced_sleep_ms
+                  + HTTP_MAX_EXCHANGE_MS(st->timeout_ms);
+
+    wake = deadline_at;
+    if (st->not_before > now) {
+        if (st->not_before < wake) {
+            wake = st->not_before;
+        }
+
+    } else if (st->idle_deadline > 0 && st->idle_deadline < wake) {
+        wake = st->idle_deadline;
+    }
+
+    if (wake <= now) {
+        return 0;
+    }
+
+    return (long) (wake - now);
+}
+
+
+/*
+ * Narrow a millisecond wait to poll()'s int timeout without letting it go
+ * negative, which poll() reads as "wait forever".
+ *
+ * `-t` accepts any positive int and HTTP_MAX_EXCHANGE_MS multiplies it by 8, so
+ * a large-but-accepted timeout (up to INT_MAX) produces a long above INT_MAX
+ * here. The implicit conversion is implementation-defined and in practice comes
+ * out negative, turning a bounded wait into an indefinite hang -- the harness
+ * silently stops instead of reporting a timeout.
+ *
+ * Clamping rather than rejecting keeps the arithmetic total: every caller loops
+ * on absolute deadlines and recomputes the remaining wait each iteration, so a
+ * clamped wait costs at most one extra poll() round-trip and the deadline it
+ * was derived from still decides when the leg gives up.
+ */
+int
+http_poll_timeout_ms(long wait)
+{
+    if (wait < 0) {
+        return 0;
+    }
+
+    if (wait > INT_MAX) {
+        return INT_MAX;
+    }
+
+    return (int) wait;
+}
+
+
+/*
+ * Drive one leg by one step, having been told whether its fd is readable.
+ *
+ * This is the former read loop's body. Every exit that used to `break` now
+ * marks the leg done and falls into the same finalize path; every exit that
+ * used to `return -1` marks it done with rc -1 after freeing the buffer. The
+ * semantics of each individual exit are unchanged -- that is the property the
+ * mutation corpus checks.
+ *
+ * `readable` is 0 when the caller is stepping the leg for a reason other than
+ * data (a deadline sweep, or a pacing gate that just opened). Such a step
+ * performs the deadline check and the pacing gate and then returns without
+ * reading, so a leg is never blocked in read() waiting for a peer that is
+ * silent.
+ *
+ * Returns 1 while the leg wants more steps, 0 once it is terminal.
+ */
+static int
+http_read_state_step(http_read_state *st, int readable,
+                     char *errbuf, size_t errlen)
+{
+    ssize_t     n;
+    size_t      want;
+    long long   now = now_ms();
+    char       *buf = st->buf;
+    size_t      len = st->len;
+
+    /*
+     * Close out a pacing gate that has opened and credit it.
+     *
+     * WHAT IS CREDITED, and this is the load-bearing decision of the S-4
+     * rewrite. The credit is the width of the gate that was actually enforced
+     * (`not_before - gate_start`), taken HERE on the far side of it -- never
+     * `recv_opt->ms` at gate-set time, which would record what this code
+     * intended and would survive the gate being gutted. Reaching this line is
+     * itself the evidence: it is reachable only once `now >= not_before`, so a
+     * gate that never held cannot pay out.
+     *
+     * NOT the raw elapsed wall time (`now - gate_start`). That was the first
+     * cut and it is subtly wrong: poll() returns late under load, so the credit
+     * picked up scheduling jitter and drifted a millisecond or two above the
+     * gate width -- measured at 120-121 ms for four 30 ms gates. That turns a
+     * counter the machine fully controls into a second wall clock, and the
+     * whole point of this counter (see http.h) is to be the ONE pacing witness
+     * that is not a wall clock. The assertion built on it is an exact equality
+     * precisely because the quantity is supposed to be exact; crediting jitter
+     * would have forced that equality to be widened into a tolerance, and a
+     * tolerance is a defect of that size chosen not to be detected.
+     *
+     * The deadline is discounted by this same figure, so under-crediting the
+     * jitter is also the conservative direction there: a paced leg is charged
+     * for the few ms of lateness rather than being handed extra budget.
+     */
+    if (st->not_before != 0 && now >= st->not_before) {
+        st->paced_sleep_ms += st->not_before - st->gate_start;
+        st->resp->paced_sleep_ms = st->paced_sleep_ms;
+
+        st->not_before = 0;
+        st->gate_start = 0;
+
+        /* Restart the idle clock on the far side of the gate. The interval the
+         * client deliberately withheld is not the server being silent, so
+         * charging it to the idle budget would fail a paced case whose gate is
+         * merely wider than timeout_ms -- the client's own sip interval killing
+         * the exchange it was configured for. Same reasoning as discounting the
+         * gate from the whole-exchange deadline, one clock down. */
+        st->idle_deadline = now + st->timeout_ms;
+    }
+
+    {
         /*
          * AUD-07: the whole-exchange deadline, checked before every read. The
          * per-read SO_RCVTIMEO does not bound a peer that trickles one byte per
@@ -1625,21 +1883,20 @@ http_read_response(int fd, int timeout_ms,
          * the connection open too long); otherwise it is a harness failure of
          * this case, not a silent pass.
          */
-        if (elapsed_since(sent_at) - paced_sleep_ms
-                > HTTP_MAX_EXCHANGE_MS(timeout_ms)) {
-            if (want_close) {
-                resp->close_reason = HTTP_CLOSE_TIMEOUT;
-                resp->close_ms = elapsed_since(sent_at);
-                break;
+        if (elapsed_since(st->sent_at) - st->paced_sleep_ms
+                > HTTP_MAX_EXCHANGE_MS(st->timeout_ms)) {
+            if (st->want_close) {
+                st->resp->close_reason = HTTP_CLOSE_TIMEOUT;
+                st->resp->close_ms = elapsed_since(st->sent_at);
+                goto finish;
             }
 
             snprintf(errbuf, errlen,
                      "response did not complete within %ld ms whole-exchange "
                      "budget (%zu bytes so far); a server trickling bytes under "
                      "the per-read timeout never trips it",
-                     HTTP_MAX_EXCHANGE_MS(timeout_ms), len);
-            free(buf);
-            return -1;
+                     HTTP_MAX_EXCHANGE_MS(st->timeout_ms), len);
+            goto fail;
         }
 
         /*
@@ -1654,30 +1911,29 @@ http_read_response(int fd, int timeout_ms,
                      "response exceeded the %d-byte ceiling; a server emitting "
                      "an unbounded body is a failure, not a payload",
                      HTTP_MAX_RESPONSE);
-            free(buf);
-            return -1;
+            goto fail;
         }
 
-        if (len + 4096 > cap) {
+        if (len + 4096 > st->cap) {
             char *bigger;
 
             /* Never grow past the ceiling (plus one chunk of headroom so the
              * len > ceiling check above still gets to fire on the collected
              * bytes rather than the allocation aborting first). */
-            cap *= 2;
-            if (cap > HTTP_MAX_RESPONSE + 4096) {
-                cap = HTTP_MAX_RESPONSE + 4096;
+            st->cap *= 2;
+            if (st->cap > HTTP_MAX_RESPONSE + 4096) {
+                st->cap = HTTP_MAX_RESPONSE + 4096;
             }
-            bigger = realloc(buf, cap);
+            bigger = realloc(buf, st->cap);
             if (bigger == NULL) {
                 snprintf(errbuf, errlen, "out of memory");
-                free(buf);
-                return -1;
+                goto fail;
             }
             buf = bigger;
+            st->buf = bigger;
         }
 
-        want = cap - len - 1;
+        want = st->cap - len - 1;
 
         /*
          * Pacing caps how much is taken per read and sleeps between reads, so
@@ -1692,34 +1948,93 @@ http_read_response(int fd, int timeout_ms,
          * response smaller than one chunk cost a full stall, which is the
          * read-side mirror of the trailing-sleep bug write_paced() avoids.
          */
-        if (recv_opt != NULL && recv_opt->chunk > 0) {
-            if (want > recv_opt->chunk) {
-                want = recv_opt->chunk;
+        if (st->recv_opt != NULL && st->recv_opt->chunk > 0) {
+            if (want > st->recv_opt->chunk) {
+                want = st->recv_opt->chunk;
             }
 
-            if (paced_full) {
-                /* AUD-07: this sleep is the harness's OWN deliberate pacing, not
+            if (st->paced_full) {
+                /* AUD-07: this pacing is the harness's OWN deliberate delay, not
                  * the server being slow, so it must not count against the
                  * whole-exchange deadline -- otherwise a legitimately paced
                  * recv_slow case that needs many chunks would trip the trickle
                  * guard despite the server making continuous progress.
                  *
-                 * Credited from sleep_ms()'s RETURN, never from recv_opt->ms
-                 * directly. Incrementing by the configured value beside the call
-                 * would record what this code meant to do, so gutting the sleep
-                 * to a no-op would leave the counter reporting a full set of
-                 * sleeps that never happened -- and the assertion built on it
-                 * would certify the mechanism it exists to catch. */
-                paced_sleep_ms += sleep_ms(recv_opt->ms);
-                resp->paced_sleep_ms = paced_sleep_ms;
+                 * S-4: this used to be an inline sleep_ms(). Under a shared
+                 * poll() drain a sleep here would block EVERY leg, reintroducing
+                 * exactly the serialization the fan exists to remove -- so the
+                 * delay became a per-leg GATE. The leg sets not_before, drops out
+                 * of the pollfd set, and is stepped again once the gate opens.
+                 *
+                 * The witness S-5 built survives the change, but only because the
+                 * credit is taken on the FAR side of the gate: gate_start is
+                 * stamped when the gate is set and the credit is the interval
+                 * actually withheld, measured, when the leg resumes. Crediting
+                 * recv_opt->ms here at gate-set time would record what this code
+                 * meant to do -- the intent-not-witness defect S-5 fixed, rebuilt
+                 * in a new place. If the gate is later gutted, no time passes and
+                 * the counter reports none. */
+                /* A non-positive delay is not a short pause, it is no pause --
+                 * the same guard sleep_ms() carries, and for the same reason:
+                 * without it `not_before` lands in the past, the gate opens
+                 * immediately, and the credit above goes NEGATIVE, reporting
+                 * pacing that ran backwards. rules.c clamps to 1..MAX_PAUSE_MS
+                 * so a rule file cannot reach this, but http_exchange() is a
+                 * public entry point and the parser is not the only way in.
+                 * Assertion 108 drives it directly from C. */
+                if (st->recv_opt->ms > 0) {
+                    st->gate_start = now;
+                    st->not_before = now + st->recv_opt->ms;
+                    st->paced_full = 0;
+                    return 1;
+                }
+
+                st->paced_full = 0;
             }
         }
 
-        n = read(fd, buf + len, want);
+        if (!readable) {
+            /*
+             * Stepped for a deadline sweep or a newly-opened pacing gate, with
+             * nothing known to be waiting on the socket. The checks above have
+             * run; reading now would block this leg -- and under a shared drain,
+             * every other leg with it.
+             *
+             * The per-read idle deadline is enforced HERE, on the not-readable
+             * path, because that is the state it describes: the peer has said
+             * nothing since the last read. Its expiry is deliberately routed
+             * into the SAME verdict the blocking reader's SO_RCVTIMEO produced
+             * -- HTTP_CLOSE_TIMEOUT under want_close, otherwise the read-timed-
+             * out failure naming timeout_ms -- so the observable contract is the
+             * pre-S-4 one rather than a new third outcome. The text is shared
+             * with the EAGAIN branch below for the same reason.
+             *
+             * A leg still inside a pacing gate never reaches this: the gate
+             * above returns first while it is closed, and the wakeup function
+             * excludes the idle deadline for exactly that window.
+             */
+            if (st->idle_deadline > 0 && now >= st->idle_deadline) {
+                if (st->want_close) {
+                    st->resp->close_reason = HTTP_CLOSE_TIMEOUT;
+                    st->resp->close_ms = elapsed_since(st->sent_at);
+                    goto finish;
+                }
+
+                snprintf(errbuf, errlen,
+                         "read timed out after %d ms (%zu bytes so far); "
+                         "does the request ask for Connection: close?",
+                         st->timeout_ms, len);
+                goto fail;
+            }
+
+            return 1;
+        }
+
+        n = read(st->fd, buf + len, want);
 
         if (n < 0) {
             if (errno == EINTR) {
-                continue;
+                return 1;
             }
 
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1729,19 +2044,34 @@ http_read_response(int fd, int timeout_ms,
                  * the deadline, which is a fact about the server. Keep the
                  * bytes that did arrive and let the assertion layer judge --
                  * see want_close in http.h for why this cannot be an error.
+                 *
+                 * S-4: this branch is now RARELY reached and is kept as a
+                 * backstop, not as the mechanism. The drain waits for readiness
+                 * in poll() before stepping a leg, so a read that would have
+                 * blocked until SO_RCVTIMEO expired generally does not happen;
+                 * the whole-exchange deadline above is what produces the
+                 * want_close timeout verdict now (proven by mutation -- it reds
+                 * assertions 120-122, while mutating THIS branch survives
+                 * because nothing reaches it).
+                 *
+                 * Kept because the sockets are still blocking and SO_RCVTIMEO
+                 * is still set: a read that begins after poll() reported
+                 * readiness can still time out if the peer sends a partial
+                 * segment and stalls. Deleting it would turn that case into the
+                 * generic read-error path below, which reports HTTP_CLOSE_NONE
+                 * and would blame the server for a close it never made.
                  */
-                if (want_close) {
-                    resp->close_reason = HTTP_CLOSE_TIMEOUT;
-                    resp->close_ms = elapsed_since(sent_at);
-                    break;
+                if (st->want_close) {
+                    st->resp->close_reason = HTTP_CLOSE_TIMEOUT;
+                    st->resp->close_ms = elapsed_since(st->sent_at);
+                    goto finish;
                 }
 
                 snprintf(errbuf, errlen,
                          "read timed out after %d ms (%zu bytes so far); "
                          "does the request ask for Connection: close?",
-                         timeout_ms, len);
-                free(buf);
-                return -1;
+                         st->timeout_ms, len);
+                goto fail;
             }
 
             /* A reset after a complete response is a legitimate outcome for
@@ -1756,25 +2086,34 @@ http_read_response(int fd, int timeout_ms,
              * HTTP_CLOSE_NONE means; the deadline then reports that it could
              * not be judged rather than blaming the server for a reset it
              * never sent. */
-            resp->close_reason = (errno == ECONNRESET) ? HTTP_CLOSE_RESET
-                                                       : HTTP_CLOSE_NONE;
-            resp->close_ms = elapsed_since(sent_at);
-            break;
+            st->resp->close_reason = (errno == ECONNRESET) ? HTTP_CLOSE_RESET
+                                                           : HTTP_CLOSE_NONE;
+            st->resp->close_ms = elapsed_since(st->sent_at);
+            goto finish;
         }
 
         if (n == 0) {
-            resp->close_reason = HTTP_CLOSE_FIN;
-            resp->close_ms = elapsed_since(sent_at);
-            break;
+            st->resp->close_reason = HTTP_CLOSE_FIN;
+            st->resp->close_ms = elapsed_since(st->sent_at);
+            goto finish;
         }
 
         /* Whether this read filled its chunk decides if the NEXT one is paced;
-         * see the sleep above. */
-        paced_full = (recv_opt != NULL && recv_opt->chunk > 0
-                      && (size_t) n == want);
+         * see the gate above. */
+        st->paced_full = (st->recv_opt != NULL && st->recv_opt->chunk > 0
+                          && (size_t) n == want);
 
-        resp->reads++;
+        /* The peer spoke, so the idle clock restarts. This is what makes the
+         * deadline per-READ: a server making steady progress renews it on every
+         * read and is never cut off by it, while the whole-exchange budget above
+         * remains the bound on a peer that trickles a byte per window forever.
+         * Stamped from a fresh now_ms() rather than the `now` at the top of this
+         * step, so the read's own duration is not charged to the next wait. */
+        st->idle_deadline = now_ms() + st->timeout_ms;
+
+        st->resp->reads++;
         len += (size_t) n;
+        st->len = len;
 
         /*
          * Framed mode: stop at the framed end of ONE response rather than at
@@ -1804,18 +2143,19 @@ http_read_response(int fd, int timeout_ms,
          * this case so the assertion layer never runs against a boundary that
          * was invented.
          */
-        if (framed) {
+        if (st->framed) {
             size_t  resp_len = 0;
             int     fs = http_framed_state(buf, len, &resp_len);
 
             if (fs == HTTP_FRAMED_COMPLETE) {
                 len = resp_len;
-                resp->close_reason = HTTP_CLOSE_FRAMED;
-                resp->close_ms = elapsed_since(sent_at);
-                if (conn_open != NULL) {
-                    *conn_open = 1;
+                st->len = len;
+                st->resp->close_reason = HTTP_CLOSE_FRAMED;
+                st->resp->close_ms = elapsed_since(st->sent_at);
+                if (st->conn_open != NULL) {
+                    *st->conn_open = 1;
                 }
-                break;
+                goto finish;
             }
 
             if (fs == HTTP_FRAMED_UNFRAMEABLE) {
@@ -1823,8 +2163,7 @@ http_read_response(int fd, int timeout_ms,
                          "framed read: response has no Content-Length, no "
                          "chunked coding, and is not a bodiless status -- its "
                          "end is unknowable on a connection that stays open");
-                free(buf);
-                return -1;
+                goto fail;
             }
 
             if (fs == HTTP_FRAMED_MALFORMED) {
@@ -1833,21 +2172,126 @@ http_read_response(int fd, int timeout_ms,
                          "(%zu bytes collected); the response boundary cannot be "
                          "trusted",
                          len);
-                free(buf);
-                return -1;
+                goto fail;
             }
 
             /* HTTP_FRAMED_INCOMPLETE: keep reading. */
         }
     }
 
+    return 1;
+
+finish:
+
+    /* The success terminal. Ownership of buf transfers to resp->raw here, and
+     * st->buf is cleared so http_read_state_free() cannot double-free it. */
     buf[len] = '\0';
-    resp->raw = buf;
-    resp->raw_len = len;
+    st->resp->raw = buf;
+    st->resp->raw_len = len;
+    st->buf = NULL;
 
-    http_parse_response(resp);
+    http_parse_response(st->resp);
 
+    st->done = 1;
+    st->rc = 0;
     return 0;
+
+fail:
+
+    /* The failure terminal. errbuf is already set by the branch that jumped
+     * here. Freeing through the state (rather than the local) is what keeps a
+     * later http_read_state_free() safe. */
+    http_read_state_free(st);
+    st->done = 1;
+    st->rc = -1;
+    return 0;
+}
+
+
+/*
+ * The response-reading half of an exchange: drive one leg's state machine to
+ * completion, blocking on poll() between steps.
+ *
+ * This is the N=1 case of the same machine the concurrent fan drives, and that
+ * is deliberate -- a second single-leg implementation would be a copy of the
+ * framing, dechunk, deadline and pacing logic that has to be kept in agreement
+ * forever, and every mutant in the corpus would cover only one of the two.
+ * Every existing single-exchange test is therefore also a test of the machine
+ * the fan uses.
+ *
+ * `sent_at` is passed in because the whole-exchange deadline and every close_ms
+ * measure from the instant the request finished going out, which only the
+ * writer knows; taking a fresh timestamp here would silently restart the clock
+ * and hand a trickling server the budget twice over.
+ *
+ * Return and errbuf semantics are http_exchange()'s: 0 when the exchange
+ * completed (the verdict belongs to the assertion layer), -1 with errbuf set
+ * on a harness-side failure.
+ */
+static int
+http_read_response(int fd, int timeout_ms,
+                   const http_recv *recv_opt, int want_close, int framed,
+                   long long sent_at,
+                   http_response *resp, int *conn_open,
+                   char *errbuf, size_t errlen)
+{
+    http_read_state  st;
+
+    if (http_read_state_init(&st, fd, timeout_ms, recv_opt, want_close, framed,
+                             sent_at, resp, conn_open, errbuf, errlen) != 0)
+    {
+        return -1;
+    }
+
+    while (!st.done) {
+        struct pollfd  pfd;
+        long long      now = now_ms();
+        int            readable = 0;
+
+        if (http_read_state_pollable(&st, now)) {
+            int  pr;
+
+            pfd.fd = fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+
+            pr = poll(&pfd, 1,
+                      http_poll_timeout_ms(
+                          http_read_state_next_wakeup(&st, now)));
+
+            if (pr < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+
+                snprintf(errbuf, errlen, "poll: %s", strerror(errno));
+                http_read_state_free(&st);
+                return -1;
+            }
+
+            /* POLLERR/POLLHUP mean the read below will report the real reason
+             * (a reset, or EOF), so they are treated as readable rather than
+             * diagnosed here -- the read loop's own error classification is
+             * what the close_reason contract is written against. */
+            readable = (pr > 0);
+
+        } else {
+            /* Pacing gate is closed: wait it out rather than spinning. In the
+             * N=1 case there is nothing else to do with the time; in the fan
+             * this leg simply stays out of the pollfd set. */
+            long  wait = http_read_state_next_wakeup(&st, now);
+
+            if (wait > 0) {
+                (void) poll(NULL, 0, http_poll_timeout_ms(wait));
+            }
+        }
+
+        (void) http_read_state_step(&st, readable, errbuf, errlen);
+    }
+
+    http_read_state_free(&st);
+
+    return st.rc;
 }
 
 
@@ -2051,30 +2495,214 @@ http_exchange_concurrent(const char *host, int port, int n,
     }
 
     /*
-     * Phase 3: drain. Each leg's read is charged against its own sent_at, so a
-     * server that answers leg 0 promptly and stalls leg N-1 is reported as a
-     * stall on leg N-1 rather than being absorbed by leg 0's headroom.
+     * Phase 3: drain every leg through ONE poll() loop, S-4.
      *
-     * Legs are read in order rather than by poll() readiness. The responses are
-     * collected in full either way and each carries its own timing, so readiness
-     * ordering would change which leg is read first without changing any
-     * assertion -- and an in-order drain keeps the failure attribution simple
-     * enough to trust. The overlap has already happened by the time this loop
-     * starts; nothing here can undo it.
+     * Each leg's read is charged against its own sent_at, so a server that
+     * answers leg 0 promptly and stalls leg N-1 is reported as a stall on leg
+     * N-1 rather than being absorbed by leg 0's headroom.
+     *
+     * This used to read the legs in index order with a blocking read per leg.
+     * That was not merely a timing-attribution flaw: leg i+1 was not read at
+     * all until leg i finished or timed out, so the fan could not observe its
+     * legs out of index order under ANY circumstance -- a server answering leg
+     * 5 first and leg 0 last was indistinguishable from one answering strictly
+     * in order, and time spent draining an earlier leg was charged to every
+     * later leg's clock. Polling all live legs together removes both.
+     *
+     * FAILURE ATTRIBUTION IS FIRST-BY-INDEX, not first-by-time. Several legs
+     * can now fail within one poll() iteration, so the rule has to be stated
+     * rather than left emergent from loop order. Index order preserves the
+     * existing "concurrent leg %d/%d" message and, more importantly, is
+     * reproducible: first-by-time is the more truthful account of what the
+     * server did, but it makes the reported leg depend on scheduling, and a
+     * harness whose failure text moves between runs is one nobody can bisect.
      */
-    for (i = 0; i < n; i++) {
-        int  conn_open = 0;
+    {
+        http_read_state  *sts;
+        struct pollfd    *pfds;
+        int              *pidx;
+        char             *errs;
+        int               live;
 
-        if (http_read_response(fds[i], timeout_ms, recv_opt, want_close, framed,
-                               sent_at[i], &resps[i], &conn_open,
-                               errbuf, errlen) != 0)
-        {
-            char  detail[256];
+        sts = calloc((size_t) n, sizeof(*sts));
+        pfds = calloc((size_t) n, sizeof(*pfds));
+        pidx = calloc((size_t) n, sizeof(*pidx));
 
-            snprintf(detail, sizeof(detail), "%s", errbuf);
-            snprintf(errbuf, errlen, "concurrent leg %d/%d: %s",
-                     i + 1, n, detail);
+        /* Per-leg error text. A single shared errbuf cannot serve first-by-
+         * index attribution: the step function writes errbuf on every failure,
+         * so a later leg failing in the same iteration overwrites the message
+         * belonging to the leg that will actually be reported. Each leg gets
+         * its own slot and the winner's is copied out at the end. */
+        errs = calloc((size_t) n, HTTP_LEG_ERRLEN);
+
+        if (sts == NULL || pfds == NULL || pidx == NULL || errs == NULL) {
+            free(sts);
+            free(pfds);
+            free(pidx);
+            free(errs);
+            snprintf(errbuf, errlen,
+                     "out of memory draining a %d-way concurrent fan", n);
             rc = -1;
+            goto done;
+        }
+
+        /* Arm every leg BEFORE polling any of them: a leg whose buffer was not
+         * allocated cannot be in the pollfd set, and allocating lazily on first
+         * readiness would make the failure path depend on arrival order. */
+        for (i = 0; i < n; i++) {
+            /*
+             * NULL, not the address of a local. The state outlives this
+             * iteration, so storing a pointer to a per-iteration `conn_open`
+             * would leave every leg holding a dangling pointer that the framed
+             * exit later writes through -- caught by ASan as a
+             * stack-use-after-scope, and invisible in the plain build.
+             *
+             * NULL is also the correct VALUE here, not merely a safe one: the
+             * fan closes every leg in its `done` block, so there is no reusable
+             * connection to report and http_read_state_step() already treats a
+             * NULL conn_open as "nobody is asking".
+             */
+            if (http_read_state_init(&sts[i], fds[i], timeout_ms, recv_opt,
+                                     want_close, framed, sent_at[i], &resps[i],
+                                     NULL, errbuf, errlen) != 0)
+            {
+                char  detail[256];
+                int   j;
+
+                snprintf(detail, sizeof(detail), "%s", errbuf);
+                snprintf(errbuf, errlen, "concurrent leg %d/%d: %s",
+                         i + 1, n, detail);
+
+                for (j = 0; j <= i; j++) {
+                    http_read_state_free(&sts[j]);
+                }
+
+                free(sts);
+                free(pfds);
+                free(pidx);
+                free(errs);
+                rc = -1;
+                goto done;
+            }
+        }
+
+        for ( ;; ) {
+            long long  now;
+            long       timeout = -1;
+            int        nfds = 0;
+            int        pr;
+
+            live = 0;
+            now = now_ms();
+
+            for (i = 0; i < n; i++) {
+                long  wake;
+
+                if (sts[i].done) {
+                    continue;
+                }
+
+                live++;
+
+                wake = http_read_state_next_wakeup(&sts[i], now);
+                if (timeout < 0 || wake < timeout) {
+                    timeout = wake;
+                }
+
+                /* A leg held by its pacing gate stays OUT of the set: it has
+                 * nothing to wait for on the socket, and including it would let
+                 * data readiness cancel a delay the case asked for. The timeout
+                 * above still accounts for it, so it is stepped when the gate
+                 * opens. */
+                if (!http_read_state_pollable(&sts[i], now)) {
+                    continue;
+                }
+
+                pfds[nfds].fd = sts[i].fd;
+                pfds[nfds].events = POLLIN;
+                pfds[nfds].revents = 0;
+                pidx[nfds] = i;
+                nfds++;
+            }
+
+            if (live == 0) {
+                break;
+            }
+
+            pr = poll(nfds > 0 ? pfds : NULL, (nfds_t) nfds,
+                      http_poll_timeout_ms(timeout));
+
+            if (pr < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+
+                snprintf(errbuf, errlen, "concurrent drain: poll: %s",
+                         strerror(errno));
+
+                for (i = 0; i < n; i++) {
+                    http_read_state_free(&sts[i]);
+                }
+
+                free(sts);
+                free(pfds);
+                free(pidx);
+                free(errs);
+                rc = -1;
+                goto done;
+            }
+
+            /*
+             * Step every leg that is ready, then sweep the rest. The sweep is
+             * not optional: a leg whose deadline expired or whose pacing gate
+             * opened has no readiness event to announce it, and would otherwise
+             * sit un-stepped for as long as its siblings kept the loop busy.
+             */
+            for (i = 0; i < nfds; i++) {
+                if (pfds[i].revents != 0) {
+                    (void) http_read_state_step(&sts[pidx[i]], 1,
+                                                errs + (size_t) pidx[i]
+                                                       * HTTP_LEG_ERRLEN,
+                                                HTTP_LEG_ERRLEN);
+                }
+            }
+
+            for (i = 0; i < n; i++) {
+                if (!sts[i].done) {
+                    (void) http_read_state_step(&sts[i], 0,
+                                                errs + (size_t) i
+                                                       * HTTP_LEG_ERRLEN,
+                                                HTTP_LEG_ERRLEN);
+                }
+            }
+        }
+
+        /* First-by-index, as documented above, reading the winning leg's OWN
+         * error slot rather than the shared buffer -- which by now holds
+         * whichever leg wrote to it last. */
+        for (i = 0; i < n; i++) {
+            if (sts[i].rc != 0) {
+                snprintf(errbuf, errlen, "concurrent leg %d/%d: %s",
+                         i + 1, n, errs + (size_t) i * HTTP_LEG_ERRLEN);
+                rc = -1;
+                break;
+            }
+        }
+
+        /* Unconditional, per the ownership invariant on http_read_state: a
+         * terminal leg has already released or transferred its buffer and a
+         * non-terminal one still owns it, so this is correct for both and is
+         * what makes abandoning a drain leak-free. */
+        for (i = 0; i < n; i++) {
+            http_read_state_free(&sts[i]);
+        }
+
+        free(sts);
+        free(pfds);
+        free(pidx);
+        free(errs);
+
+        if (rc != 0) {
             goto done;
         }
     }

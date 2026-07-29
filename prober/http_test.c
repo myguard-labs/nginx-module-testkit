@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  163
+#define PLANNED  173
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -532,6 +532,128 @@ spawn_lingering(int *port, int linger_ms, int reply)
 
 
 /*
+ * Fan fixture for the per-read idle deadline: accept `n` connections, answer
+ * every one of them, then hold ALL of them open and silent for `linger_ms`.
+ *
+ * `chatty_ms` is what makes this a fan test rather than N copies of the N=1
+ * one. Leg 0 keeps talking -- it emits a byte every `chatty_ms` for the life of
+ * the fixture -- while legs 1..n-1 answer once and then go silent. That is the
+ * precondition for the failure mode the idle deadline has to survive under a
+ * SHARED poll() loop: a chatty sibling wakes the loop constantly, so an
+ * implementation that recomputed the idle bound from a fresh timeout_ms on
+ * every poll iteration, or kept one idle clock for the whole fan, would let
+ * leg 0's traffic postpone the silent legs' deadlines forever. With the
+ * deadline held per leg the silent legs expire on their own schedule
+ * regardless of how loud leg 0 is.
+ *
+ * Every leg is answered first (rather than some legs staying wholly silent) so
+ * the case under test is specifically the idle-AFTER-response state that
+ * want_close judges, not a connect-time failure.
+ *
+ * All accepts happen before any reply: the client opens every leg before
+ * draining any, so accepting lazily would deadlock against its own fan.
+ */
+static pid_t
+spawn_fan_lingering(int *port, int n, int linger_ms, int chatty_ms)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "http_test: socket: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, n) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        fprintf(stderr, "http_test: listen: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "http_test: fork: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    if (pid == 0) {
+        int              conns[MAX_CONCURRENT];
+        int              i;
+        long             waited = 0;
+        struct timespec  ts;
+        char             scratch[256];
+
+        /* Same guard the sibling fixtures carry, and for the same reason: `n`
+         * indexes a fixed array in the FORKED CHILD, so an oversized fan would
+         * write past it there rather than in the test process -- surfacing as
+         * an ASan report with no obvious connection to the caller instead of a
+         * clear failure. `chatty_ms <= 0` is fatal for a different reason:
+         * nanosleep(0) with `waited += 0` never advances, so the child spins
+         * forever and the case hangs instead of failing. */
+        if (n > MAX_CONCURRENT || chatty_ms <= 0) {
+            _exit(2);
+        }
+
+        for (i = 0; i < n; i++) {
+            conns[i] = accept(srv, NULL, NULL);
+            if (conns[i] < 0) {
+                _exit(2);
+            }
+
+            if (read(conns[i], scratch, sizeof(scratch)) < 0) {
+                _exit(2);
+            }
+
+            (void) send(conns[i], SPAWN_REPLY, SPAWN_REPLY_LEN, MSG_NOSIGNAL);
+        }
+
+        /* Leg 0 keeps the poll loop busy; every other leg stays silent. The
+         * trailing byte is deliberately not valid HTTP framing -- this fixture
+         * is read to EOF, and the point is only that leg 0 produces readiness
+         * events while its siblings produce none. */
+        ts.tv_sec = chatty_ms / 1000;
+        ts.tv_nsec = (chatty_ms % 1000) * 1000000L;
+
+        while (waited < linger_ms) {
+            struct timespec  rem = ts;
+
+            while (nanosleep(&rem, &rem) != 0 && errno == EINTR) {
+                /* keep sleeping */
+            }
+
+            (void) send(conns[0], ".", 1, MSG_NOSIGNAL);
+            waited += chatty_ms;
+        }
+
+        for (i = 0; i < n; i++) {
+            close(conns[i]);
+        }
+
+        _exit(0);
+    }
+
+    close(srv);
+
+    return pid;
+}
+
+
+/*
  * Framed-mode fixture: write `bytes` verbatim (one or two whole framed
  * responses), then HOLD the connection open without closing for `linger_ms`.
  *
@@ -804,6 +926,170 @@ spawn_barrier(int *port, int want)
         }
 
 #undef BARRIER_REPLY
+
+        _exit(0);
+    }
+
+    close(srv);
+
+    return pid;
+}
+
+
+/*
+ * The out-of-order fixture, S-4. Accept `want` connections, then make answering
+ * leg 0 DEPEND on the client having drained the last leg.
+ *
+ * >> WHY THE OBVIOUS FIXTURE DOES NOT WORK, because it was tried first and it
+ * passed against the very drain it was written to catch.
+ *
+ * The intuitive version simply answers the legs in reverse order and stalls
+ * before leg 0. It does not discriminate: while the in-order drain blocks in
+ * leg 0's read(), the kernel is receiving legs 1..N-1 concurrently into their
+ * socket buffers, so once leg 0 finally answers the remaining legs are already
+ * complete and are collected instantly. Both drains finish at
+ * max(answer_time) -- measured at 401 ms against a 400 ms stall for BOTH. Any
+ * fixture whose server answers on its own schedule is therefore blind to drain
+ * order, and an elapsed-time bound over it is vacuous in the S-3 sense.
+ *
+ * What an in-order drain genuinely cannot do is REACT to a later leg before an
+ * earlier one completes. So the dependency has to run through the client: this
+ * server sends a body on the last leg that is far larger than the socket
+ * buffer, so its own send() blocks partway until the client drains it, and only
+ * once that send completes does it answer leg 0.
+ *
+ *   - poll() drain: legs 1..N-1 are readable, so the client drains the big
+ *     body, the server's send() completes, leg 0 is answered, the fan finishes.
+ *   - in-order drain: the client is blocked in leg 0's read(); it never drains
+ *     the big body; the server stays blocked in send() and never answers leg 0.
+ *     Deadlock, broken only by the whole-exchange deadline -- a hard failure,
+ *     not a slow pass.
+ *
+ * That makes this a true negative control: the property under test is the only
+ * thing standing between the fan and a timeout.
+ */
+static pid_t
+spawn_readback(int *port, int want, size_t big_len)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "http_test: socket: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, want) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        fprintf(stderr, "http_test: listen: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "http_test: fork: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    if (pid == 0) {
+        int   conns[MAX_BARRIER];
+        char  scratch[512];
+        int   i;
+
+        if (want > MAX_BARRIER) {
+            _exit(2);
+        }
+
+        /* Collect every connection and its request first, exactly as the
+         * barrier does: the reversal must be in the ANSWERING order, not in
+         * which connections exist. */
+        for (i = 0; i < want; i++) {
+            conns[i] = accept(srv, NULL, NULL);
+
+            if (conns[i] < 0) {
+                _exit(2);
+            }
+
+            if (read(conns[i], scratch, sizeof(scratch)) < 0) {
+                _exit(2);
+            }
+        }
+
+#define SMALL_REPLY  "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"
+
+        /* Middle legs: small, immediate, closed. Nothing depends on them; they
+         * exist so the fan is genuinely N-way rather than a special-cased 2. */
+        for (i = 1; i < want - 1; i++) {
+            (void) send(conns[i], SMALL_REPLY, sizeof(SMALL_REPLY) - 1,
+                        MSG_NOSIGNAL);
+            close(conns[i]);
+        }
+
+        /*
+         * The LAST leg carries a body far larger than the socket buffer, so
+         * this send() cannot complete until the client reads most of it. This
+         * is the dependency the whole fixture turns on -- see the header.
+         */
+        {
+            char   *hdr;
+            char   *body;
+            size_t  off;
+
+            hdr = malloc(128);
+            body = malloc(big_len);
+
+            if (hdr == NULL || body == NULL) {
+                _exit(2);
+            }
+
+            memset(body, 'x', big_len);
+            snprintf(hdr, 128,
+                     "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", big_len);
+
+            (void) send(conns[want - 1], hdr, strlen(hdr), MSG_NOSIGNAL);
+
+            off = 0;
+            while (off < big_len) {
+                ssize_t w = send(conns[want - 1], body + off, big_len - off,
+                                 MSG_NOSIGNAL);
+
+                if (w <= 0) {
+                    /* The client gave up (in-order drain deadlocked and the
+                     * case timed out). Leave leg 0 unanswered: that is the
+                     * failure the assertion is there to see. */
+                    _exit(0);
+                }
+
+                off += (size_t) w;
+            }
+
+            close(conns[want - 1]);
+            free(hdr);
+            free(body);
+        }
+
+        /* Only now -- the big body is fully handed over, which proves the
+         * client drained a LATER leg while leg 0 was still outstanding. */
+        (void) send(conns[0], SMALL_REPLY, sizeof(SMALL_REPLY) - 1,
+                    MSG_NOSIGNAL);
+        close(conns[0]);
+
+#undef SMALL_REPLY
 
         _exit(0);
     }
@@ -2213,6 +2499,31 @@ main(void)
             ok(rc == 0 && resp.close_ms >= 250 && t1 - t0 >= 250,
                "the timeout verdict carries the time actually waited");
 
+            /*
+             * WHICH deadline ended the read, and this is the assertion the
+             * floor above cannot make.
+             *
+             * The per-read idle bound is timeout_ms (300); the whole-exchange
+             * budget is 8x that (2400). A floor-only assertion is satisfied by
+             * BOTH, which is exactly how the S-4 poll() drain regressed this
+             * without reddening anything: waiting in poll() rather than in
+             * read() dropped SO_RCVTIMEO as the idle bound, and this case went
+             * from 316 ms to a measured 2401 ms while staying green.
+             *
+             * The ceiling is therefore the witness, and it is not a tuning
+             * knob: it separates the two deadlines rather than describing this
+             * box's speed. Placed at 4x timeout_ms it sits far above any
+             * plausible scheduling stretch of a 300 ms wait and still far below
+             * the 2400 ms budget, so it distinguishes the two mechanisms
+             * without being load-sensitive in the way a tight wall-clock bound
+             * would be. If the idle bound is removed again, this reds; the
+             * trickle case below is the negative control that keeps the
+             * whole-exchange budget honest at the same time.
+             */
+            ok(rc == 0 && t1 - t0 < 4 * 300,
+               "the idle read timeout -- not the 8x whole-exchange budget -- "
+               "is what ends a silent non-closing exchange");
+
             if (rc == 0) {
                 http_response_free(&resp);
             }
@@ -2795,6 +3106,207 @@ main(void)
         for (i = 0; i < 3; i++) {
             http_response_free(&resps[i]);
         }
+
+        /*
+         * 4. S-4: the fan collects its legs OUT OF INDEX ORDER.
+         *
+         * This is the assertion the poll() drain exists for, and the one no
+         * other case in this file can make. The barrier above proves the fan
+         * writes all N before reading any -- a property of the WRITE phase.
+         * Nothing there constrains the drain, because the barrier releases
+         * every leg simultaneously and an in-order drain collects them all.
+         *
+         * spawn_readback() makes leg 0's answer DEPEND on the client having
+         * drained the last leg: that leg carries a body far larger than the
+         * socket buffer, so the server blocks in send() until the client reads
+         * it, and only then answers leg 0. An in-order drain is blocked in leg
+         * 0's read and never drains the big body, so neither side can proceed
+         * and the fan dies on its deadline.
+         *
+         * >> THE FIRST VERSION OF THIS FIXTURE WAS VACUOUS AND THE MUTANT IS
+         * THE ONLY REASON THAT IS KNOWN. It answered the legs in reverse order
+         * and stalled before leg 0, then asserted an elapsed-time bound. It
+         * PASSED against a restored in-order drain -- 401 ms for BOTH
+         * implementations against a 400 ms stall -- because while the in-order
+         * drain blocks on leg 0 the kernel is buffering the other legs
+         * concurrently, so they are already complete when it reaches them. Any
+         * fixture whose server answers on its own schedule cannot see drain
+         * order at all, and an elapsed-time bound over it is vacuous in the S-3
+         * sense. The dependency has to run through the CLIENT, which is what
+         * this one does.
+         *
+         * VERIFIED AS A CONTROL: with phase 3 reverted to the in-order
+         * `for (i...) http_read_response(...)` loop, this case fails BY THIS
+         * ASSERTION while the barrier case above still passes -- the barrier
+         * being exactly what an in-order drain satisfies.
+         *
+         * Asserted on completion, not on elapsed time. Under the poll() drain
+         * every leg carries its response; under the in-order drain leg 0 never
+         * arrives and the fan returns a harness error. There is no tolerance to
+         * choose and nothing for load to inflate.
+         */
+        {
+            int            port2, st2, k;
+            pid_t          pid2;
+            int            all_ok;
+
+            /* 4 MiB: far above any socket buffer this test could meet (loopback
+             * autotuning tops out in the low hundreds of KiB), so the server's
+             * send() is guaranteed to block partway rather than being absorbed
+             * whole -- which is what creates the dependency. Well under
+             * HTTP_MAX_RESPONSE, so the ceiling is not what is being tested. */
+            pid2 = spawn_readback(&port2, 4, 4 * 1024 * 1024);
+
+            rc = http_exchange_concurrent("127.0.0.1", port2, 4, creq, creq_len,
+                                          1000, NULL, NULL, 0, HTTP_SHUT_NONE,
+                                          NULL, 0, 1, resps,
+                                          errbuf, sizeof(errbuf));
+
+            all_ok = (rc == 0);
+            for (k = 0; rc == 0 && k < 4; k++) {
+                if (resps[k].status != 200) {
+                    all_ok = 0;
+                }
+            }
+
+            ok(all_ok,
+               "the fan drains legs by readiness, so a leg whose answer depends "
+               "on a LATER leg being read still completes");
+
+            for (k = 0; k < 4; k++) {
+                http_response_free(&resps[k]);
+            }
+
+            kill(pid2, SIGKILL);
+            waitpid(pid2, &st2, 0);
+        }
+
+        /*
+         * The per-read idle deadline is PER LEG, and a chatty sibling does not
+         * postpone it.
+         *
+         * This is the fan half of the F1 regression. The N=1 case proves the
+         * idle bound exists again; it cannot prove the bound is held per leg,
+         * because with one leg there is nothing to confuse it with. Under a
+         * shared poll() loop the natural wrong implementations -- one idle
+         * clock for the fan, or a bound recomputed from timeout_ms whenever
+         * poll() returns -- are indistinguishable from the correct one at N=1
+         * and fail only here.
+         *
+         * Leg 0 emits a byte every 50 ms for 3 s; legs 1-3 answer once and go
+         * silent. With a 300 ms timeout the silent legs must give up at about
+         * 300 ms even though poll() is being woken roughly every 50 ms by leg 0
+         * throughout. want_close makes that expiry the verdict rather than an
+         * error, so the fan completes and each leg carries its own close_reason.
+         *
+         * The ceiling is again the witness and is set the same way as the N=1
+         * one: 4x timeout_ms sits far above scheduling noise on a 300 ms wait
+         * and far below the 2400 ms whole-exchange budget, so it names WHICH
+         * deadline fired. It is applied to each silent leg's own close_ms
+         * rather than to the fan's elapsed time -- see the note at the loop
+         * below for why the fan-wide wall clock cannot express this. A shared
+         * or postponed idle clock keeps the silent legs alive behind leg 0's
+         * traffic and reds this.
+         */
+        {
+            int            port3, st3, k;
+            pid_t          pid3;
+            int            silent_timed_out = 1;
+            int            silent_bounded = 1;
+
+            pid3 = spawn_fan_lingering(&port3, 4, 3000, 50);
+
+            memset(resps, 0, sizeof(resps));
+            rc = http_exchange_concurrent("127.0.0.1", port3, 4, creq, creq_len,
+                                          300, NULL, NULL, 0, HTTP_SHUT_NONE,
+                                          NULL, 1, 0, resps,
+                                          errbuf, sizeof(errbuf));
+
+            /*
+             * The silent legs, not leg 0: leg 0 is still being fed, so it is
+             * not idle and is entitled to run to the whole-exchange budget.
+             *
+             * That is also why the witness is each leg's OWN close_ms and not
+             * the fan's elapsed wall time. The fan does not return until every
+             * leg is terminal, so leg 0 pins fan completion at the 8x budget
+             * (measured: 2401 ms) no matter how promptly the silent legs
+             * expire. A wall-clock bound over the whole fan therefore cannot
+             * express this property at all -- it reds against correct code, as
+             * the first cut of this assertion did. close_ms is per leg and
+             * measured from that leg's own sent_at, which is exactly the
+             * quantity the claim is about.
+             */
+            for (k = 1; rc == 0 && k < 4; k++) {
+                if (resps[k].close_reason != HTTP_CLOSE_TIMEOUT) {
+                    silent_timed_out = 0;
+                }
+
+                if (resps[k].close_ms >= 4 * 300) {
+                    silent_bounded = 0;
+                }
+            }
+
+            ok(rc == 0 && silent_timed_out,
+               "every silent leg of a fan reaches its own idle timeout verdict");
+
+            ok(rc == 0 && silent_bounded,
+               "a chatty leg does not postpone its silent siblings' per-read "
+               "idle deadlines");
+
+            /* Unconditional, matching the sibling fan blocks and the contract
+             * on http_exchange_concurrent(): resps[] is safe to free on every
+             * return, including a failed one. Gating this on rc == 0 would
+             * attach an LSan leak report to any red assertion under SAN=1 --
+             * and this fan returns non-zero precisely when the idle behaviour
+             * regresses, so the leak noise would land on top of the diagnosis
+             * worth reading. */
+            for (k = 0; k < 4; k++) {
+                http_response_free(&resps[k]);
+            }
+
+            kill(pid3, SIGKILL);
+            waitpid(pid3, &st3, 0);
+        }
+    }
+
+    /* ---- http_poll_timeout_ms -------------------------------------------
+     *
+     * The narrowing that feeds poll(). `-t` accepts up to INT_MAX and the
+     * whole-exchange budget is 8x that, so the values that matter here are
+     * above INT_MAX -- an exchange would need weeks of wall time to reach one,
+     * which is why this boundary cannot be tested through a socket and went
+     * untested when the S-4 drain first started passing the 8x budget straight
+     * to the poll() API.
+     *
+     * The failure being excluded is specific: an oversized long narrowed to int
+     * comes out NEGATIVE in practice, and a negative poll() timeout means "wait
+     * forever". The harness would hang with no error rather than time out.
+     */
+    {
+        ok(http_poll_timeout_ms(0) == 0,
+           "a zero wait narrows to an immediate poll, not a blocking one");
+
+        ok(http_poll_timeout_ms(1000) == 1000,
+           "an ordinary wait passes through unchanged");
+
+        ok(http_poll_timeout_ms(INT_MAX) == INT_MAX,
+           "a wait at exactly INT_MAX is still representable and is kept");
+
+        /* The whole point: 8 * INT_MAX as HTTP_MAX_EXCHANGE_MS would produce it
+         * on a 64-bit long. Must clamp to a finite bound, never go negative. */
+        ok(http_poll_timeout_ms((long) INT_MAX + 1) == INT_MAX,
+           "a wait past INT_MAX clamps to INT_MAX rather than wrapping "
+           "negative into an infinite poll");
+
+        ok(HTTP_MAX_EXCHANGE_MS(INT_MAX) > INT_MAX
+           && http_poll_timeout_ms(HTTP_MAX_EXCHANGE_MS(INT_MAX)) == INT_MAX,
+           "the 8x whole-exchange budget of the largest accepted -t clamps to a "
+           "finite poll timeout");
+
+        /* Defensive: nothing should hand this a negative wait, but a wait that
+         * is already past is a reason to poll immediately, not forever. */
+        ok(http_poll_timeout_ms(-1) == 0,
+           "a negative wait polls immediately rather than blocking forever");
     }
 
     if (tests_run != PLANNED) {

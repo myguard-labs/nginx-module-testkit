@@ -1499,37 +1499,65 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
         }
 
         /*
-         * Timing assertions cannot be trusted across a fan, because the drain
-         * is sequential and BLOCKING: leg i+1 is not read until leg i has been
-         * read to completion, while its `sent_at` clock has been running the
-         * whole time. Time spent draining an earlier leg is therefore charged
-         * to every later leg's whole-exchange deadline and close_ms.
+         * `concurrent` + `recv_slow` / `expect_close_within` used to be
+         * REJECTED here, and the rejection was lifted by S-4.
          *
-         * With `recv_slow` the effect is deterministic rather than incidental
-         * -- the pacing sleeps are deliberate, and http_read_response()
-         * discounts only the pacing performed while reading THAT leg. A prompt
-         * final leg can then be reported as a timeout or a late close purely
-         * because an earlier leg was slow, which is a false failure that also
-         * blames the wrong leg.
+         * The reason it existed: the fan drained its legs in index order with a
+         * blocking read each, so time spent draining leg i elapsed against every
+         * later leg's sent_at clock. A prompt final leg could be reported as a
+         * timeout purely because an earlier leg was slow -- a false failure that
+         * also blamed the wrong leg -- so refusing the combination was more
+         * honest than reporting a number known to be wrong.
          *
-         * Rejected rather than silently mismeasured. Fixing it properly means
-         * draining all N sockets through one poll() loop with per-leg
-         * nonblocking state, which is a real feature and a separate concern
-         * from this directive; until then the honest move is to refuse the
-         * combination instead of reporting a number that is wrong.
+         * What changed: the drain is now one poll() loop over per-leg state
+         * (http.c), so legs advance independently and each leg's timing is
+         * measured against its own clock alone. Pacing is a per-leg gate rather
+         * than a sleep, so a paced leg no longer withholds the others, and the
+         * pacing credit is discounted from that leg's deadline only.
+         *
+         * ONE combination is still mismeasured, and it is gated below rather
+         * than allowed: all three of concurrent + recv_slow +
+         * expect_close_within together.
          */
-        if (tc->concurrent > 0
-            && (tc->saw_close_within || tc->saw_recv_slow))
-        {
-            const char *which = tc->saw_close_within
-                                    ? "expect_close_within" : "recv_slow";
 
-            die("%s: case \"%s\" carries concurrent %d and %s; the fan drains "
-                "its legs in order, so an earlier leg's read time is charged "
-                "to every later leg's clock and the timing verdict would be "
-                "measured against the wrong interval", file,
-                tc->name != NULL ? tc->name : "(unnamed)", tc->concurrent,
-                which);
+        /*
+         * The paced close-deadline triple stays REJECTED, for a reason the
+         * poll() drain does not touch.
+         *
+         * Every close path records close_ms as a raw elapsed_since(sent_at)
+         * (http.c) and subtracts no pacing. That is correct for the deadline's
+         * documented meaning -- README defines it as when the SERVER ended the
+         * connection -- only while the client is draining as fast as it can.
+         * recv_slow breaks exactly that: the client withholds reads on purpose,
+         * so it cannot observe EOF until after its own gates have elapsed, and
+         * a server that closed promptly is reported as closing late. A prompt
+         * response spanning four 50 ms gates fails expect_close_within 100 as a
+         * 200+ ms close.
+         *
+         * This is NOT the drain defect the lift above fixed. Serialization
+         * charged one leg's time to another leg's clock, and per-leg state
+         * fixed it; this charges the CLIENT's deliberate delay to the SERVER's
+         * number, on one leg, with no other leg involved.
+         *
+         * Subtracting paced_sleep_ms from close_ms would not be a fix either:
+         * it would produce a plausible number that is still not the remote
+         * FIN's timestamp, since the FIN may have arrived at any point during a
+         * gate. Measuring a server close independently of unread queued data is
+         * what this needs, and until the harness can do that, refusing the case
+         * is more honest than reporting a quantity known to be wrong.
+         *
+         * Deliberately narrow: concurrent + recv_slow alone is fine (nothing
+         * asserts on close timing), and concurrent + expect_close_within alone
+         * is fine (nothing withholds reads). Only the three together are
+         * unmeasurable.
+         */
+        if (tc->concurrent > 0 && tc->saw_recv_slow && tc->saw_close_within) {
+            die("%s: case \"%s\" carries concurrent %d with both recv_slow and "
+                "expect_close_within; recv_slow makes the client withhold "
+                "reads, so the observed close time includes the client's own "
+                "pacing and no longer describes when the server closed. Drop "
+                "one of the two", file,
+                tc->name != NULL ? tc->name : "(unnamed)", tc->concurrent);
         }
 
         /*
