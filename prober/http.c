@@ -139,6 +139,24 @@ typedef struct {
     long long         not_before;
     long long         gate_start;
 
+    /* The per-read idle deadline: the instant this leg gives up waiting for the
+     * NEXT byte. Restamped after every read that delivered data, so it bounds
+     * silence between reads rather than the exchange as a whole.
+     *
+     * This exists because the S-4 drain stopped bounding that silence. The
+     * pre-S-4 reader sat in a blocking read() and SO_RCVTIMEO=timeout_ms cut it
+     * off; the drain waits in poll() instead, where SO_RCVTIMEO does not apply,
+     * so the only remaining server-side boundary was the 8x whole-exchange
+     * budget -- an 8x inflation of every silent-peer case, measured at 2401 ms
+     * against a 300 ms timeout where the old reader took 316 ms. That
+     * contradicts want_close's contract in http.h, which promises a
+     * non-closing server is answered after timeout_ms.
+     *
+     * Held per leg, never recomputed from a fresh timeout_ms on each poll
+     * iteration: the fan polls all legs together, so a chatty sibling waking
+     * the loop must not postpone a silent leg's own deadline. */
+    long long         idle_deadline;
+
     int               done;
     int               rc;
 } http_read_state;
@@ -1662,6 +1680,11 @@ http_read_state_init(http_read_state *st, int fd, int timeout_ms,
     st->conn_open = conn_open;
     st->cap = 8192;
 
+    /* Armed here rather than on first step: the wait for the FIRST byte is
+     * exactly as much a per-read idle wait as the wait for any later one, and
+     * it is the one a silent peer exercises. */
+    st->idle_deadline = now_ms() + timeout_ms;
+
     st->buf = malloc(st->cap);
     if (st->buf == NULL) {
         snprintf(errbuf, errlen, "out of memory");
@@ -1707,12 +1730,22 @@ http_read_state_pollable(const http_read_state *st, long long now)
 
 
 /*
- * How long, in ms, until this leg next needs attention: either its pacing gate
- * opens or its whole-exchange deadline expires. The drain loop takes the
- * minimum across live legs as its poll() timeout, so no leg oversleeps its own
- * deadline because another leg had nothing to say.
+ * How long, in ms, until this leg next needs attention: its pacing gate opens,
+ * its per-read idle deadline expires, or its whole-exchange deadline expires.
+ * The drain loop takes the minimum across live legs as its poll() timeout, so
+ * no leg oversleeps its own deadline because another leg had nothing to say.
  *
- * Never negative: a leg already past either boundary wants an immediate wakeup.
+ * The idle deadline is in this minimum, not merely checked after poll() returns:
+ * a silent peer produces no readiness event, so a wakeup that ignored it would
+ * sleep until the 8x whole-exchange budget and the idle bound would never fire.
+ * That omission IS the F1 regression this restores.
+ *
+ * A gate that is open (`not_before` in the past) is excluded, and so is an idle
+ * deadline while a gate is closed: a leg deliberately withheld by pacing is not
+ * idle, and charging the client's own sip interval to the server's silence
+ * budget would fail a paced case that the server was answering promptly.
+ *
+ * Never negative: a leg already past any boundary wants an immediate wakeup.
  */
 static long
 http_read_state_next_wakeup(const http_read_state *st, long long now)
@@ -1723,8 +1756,13 @@ http_read_state_next_wakeup(const http_read_state *st, long long now)
                   + HTTP_MAX_EXCHANGE_MS(st->timeout_ms);
 
     wake = deadline_at;
-    if (st->not_before > now && st->not_before < wake) {
-        wake = st->not_before;
+    if (st->not_before > now) {
+        if (st->not_before < wake) {
+            wake = st->not_before;
+        }
+
+    } else if (st->idle_deadline > 0 && st->idle_deadline < wake) {
+        wake = st->idle_deadline;
     }
 
     if (wake <= now) {
@@ -1732,6 +1770,36 @@ http_read_state_next_wakeup(const http_read_state *st, long long now)
     }
 
     return (long) (wake - now);
+}
+
+
+/*
+ * Narrow a millisecond wait to poll()'s int timeout without letting it go
+ * negative, which poll() reads as "wait forever".
+ *
+ * `-t` accepts any positive int and HTTP_MAX_EXCHANGE_MS multiplies it by 8, so
+ * a large-but-accepted timeout (up to INT_MAX) produces a long above INT_MAX
+ * here. The implicit conversion is implementation-defined and in practice comes
+ * out negative, turning a bounded wait into an indefinite hang -- the harness
+ * silently stops instead of reporting a timeout.
+ *
+ * Clamping rather than rejecting keeps the arithmetic total: every caller loops
+ * on absolute deadlines and recomputes the remaining wait each iteration, so a
+ * clamped wait costs at most one extra poll() round-trip and the deadline it
+ * was derived from still decides when the leg gives up.
+ */
+int
+http_poll_timeout_ms(long wait)
+{
+    if (wait < 0) {
+        return 0;
+    }
+
+    if (wait > INT_MAX) {
+        return INT_MAX;
+    }
+
+    return (int) wait;
 }
 
 
@@ -1794,6 +1862,14 @@ http_read_state_step(http_read_state *st, int readable,
 
         st->not_before = 0;
         st->gate_start = 0;
+
+        /* Restart the idle clock on the far side of the gate. The interval the
+         * client deliberately withheld is not the server being silent, so
+         * charging it to the idle budget would fail a paced case whose gate is
+         * merely wider than timeout_ms -- the client's own sip interval killing
+         * the exchange it was configured for. Same reasoning as discounting the
+         * gate from the whole-exchange deadline, one clock down. */
+        st->idle_deadline = now + st->timeout_ms;
     }
 
     {
@@ -1916,10 +1992,39 @@ http_read_state_step(http_read_state *st, int readable,
         }
 
         if (!readable) {
-            /* Stepped for a deadline sweep or a newly-opened pacing gate, with
+            /*
+             * Stepped for a deadline sweep or a newly-opened pacing gate, with
              * nothing known to be waiting on the socket. The checks above have
              * run; reading now would block this leg -- and under a shared drain,
-             * every other leg with it. */
+             * every other leg with it.
+             *
+             * The per-read idle deadline is enforced HERE, on the not-readable
+             * path, because that is the state it describes: the peer has said
+             * nothing since the last read. Its expiry is deliberately routed
+             * into the SAME verdict the blocking reader's SO_RCVTIMEO produced
+             * -- HTTP_CLOSE_TIMEOUT under want_close, otherwise the read-timed-
+             * out failure naming timeout_ms -- so the observable contract is the
+             * pre-S-4 one rather than a new third outcome. The text is shared
+             * with the EAGAIN branch below for the same reason.
+             *
+             * A leg still inside a pacing gate never reaches this: the gate
+             * above returns first while it is closed, and the wakeup function
+             * excludes the idle deadline for exactly that window.
+             */
+            if (st->idle_deadline > 0 && now >= st->idle_deadline) {
+                if (st->want_close) {
+                    st->resp->close_reason = HTTP_CLOSE_TIMEOUT;
+                    st->resp->close_ms = elapsed_since(st->sent_at);
+                    goto finish;
+                }
+
+                snprintf(errbuf, errlen,
+                         "read timed out after %d ms (%zu bytes so far); "
+                         "does the request ask for Connection: close?",
+                         st->timeout_ms, len);
+                goto fail;
+            }
+
             return 1;
         }
 
@@ -1995,6 +2100,14 @@ http_read_state_step(http_read_state *st, int readable,
          * see the gate above. */
         st->paced_full = (st->recv_opt != NULL && st->recv_opt->chunk > 0
                           && (size_t) n == want);
+
+        /* The peer spoke, so the idle clock restarts. This is what makes the
+         * deadline per-READ: a server making steady progress renews it on every
+         * read and is never cut off by it, while the whole-exchange budget above
+         * remains the bound on a peer that trickles a byte per window forever.
+         * Stamped from a fresh now_ms() rather than the `now` at the top of this
+         * step, so the read's own duration is not charged to the next wait. */
+        st->idle_deadline = now_ms() + st->timeout_ms;
 
         st->resp->reads++;
         len += (size_t) n;
@@ -2140,7 +2253,9 @@ http_read_response(int fd, int timeout_ms,
             pfd.events = POLLIN;
             pfd.revents = 0;
 
-            pr = poll(&pfd, 1, (int) http_read_state_next_wakeup(&st, now));
+            pr = poll(&pfd, 1,
+                      http_poll_timeout_ms(
+                          http_read_state_next_wakeup(&st, now)));
 
             if (pr < 0) {
                 if (errno == EINTR) {
@@ -2165,7 +2280,7 @@ http_read_response(int fd, int timeout_ms,
             long  wait = http_read_state_next_wakeup(&st, now);
 
             if (wait > 0) {
-                (void) poll(NULL, 0, (int) wait);
+                (void) poll(NULL, 0, http_poll_timeout_ms(wait));
             }
         }
 
@@ -2512,7 +2627,8 @@ http_exchange_concurrent(const char *host, int port, int n,
                 break;
             }
 
-            pr = poll(nfds > 0 ? pfds : NULL, (nfds_t) nfds, (int) timeout);
+            pr = poll(nfds > 0 ? pfds : NULL, (nfds_t) nfds,
+                      http_poll_timeout_ms(timeout));
 
             if (pr < 0) {
                 if (errno == EINTR) {

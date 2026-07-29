@@ -576,13 +576,84 @@ mutate "concurrent: block exclusion removed" rules.c \
 # in-order drain deadlocks on. Note a reverse-answering fixture does NOT catch
 # it (the kernel buffers the other legs while the drain blocks on leg 0), which
 # is why the fixture is built the way it is.
+#
+# It must be a TRUE in-order drain, and getting this wrong once already
+# produced a false green. The obvious `if (i > 0) continue` is NOT this
+# control: it drops legs 1..N-1 from the pollfd set permanently, so they are
+# never read even after leg 0 finishes. That breaks the fan far more broadly
+# than the claim -- the earlier barrier assertion reds simply because N-1
+# replies are never collected -- and it therefore proves nothing about whether
+# assertion 165's later-leg readback dependency is pinned.
+#
+# What follows advances the LOWEST-INDEX non-terminal leg only, which is
+# exactly the pre-S-4 semantics: leg i+1 is not read until leg i is terminal.
+# Every leg is still eventually read, so a fan whose legs are independent still
+# completes and the barrier assertion stays green; only a fan whose earlier leg
+# depends on a LATER leg being drained deadlocks, which is assertion 165 and
+# nothing else.
 mutate "concurrent: drain serialized (legs read in index order, blocking)" http.c \
     '            if (!http_read_state_pollable(&sts[i], now)) {
                     continue;
                 }' \
-    '            if (i > 0) {
+    '            if (!http_read_state_pollable(&sts[i], now) || nfds > 0) {
                     continue;
                 }' \
+    http_test
+
+# The paced close-deadline triple must stay rejected. Dropping the gate lets a
+# case load whose close_ms includes the client's own recv_slow gates while the
+# README defines that number as the server's close time -- a prompt server
+# reported as late, blamed by name. Narrow on purpose: the mutant only has to
+# make the triple load, since each PAIR loading is correct and is asserted
+# separately.
+mutate "concurrent: paced close-deadline triple accepted (unmeasurable)" rules.c \
+    '        if (tc->concurrent > 0 && tc->saw_recv_slow && tc->saw_close_within) {' \
+    '        if (tc->concurrent < 0 && tc->saw_recv_slow && tc->saw_close_within) {' \
+    rules_test
+
+# The poll() timeout clamp. Removing it restores the raw narrowing the S-4
+# drain shipped: the 8x whole-exchange budget of a large accepted -t exceeds
+# INT_MAX, narrows to a negative int, and poll() reads that as "wait forever" --
+# the harness hangs silently instead of timing out. Caught by the boundary
+# assertions, which are the only way to reach these values (a real exchange
+# would need weeks of wall time).
+mutate "poll timeout: oversized wait not clamped (negative = infinite poll)" http.c \
+    '    if (wait > INT_MAX) {
+        return INT_MAX;
+    }' \
+    '    if (wait > INT_MAX && wait < 0) {
+        return INT_MAX;
+    }' \
+    http_test
+
+# The per-read idle deadline, in the wakeup calculation. Dropping it there is
+# the F1 regression exactly as it shipped: the deadline still exists and is
+# still checked, but poll() never wakes for it, so a silent peer sleeps until
+# the 8x whole-exchange budget instead of timeout_ms. Measured at 2401 ms
+# against a 300 ms timeout where the pre-S-4 blocking reader took 316 ms.
+# Caught by the N=1 ceiling, which is the assertion that names WHICH deadline
+# ended the read -- the pre-existing floor-only assertions stayed green through
+# the entire regression and are why it shipped.
+mutate "idle timeout: dropped from the poll wakeup (8x inflation)" http.c \
+    '    } else if (st->idle_deadline > 0 && st->idle_deadline < wake) {
+        wake = st->idle_deadline;
+    }' \
+    '    }' \
+    http_test
+
+# The idle deadline must be held PER LEG, not recomputed from timeout_ms
+# whenever the leg is stepped. Refreshing it on every step means any reason the
+# shared poll() loop wakes -- including a chatty sibling's traffic -- postpones
+# a silent leg's deadline forever. This is invisible at N=1, where there is no
+# sibling to do the postponing, so the N=1 ceiling does NOT catch it; the fan
+# fixture with one talkative leg and three silent ones is what does.
+mutate "idle timeout: clock refreshed every step (sibling postpones it)" http.c \
+    '    if (st->not_before != 0 && now >= st->not_before) {
+        st->paced_sleep_ms += st->not_before - st->gate_start;' \
+    '    st->idle_deadline = now + st->timeout_ms;
+
+    if (st->not_before != 0 && now >= st->not_before) {
+        st->paced_sleep_ms += st->not_before - st->gate_start;' \
     http_test
 
 # The pacing gate must not be cancelled by readiness. Polling a gated leg lets

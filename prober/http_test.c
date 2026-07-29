@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  164
+#define PLANNED  173
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -522,6 +522,117 @@ spawn_lingering(int *port, int linger_ms, int reply)
         }
 
         close(c);
+        _exit(0);
+    }
+
+    close(srv);
+
+    return pid;
+}
+
+
+/*
+ * Fan fixture for the per-read idle deadline: accept `n` connections, answer
+ * every one of them, then hold ALL of them open and silent for `linger_ms`.
+ *
+ * `chatty_ms` is what makes this a fan test rather than N copies of the N=1
+ * one. Leg 0 keeps talking -- it emits a byte every `chatty_ms` for the life of
+ * the fixture -- while legs 1..n-1 answer once and then go silent. That is the
+ * precondition for the failure mode the idle deadline has to survive under a
+ * SHARED poll() loop: a chatty sibling wakes the loop constantly, so an
+ * implementation that recomputed the idle bound from a fresh timeout_ms on
+ * every poll iteration, or kept one idle clock for the whole fan, would let
+ * leg 0's traffic postpone the silent legs' deadlines forever. With the
+ * deadline held per leg the silent legs expire on their own schedule
+ * regardless of how loud leg 0 is.
+ *
+ * Every leg is answered first (rather than some legs staying wholly silent) so
+ * the case under test is specifically the idle-AFTER-response state that
+ * want_close judges, not a connect-time failure.
+ *
+ * All accepts happen before any reply: the client opens every leg before
+ * draining any, so accepting lazily would deadlock against its own fan.
+ */
+static pid_t
+spawn_fan_lingering(int *port, int n, int linger_ms, int chatty_ms)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "http_test: socket: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, n) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        fprintf(stderr, "http_test: listen: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "http_test: fork: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    if (pid == 0) {
+        int              conns[MAX_CONCURRENT];
+        int              i;
+        long             waited = 0;
+        struct timespec  ts;
+        char             scratch[256];
+
+        for (i = 0; i < n; i++) {
+            conns[i] = accept(srv, NULL, NULL);
+            if (conns[i] < 0) {
+                _exit(2);
+            }
+
+            if (read(conns[i], scratch, sizeof(scratch)) < 0) {
+                _exit(2);
+            }
+
+            (void) send(conns[i], SPAWN_REPLY, SPAWN_REPLY_LEN, MSG_NOSIGNAL);
+        }
+
+        /* Leg 0 keeps the poll loop busy; every other leg stays silent. The
+         * trailing byte is deliberately not valid HTTP framing -- this fixture
+         * is read to EOF, and the point is only that leg 0 produces readiness
+         * events while its siblings produce none. */
+        ts.tv_sec = chatty_ms / 1000;
+        ts.tv_nsec = (chatty_ms % 1000) * 1000000L;
+
+        while (waited < linger_ms) {
+            struct timespec  rem = ts;
+
+            while (nanosleep(&rem, &rem) != 0 && errno == EINTR) {
+                /* keep sleeping */
+            }
+
+            (void) send(conns[0], ".", 1, MSG_NOSIGNAL);
+            waited += chatty_ms;
+        }
+
+        for (i = 0; i < n; i++) {
+            close(conns[i]);
+        }
+
         _exit(0);
     }
 
@@ -2377,6 +2488,31 @@ main(void)
             ok(rc == 0 && resp.close_ms >= 250 && t1 - t0 >= 250,
                "the timeout verdict carries the time actually waited");
 
+            /*
+             * WHICH deadline ended the read, and this is the assertion the
+             * floor above cannot make.
+             *
+             * The per-read idle bound is timeout_ms (300); the whole-exchange
+             * budget is 8x that (2400). A floor-only assertion is satisfied by
+             * BOTH, which is exactly how the S-4 poll() drain regressed this
+             * without reddening anything: waiting in poll() rather than in
+             * read() dropped SO_RCVTIMEO as the idle bound, and this case went
+             * from 316 ms to a measured 2401 ms while staying green.
+             *
+             * The ceiling is therefore the witness, and it is not a tuning
+             * knob: it separates the two deadlines rather than describing this
+             * box's speed. Placed at 4x timeout_ms it sits far above any
+             * plausible scheduling stretch of a 300 ms wait and still far below
+             * the 2400 ms budget, so it distinguishes the two mechanisms
+             * without being load-sensitive in the way a tight wall-clock bound
+             * would be. If the idle bound is removed again, this reds; the
+             * trickle case below is the negative control that keeps the
+             * whole-exchange budget honest at the same time.
+             */
+            ok(rc == 0 && t1 - t0 < 4 * 300,
+               "the idle read timeout -- not the 8x whole-exchange budget -- "
+               "is what ends a silent non-closing exchange");
+
             if (rc == 0) {
                 http_response_free(&resp);
             }
@@ -3033,6 +3169,128 @@ main(void)
             kill(pid2, SIGKILL);
             waitpid(pid2, &st2, 0);
         }
+
+        /*
+         * The per-read idle deadline is PER LEG, and a chatty sibling does not
+         * postpone it.
+         *
+         * This is the fan half of the F1 regression. The N=1 case proves the
+         * idle bound exists again; it cannot prove the bound is held per leg,
+         * because with one leg there is nothing to confuse it with. Under a
+         * shared poll() loop the natural wrong implementations -- one idle
+         * clock for the fan, or a bound recomputed from timeout_ms whenever
+         * poll() returns -- are indistinguishable from the correct one at N=1
+         * and fail only here.
+         *
+         * Leg 0 emits a byte every 50 ms for 3 s; legs 1-3 answer once and go
+         * silent. With a 300 ms timeout the silent legs must give up at about
+         * 300 ms even though poll() is being woken roughly every 50 ms by leg 0
+         * throughout. want_close makes that expiry the verdict rather than an
+         * error, so the fan completes and each leg carries its own close_reason.
+         *
+         * The ceiling is again the witness and is set the same way as the N=1
+         * one: 4x timeout_ms sits far above scheduling noise on a 300 ms wait
+         * and far below the 2400 ms whole-exchange budget, so it names WHICH
+         * deadline fired. It is applied to each silent leg's own close_ms
+         * rather than to the fan's elapsed time -- see the note at the loop
+         * below for why the fan-wide wall clock cannot express this. A shared
+         * or postponed idle clock keeps the silent legs alive behind leg 0's
+         * traffic and reds this.
+         */
+        {
+            int            port3, st3, k;
+            pid_t          pid3;
+            int            silent_timed_out = 1;
+            int            silent_bounded = 1;
+
+            pid3 = spawn_fan_lingering(&port3, 4, 3000, 50);
+
+            memset(resps, 0, sizeof(resps));
+            rc = http_exchange_concurrent("127.0.0.1", port3, 4, creq, creq_len,
+                                          300, NULL, NULL, 0, HTTP_SHUT_NONE,
+                                          NULL, 1, 0, resps,
+                                          errbuf, sizeof(errbuf));
+
+            /*
+             * The silent legs, not leg 0: leg 0 is still being fed, so it is
+             * not idle and is entitled to run to the whole-exchange budget.
+             *
+             * That is also why the witness is each leg's OWN close_ms and not
+             * the fan's elapsed wall time. The fan does not return until every
+             * leg is terminal, so leg 0 pins fan completion at the 8x budget
+             * (measured: 2401 ms) no matter how promptly the silent legs
+             * expire. A wall-clock bound over the whole fan therefore cannot
+             * express this property at all -- it reds against correct code, as
+             * the first cut of this assertion did. close_ms is per leg and
+             * measured from that leg's own sent_at, which is exactly the
+             * quantity the claim is about.
+             */
+            for (k = 1; rc == 0 && k < 4; k++) {
+                if (resps[k].close_reason != HTTP_CLOSE_TIMEOUT) {
+                    silent_timed_out = 0;
+                }
+
+                if (resps[k].close_ms >= 4 * 300) {
+                    silent_bounded = 0;
+                }
+            }
+
+            ok(rc == 0 && silent_timed_out,
+               "every silent leg of a fan reaches its own idle timeout verdict");
+
+            ok(rc == 0 && silent_bounded,
+               "a chatty leg does not postpone its silent siblings' per-read "
+               "idle deadlines");
+
+            if (rc == 0) {
+                for (k = 0; k < 4; k++) {
+                    http_response_free(&resps[k]);
+                }
+            }
+
+            kill(pid3, SIGKILL);
+            waitpid(pid3, &st3, 0);
+        }
+    }
+
+    /* ---- http_poll_timeout_ms -------------------------------------------
+     *
+     * The narrowing that feeds poll(). `-t` accepts up to INT_MAX and the
+     * whole-exchange budget is 8x that, so the values that matter here are
+     * above INT_MAX -- an exchange would need weeks of wall time to reach one,
+     * which is why this boundary cannot be tested through a socket and went
+     * untested when the S-4 drain first started passing the 8x budget straight
+     * to the poll() API.
+     *
+     * The failure being excluded is specific: an oversized long narrowed to int
+     * comes out NEGATIVE in practice, and a negative poll() timeout means "wait
+     * forever". The harness would hang with no error rather than time out.
+     */
+    {
+        ok(http_poll_timeout_ms(0) == 0,
+           "a zero wait narrows to an immediate poll, not a blocking one");
+
+        ok(http_poll_timeout_ms(1000) == 1000,
+           "an ordinary wait passes through unchanged");
+
+        ok(http_poll_timeout_ms(INT_MAX) == INT_MAX,
+           "a wait at exactly INT_MAX is still representable and is kept");
+
+        /* The whole point: 8 * INT_MAX as HTTP_MAX_EXCHANGE_MS would produce it
+         * on a 64-bit long. Must clamp to a finite bound, never go negative. */
+        ok(http_poll_timeout_ms((long) INT_MAX + 1) == INT_MAX,
+           "a wait past INT_MAX clamps to INT_MAX rather than wrapping "
+           "negative into an infinite poll");
+
+        ok(HTTP_MAX_EXCHANGE_MS(INT_MAX) > INT_MAX
+           && http_poll_timeout_ms(HTTP_MAX_EXCHANGE_MS(INT_MAX)) == INT_MAX,
+           "the 8x whole-exchange budget of the largest accepted -t clamps to a "
+           "finite poll timeout");
+
+        /* Defensive: nothing should hand this a negative wait, but a wait that
+         * is already past is a reason to poll immediately, not forever. */
+        ok(http_poll_timeout_ms(-1) == 0,
+           "a negative wait polls immediately rather than blocking forever");
     }
 
     if (tests_run != PLANNED) {
