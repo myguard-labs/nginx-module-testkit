@@ -598,6 +598,17 @@ spawn_fan_lingering(int *port, int n, int linger_ms, int chatty_ms)
         struct timespec  ts;
         char             scratch[256];
 
+        /* Same guard the sibling fixtures carry, and for the same reason: `n`
+         * indexes a fixed array in the FORKED CHILD, so an oversized fan would
+         * write past it there rather than in the test process -- surfacing as
+         * an ASan report with no obvious connection to the caller instead of a
+         * clear failure. `chatty_ms <= 0` is fatal for a different reason:
+         * nanosleep(0) with `waited += 0` never advances, so the child spins
+         * forever and the case hangs instead of failing. */
+        if (n > MAX_CONCURRENT || chatty_ms <= 0) {
+            _exit(2);
+        }
+
         for (i = 0; i < n; i++) {
             conns[i] = accept(srv, NULL, NULL);
             if (conns[i] < 0) {
@@ -3242,10 +3253,15 @@ main(void)
                "a chatty leg does not postpone its silent siblings' per-read "
                "idle deadlines");
 
-            if (rc == 0) {
-                for (k = 0; k < 4; k++) {
-                    http_response_free(&resps[k]);
-                }
+            /* Unconditional, matching the sibling fan blocks and the contract
+             * on http_exchange_concurrent(): resps[] is safe to free on every
+             * return, including a failed one. Gating this on rc == 0 would
+             * attach an LSan leak report to any red assertion under SAN=1 --
+             * and this fan returns non-zero precisely when the idle behaviour
+             * regresses, so the leak noise would land on top of the diagnosis
+             * worth reading. */
+            for (k = 0; k < 4; k++) {
+                http_response_free(&resps[k]);
             }
 
             kill(pid3, SIGKILL);
