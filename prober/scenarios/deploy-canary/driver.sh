@@ -254,14 +254,13 @@ mask_headers() {
 # two, still reds O2. Every other planned path has fixed literal content, so
 # its Content-Length stays compared exactly -- that is a real oracle and the
 # narrow-mask warning above applies to it in full.
-# The trailing (\r?) is captured and replayed rather than absorbed: every other
-# header line in this block still carries the CR from the wire (raw_request
-# keeps CRLF -- see its own \r\n\r\n guard), so swallowing it here would make
-# /__probe's line the one line in the set that differs structurally from its
-# neighbours, which is a new differential rather than a removed one. The
-# surrounding classes are [ \t] and NOT [[:space:]] for the same reason:
-# [[:space:]] matches \r, so a greedy one eats the CR before the capture group
-# can keep it (verified -- [[:space:]] drops it, [ \t] preserves it).
+# raw_request already strips CR from the header block (`tr -d '\r'`, :222), so
+# these lines are bare-LF by the time they reach here and the trailing (\r?)
+# normally matches nothing. It is kept, with [ \t] classes rather than
+# [[:space:]], so this function does not silently depend on that: fed a line
+# that DOES carry CR, [[:space:]] would match the \r and drop it, while [ \t]
+# leaves the capture group to replay it. A masking helper that quietly rewrites
+# line endings depending on who calls it is a differential waiting to happen.
 mask_probe_length() {
     sed -E 's/^(Content-Length:)[ \t]*[0-9]+[ \t]*(\r?)$/\1 MASKED\2/I'
 }
