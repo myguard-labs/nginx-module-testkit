@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  290
+#define PLANNED  295
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1014,6 +1014,22 @@ main(void)
        && cases[0].expects[1].kind == EXPECT_NOT_BODY_CONTAINS,
        "expect and expect_not coexist in one stanza");
     free_all(n);
+
+    /* The POSITIVE forms, for the same reason: memmem with a zero-length needle
+     * returns the haystack, so an empty pattern is a line that passes against
+     * every response. These guards were on expect_not and on
+     * raw_response_headers_like~ but not here, which left the higher-traffic
+     * direction able to hold a green assertion that tests nothing. */
+    expect_die("name t\nexpect body~\n",
+               "expect body~ with an empty pattern dies");
+    expect_die("name t\nexpect body~    \n",
+               "expect body~ with a whitespace-only pattern dies");
+    expect_die("name t\nexpect header~\n",
+               "expect header~ with an empty pattern dies");
+    expect_die("name t\nexpect header~   \n",
+               "expect header~ with a whitespace-only pattern dies");
+    expect_die("name t\nexpect body_sha256=\n",
+               "expect body_sha256= with an empty digest dies");
 
     expect_die("name t\nexpect_not body~\n",
                "expect_not body~ with an empty pattern dies");

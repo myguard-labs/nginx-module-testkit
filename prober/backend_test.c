@@ -36,7 +36,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  105
+#define PLANNED  110
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -469,6 +469,43 @@ test_store(void)
     ok(s.n_entries == 0 && backend_get(&s, "a") == NULL,
        "flush_all empties the store");
 
+    /*
+     * An over-limit key or value off the WIRE must be refused, not fatal.
+     * backend_set() die()s -- correct for a .backend authoring mistake, fatal
+     * in the wrong sense for input a peer controls: fakesrv is one process
+     * behind every connection in a scenario, so a module sending a 300-byte key
+     * used to exit the daemon and take every other live connection with it.
+     *
+     * Asserting the store is UNCHANGED as well as the return value: a refusal
+     * that still wrote a truncated key would satisfy `!= 0` while corrupting
+     * the store the rest of the scenario reads.
+     */
+    {
+        char           bigkey[BACKEND_MAX_KEY + 64];
+        unsigned char  bigval[BACKEND_MAX_VALUE + 64];
+        size_t         before = s.n_entries;
+
+        memset(bigkey, 'A', sizeof(bigkey) - 1);
+        bigkey[sizeof(bigkey) - 1] = '\0';
+        memset(bigval, 'B', sizeof(bigval));
+
+        ok(backend_set_checked(&s, bigkey, (const unsigned char *) "v", 1) != 0,
+           "a key over BACKEND_MAX_KEY is refused rather than fatal");
+        ok(s.n_entries == before && backend_get(&s, bigkey) == NULL,
+           "a refused over-long key leaves the store untouched");
+
+        ok(backend_set_checked(&s, "okkey", bigval, sizeof(bigval)) != 0,
+           "a value over BACKEND_MAX_VALUE is refused rather than fatal");
+        ok(s.n_entries == before && backend_get(&s, "okkey") == NULL,
+           "a refused over-long value leaves the store untouched");
+
+        ok(backend_set_checked(&s, "okkey", (const unsigned char *) "v", 1) == 0
+           && backend_get(&s, "okkey") != NULL,
+           "the checked store still accepts a key and value within limits");
+
+        backend_delete(&s, "okkey");
+    }
+
     /* A value with an embedded NUL survives, since the store is length-based
      * rather than NUL-terminated -- the shape a cache client mishandles. */
     backend_set(&s, "n", (const unsigned char *) "a\0b", 3);
@@ -889,7 +926,9 @@ test_lie_bytes(void)
                             &out_len);
     ok(out != NULL && memcmp(out, "$3\r\n", 4) == 0,
        "lie_bytes rewrites the RESP declared length");
-    free(out);
+    /* nosem: double-free -- `out` is REASSIGNED by the backend_apply_lie() call
+     * above between the two frees, so these release two distinct allocations. */
+    free(out);  /* nosem: double-free */
 
     /* A reply carrying no declared length cannot be falsified. Returning NULL
      * rather than mangling it is what lets the server send it untouched

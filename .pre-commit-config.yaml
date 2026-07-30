@@ -9,10 +9,18 @@
 # layout instead of drifting toward a copied-around guess.
 #
 # Purpose: catch the cheap half of what CI catches, before a push burns a
-# remote round-trip. These hooks deliberately MIRROR the CI thresholds in
-# .github/workflows/security-scanners.yml (flawfinder >=4, semgrep >=WARNING).
-# If a threshold moves there, move it here in the same commit, or local-green
-# stops predicting remote-green.
+# remote round-trip.
+#
+# NOTE ON THE SCANNER HOOKS (2026-07-31): the generator's header used to say
+# these MIRROR .github/workflows/security-scanners.yml at flawfinder >=4 /
+# semgrep >=WARNING. That workflow does not exist in THIS repo -- every other
+# repo in the 2026-07-30 rollout has one, this one never did, and no CI job here
+# runs either tool. So these two are local-only gates with no remote
+# counterpart, and the usual "keep the thresholds in sync" rule has nothing to
+# sync against. Left ENABLED anyway: they are cheap and they do catch real
+# things in new code. Do not read a green run here as a remote gate having
+# passed. If security-scanners.yml is ever added, re-derive both entries from it
+# and restore the mirroring claim.
 #
 # Detected in this repo:
 #   C source dirs : ., prober, src
