@@ -211,20 +211,18 @@ mutate "send_slow: inter-chunk sleep zeroed" http.c \
     'off += n;
 
         if (off < len) {
-            sleep_ms(ms);
-        }' 'off += n;
+            long  slept = sleep_ms(ms);' 'off += n;
 
         if (off < len) {
-            sleep_ms(ms * 0);
-        }' http_test
+            long  slept = sleep_ms(ms * 0);' http_test
 
 mutate "send_slow: leading stall dropped" http.c \
     'if (pauses[i].unit) {
                 rc = write_paced_units(fd, req + off, upto_next - off,
-                                       pauses[i].ms);' \
+                                       pauses[i].ms, slept_ms);' \
     'if (pauses[i].unit) {
                 rc = write_paced_units(fd, req + off, upto_next - off,
-                                       pauses[i].ms * 0);' http_test
+                                       pauses[i].ms * 0, slept_ms);' http_test
 
 mutate "send_slow: chunk ignored" http.c \
     'if (n > chunk) {
@@ -239,12 +237,10 @@ mutate "send_slow_chunks: inter-unit sleep zeroed" http.c \
     'off += unit;
 
         if (off < len) {
-            sleep_ms(ms);
-        }' 'off += unit;
+            long  slept = sleep_ms(ms);' 'off += unit;
 
         if (off < len) {
-            sleep_ms(ms * 0);
-        }' http_test
+            long  slept = sleep_ms(ms * 0);' http_test
 
 # The pacer selection itself: a unit entry falling through to the byte-count
 # pacer is the defect the directive exists to prevent, and chunk 0 there means

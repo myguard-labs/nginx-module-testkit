@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  183
+#define PLANNED  184
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -193,6 +193,13 @@ typedef struct {
      * client_reads gates the chunk cap, this gates the SLEEP the cap paces the
      * reads apart with. Neither can be moved by a loaded box. */
     long long  paced_sleep_ms;
+
+    /* Milliseconds the CLIENT deliberately slept while WRITING the request,
+     * lifted off the response like paced_sleep_ms above -- the send-side
+     * twin. send_slow's deterministic witness: unlike elapsed_ms, a loaded
+     * box cannot inflate or shrink it, because it is credited from
+     * sleep_ms()'s return rather than measured off a wall clock. */
+    long long  send_paced_ms;
 } echo_result;
 
 
@@ -394,6 +401,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
     int            effective_rcvbuf = 0;
     size_t         client_reads = 0;
     long long      paced_sleep_ms = 0;
+    long long      send_paced_ms = 0;
 
     if (pipe(fds) != 0) {
         return -1;
@@ -416,6 +424,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
         effective_rcvbuf = resp.effective_rcvbuf;
         client_reads = resp.reads;
         paced_sleep_ms = resp.paced_sleep_ms;
+        send_paced_ms = resp.send_paced_ms;
         http_response_free(&resp);
     }
 
@@ -436,6 +445,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
     out->effective_rcvbuf = effective_rcvbuf;
     out->client_reads = client_reads;
     out->paced_sleep_ms = paced_sleep_ms;
+    out->send_paced_ms = send_paced_ms;
 
     return rc;
 }
@@ -2108,15 +2118,20 @@ main(void)
         /*
          * send_slow: pace the whole request in 8-byte chunks, 10 ms apart.
          *
-         * req_len is 18, so this is 3 chunks: one leading sleep, then two
-         * BETWEEN the three chunks (none after the last). The fixture's clock
-         * starts at accept(), which can return after the leading sleep is
-         * already underway, so only the two inter-chunk sleeps are reliably
-         * inside the measured window -- the floor is 20 ms, not 30. Measuring
-         * against the nominal 30 leaves no margin at all: gcc lands on 30-31
-         * and clang+ASan on 29, which is a broken test rather than a real
-         * regression. The floor still cannot be reached by a write that never
-         * slept, and case 52's chunk bound covers segmentation separately.
+         * req_len is 18, so this is 3 chunks (8, 8, 2): one leading sleep
+         * before the paced span, then two BETWEEN the three chunks (none
+         * after the last) -- 3 sleeps of 10 ms each, 30 ms accounted in all.
+         *
+         * Asserted on `send_paced_ms`, not on elapsed wall-clock time: a wall
+         * floor here degrades vacuously on a loaded CI runner, where
+         * scheduling delay alone can exceed 20 ms even with the sleep gutted
+         * to a no-op (issues.md OPEN 2026-07-30 s174 -- the mutate.sh
+         * `send_slow: leading stall dropped` row survived on exactly this
+         * floor). `send_paced_ms` is credited from sleep_ms()'s RETURN at
+         * each of the three sleeps, so it reports 30 only when all three
+         * actually happened and 0 when this path is deleted -- a loaded box
+         * cannot move it either way, and an EQUALITY assertion (not a floor)
+         * catches a regression that leaves some sleeps in but drops others.
          */
         p[0].offset = 0;
         p[0].ms = 10;
@@ -2131,8 +2146,18 @@ main(void)
         ok(rc == 0 && er.reads > 1 && er.max_read <= 8,
            "send_slow splits the request into chunks no larger than asked");
 
-        ok(rc == 0 && er.elapsed_ms >= 20,
-           "send_slow paces the chunks apart in time");
+        ok(rc == 0 && er.send_paced_ms == 30,
+           "send_slow accounts the leading stall plus both inter-chunk sleeps");
+
+        /* The load-immunity control: an unpaced run accounts EXACTLY ZERO
+         * send-side sleep. Without this, a build that credits every write
+         * with a fixed nonzero amount regardless of pacing would still pass
+         * the equality assertion above by coincidence for req_len 18 -- this
+         * is what makes the accounting load-immune rather than merely
+         * differently-shaped. */
+        ok(run_echo(req, req_len, NULL, 0, &er) == 0
+           && er.send_paced_ms == 0,
+           "an unpaced request accounts zero send-side sleep");
 
         /* A chunk at or above the request length degrades to one write, but
          * still honours the leading sleep -- the pacing knob must not become a
