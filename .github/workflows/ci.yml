@@ -70,7 +70,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: mutation smoke test
+      # MUT_KIND=c because this job is a bare checkout: no nginx tarball, no
+      # .build/<flavor>-<version>/objs, so a scenario suite cannot boot a server
+      # here. The scenario rows run in the `scenarios` job, which stages that
+      # tree. Running them here reported `caught` for 11 rows that never
+      # executed their driver -- the suite bailed on the absent tree and the
+      # nonzero exit was read as a caught mutation.
+      - name: mutation smoke test (C suites)
+        env:
+          MUT_KIND: c
         run: prober/mutate.sh
 
   # Corpus replay of the parser fuzz targets, under gcc + ASan/UBSan, on the PR
@@ -693,6 +701,32 @@ jobs:
           fi
 
           cp /tmp/rule.orig "$RULE"
+
+      # The mutate.sh rows whose suites boot a real server. They live here and
+      # not in the `mutation` job because only this job stages
+      # .build/<flavor>-<version>/objs; run without it they bail before their
+      # driver and every row reports `caught` on an exit no mutation caused.
+      #
+      # The step above mutates ONE rule file and proves the tree as a whole can
+      # go red. These rows are finer-grained: each corrupts one oracle's own
+      # bound and requires that oracle to red, which is the only way the
+      # deliberately-vacuous cases (`... oracle vacuous`) can be checked at all.
+      #
+      # nginx only: these rows assert on oracle behaviour, not on flavor
+      # differences, so running them once is enough. The scenario TREE still
+      # runs on every flavor in the matrix.
+      - name: the scenario mutation rows actually catch (mutation)
+        if: matrix.flavor == 'nginx' && matrix.version == '1.29.0'
+        env:
+          PROBER_ROOT: ${{ github.workspace }}
+          PROBER_MODULE: ngx_http_test_ref_module.so
+          PROBER_DIRECTIVE: test_ref_probe
+          PROBER_PROBE: "test_ref_probe;"
+          MUT_KIND: scenario
+          # These suites boot servers and sweep; the 120 s default is sized for
+          # the C binaries and would report a caught mutation on wall clock.
+          MUT_SUITE_TIMEOUT: "600"
+        run: prober/mutate.sh
 
   header-self-sufficiency:
     runs-on: [self-hosted, builder02, lxc]
