@@ -230,6 +230,12 @@ mutate "send_slow_chunks: inter-unit pacing zeroed at the call site" http.c \
 
 # The leading stall the row above was misnamed for: the sleep taken BEFORE a
 # paced span begins, which every paced entry performs regardless of pacer.
+#
+# SC2016: the anchors are literal C source to match, not shell to expand. This
+# row needs the disable where its neighbours do not because `pauses[i]` reads as
+# an array subscript to shellcheck; the other send-side anchors open on a line
+# that carries no subscript.
+# shellcheck disable=SC2016
 mutate "send_slow: leading stall dropped" http.c \
     'slept = sleep_ms(pauses[i].ms);
 
