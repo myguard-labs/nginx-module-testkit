@@ -68,6 +68,7 @@ PRIMARY	prober/slope_check_test.sh	slope_check_test.sh	fast
 PRIMARY	prober/stale_so_test.sh	stale_so_test.sh	fast
 PRIMARY	prober/check_conf_test.sh	check_conf_test.sh	fast
 PRIMARY	prober/docs_directives_test.sh	docs_directives_test.sh	fast
+PRIMARY	prober/schema_emitter_test.sh	schema_emitter_test.sh	fast
 
 # The strace summary parser (prober_strace_counts, prober_strace_family_sum)
 # lives in lib.sh but is only exercised end-to-end by the syscall-allowlist
