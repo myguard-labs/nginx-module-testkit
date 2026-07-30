@@ -112,6 +112,22 @@ baseline_ok () {
         return
     fi
 
+    # Build first. On a fresh checkout the suite binaries do not exist yet --
+    # mutate() builds after patching, so before the first mutation there is
+    # nothing to run and `timeout` reports "No such file or directory". That is
+    # a nonzero exit, which this function would then read as "the suite is
+    # already red" and refuse every row: a false BROKEN in exactly the shape of
+    # the false `caught` it was written to prevent. The scenario suites are
+    # shell and need no build, but build.sh is idempotent and cheap here.
+    #
+    # shellcheck disable=SC2086  # $buildenv is VAR=value words for env; see mutate().
+    if ! env $buildenv ./build.sh >"$work/baseline-build.log" 2>&1; then
+        echo "          the tree does not build unmutated:"
+        sed -n '1,3p' "$work/baseline-build.log" | sed 's/^/          /'
+        echo "1" > "$stamp"
+        return 1
+    fi
+
     # shellcheck disable=SC2086  # $buildenv is VAR=value words for env; see mutate().
     env $buildenv timeout "$MUT_SUITE_TIMEOUT" ./"$suite" >"$work/baseline.log" 2>&1 || rc=$?
     echo "$rc" > "$stamp"
