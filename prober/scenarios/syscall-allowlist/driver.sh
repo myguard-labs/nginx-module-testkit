@@ -27,6 +27,17 @@
 # attaching a tracer to the server it is probing or diffing a syscall set. This
 # is server-side introspection the rule DSL cannot express.
 #
+# THE BUDGET (assertion 3). The set gate is one-directional and cannot see a
+# module that opens one file of its OWN per request: openat is necessarily
+# allowlisted, because the reference probe walks /proc/self/fd on every request
+# (baseline.syscalls:52-60 names this hole in its own comment). Only a COUNT
+# ceiling closes it. The budget is expressed per SERVED response and over syscall
+# FAMILIES (openat+open, accept4+accept) rather than single names, because the
+# libc near-neighbours are separately allowlisted and a name-wise ceiling would
+# leave the hole open to a module calling syscall(SYS_open, ...). Only counts
+# that are structurally per-request are budgeted -- see the assertion itself for
+# why readlink/getdents64 are NOT among them despite looking constant on one box.
+#
 # CROSS-VERSION STABILITY. The observed set on a bare request path is small and
 # stable across nginx mainline, stable, and angie: accept4/close for the
 # connection, epoll_ctl/epoll_wait for readiness, recvfrom for the request,
@@ -168,10 +179,21 @@ fi
 # A fixed burst -- enough requests that the full per-request surface is exercised
 # (accept, read, write, close on each), few enough to stay fast. The SET gate
 # (assertion 2) does not care about this count, but the BUDGET gate (assertion
-# 3, below) is expressed per-request as a multiple of it -- so BURST is a real
-# variable, not a magic number repeated at the call site, or the two would
-# drift apart silently if one were edited and not the other.
+# 3, below) is expressed per-request -- so BURST is a real variable, not a magic
+# number repeated at the call site, or the two would drift apart silently if one
+# were edited and not the other.
+#
+# SERVED, not BURST, is the budget's denominator. Every failure mode in the loop
+# below is deliberately swallowed (a connect that is refused, a write that takes
+# EPIPE, a read that times out) so one bad iteration cannot kill the driver --
+# which means the attempted count says nothing about how many requests the
+# traced worker actually answered. Dividing by attempts is slack in the
+# attacker's favour: if only 15 of 20 reach the worker, a mutant issuing 4
+# openat per request totals 60 and sits exactly ON a 3x20 ceiling, passing while
+# every single served request breaches it. So count the responses that were
+# actually read back, and gate on that.
 BURST=20
+SERVED=0
 for _r in $(seq 1 "$BURST"); do
     if exec 3<>"/dev/tcp/$HOST/$PORT"; then
         # trap '' PIPE + a `timeout`-bounded read, the load-bearing pattern
@@ -182,8 +204,15 @@ for _r in $(seq 1 "$BURST"); do
         # or hang it.
         (trap '' PIPE
          printf 'GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' >&3 2>/dev/null) || true
-        timeout "${PROBER_PROBE_TIMEOUT:-2}" cat <&3 >/dev/null 2>&1 || true
+        # A response line is the proof of service. Reading the whole body and
+        # matching its status is what distinguishes "the worker answered" from
+        # "the connect succeeded and then nothing came back" -- only the former
+        # spent the syscalls the budget is about to divide by.
+        _resp="$(timeout "${PROBER_PROBE_TIMEOUT:-2}" cat <&3 2>/dev/null || true)"
         exec 3>&- 3<&- || true
+        if grep -qE '^HTTP/1\.[01] [0-9]{3}' <<<"$_resp"; then
+            SERVED=$((SERVED + 1))
+        fi
     fi
 done
 
@@ -287,73 +316,96 @@ fi
 # up as "openat", already on the list. Only a per-request COUNT ceiling closes
 # that gap.
 #
-# Measured (s171, memory/labs/nginx-test-harness/issues.md): across 5 runs and
-# burst sizes 5/10/20/40 these four names are EXACT multiples of BURST, zero
-# variance --
-#     openat=3N accept4=N getdents64=4N readlink=11N
-# -- so the ceiling is set to exactly the measured multiple, no headroom. Any
-# slack here would let a mutant's extra per-request openat (3N -> 4N) hide
-# inside the gap, which defeats the point of a budget.
+# BUDGET FAMILIES, NOT NAMES. A ceiling on a single NAME closes nothing here,
+# because the libc near-neighbours are each separately allowlisted (see
+# baseline.syscalls): a module calling syscall(SYS_open, ...) once per request
+# leaves `openat` at exactly its baseline, so the set gate stays green (open is
+# allowlisted) AND a name-wise openat ceiling stays green (openat did not move).
+# The very hole this assertion exists to close survives it. Summing the family
+# is what makes the ceiling mean "a file was opened", not "openat was used".
 #
-# epoll_wait and recvfrom are deliberately EXCLUDED: they wobbled +/-1 across
-# otherwise-identical runs in the same measurement (kernel coalescing the
-# readiness loop, not module behaviour) -- budgeting them would flake the gate
-# on roughly half of all runs, exactly the kind of gate that gets "fixed" by
-# widening it into uselessness.
+# A family that appears NOWHERE in the table is RED, not zero. Absent-means-zero
+# is safe only for one optional member of a family that was itself observed; if
+# no member appears at all, the capture is not what this code thinks it is
+# (changed strace format, truncated summary, a typo in the family string) and
+# reporting 0 answers a question that could not be evaluated -- with the most
+# comfortable possible answer. prober_strace_family_sum enforces both.
 #
-# Expressed as `count <= K * BURST`, never a bare absolute -- an absolute
+# Measured per-request and per-family (s171):
+#     openat+open = 3 per served request      accept4+accept = 1 per served request
+#
+# ONLY these two. `readlink` and `getdents64` were in the first version of this
+# gate at 11N and 4N and are NOT constants: src/ngx_test_probe.c issues one
+# readlink per entry in /proc/self/fd and a getdents64 per buffer-full of the
+# two directory walks, so both scale with the worker's FD POPULATION -- build
+# config, module set, log files, listening sockets -- not with the request
+# count. CI proved it rather than argument: run 30549769006 reads readlink=13N
+# on nginx 1.29.0 and angie 1.12.0 while 1.28.0 sits at 11N. The local sweep
+# that produced 11N had zero variance because it never left one machine, which
+# rules out run-to-run noise and says nothing about environment dependence. A
+# ceiling over an FD-dependent count is a flake generator, and a flaky gate gets
+# widened until it asserts nothing. Restoring either needs a baseline observed
+# in the SAME run, not a constant.
+#
+# epoll_wait and recvfrom are excluded for the neighbouring reason: they wobbled
+# +/-1 across otherwise-identical runs (the kernel coalescing readiness, not
+# module behaviour).
+#
+# Expressed as `count <= K * SERVED`, never a bare absolute -- an absolute
 # silently re-scales (goes slack or starts flaking) the moment someone edits
-# BURST above without touching this table, which is the same failure mode this
-# whole oracle exists to catch, just one level up.
-#
-# Reuse the already-parsed `-c` summary table rather than re-deriving counts:
-# the OBSERVED awk above already isolated the syscall-NAME column ($NF); here we
-# additionally want the CALLS column.
-#
-# Take calls as $4, counting from the LEFT. Counting from the right ($(NF-1))
-# is wrong and fails in the dangerous direction: the table's `errors` column is
-# only PRESENT on rows that had errors, so a clean row is
-#     % time  seconds  usecs/call  calls  syscall              (NF=5)
-# while a row with failures is
-#     % time  seconds  usecs/call  calls  errors  syscall      (NF=6)
-# and $(NF-1) reads ERRORS, not calls, on exactly those rows. A budgeted
-# openat that starts erroring would then be compared as (say) 7 instead of 200
-# and the ceiling would PASS while massively breached -- a vacuous gate, which
-# is the failure class this scenario exists to catch. The leading four columns
-# are fixed-width in strace's -c output whether or not `errors` is populated,
-# so $4 is stable for both shapes; verified against both here.
-COUNTS="$(awk '
-    /^[[:space:]]*-+/ { next }
-    /% time/          { next }
-    /total/           { next }
-    NF >= 5 && $NF ~ /^[a-z][a-z0-9_]*$/ && $4 ~ /^[0-9]+$/ { print $NF, $4 }
-' "$STRACE_OUT")"
+# BURST without touching this table, which is the same failure mode this whole
+# oracle exists to catch, one level up.
+COUNTS="$(prober_strace_counts "$STRACE_OUT")"
 
-_count_of() {
-    # First match wins; the table has one row per syscall name so there is
-    # exactly one to find.
-    awk -v n="$1" '$1 == n { print $2; found=1; exit } END { if (!found) print 0 }' <<<"$COUNTS"
-}
+# The denominator has to be positive AND the responses have to have been served
+# by the traced worker. Assertion 1 already proved the request path was traced;
+# this proves the divisor is real. A zero here would make every ceiling zero and
+# red the gate for the wrong reason, so name it.
+if [ "$SERVED" -lt 1 ]; then
+    echo "not ok 3 - no request was served during the trace; no budget denominator"
+    echo "# attempted burst=$BURST, verified responses=$SERVED"
+    FAILED=1
+elif [ "$SERVED" -lt "$BURST" ]; then
+    # Fewer served than attempted is not itself a failure -- the ceiling scales
+    # with SERVED, so the gate stays exact -- but it is worth saying out loud,
+    # because a shrinking denominator is how this assertion would quietly lose
+    # its power to a mutant that also breaks the transport.
+    echo "# note: $SERVED of $BURST requests verified served; ceilings scale to $SERVED"
+fi
 
 BUDGET_BREACH=""
-for pair in "openat:3" "accept4:1" "getdents64:4" "readlink:11"; do
-    name="${pair%%:*}"
-    mult="${pair##*:}"
-    ceiling=$((mult * BURST))
-    got="$(_count_of "$name")"
-    if [ "$got" -gt "$ceiling" ]; then
-        BUDGET_BREACH="${BUDGET_BREACH:+$BUDGET_BREACH }$name=$got(>$ceiling)"
-    fi
-done
+BUDGET_UNREADABLE=""
+if [ "$SERVED" -ge 1 ]; then
+    for pair in "openat+open:3" "accept4+accept:1"; do
+        family="${pair%:*}"
+        mult="${pair##*:}"
+        ceiling=$((mult * SERVED))
+        if ! got="$(prober_strace_family_sum "$COUNTS" "$family")"; then
+            BUDGET_UNREADABLE="${BUDGET_UNREADABLE:+$BUDGET_UNREADABLE }$family"
+            continue
+        fi
+        if [ "$got" -gt "$ceiling" ]; then
+            BUDGET_BREACH="${BUDGET_BREACH:+$BUDGET_BREACH }$family=$got(>$ceiling)"
+        fi
+    done
 
-if [ -n "$BUDGET_BREACH" ]; then
-    echo "not ok 3 - per-request syscall budget exceeded: $BUDGET_BREACH"
-    echo "# burst=$BURST; ceilings are openat<=3N accept4<=N getdents64<=4N readlink<=11N"
-    echo "# a module opening its own file per request hides inside the SET gate (it"
-    echo "# still reads as openat) but crosses this per-request ceiling instead"
-    FAILED=1
-else
-    echo "ok 3 - per-request syscall counts stay at or under budget (burst=$BURST)"
+    if [ -n "$BUDGET_UNREADABLE" ]; then
+        echo "not ok 3 - budgeted syscall family absent from the strace summary: $BUDGET_UNREADABLE"
+        echo "# not one member of that family appears in the table, so the ceiling could"
+        echo "# not be evaluated -- treated as a failure, never as a count of zero"
+        echo "# strace summary:"
+        sed 's/^/#   /' "$STRACE_OUT"
+        FAILED=1
+    elif [ -n "$BUDGET_BREACH" ]; then
+        echo "not ok 3 - per-request syscall budget exceeded: $BUDGET_BREACH"
+        echo "# served=$SERVED; ceilings are openat+open <= 3N, accept4+accept <= N"
+        echo "# a module opening its own file per request hides inside the SET gate (it"
+        echo "# still reads as openat, or as an allowlisted near-neighbour) but crosses"
+        echo "# this per-request ceiling instead"
+        FAILED=1
+    else
+        echo "ok 3 - per-request syscall counts stay at or under budget (served=$SERVED)"
+    fi
 fi
 
 exit "$FAILED"

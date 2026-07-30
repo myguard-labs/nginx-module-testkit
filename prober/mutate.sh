@@ -813,6 +813,40 @@ mutate "schema: reverse-sweep anchor removed" schema_emitter_test.sh \
     schema_emitter_test.sh
 
 
+# ---- syscall budget parser -------------------------------------------------
+
+# The errors column. strace's -c table emits `errors` only on rows that HAD
+# errors, so counting the calls column backwards from the syscall name reads
+# ERRORS on exactly those rows -- and reads them LOW, which is to say under
+# every ceiling. A budgeted openat that starts failing would be compared as 7
+# instead of 200 and the budget gate would pass while massively breached, which
+# is the vacuous-gate class the syscall-allowlist scenario exists to catch.
+#
+# This is the mutation the parser was extracted from the driver FOR. CI's real
+# captures are all clean rows, so the scenario cannot exercise the shape that
+# breaks it: without a fixture test this revert stays green forever.
+# SC2016: literal source text to match, not shell to expand.
+# shellcheck disable=SC2016
+mutate "syscall budget: calls column counted backwards past errors" lib.sh \
+    'NF >= 5 && $NF ~ /^[a-z][a-z0-9_]*$/ && $4 ~ /^[0-9]+$/ { print $NF, $4 }' \
+    'NF >= 5 && $NF ~ /^[a-z][a-z0-9_]*$/ && $(NF-1) ~ /^[0-9]+$/ { print $NF, $(NF-1) }' \
+    syscall_budget_test.sh
+
+# Absent-family-means-zero. If NOT ONE member of a budgeted family appears in
+# the table, the capture is not what the caller thinks it is -- a changed strace
+# format, a truncated summary, a typo in the family string -- and answering 0
+# gives the most comfortable possible answer to a question that could not be
+# evaluated. Every ceiling then passes. The rule is deliberately narrow: an
+# absent member of a family that WAS observed still contributes zero, and
+# assertion 13 pins that boundary, so this mutant cannot be "fixed" by making
+# the whole thing stricter.
+# shellcheck disable=SC2016
+mutate "syscall budget: an absent family sums to zero instead of erroring" lib.sh \
+    '    [ "$seen" -eq 1 ] || return 1' \
+    '    [ "$seen" -eq 1 ] || sum=0' \
+    syscall_budget_test.sh
+
+
 # ---- probe_baseline --------------------------------------------------------
 
 # The separate list. `probe_baseline` and `delta` share an evaluator but not an

@@ -1601,6 +1601,89 @@ prober_backend_scrape() {
     return "$rc"
 }
 
+# prober_strace_counts FILE
+#
+# Parse an `strace -c` summary table on stdout as `NAME COUNT` pairs, one per
+# data row. Lives here rather than inline in the syscall-allowlist driver for
+# one reason: a parser that only ever runs inside a scenario can only be tested
+# by booting a server, so the shapes that matter -- an errors row, a missing
+# row, a duplicate name -- are exactly the ones CI never produces. Extracted, it
+# takes committed fixtures in syscall_budget_test.sh and a mutation that must
+# red.
+#
+# Take calls as $4, counting from the LEFT. Counting from the right ($(NF-1))
+# is wrong and fails in the dangerous direction: the `errors` column is only
+# PRESENT on rows that had errors, so a clean row is
+#     % time  seconds  usecs/call  calls  syscall              (NF=5)
+# while a row with failures is
+#     % time  seconds  usecs/call  calls  errors  syscall      (NF=6)
+# and $(NF-1) reads ERRORS, not calls, on exactly those rows. A budgeted openat
+# that starts erroring would then be compared as (say) 7 instead of 200 and a
+# ceiling would PASS while massively breached -- a vacuous gate, which is the
+# failure class the scenario using this exists to catch. strace's leading four
+# columns are present in both shapes, so $4 is stable for both.
+prober_strace_counts() {
+    awk '
+        /^[[:space:]]*-+/ { next }
+        /% time/          { next }
+        /total/           { next }
+        NF >= 5 && $NF ~ /^[a-z][a-z0-9_]*$/ && $4 ~ /^[0-9]+$/ { print $NF, $4 }
+    ' "$1"
+}
+
+# prober_strace_family_sum COUNTS FAMILY
+#
+# Sum the call counts of a syscall FAMILY (a `+`-separated list of names, e.g.
+# "openat+open") over the `NAME COUNT` pairs in COUNTS. Prints the sum on
+# success and returns 0; prints nothing and returns 1 when the family is
+# malformed or when NOT ONE of its members appears in the table.
+#
+# WHY A FAMILY, AND WHY MISSING-IS-AN-ERROR. Both properties come from the same
+# defect (s171): budgeting a single NAME whose libc near-neighbours are each
+# separately allowlisted closes nothing. A module calling syscall(SYS_open, ...)
+# once per request leaves `openat` at its baseline, so a name-wise budget passes
+# while the per-request file open it was built to catch sails through. Summing
+# the family is what makes the ceiling attacker-relevant.
+#
+# And absent-means-zero is safe ONLY for one optional member of a family that
+# was itself observed. If NO member appears, the table is not what the caller
+# thinks it is -- a changed strace format, a truncated capture, a typo in the
+# family string -- and returning 0 would report the most comfortable possible
+# answer to a question that could not be evaluated. That is the vacuous-gate
+# shape, so it is an error the caller must red on.
+prober_strace_family_sum() {
+    local counts="$1" family="$2"
+
+    case "$family" in
+        '' | *'++'* | '+'* | *'+') return 1 ;;
+    esac
+
+    local name sum=0 seen=0 got
+    local IFS='+'
+    # shellcheck disable=SC2086
+    set -- $family
+    unset IFS
+
+    for name in "$@"; do
+        case "$name" in
+            [a-z]*) ;;
+            *) return 1 ;;
+        esac
+        # Every matching row is summed, not just the first: a table carrying the
+        # same name twice (an -f capture that did not fold two threads, a
+        # concatenated summary) would otherwise be read at a fraction of its
+        # real count -- again low, again in the passing direction.
+        got="$(awk -v n="$name" '$1 == n { s += $2; f = 1 } END { if (f) print s }' <<<"$counts")"
+        if [ -n "$got" ]; then
+            seen=1
+            sum=$((sum + got))
+        fi
+    done
+
+    [ "$seen" -eq 1 ] || return 1
+    printf '%s\n' "$sum"
+}
+
 # prober_cleanup
 #
 # Idempotent teardown of everything a scenario allocated: fake upstream,
