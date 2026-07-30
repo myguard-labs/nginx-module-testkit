@@ -61,6 +61,19 @@
 #                           what is genuinely cross-flavor.
 #
 #   INVARIANT (asserted, exact value both flavors must produce):
+#     timers                -- armed entries in the event-timer rbtree. Pinned
+#                               at 0, NOT masked: this conf sets no keepalive
+#                               and nothing but the probe request is in flight
+#                               at snapshot time, so a healthy worker of either
+#                               flavor parks at zero armed timers. Confirmed on
+#                               all three matrix legs (nginx 1.28.0/1.29.0,
+#                               angie 1.12.0) -- each rendered "timers":0 on the
+#                               run that added the field. Unlike fds/free it is
+#                               not environment-fragile: it counts what THIS
+#                               worker armed, not what it inherited. Masking it
+#                               would make the golden blind to an emitter that
+#                               starts reporting a constant, which is the one
+#                               failure a leak gauge cannot survive.
 #     page_size             -- ngx_pagesize; same host, same libc, same
 #                               getconf(_SC_PAGESIZE) on both binaries.
 #     connections.total     -- worker_connections from THIS conf, echoed back
