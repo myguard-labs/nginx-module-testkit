@@ -197,7 +197,19 @@ step_clock '+0'
 sleep 0.5
 
 KA_OUT="$PROBER_PREFIX/logs/clock-jump.keepalive"
-H="$HOST" P="$PORT" FT="$FT" STEP="$STEP_SECONDS" WAIT="$KEEPALIVE_WAIT" \
+# LD_PRELOAD= clears the inherited libfaketime interposer for THIS process only
+# (the server keeps it -- preloaded at fork, unaffected by an env change here).
+# This probe is the OBSERVER: it measures elapsed time with time.monotonic()
+# around a time.sleep(), and CPython's time.sleep() is clock_nanosleep(...,
+# TIMER_ABSTIME, deadline) -- an absolute-deadline call, not the plain
+# clock_gettime()/recv() the other three assertions make. libfaketime does not
+# honour FAKETIME_DONT_FAKE_MONOTONIC (see 'env') consistently on that
+# interception path, so a preloaded probe computes its sleep deadline against
+# one clock scale and the kernel rejects it against another -- EINVAL, no
+# socket ever touched. A self-faking observer can't measure real elapsed time
+# regardless of the crash, so leaving the preload on here would be wrong even
+# if libfaketime patched the EINVAL away.
+H="$HOST" P="$PORT" FT="$FT" STEP="$STEP_SECONDS" WAIT="$KEEPALIVE_WAIT" LD_PRELOAD= \
 timeout $(( KEEPALIVE_WAIT + 6 )) python3 - >"$KA_OUT" 2>&1 <<'PY' || true
 import os, socket, time
 
