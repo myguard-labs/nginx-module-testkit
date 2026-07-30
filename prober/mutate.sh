@@ -1447,6 +1447,22 @@ mutate "deploy-canary: O3 body differential (candidate flips one byte of /canary
     'CANARY_ARM_SED="${CANARY_ARM_SED:-s/canary-stable-payload/canary-Stable-payload/}"' \
     scenarios/deploy-canary/mutate-suite.sh
 
+# mask_probe_length masks /__probe's Content-Length VALUE so a boot-identity
+# digit-width change cannot red O2 (see its comment in driver.sh). The mask is
+# deliberately blind to that one value, so what must be pinned is that O2 still
+# discriminates everything ELSE about /__probe's header set -- the path the mask
+# actually touches, which the /canary rows above cannot speak for.
+#
+# This arms a candidate-only header on the /__probe location. It reds only if
+# the masked capture still compares header NAMES on that path, which is the
+# property separating "mask one value" from "stop looking at this path".
+# shellcheck disable=SC2016
+mutate "deploy-canary: O2 still catches a new /__probe header despite the length mask" \
+    scenarios/deploy-canary/driver.sh \
+    'CANARY_ARM_SED="${CANARY_ARM_SED:-}"' \
+    'CANARY_ARM_SED="${CANARY_ARM_SED:-s|location /__probe {|location /__probe { add_header X-Probe-Leak leaked always;|}"' \
+    scenarios/deploy-canary/mutate-suite.sh
+
 # SC2016: the single-quoted text is a line of driver.sh's own bash being patched.
 # shellcheck disable=SC2016
 mutate "deploy-canary: O5 death oracle vacuous (expectation corrupted, suite must still red)" \

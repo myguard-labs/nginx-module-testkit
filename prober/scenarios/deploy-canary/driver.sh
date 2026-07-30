@@ -237,6 +237,34 @@ mask_headers() {
     grep -vEi '^(Date|Connection|Server):' || true
 }
 
+# mask_probe_length: normalize /__probe's Content-Length VALUE (D-5 O2).
+#
+# /__probe's body is the probe document, and capture_plan already routes that
+# body through prober_probe_normalize before hashing it for O3 -- because pid,
+# config_generation and the cycle counters legitimately differ between the
+# control boot and the candidate's own fresh boot. Those same fields determine
+# the document's LENGTH, and the module sets Content-Length from the
+# unnormalized document (t/module/ngx_http_test_ref_module.c:168), so a pid of
+# 703 against one of 6693 shifts Content-Length by a byte and reds O2 while O1
+# and O3 agree. That is a boot-identity difference wearing a header's clothes,
+# not a candidate regression.
+#
+# The VALUE is replaced rather than the header dropped, and only for this one
+# path: a /__probe reply that stops emitting Content-Length, or starts emitting
+# two, still reds O2. Every other planned path has fixed literal content, so
+# its Content-Length stays compared exactly -- that is a real oracle and the
+# narrow-mask warning above applies to it in full.
+# raw_request already strips CR from the header block (`tr -d '\r'`, :222), so
+# these lines are bare-LF by the time they reach here and the trailing (\r?)
+# normally matches nothing. It is kept, with [ \t] classes rather than
+# [[:space:]], so this function does not silently depend on that: fed a line
+# that DOES carry CR, [[:space:]] would match the \r and drop it, while [ \t]
+# leaves the capture group to replay it. A masking helper that quietly rewrites
+# line endings depending on who calls it is a differential waiting to happen.
+mask_probe_length() {
+    sed -E 's/^(Content-Length:)[ \t]*[0-9]+[ \t]*(\r?)$/\1 MASKED\2/I'
+}
+
 # capture_plan LABEL -> writes $PROBER_PREFIX/canary-$LABEL.tuples, one line
 # per planned request: "path method status masked-header-sha256 body-sha256".
 # Header SET is hashed (sorted, masked) rather than compared line-by-line here
@@ -256,6 +284,12 @@ capture_plan() {
         fi
         status="$(printf '%s\n' "$raw" | sed -n '1p')"
         headers_masked="$(printf '%s\n' "$raw" | sed -n '2,/^$/p' | sed '$d' | mask_headers)"
+        # See mask_probe_length: /__probe's length is derived from fields the
+        # body hash already masks, so it has to be masked here too or O2 reds on
+        # a boot-identity digit-width change that O3 correctly ignores.
+        if [ "$path" = "/__probe" ]; then
+            headers_masked="$(printf '%s\n' "$headers_masked" | mask_probe_length)"
+        fi
         # Body is everything after the blank line raw_request inserted between
         # headers and body -- same "print from the line after the first empty
         # one" idiom raw_request itself uses to split $resp, applied again
