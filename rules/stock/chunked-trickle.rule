@@ -1,0 +1,99 @@
+# Stock: a chunked body trickled one framing unit at a time, and leaks nothing.
+#
+# Module-agnostic: every consumer has /__probe, and nginx/angie hold a request
+# open while its body is still arriving, so these hold without depending on any
+# consumer-specific content.
+#
+# HOW THIS DIFFERS FROM slowloris.rule. `send_slow <chunk> <ms>` dribbles the
+# HEADER block in fixed-size byte pieces, so the server's header path is entered
+# once per chunk. This file dribbles the BODY, and it cuts at chunked-framing
+# boundaries rather than at fixed byte offsets: one complete
+# `<hex>[;ext]\r\n<data>\r\n` unit per write. That is the difference the
+# directive exists for -- a byte count lands mid size-line as often as on a
+# boundary, so `send_slow` over a chunked body mostly exercises the server's
+# partial-chunk-header path. `send_slow_chunks` exercises the one a real slow
+# uploader produces: every read delivers a complete, valid, tiny chunk.
+#
+# HOW THIS DIFFERS FROM malformed-body.rule. That file puts hostile FRAMING on
+# the wire (bare LF size lines, lengths beyond any real body) in a single write
+# and asserts the worker survives parsing it. Every unit here is well-formed;
+# the hostility is entirely in the ARRIVAL RATE. A module can parse malformed
+# framing perfectly and still allocate once per read event, which is what this
+# case is built to surface.
+#
+# WHY THE DELTAS ARE THE POINT. The status is the weaker half: a 200 only says
+# the body eventually reassembled. `delta fds == 0` and
+# `delta pool.cycle_used == 0` are what catch the real failure mode -- a module
+# that allocates per READ rather than per REQUEST looks identical on a body that
+# arrives in one packet and leaks once per chunk here. Nine units at 20 ms is
+# the cheapest way to make that class of bug observable on a body path.
+#
+# THE PACE IS DELIBERATELY MODEST. The interval only has to exceed the loopback
+# round-trip to guarantee a separate read event per unit. It does NOT approach
+# client_body_timeout: that value is consumer-configurable, and a rule assuming
+# a default would fail on a conf that tuned it. This asserts that a slowly
+# arriving body is served correctly, NOT that it is eventually cut off -- the
+# timeout policy belongs to the consumer, not to the harness.
+#
+# The prober bounds a case's total stall (MAX_PAUSE_MS) and costs
+# `send_slow_chunks` as if every unit were the smallest the wire allows (a
+# zero-sized chunk, 5 bytes), so a pace slow enough to exceed that ceiling is
+# rejected when the rule file loads rather than reported as a harness timeout
+# later. The bodies here are far under it.
+#
+# CONFIG DEPENDENCE, same caveat as short-body.rule. The location must actually
+# read the request body for the delta oracles to cover the body path. A GET-only
+# /__probe may answer with a method rejection before the body is touched, in
+# which case these still assert that the HARNESS's own paced writer and the
+# server's read loop survive a trickled body -- the module-agnostic floor this
+# file promises. Point it at a body-reading location for the strong assertion.
+
+name              a chunked body trickled one unit at a time still completes
+send              POST /__probe HTTP/1.1\r\n
+send              Host: prober\r\n
+send              Transfer-Encoding: chunked\r\n
+send              Connection: close\r\n\r\n
+send_slow_chunks  20
+send              1\r\nA\r\n1\r\nB\r\n1\r\nC\r\n1\r\nD\r\n
+send              1\r\nE\r\n1\r\nF\r\n1\r\nG\r\n1\r\nH\r\n
+send              0\r\n\r\n
+delta             fds == 0
+delta             pool.cycle_used == 0
+delta             pool.cycle_large == 0
+
+# A size line carrying a chunk extension is one unit like any other -- the
+# framing walk skips the extension to find the CRLF, so the pacing boundary is
+# still the end of the data CRLF and not the semicolon. Worth its own case
+# because an extension is the one legal way a size line can be arbitrarily long,
+# which is exactly what makes the load-time cost estimate a floor rather than an
+# exact count.
+name              chunk extensions do not disturb the framing walk
+send              POST /__probe HTTP/1.1\r\n
+send              Host: prober\r\n
+send              Transfer-Encoding: chunked\r\n
+send              Connection: close\r\n\r\n
+send_slow_chunks  20
+send              2;a=1\r\nhi\r\n2;b=2\r\nyo\r\n0\r\n\r\n
+delta             fds == 0
+delta             pool.cycle_used == 0
+
+# Zero-sized chunks are the smallest unit the wire allows and the one the
+# load-time cost estimate is built on. A body made entirely of them sends no
+# data at all, so any per-read allocation shows up with nothing to hide behind.
+name              a run of zero-sized chunks is still one unit per write
+send              POST /__probe HTTP/1.1\r\n
+send              Host: prober\r\n
+send              Transfer-Encoding: chunked\r\n
+send              Connection: close\r\n\r\n
+send_slow_chunks  20
+send              0\r\n\r\n0\r\n\r\n0\r\n\r\n
+delta             fds == 0
+delta             pool.cycle_used == 0
+
+name              worker survives the chunked-trickle battery
+send              GET /__probe HTTP/1.1\r\n
+send              Host: prober\r\nConnection: close\r\n\r\n
+expect            status=200
+probe             zone.present == true
+delta             fds == 0
+delta             pool.cycle_used == 0
