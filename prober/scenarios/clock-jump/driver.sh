@@ -209,7 +209,7 @@ KA_OUT="$PROBER_PREFIX/logs/clock-jump.keepalive"
 # socket ever touched. A self-faking observer can't measure real elapsed time
 # regardless of the crash, so leaving the preload on here would be wrong even
 # if libfaketime patched the EINVAL away.
-H="$HOST" P="$PORT" FT="$FT" STEP="$STEP_SECONDS" WAIT="$KEEPALIVE_WAIT" LD_PRELOAD= \
+H="$HOST" P="$PORT" FT="$FT" STEP="$STEP_SECONDS" WAIT="$KEEPALIVE_WAIT" LD_PRELOAD='' \
 timeout $(( KEEPALIVE_WAIT + 6 )) python3 - >"$KA_OUT" 2>&1 <<'PY' || true
 import os, socket, time
 
