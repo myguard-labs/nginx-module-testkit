@@ -570,13 +570,21 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends eatmydata
           sudo eatmydata apt-get install -y --no-install-recommends \
-              libpcre2-dev zlib1g-dev libssl-dev strace
+              libpcre2-dev zlib1g-dev libssl-dev strace faketime
           # strace: the syscall-allowlist scenario attaches a tracer to the
           # worker and asserts on its per-request syscall set. Without it the
           # driver SKIPs (it guards on `command -v strace`), which would make
           # that leg silently vacuous rather than fail. GitHub's ubuntu runners
           # default to yama ptrace_scope=0, so a same-uid attach needs no
           # privilege.
+          #
+          # faketime: the clock-jump scenario LD_PRELOADs libfaketime to step
+          # the worker's WALL clock mid-run. Without it the scenario's
+          # `requires` gate SKIPs it -- same contract, and same hazard: a skip
+          # here is a leg that proves nothing. This scenario spent its whole
+          # life vacuous for want of exactly this dependency (it shipped no
+          # env/driver at all until 2026-07-29), so the install is the thing
+          # keeping it honest.
 
       # Same fetch discipline as probe-compiles: download, verify, THEN unpack.
       # Never `curl | tar`, which extracts whatever is served at the moment CI

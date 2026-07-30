@@ -1,0 +1,43 @@
+# Sourced before boot. LD_PRELOAD libfaketime into the server so the driver can
+# step its wall clock, and point it at a timestamp FILE rather than a fixed
+# offset -- the file is what makes the step happen mid-run, under a worker that
+# is already up, instead of merely booting the server in the past.
+#
+# FAKETIME_DONT_FAKE_MONOTONIC=1 is the load-bearing setting, and it is the
+# difference between this scenario testing something and testing nothing.
+# Without it libfaketime fakes CLOCK_MONOTONIC TOO (measured: an unpreloaded
+# CLOCK_MONOTONIC reads ~90183 while the faked one reads the realtime value
+# ~1785276494, and a -3600 step moves BOTH). A monotonic clock that jumps
+# backwards is not a scenario nginx is required to survive -- the kernel
+# guarantees it never happens -- so asserting against one measures libfaketime,
+# not the server. With this set, CLOCK_MONOTONIC is passed through untouched
+# (mono ~90191, real stepped back an hour) and the step is a genuine wall-clock
+# step: exactly the NTP-correction shape a real server does have to survive.
+#
+# The three `env` directives in nginx.conf are the other half of this; see the
+# comment there. Without them the worker inherits the mapped library but NOT
+# these variables, and every step is silently ignored.
+for _so in /usr/lib/*/faketime/libfaketime.so.1 /usr/lib/faketime/libfaketime.so.1; do
+    [ -r "$_so" ] && { LD_PRELOAD="$_so"; break; }
+done
+export LD_PRELOAD
+
+# The driver rewrites this file to step the clock. "+0" boots at the real time.
+#
+# The env file is sourced BEFORE run-scenario.sh creates the run prefix, so the
+# prefix has to be materialised here -- prober_make_prefix is idempotent and the
+# backend path already calls it the same way, for the same reason (it needs the
+# prefix before the conf render too).
+prober_make_prefix
+FAKETIME_TIMESTAMP_FILE="$PROBER_PREFIX/faketime.rc"
+# Atomic write, as in the driver's step_clock(): the library re-reads this file
+# on every clock call, so a reader must never catch it half-written.
+printf '+0\n' > "$FAKETIME_TIMESTAMP_FILE.tmp"
+mv -f "$FAKETIME_TIMESTAMP_FILE.tmp" "$FAKETIME_TIMESTAMP_FILE"
+export FAKETIME_TIMESTAMP_FILE
+
+# Re-read the file on every call rather than caching it for 10s (the default),
+# so a step takes effect immediately instead of whenever the cache happens to
+# expire -- a cached offset would make the driver's timing race the library's.
+export FAKETIME_NO_CACHE=1
+export FAKETIME_DONT_FAKE_MONOTONIC=1
