@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  177
+#define PLANNED  183
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -147,6 +147,19 @@ typedef struct {
     size_t  got_len;
     size_t  reads;          /* successful read() calls that returned bytes */
     size_t  max_read;       /* largest single read, in bytes */
+
+    /* Size of each read, in order, truncated at ECHO_SEGS entries.
+     *
+     * `reads` and `max_read` bound how the request was segmented; they cannot
+     * say WHERE it was cut, and for chunk-unit pacing that is the whole claim.
+     * A byte-count pacer and a unit pacer over the same body can agree on both
+     * summary numbers while splitting at completely different offsets -- one of
+     * them mid size-line -- so proving `send_slow_chunks` paces by framing needs
+     * the boundaries themselves. Coalescing still applies (see the read loop),
+     * so assertions on this look for the framing offsets among the boundaries
+     * rather than demanding an exact segment list. */
+    size_t  segs[16];
+    size_t  n_segs;
     int     saw_eof;        /* the client half-closed: read() returned 0 */
 
     /* The client reset the connection: read() failed with ECONNRESET rather
@@ -269,6 +282,10 @@ spawn_echo(int *port, size_t want_len, int want_eof, int result_fd)
 
             if ((size_t) n > r.max_read) {
                 r.max_read = (size_t) n;
+            }
+
+            if (r.n_segs < sizeof(r.segs) / sizeof(r.segs[0])) {
+                r.segs[r.n_segs++] = (size_t) n;
             }
 
             len += (size_t) n;
@@ -2022,10 +2039,12 @@ main(void)
     {
         static const unsigned char  req[] = "GET / HTTP/1.0\r\n\r\n";
         const size_t                req_len = sizeof(req) - 1;
-        /* Zeroed so `chunk` is 0 (plain stall) in every case that does not set
-         * it -- an uninitialized chunk would turn the pause cases into pacing
-         * cases at random. */
-        http_pause                  p[2] = {{0, 0, 0}, {0, 0, 0}};
+        /* Zeroed so `chunk` and `unit` are both 0 (plain stall) in every case
+         * that does not set them -- an uninitialized chunk would turn the pause
+         * cases into pacing cases at random. Written as {0} rather than a
+         * field-count list so adding a pacing field to http_pause cannot leave
+         * this fixture partly indeterminate. */
+        http_pause                  p[2] = {{0}, {0}};
         echo_result                 er;
         int                         rc;
 
@@ -2144,6 +2163,182 @@ main(void)
            "send_slow can begin partway through the request");
 
         p[0].chunk = 0;
+
+        /* ---- send_slow_chunks: pacing at chunked-framing granularity ----- */
+
+        {
+            /*
+             * Three units of DELIBERATELY UNEQUAL length -- 6, 8, 5 -- after a
+             * 48-byte header block. Unequal because equal ones cannot tell the
+             * two pacers apart: any fixed chunk size that happens to match the
+             * unit length segments an equal-unit body identically, so the test
+             * would pass with the byte-count pacer wired in by mistake. With
+             * 6/8/5 the boundaries fall at 54, 62 and 67 bytes, which no single
+             * chunk size reproduces.
+             */
+            static const unsigned char  creq[] =
+                "POST /c HTTP/1.1\r\n"
+                "Transfer-Encoding: chunked\r\n\r\n"
+                "1\r\nX\r\n"
+                "3\r\nYYY\r\n"
+                "0\r\n\r\n";
+            const size_t  creq_len = sizeof(creq) - 1;
+            const size_t  head_len = 48;   /* through the header terminator */
+            size_t        cum, s;
+            int           saw_first, saw_second;
+
+            /* Pace only the body: a rule file that dribbles the header block
+             * too is a different (slowloris) test, and the framing walk has
+             * nothing to parse before the body starts. */
+            p[0].offset = head_len;
+            p[0].ms = 20;
+            p[0].chunk = 0;
+            p[0].unit = 1;
+
+            rc = run_echo(creq, creq_len, p, 1, &er);
+
+            ok(rc == 0 && er.got_len == creq_len
+               && memcmp(er.got, creq, creq_len) == 0,
+               "a unit-paced request arrives byte-identical and in order");
+
+            /*
+             * The framing claim: the cut after the first unit (offset 54 =
+             * 48 + 6) and after the second (62 = 54 + 8) both appear as read
+             * boundaries. Searched among the cumulative boundaries rather than
+             * compared to an exact segment list, because TCP may coalesce the
+             * later writes -- which can only ever REMOVE a boundary, so finding
+             * both is decisive while missing one is not attributable to
+             * coalescing alone.
+             */
+            cum = 0;
+            saw_first = 0;
+            saw_second = 0;
+
+            for (s = 0; s < er.n_segs; s++) {
+                cum += er.segs[s];
+
+                if (cum == head_len + 6) {
+                    saw_first = 1;
+                }
+
+                if (cum == head_len + 6 + 8) {
+                    saw_second = 1;
+                }
+            }
+
+            ok(rc == 0 && saw_first && saw_second,
+               "send_slow_chunks cuts on the chunk-unit boundaries, not on a "
+               "byte count");
+
+            /*
+             * The negative control for the assertion above, and the reason this
+             * directive exists at all: the byte-count pacer over the SAME body,
+             * with the chunk size set to the first unit's length. It agrees on
+             * the first boundary and must then drift -- 6 bytes into an 8-byte
+             * unit is mid size-line -- so the second framing boundary is absent.
+             * If this passed, `send_slow` already did the job and the whole
+             * directive would be dead weight.
+             */
+            p[0].chunk = 6;
+            p[0].unit = 0;
+
+            rc = run_echo(creq, creq_len, p, 1, &er);
+
+            cum = 0;
+            saw_second = 0;
+
+            for (s = 0; s < er.n_segs; s++) {
+                cum += er.segs[s];
+
+                if (cum == head_len + 6 + 8) {
+                    saw_second = 1;
+                }
+            }
+
+            ok(rc == 0 && !saw_second,
+               "the byte-count pacer misses the second unit boundary, which is "
+               "what send_slow_chunks exists to hit");
+
+            /* One sleep per unit, two of them inside the fixture's measured
+             * window for the same reason case 53 states: the clock starts at
+             * accept(), so the leading sleep may already be underway. Floor of
+             * 30 against a nominal 3 x 20 = 60. */
+            p[0].chunk = 0;
+            p[0].unit = 1;
+
+            rc = run_echo(creq, creq_len, p, 1, &er);
+
+            ok(rc == 0 && er.elapsed_ms >= 30,
+               "send_slow_chunks paces the units apart in time");
+
+            /*
+             * Framing this parser rejects is still SENT, in full, byte-identical
+             * -- the harness exists to put malformed framing on the wire. Bare
+             * LF after the size, which parse_chunk_size() refuses on purpose (a
+             * lenient reading of it is the smuggling differential), so the walk
+             * bails on the first unit and the whole body goes out as one write.
+             */
+            {
+                static const unsigned char  bad[] =
+                    "POST /c HTTP/1.1\r\n"
+                    "Transfer-Encoding: chunked\r\n\r\n"
+                    "1\nX\r\n0\r\n\r\n";
+                const size_t  bad_len = sizeof(bad) - 1;
+
+                rc = run_echo(bad, bad_len, p, 1, &er);
+
+                ok(rc == 0 && er.got_len == bad_len
+                   && memcmp(er.got, bad, bad_len) == 0,
+                   "unparseable chunked framing is still written whole and "
+                   "unaltered");
+            }
+
+            /*
+             * A LYING LENGTH: the size line parses cleanly, and only the data's
+             * trailing CRLF says the unit is wrong. `2\r\nX\r\n` declares two
+             * data bytes where one and a terminator follow, so the walk consumes
+             * `X\r` as data and then finds `\n0` where the terminator must be.
+             *
+             * This is the case the terminator check exists for, and it needs its
+             * own fixture because the bare-LF case above never reaches it -- that
+             * one is rejected in the SIZE line, one step earlier. With the check
+             * removed the walk accepts the unit and resumes two bytes into the
+             * next one, so the body is cut at an offset the framing does not
+             * have. The observable is segmentation, not the bytes: a bail writes
+             * the remainder in one go, so the only read boundary inside the body
+             * is its end.
+             */
+            {
+                static const unsigned char  lying[] =
+                    "POST /c HTTP/1.1\r\n"
+                    "Transfer-Encoding: chunked\r\n\r\n"
+                    "2\r\nX\r\n0\r\n\r\n";
+                const size_t  lying_len = sizeof(lying) - 1;
+                int           cut_inside;
+
+                rc = run_echo(lying, lying_len, p, 1, &er);
+
+                cum = 0;
+                cut_inside = 0;
+
+                for (s = 0; s < er.n_segs; s++) {
+                    cum += er.segs[s];
+
+                    if (cum > head_len && cum < lying_len) {
+                        cut_inside = 1;
+                    }
+                }
+
+                ok(rc == 0 && er.got_len == lying_len
+                   && memcmp(er.got, lying, lying_len) == 0 && !cut_inside,
+                   "a chunk whose declared length runs past its CRLF terminator "
+                   "stops the pacing instead of resuming mid-framing");
+            }
+
+            p[0].unit = 0;
+            p[0].offset = 0;
+            p[0].ms = 0;
+        }
 
         /*
          * shutdown SHUT_WR half-closes the sending side once the request is

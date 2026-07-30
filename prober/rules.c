@@ -386,9 +386,20 @@ pause_cost_ms_raw(size_t offset, size_t upto, size_t chunk, long ms)
 }
 
 
+/*
+ * A `unit` entry has no chunk size to cost against, so it is charged as if every
+ * framing unit were the smallest one the wire allows (MIN_CHUNK_UNIT_BYTES).
+ * Costing it as a plain stall instead -- which is what a `chunk == 0` entry gets
+ * -- would charge N units of sleep as one, and the ceiling would pass a case
+ * that spends far past the read timeout.
+ */
 static long
 pause_cost_ms(const http_pause *p, size_t upto)
 {
+    if (p->unit) {
+        return pause_cost_ms_raw(p->offset, upto, MIN_CHUNK_UNIT_BYTES, p->ms);
+    }
+
     return pause_cost_ms_raw(p->offset, upto, p->chunk, p->ms);
 }
 
@@ -708,6 +719,7 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
             PX(pauses)[PX(n_pauses)].offset = PX(request_len);
             PX(pauses)[PX(n_pauses)].ms = ms;
             PX(pauses)[PX(n_pauses)].chunk = 0;
+            PX(pauses)[PX(n_pauses)].unit = 0;
             PX(n_pauses)++;
 
         } else if (strcmp(directive, "send_slow") == 0) {
@@ -776,6 +788,61 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
             PX(pauses)[PX(n_pauses)].offset = PX(request_len);
             PX(pauses)[PX(n_pauses)].ms = ms;
             PX(pauses)[PX(n_pauses)].chunk = (size_t) chunk;
+            PX(pauses)[PX(n_pauses)].unit = 0;
+            PX(n_pauses)++;
+
+        } else if (strcmp(directive, "send_slow_chunks") == 0) {
+            char       *ms_s = trim(arg);
+            char       *stop;
+            long        ms;
+            size_t      k;
+            long        total = 0;
+
+            if (*ms_s == '\0') {
+                die("%s:%d: send_slow_chunks needs <ms>", file, lineno);
+            }
+
+            ms = strtol(ms_s, &stop, 10);
+
+            if (stop == ms_s || *stop != '\0') {
+                die("%s:%d: send_slow_chunks \"%s\" is not a number",
+                    file, lineno, ms_s);
+            }
+
+            if (ms < 1 || ms > MAX_PAUSE_MS) {
+                die("%s:%d: send_slow_chunks %ld out of range (1..%d ms)",
+                    file, lineno, ms, MAX_PAUSE_MS);
+            }
+
+            if (PX(n_pauses) >= MAX_PAUSES) {
+                die("%s:%d: too many pause/send_slow directives (max %d)",
+                    file, lineno, MAX_PAUSES);
+            }
+
+            for (k = 0; k < PX(n_pauses); k++) {
+                total += pause_cost_ms(&PX(pauses)[k],
+                                       k + 1 < PX(n_pauses)
+                                           ? PX(pauses)[k + 1].offset
+                                           : PX(request_len));
+            }
+
+            /* Same load-time cost check as send_slow, against the smallest unit
+             * the framing allows rather than a declared chunk size -- see
+             * MIN_CHUNK_UNIT_BYTES for why the overestimate is the safe
+             * direction. Re-checked at close, since the bytes this entry paces
+             * are not known until the case ends. */
+            total += pause_cost_ms_raw(PX(request_len), PX(request_len),
+                                       MIN_CHUNK_UNIT_BYTES, ms);
+
+            if (total > MAX_PAUSE_MS) {
+                die("%s:%d: send_slow_chunks pushes the case to %ld ms, over "
+                    "the %d ms ceiling", file, lineno, total, MAX_PAUSE_MS);
+            }
+
+            PX(pauses)[PX(n_pauses)].offset = PX(request_len);
+            PX(pauses)[PX(n_pauses)].ms = ms;
+            PX(pauses)[PX(n_pauses)].chunk = 0;
+            PX(pauses)[PX(n_pauses)].unit = 1;
             PX(n_pauses)++;
 
         } else if (strcmp(directive, "shutdown") == 0) {

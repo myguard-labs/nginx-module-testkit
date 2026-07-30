@@ -30,6 +30,14 @@
  * (or the end of the request) go out `chunk` bytes at a time with `ms` between
  * writes, which is the slowloris primitive. Zero means the plain single stall.
  *
+ * `unit` paces the same span at CHUNKED-FRAMING granularity instead of by a
+ * byte count: one `<hex>[;ext]\r\n<data>\r\n` unit per write, `ms` between
+ * them. A byte count cannot express this -- `chunk` slices the span at fixed
+ * offsets irrespective of framing, so a split lands mid size-line as often as
+ * on a boundary, and the peer sees a partial chunk header rather than a
+ * complete-but-tiny chunk. `unit` and `chunk` are mutually exclusive; `unit`
+ * wins if both are set, and the rule parser rejects the combination outright.
+ *
  * Declared here rather than in rules.h because the transport owns the wire
  * behaviour and must not depend on the rule parser -- rules.c fills these in,
  * but http.c is what makes them mean anything, and http_test.c drives them
@@ -39,6 +47,7 @@ typedef struct {
     size_t  offset;
     long    ms;
     size_t  chunk;
+    int     unit;
 } http_pause;
 
 typedef struct {

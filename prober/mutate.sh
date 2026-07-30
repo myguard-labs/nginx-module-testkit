@@ -204,19 +204,27 @@ trap summarise EXIT INT TERM
 
 # ---- transport: send-side pacing -------------------------------------------
 
+# The two pacers now sleep with the same statement, so each anchor carries the
+# preceding line that is unique to its own loop -- an ambiguous anchor is
+# reported BROKEN rather than silently mutating the wrong function.
 mutate "send_slow: inter-chunk sleep zeroed" http.c \
-    'if (off < len) {
+    'off += n;
+
+        if (off < len) {
             sleep_ms(ms);
-        }' 'if (off < len) {
+        }' 'off += n;
+
+        if (off < len) {
             sleep_ms(ms * 0);
         }' http_test
 
 mutate "send_slow: leading stall dropped" http.c \
-    'sleep_ms(pauses[i].ms);
-
-            if (write_paced(' 'sleep_ms(pauses[i].ms * 0);
-
-            if (write_paced(' http_test
+    'if (pauses[i].unit) {
+                rc = write_paced_units(fd, req + off, upto_next - off,
+                                       pauses[i].ms);' \
+    'if (pauses[i].unit) {
+                rc = write_paced_units(fd, req + off, upto_next - off,
+                                       pauses[i].ms * 0);' http_test
 
 mutate "send_slow: chunk ignored" http.c \
     'if (n > chunk) {
@@ -224,6 +232,35 @@ mutate "send_slow: chunk ignored" http.c \
         }' 'if (0) {
             n = chunk;
         }' http_test
+
+# ---- transport: chunk-unit pacing ------------------------------------------
+
+mutate "send_slow_chunks: inter-unit sleep zeroed" http.c \
+    'off += unit;
+
+        if (off < len) {
+            sleep_ms(ms);
+        }' 'off += unit;
+
+        if (off < len) {
+            sleep_ms(ms * 0);
+        }' http_test
+
+# The pacer selection itself: a unit entry falling through to the byte-count
+# pacer is the defect the directive exists to prevent, and chunk 0 there means
+# "no clamp", so the whole span goes out in one write.
+mutate "send_slow_chunks: paced by byte count instead of framing" http.c \
+    'if (pauses[i].unit) {
+                rc = write_paced_units(' \
+    'if (0) {
+                rc = write_paced_units(' http_test
+
+# The data CRLF check: dropping it makes the walk accept a unit whose data is
+# not CRLF-terminated and resume at the wrong offset, so later cuts land mid
+# framing -- the same failure as pacing by byte count, reached differently.
+mutate "send_slow_chunks: unit CRLF terminator unchecked" http.c \
+    'if (start[unit] != '"'"'\r'"'"' || start[unit + 1] != '"'"'\n'"'"') {' \
+    'if (0) {' http_test
 
 # ---- transport: shutdown ----------------------------------------------------
 
@@ -285,6 +322,16 @@ mutate "send_slow: post-parse ceiling not enforced" rules.c \
                 die("%s: case \"%s\" stalls %ld ms in total, over the %d ms "' \
     'if (0) {
                 die("%s: case \"%s\" stalls %ld ms in total, over the %d ms "' \
+    rules_test
+
+# A unit entry costed as a plain stall: N units of sleep charged as one, so the
+# ceiling passes a case that spends far past the prober's read timeout and the
+# suite reports a harness timeout as if it were a server verdict.
+mutate "send_slow_chunks: unit entry costed as a single stall" rules.c \
+    'if (p->unit) {
+        return pause_cost_ms_raw(p->offset, upto, MIN_CHUNK_UNIT_BYTES, p->ms);' \
+    'if (0) {
+        return pause_cost_ms_raw(p->offset, upto, MIN_CHUNK_UNIT_BYTES, p->ms);' \
     rules_test
 
 # ---- transport: hold --------------------------------------------------------
