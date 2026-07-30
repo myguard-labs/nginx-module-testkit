@@ -698,11 +698,19 @@ write_all(int fd, const unsigned char *buf, size_t len)
  * version token is walked byte by byte and the terminating space must be the
  * one that ends *that* token, not merely the first space in the buffer.
  *
- * Only HTTP/1.x is accepted. nginx and angie only ever put HTTP/1.0 or HTTP/1.1
- * on the wire for the framing this prober reads (h2/h3 are negotiated, not
- * spelled out in a text status line), so a bare "HTTP/2" with no minor version
- * is exactly the kind of malformed input this rejects, not a real case to
- * special-case for.
+ * What is required is the SHAPE `HTTP/<digits>.<digits> `, not a specific
+ * version number: the walk is digit-run based, so "HTTP/10.99 200" parses (
+ * pinned by http_test.c "multi-digit major.minor still parses") while a bare
+ * major-only "HTTP/2 200" does not, because it has no minor version. nginx and
+ * angie only ever put HTTP/1.0 or HTTP/1.1 on the wire for the framing this
+ * prober reads -- h2/h3 are negotiated, not spelled out in a text status line --
+ * so a well-formed but implausible version is left to the rules to assert on
+ * rather than rejected here.
+ *
+ * Version-number filtering would add nothing to framing safety: a status code is
+ * bodiless (or not) by RFC 9110 regardless of the version token that preceded
+ * it, and a 204 carrying a Content-Length is a lying server whose declared body
+ * this code correctly refuses to consume for HTTP/1.1 exactly as for HTTP/2.0.
  *
  * SHARED by http_parse_response() and http_framed_state() on purpose. The
  * classifier used to keep its own looser copy of this walk while its comment

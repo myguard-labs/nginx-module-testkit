@@ -40,14 +40,27 @@ void
 backend_set(backend_script *s, const char *key, const unsigned char *value,
             size_t len)
 {
+    /* Fatal for a SCRIPT-supplied key: a .backend file naming an over-long key
+     * is an authoring mistake, and dying names the file and line while a silent
+     * skip would surface much later as a mystery cache miss. Input off the WIRE
+     * goes through backend_set_checked() instead, which reports rather than
+     * exits -- see the note there.
+     *
+     * The three refusal reasons are distinguished rather than merged into one
+     * message: a script that fills the store told "the key is too long" sends
+     * its author looking at the wrong line entirely. */
+    if (strlen(key) >= BACKEND_MAX_KEY) {
+        die("backend: key \"%s\" is longer than %d bytes", key,
+            BACKEND_MAX_KEY - 1);
+    }
+
+    if (len > BACKEND_MAX_VALUE) {
+        die("backend: value for \"%s\" is %zu bytes, over the %d byte limit",
+            key, len, BACKEND_MAX_VALUE);
+    }
+
     if (backend_set_checked(s, key, value, len) != 0) {
-        /* Fatal for a SCRIPT-supplied key: a .backend file naming an
-         * over-long key is an authoring mistake, and dying names the file and
-         * line while a silent skip would surface much later as a mystery cache
-         * miss. Input off the WIRE goes through backend_set_checked() instead,
-         * which reports rather than exits -- see the note there. */
-        die("backend: key \"%s\" is longer than %d bytes, or its value is over "
-            "the %d byte limit", key, BACKEND_MAX_KEY - 1, BACKEND_MAX_VALUE);
+        die("backend: store is full (max %d entries)", BACKEND_MAX_ENTRIES);
     }
 }
 
