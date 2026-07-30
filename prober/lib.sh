@@ -1720,9 +1720,15 @@ prober_strace_family_sum() {
 # returns non-zero on a missing field precisely so absent cannot read as a value,
 # and here that fails closed (uncounted) rather than crediting the denominator.
 prober_served_by() {
-    local resp="$1" want="$2" got
+    local resp="$1" want="$2" got status_line
 
-    grep -qE '^HTTP/1\.[01] 200( |$)' <<<"$resp" || return 1
+    # ONLY the first line. `grep` anchors ^/$ per LINE, so feeding it the whole
+    # document matches a status-shaped line ANYWHERE -- including one in the
+    # body, which is attacker-influenced content in a scenario that echoes
+    # request data back. A 500 whose body carried `HTTP/1.1 200 OK` on a line of
+    # its own counted as served.
+    status_line="${resp%%$'\n'*}"
+    grep -qE '^HTTP/1\.[01] 200( |$)' <<<"${status_line%$'\r'}" || return 1
     got="$(prober_probe_field "$resp" pid 2>/dev/null)" || return 1
     [ "$got" = "$want" ]
 }

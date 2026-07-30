@@ -34,7 +34,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=32
+PLANNED=33
 tests_run=0
 failures=0
 
@@ -325,11 +325,17 @@ done
 assert_eq "a malformed '2000' status is NOT served" \
     "no" "$(prober_served_by $'HTTP/1.1 2000 Bogus\r\n\r\n{"pid":1111}' "$TRACED" && echo yes || echo no)"
 
-# The paired negative for the anchor, kept from the s173 review: a status-like
-# line in the BODY must not count, but a real status line must still be found
-# even though it is not the only line in the document.
-assert_eq "a status-like line in the BODY does not make an unserved response served" \
-    "no" "$(prober_served_by $'HTTP/1.1 500 Internal\r\n\r\nX: HTTP/1.1 200 OK\n{"pid":1111}' "$TRACED" && echo yes || echo no)"
+# The paired negative for the anchor. NOTE the body line is UNPREFIXED: a
+# `X: `-prefixed one fails the regex on any line-matching implementation, buggy
+# or fixed, so it proves nothing. This shape reds against the whole-document
+# grep and passes only once the match is pinned to the status line.
+assert_eq "an unprefixed status-like line in the BODY does not make an unserved response served" \
+    "no" "$(prober_served_by $'HTTP/1.1 500 Internal\r\n\r\nHTTP/1.1 200 OK\n{"pid":1111}' "$TRACED" && echo yes || echo no)"
+
+# The other half of the same anchor: a REAL status line must still be found
+# when it is not the only line in the document.
+assert_eq "a 200 with a multi-line body is still served" \
+    "yes" "$(prober_served_by $'HTTP/1.1 200 OK\r\nX: y\r\n\r\nnoise\n{"pid":1111}' "$TRACED" && echo yes || echo no)"
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
     echo "not ok $((tests_run + 1)) - plan said $PLANNED, ran $tests_run"

@@ -867,8 +867,20 @@ mutate "syscall budget: family member validated by first character only" lib.sh 
 # exact behaviour they exist to catch. This restores the original matcher.
 # shellcheck disable=SC2016
 mutate "syscall budget: served counted without binding the response to the traced pid" lib.sh \
-    "    grep -qE '^HTTP/1\.[01] 200( |\$)' <<<\"\$resp\" || return 1" \
+    "    grep -qE '^HTTP/1\.[01] 200( |\$)' <<<\"\${status_line%\$'\\r'}\" || return 1" \
     "    grep -qE '^HTTP/1\.[01] [0-9]{3}' <<<\"\$resp\" && return 0 || return 1" \
+    syscall_budget_test.sh
+
+# grep anchors ^/\$ per LINE, so matching the status over the WHOLE document
+# accepts a status-shaped line anywhere in it -- including the body, which in
+# this scenario echoes request-influenced content. A 500 carrying
+# `HTTP/1.1 200 OK` on its own line then counts toward the denominator. The
+# control this row protects has to use an UNPREFIXED body line: a prefixed one
+# fails the regex on the buggy and the fixed implementation alike.
+# shellcheck disable=SC2016
+mutate "syscall budget: status matched over the whole response, not the status line" lib.sh \
+    "    status_line=\"\${resp%%\$'\\n'*}\"" \
+    "    status_line=\"\$resp\"" \
     syscall_budget_test.sh
 
 
