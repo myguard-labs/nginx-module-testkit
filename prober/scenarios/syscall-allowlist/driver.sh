@@ -27,6 +27,17 @@
 # attaching a tracer to the server it is probing or diffing a syscall set. This
 # is server-side introspection the rule DSL cannot express.
 #
+# THE BUDGET (assertion 3). The set gate is one-directional and cannot see a
+# module that opens one file of its OWN per request: openat is necessarily
+# allowlisted, because the reference probe walks /proc/self/fd on every request
+# (baseline.syscalls:52-60 names this hole in its own comment). Only a COUNT
+# ceiling closes it. The budget is expressed per SERVED response and over syscall
+# FAMILIES (openat+open, accept4+accept) rather than single names, because the
+# libc near-neighbours are separately allowlisted and a name-wise ceiling would
+# leave the hole open to a module calling syscall(SYS_open, ...). Only counts
+# that are structurally per-request are budgeted -- see the assertion itself for
+# why readlink/getdents64 are NOT among them despite looking constant on one box.
+#
 # CROSS-VERSION STABILITY. The observed set on a bare request path is small and
 # stable across nginx mainline, stable, and angie: accept4/close for the
 # connection, epoll_ctl/epoll_wait for readiness, recvfrom for the request,
@@ -55,7 +66,7 @@ FAILED=0
 # A precondition that is not met SKIPs the whole scenario the harness-native way:
 # a lone `1..0 # SKIP <reason>` plan line, which test-scenarios.sh renders as
 # `ok N - <scenario> # SKIP <reason>` (same idiom as run-scenario.sh's requires
-# gate). The real `1..2` plan is emitted only once every precondition holds, so a
+# gate). The real `1..3` plan is emitted only once every precondition holds, so a
 # skipped leg reports as SKIPPED, not as two vacuous passes.
 #
 # A sanitizer-instrumented server pollutes the request-path syscall set with the
@@ -112,8 +123,8 @@ if grep -qiE 'operation not permitted|ptrace|could not attach|permission denied'
     exit 0
 fi
 
-# Every precondition holds: from here the scenario runs its two real assertions.
-echo "1..2"
+# Every precondition holds: from here the scenario runs its three real assertions.
+echo "1..3"
 
 # The worker, not the master: the master accepts no connections and answers no
 # probe, so its syscall set is a boot-and-signal surface, not the request path.
@@ -166,16 +177,30 @@ if [ "$ATTACHED" -ne 1 ]; then
 fi
 
 # A fixed burst -- enough requests that the full per-request surface is exercised
-# (accept, read, write, close on each), few enough to stay fast. Count is not
-# asserted on; only the set of names is. Each request goes to /__probe, the
-# location wired to the MODULE handler: a burst to a `return 200` location would
-# exercise only nginx core and never touch the syscalls a module makes.
+# (accept, read, write, close on each), few enough to stay fast. The SET gate
+# (assertion 2) does not care about this count, but the BUDGET gate (assertion
+# 3, below) is expressed per-request -- so BURST is a real variable, not a magic
+# number repeated at the call site, or the two would drift apart silently if one
+# were edited and not the other.
 #
-# Over /dev/tcp (bash's own client), not curl -- the same client lib.sh uses, so
-# the scenario carries no dependency the rest of the harness does not already
-# have. Read to EOF (Connection: close) so each exchange completes -- accept
-# through close -- before the next, keeping the per-request surface intact.
-for _r in $(seq 1 20); do
+# SERVED, not BURST, is the budget's denominator. Every failure mode in the loop
+# below is deliberately swallowed (a connect that is refused, a write that takes
+# EPIPE, a read that times out) so one bad iteration cannot kill the driver --
+# which means the attempted count says nothing about how many requests the
+# traced worker actually answered. Dividing by attempts is slack in the
+# attacker's favour: if only 15 of 20 reach the worker, a mutant issuing 4
+# openat per request totals 60 and sits exactly ON a 3x20 ceiling, passing while
+# every single served request breaches it. So count the responses that were
+# actually read back, and gate on that.
+#
+# And "read back" is not enough on its own: the response must have come from the
+# TRACED worker. A response served by a replacement worker spends its syscalls
+# where strace is not looking, so counting it inflates the denominator without
+# contributing to the numerator -- the same vacuous-gate shape by a second route.
+# See the pid check in the loop.
+BURST=20
+SERVED=0
+for _r in $(seq 1 "$BURST"); do
     if exec 3<>"/dev/tcp/$HOST/$PORT"; then
         # trap '' PIPE + a `timeout`-bounded read, the load-bearing pattern
         # lib.sh uses on this same transport: a `Connection: close` server can
@@ -185,8 +210,38 @@ for _r in $(seq 1 20); do
         # or hang it.
         (trap '' PIPE
          printf 'GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' >&3 2>/dev/null) || true
-        timeout "${PROBER_PROBE_TIMEOUT:-2}" cat <&3 >/dev/null 2>&1 || true
+        # Read the WHOLE response, headers and body: the body is where the
+        # answering worker's pid is, and that pid -- not the status line alone --
+        # is what makes this response countable. A status line only distinguishes
+        # "something answered" from "the connect succeeded and nothing came
+        # back"; it says nothing about WHICH worker spent the syscalls the budget
+        # is about to divide by.
+        _resp="$(timeout "${PROBER_PROBE_TIMEOUT:-2}" cat <&3 2>/dev/null || true)"
         exec 3>&- 3<&- || true
+        # ...AND that the worker which answered is the one being TRACED. A
+        # status line alone is not that proof. strace is attached to a single pid
+        # (-f follows that pid's children, but a replacement worker is forked by
+        # the MASTER, not by the tracee). If the traced worker retires mid-burst
+        # -- it exits, it is killed, it hits worker_shutdown_timeout -- the master
+        # forks a successor that serves the remaining requests off-tracee, and
+        # every one of those responses would still be counted here. The
+        # denominator then inflates to the full burst while the numerator holds
+        # only the syscalls of the handful the tracee actually answered, so the
+        # ceiling is compared against a burst the tracee never served and a
+        # mutant's extra opens land on a pid nothing is counting. All three
+        # assertions pass on precisely the behaviour they exist to catch, and
+        # `worker_processes 1` does not prevent it -- sequential replacement is
+        # still one worker at a time.
+        #
+        # The predicate lives in lib.sh as prober_served_by rather than inline
+        # here, for the same reason the summary parser does: a rule that only
+        # ever runs inside a scenario can only be tested by booting a server, and
+        # the shapes that matter -- a response from a REPLACEMENT worker, a body
+        # with no pid, an interim 103 -- are precisely the ones a healthy run
+        # never produces. Extracted, syscall_budget_test.sh feeds it all of them.
+        if prober_served_by "$_resp" "$WORKER"; then
+            SERVED=$((SERVED + 1))
+        fi
     fi
 done
 
@@ -216,8 +271,9 @@ if [ -z "$OBSERVED" ]; then
     echo "# strace stderr:"
     sed 's/^/# /' "$STRACE_OUT.err"
     FAILED=1
-    # Still emit test 2's line so the plan count holds.
+    # Still emit test 2 and 3's lines so the plan count holds.
     echo "not ok 2 - no observed set to check against the allowlist"
+    echo "not ok 3 - no observed set to check against the budget"
     exit "$FAILED"
 fi
 
@@ -243,6 +299,7 @@ if [ -n "$MISSING" ]; then
     printf '%s\n' "$OBSERVED" | sed 's/^/#   /'
     FAILED=1
     echo "not ok 2 - no request-path trace to check against the allowlist"
+    echo "not ok 3 - no request-path trace to check against the budget"
     exit "$FAILED"
 fi
 echo "ok 1 - traced the request path on the worker (accept+read+write present)"
@@ -256,6 +313,7 @@ echo "ok 1 - traced the request path on the worker (accept+read+write present)"
 ALLOWED="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$ALLOWLIST" | grep -E '^[a-z][a-z0-9_]*$' | sort -u || true)"
 if [ -z "$ALLOWED" ]; then
     echo "not ok 2 - allowlist $ALLOWLIST is empty or unreadable"
+    echo "not ok 3 - no allowlist, budget check skipped"
     exit 1
 fi
 
@@ -276,6 +334,107 @@ if [ -n "$UNKNOWN" ]; then
     FAILED=1
 else
     echo "ok 2 - every request-path syscall is in the allowlist"
+fi
+
+# --- the budget gate -------------------------------------------------------
+#
+# The SET gate above is one-directional by design (baseline.syscalls:11-16) and
+# baseline.syscalls:52-60 names its own hole: openat MUST be allowlisted because
+# the reference probe walks /proc/self/fd every request, so a module that opens
+# ONE FILE OF ITS OWN per request is invisible to the set gate -- it still shows
+# up as "openat", already on the list. Only a per-request COUNT ceiling closes
+# that gap.
+#
+# BUDGET FAMILIES, NOT NAMES. A ceiling on a single NAME closes nothing here,
+# because the libc near-neighbours are each separately allowlisted (see
+# baseline.syscalls): a module calling syscall(SYS_open, ...) once per request
+# leaves `openat` at exactly its baseline, so the set gate stays green (open is
+# allowlisted) AND a name-wise openat ceiling stays green (openat did not move).
+# The very hole this assertion exists to close survives it. Summing the family
+# is what makes the ceiling mean "a file was opened", not "openat was used".
+#
+# A family that appears NOWHERE in the table is RED, not zero. Absent-means-zero
+# is safe only for one optional member of a family that was itself observed; if
+# no member appears at all, the capture is not what this code thinks it is
+# (changed strace format, truncated summary, a typo in the family string) and
+# reporting 0 answers a question that could not be evaluated -- with the most
+# comfortable possible answer. prober_strace_family_sum enforces both.
+#
+# Measured per-request and per-family (s171):
+#     openat+open = 3 per served request      accept4+accept = 1 per served request
+#
+# ONLY these two. `readlink` and `getdents64` were in the first version of this
+# gate at 11N and 4N and are NOT constants: src/ngx_test_probe.c issues one
+# readlink per entry in /proc/self/fd and a getdents64 per buffer-full of the
+# two directory walks, so both scale with the worker's FD POPULATION -- build
+# config, module set, log files, listening sockets -- not with the request
+# count. CI proved it rather than argument: run 30549769006 reads readlink=13N
+# on nginx 1.29.0 and angie 1.12.0 while 1.28.0 sits at 11N. The local sweep
+# that produced 11N had zero variance because it never left one machine, which
+# rules out run-to-run noise and says nothing about environment dependence. A
+# ceiling over an FD-dependent count is a flake generator, and a flaky gate gets
+# widened until it asserts nothing. Restoring either needs a baseline observed
+# in the SAME run, not a constant.
+#
+# epoll_wait and recvfrom are excluded for the neighbouring reason: they wobbled
+# +/-1 across otherwise-identical runs (the kernel coalescing readiness, not
+# module behaviour).
+#
+# Expressed as `count <= K * SERVED`, never a bare absolute -- an absolute
+# silently re-scales (goes slack or starts flaking) the moment someone edits
+# BURST without touching this table, which is the same failure mode this whole
+# oracle exists to catch, one level up.
+COUNTS="$(prober_strace_counts "$STRACE_OUT")"
+
+# The denominator has to be positive AND the responses have to have been served
+# by the traced worker. Assertion 1 already proved the request path was traced;
+# this proves the divisor is real. A zero here would make every ceiling zero and
+# red the gate for the wrong reason, so name it.
+if [ "$SERVED" -lt 1 ]; then
+    echo "not ok 3 - no request was served during the trace; no budget denominator"
+    echo "# attempted burst=$BURST, verified responses=$SERVED"
+    FAILED=1
+elif [ "$SERVED" -lt "$BURST" ]; then
+    # Fewer served than attempted is not itself a failure -- the ceiling scales
+    # with SERVED, so the gate stays exact -- but it is worth saying out loud,
+    # because a shrinking denominator is how this assertion would quietly lose
+    # its power to a mutant that also breaks the transport.
+    echo "# note: $SERVED of $BURST requests verified served; ceilings scale to $SERVED"
+fi
+
+BUDGET_BREACH=""
+BUDGET_UNREADABLE=""
+if [ "$SERVED" -ge 1 ]; then
+    for pair in "openat+open:3" "accept4+accept:1"; do
+        family="${pair%:*}"
+        mult="${pair##*:}"
+        ceiling=$((mult * SERVED))
+        if ! got="$(prober_strace_family_sum "$COUNTS" "$family")"; then
+            BUDGET_UNREADABLE="${BUDGET_UNREADABLE:+$BUDGET_UNREADABLE }$family"
+            continue
+        fi
+        if [ "$got" -gt "$ceiling" ]; then
+            BUDGET_BREACH="${BUDGET_BREACH:+$BUDGET_BREACH }$family=$got(>$ceiling)"
+        fi
+    done
+
+    if [ -n "$BUDGET_UNREADABLE" ]; then
+        echo "not ok 3 - budgeted syscall family absent from the strace summary: $BUDGET_UNREADABLE"
+        echo "# not one member of that family appears in the table, so the ceiling could"
+        echo "# not be evaluated -- treated as a failure, never as a count of zero"
+        echo "# strace summary:"
+        sed 's/^/#   /' "$STRACE_OUT"
+        FAILED=1
+    elif [ -n "$BUDGET_BREACH" ]; then
+        echo "not ok 3 - per-request syscall budget exceeded: $BUDGET_BREACH"
+        echo "# served=$SERVED; ceilings are openat+open <= 3N, accept4+accept <= N"
+        echo "# a module opening its own file per request hides inside the SET gate (it"
+        echo "# still reads as openat, or as an allowlisted near-neighbour) but crosses"
+        echo "# this per-request ceiling instead"
+        FAILED=1
+    else
+        echo "ok 3 - per-request syscall counts stay at or under budget (served=$SERVED)"
+    fi
 fi
 
 exit "$FAILED"

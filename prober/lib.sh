@@ -1601,6 +1601,138 @@ prober_backend_scrape() {
     return "$rc"
 }
 
+# prober_strace_counts FILE
+#
+# Parse an `strace -c` summary table on stdout as `NAME COUNT` pairs, one per
+# data row. Lives here rather than inline in the syscall-allowlist driver for
+# one reason: a parser that only ever runs inside a scenario can only be tested
+# by booting a server, so the shapes that matter -- an errors row, a missing
+# row, a duplicate name -- are exactly the ones CI never produces. Extracted, it
+# takes committed fixtures in syscall_budget_test.sh and a mutation that must
+# red.
+#
+# Take calls as $4, counting from the LEFT. Counting from the right ($(NF-1))
+# is wrong and fails in the dangerous direction: the `errors` column is only
+# PRESENT on rows that had errors, so a clean row is
+#     % time  seconds  usecs/call  calls  syscall              (NF=5)
+# while a row with failures is
+#     % time  seconds  usecs/call  calls  errors  syscall      (NF=6)
+# and $(NF-1) reads ERRORS, not calls, on exactly those rows. A budgeted openat
+# that starts erroring would then be compared as (say) 7 instead of 200 and a
+# ceiling would PASS while massively breached -- a vacuous gate, which is the
+# failure class the scenario using this exists to catch. strace's leading four
+# columns are present in both shapes, so $4 is stable for both.
+prober_strace_counts() {
+    awk '
+        /^[[:space:]]*-+/ { next }
+        /% time/          { next }
+        /total/           { next }
+        NF >= 5 && $NF ~ /^[a-z][a-z0-9_]*$/ && $4 ~ /^[0-9]+$/ { print $NF, $4 }
+    ' "$1"
+}
+
+# prober_strace_family_sum COUNTS FAMILY
+#
+# Sum the call counts of a syscall FAMILY (a `+`-separated list of names, e.g.
+# "openat+open") over the `NAME COUNT` pairs in COUNTS. Prints the sum on
+# success and returns 0; prints nothing and returns 1 when the family is
+# malformed or when NOT ONE of its members appears in the table.
+#
+# WHY A FAMILY, AND WHY MISSING-IS-AN-ERROR. Both properties come from the same
+# defect (s171): budgeting a single NAME whose libc near-neighbours are each
+# separately allowlisted closes nothing. A module calling syscall(SYS_open, ...)
+# once per request leaves `openat` at its baseline, so a name-wise budget passes
+# while the per-request file open it was built to catch sails through. Summing
+# the family is what makes the ceiling attacker-relevant.
+#
+# And absent-means-zero is safe ONLY for one optional member of a family that
+# was itself observed. If NO member appears, the table is not what the caller
+# thinks it is -- a changed strace format, a truncated capture, a typo in the
+# family string -- and returning 0 would report the most comfortable possible
+# answer to a question that could not be evaluated. That is the vacuous-gate
+# shape, so it is an error the caller must red on.
+prober_strace_family_sum() {
+    local counts="$1" family="$2"
+
+    case "$family" in
+        '' | *'++'* | '+'* | *'+') return 1 ;;
+    esac
+
+    # Split on `+` WITHOUT letting the shell glob the members. Unquoted `set --
+    # $family` word-splits correctly but also pathname-expands, so a member
+    # containing a glob metacharacter ("openat+open*") either expands against the
+    # cwd or -- finding no match -- survives verbatim, and either way the caller's
+    # typo becomes something other than what it wrote. `read -r -a` under IFS
+    # splits with no expansion at all.
+    local -a names=()
+    IFS='+' read -r -a names <<<"$family"
+
+    local name sum=0 seen=0 got
+    for name in "${names[@]}"; do
+        # Validate the WHOLE name, not its first character. `case "$name" in
+        # [a-z]*)` accepted "opemat", "open!", "open_at" and "open*" alike: each
+        # starts with a lowercase letter, so each passed, and family-wide `seen`
+        # then let the one VALID member (openat) mask its typo'd sibling -- the
+        # sum came back rc=0 at openat's count alone. That is the name-wise
+        # bypass this function exists to close, silently recreated by any future
+        # edit to a family string. A member must be syscall-shaped end to end, or
+        # the family is unevaluable and the caller must red.
+        case "$name" in
+            '' | [!a-z]* | *[!a-z0-9_]*) return 1 ;;
+        esac
+        # Every matching row is summed, not just the first: a table carrying the
+        # same name twice (an -f capture that did not fold two threads, a
+        # concatenated summary) would otherwise be read at a fraction of its
+        # real count -- again low, again in the passing direction.
+        got="$(awk -v n="$name" '$1 == n { s += $2; f = 1 } END { if (f) print s }' <<<"$counts")"
+        if [ -n "$got" ]; then
+            seen=1
+            sum=$((sum + got))
+        fi
+    done
+
+    [ "$seen" -eq 1 ] || return 1
+    printf '%s\n' "$sum"
+}
+
+# prober_served_by RESPONSE PID
+#
+# True when RESPONSE is a final 200 whose probe body reports it was answered by
+# PID. This is the syscall budget's denominator predicate: it decides whether a
+# response counts toward the SERVED figure the per-request ceilings scale with.
+#
+# WHY THE PID, NOT JUST A STATUS LINE. strace attaches to ONE pid. `-f` follows
+# that tracee's children, but a replacement worker is forked by the MASTER, not
+# by the tracee -- so if the traced worker retires mid-burst, its successor
+# serves the remainder entirely off-tracee. Counting those responses inflates the
+# denominator while the numerator still holds only the tracee's syscalls: the
+# ceiling is then compared against a burst the traced worker never served, and a
+# mutant's extra opens land on a pid nothing is counting. Every assertion passes
+# on exactly the behaviour they exist to catch. `worker_processes 1` does not
+# prevent this -- sequential replacement is still one worker at a time.
+#
+# WHY 200 AND NOT ANY THREE DIGITS. The status is matched as a final 200
+# specifically. An interim `103`, a `500`, and the malformed `2000` all matched a
+# bare `[0-9]{3}` pattern and each counted as a served response, none of which
+# spent a served request's worth of syscalls.
+#
+# Absent or unparseable pid is NOT served for this purpose: prober_probe_field
+# returns non-zero on a missing field precisely so absent cannot read as a value,
+# and here that fails closed (uncounted) rather than crediting the denominator.
+prober_served_by() {
+    local resp="$1" want="$2" got status_line
+
+    # ONLY the first line. `grep` anchors ^/$ per LINE, so feeding it the whole
+    # document matches a status-shaped line ANYWHERE -- including one in the
+    # body, which is attacker-influenced content in a scenario that echoes
+    # request data back. A 500 whose body carried `HTTP/1.1 200 OK` on a line of
+    # its own counted as served.
+    status_line="${resp%%$'\n'*}"
+    grep -qE '^HTTP/1\.[01] 200( |$)' <<<"${status_line%$'\r'}" || return 1
+    got="$(prober_probe_field "$resp" pid 2>/dev/null)" || return 1
+    [ "$got" = "$want" ]
+}
+
 # prober_cleanup
 #
 # Idempotent teardown of everything a scenario allocated: fake upstream,

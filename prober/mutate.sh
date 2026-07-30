@@ -813,6 +813,77 @@ mutate "schema: reverse-sweep anchor removed" schema_emitter_test.sh \
     schema_emitter_test.sh
 
 
+# ---- syscall budget parser -------------------------------------------------
+
+# The errors column. strace's -c table emits `errors` only on rows that HAD
+# errors, so counting the calls column backwards from the syscall name reads
+# ERRORS on exactly those rows -- and reads them LOW, which is to say under
+# every ceiling. A budgeted openat that starts failing would be compared as 7
+# instead of 200 and the budget gate would pass while massively breached, which
+# is the vacuous-gate class the syscall-allowlist scenario exists to catch.
+#
+# This is the mutation the parser was extracted from the driver FOR. CI's real
+# captures are all clean rows, so the scenario cannot exercise the shape that
+# breaks it: without a fixture test this revert stays green forever.
+# SC2016: literal source text to match, not shell to expand.
+# shellcheck disable=SC2016
+mutate "syscall budget: calls column counted backwards past errors" lib.sh \
+    'NF >= 5 && $NF ~ /^[a-z][a-z0-9_]*$/ && $4 ~ /^[0-9]+$/ { print $NF, $4 }' \
+    'NF >= 5 && $NF ~ /^[a-z][a-z0-9_]*$/ && $(NF-1) ~ /^[0-9]+$/ { print $NF, $(NF-1) }' \
+    syscall_budget_test.sh
+
+# Absent-family-means-zero. If NOT ONE member of a budgeted family appears in
+# the table, the capture is not what the caller thinks it is -- a changed strace
+# format, a truncated summary, a typo in the family string -- and answering 0
+# gives the most comfortable possible answer to a question that could not be
+# evaluated. Every ceiling then passes. The rule is deliberately narrow: an
+# absent member of a family that WAS observed still contributes zero, and
+# assertion 13 pins that boundary, so this mutant cannot be "fixed" by making
+# the whole thing stricter.
+# shellcheck disable=SC2016
+mutate "syscall budget: an absent family sums to zero instead of erroring" lib.sh \
+    '    [ "$seen" -eq 1 ] || return 1' \
+    '    [ "$seen" -eq 1 ] || sum=0' \
+    syscall_budget_test.sh
+
+# First-character-only member validation. `case "$name" in [a-z]*)` tests the
+# first character and nothing else, so "open!", "open*" and "open-at" all pass
+# it -- and family-wide `seen` then lets the one VALID member (openat) satisfy
+# the whole family, returning rc=0 with openat's count alone. That is the
+# name-wise budget the family form exists to replace, restored silently by any
+# future edit to a family string. The "Openat" assertion does not catch it: that
+# one tests the first-character rule, which this mutation keeps intact.
+# shellcheck disable=SC2016
+mutate "syscall budget: family member validated by first character only" lib.sh \
+    "            '' | [!a-z]* | *[!a-z0-9_]*) return 1 ;;" \
+    "            [a-z]*) ;; *) return 1 ;;" \
+    syscall_budget_test.sh
+
+# The pid-blind denominator. strace attaches to ONE pid and -f does not follow a
+# replacement worker (the MASTER forks it, not the tracee), so counting any
+# status line credits responses whose syscalls were never traced. The denominator
+# inflates to the full burst while the numerator holds only the tracee's calls,
+# and the mutant's extra opens land off-tracee -- every assertion passes on the
+# exact behaviour they exist to catch. This restores the original matcher.
+# shellcheck disable=SC2016
+mutate "syscall budget: served counted without binding the response to the traced pid" lib.sh \
+    "    grep -qE '^HTTP/1\.[01] 200( |\$)' <<<\"\${status_line%\$'\\r'}\" || return 1" \
+    "    grep -qE '^HTTP/1\.[01] [0-9]{3}' <<<\"\$resp\" && return 0 || return 1" \
+    syscall_budget_test.sh
+
+# grep anchors ^/\$ per LINE, so matching the status over the WHOLE document
+# accepts a status-shaped line anywhere in it -- including the body, which in
+# this scenario echoes request-influenced content. A 500 carrying
+# `HTTP/1.1 200 OK` on its own line then counts toward the denominator. The
+# control this row protects has to use an UNPREFIXED body line: a prefixed one
+# fails the regex on the buggy and the fixed implementation alike.
+# shellcheck disable=SC2016
+mutate "syscall budget: status matched over the whole response, not the status line" lib.sh \
+    "    status_line=\"\${resp%%\$'\\n'*}\"" \
+    "    status_line=\"\$resp\"" \
+    syscall_budget_test.sh
+
+
 # ---- probe_baseline --------------------------------------------------------
 
 # The separate list. `probe_baseline` and `delta` share an evaluator but not an

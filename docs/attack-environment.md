@@ -103,10 +103,31 @@ near neighbours a different kernel or libc can substitute (`accept`,
 `baseline.syscalls`, so a benign substitution is not mistaken for a new
 capability.
 
-**What it does not yet do:** assert a *budget*. "This operation must not exceed N
-`openat` calls" would catch a module that works but does so via a per-request file
-open. Tracked in
-[Ideas and opportunities](../README.md#ideas-and-opportunities--ways-to-break-a-module-we-do-not-yet-try).
+**The budget (assertion 3).** The set gate above is one-directional and cannot
+see a module that opens one file of its OWN per request: `openat` is necessarily
+allowlisted, because the reference probe walks `/proc/self/fd` on every request.
+Only a COUNT ceiling closes that, so assertion 3 budgets `openat+open <= 3` and
+`accept4+accept <= 1` per SERVED response.
+
+Three properties of that gate are load-bearing, each closing a way it could have
+reported green on the behaviour it exists to catch:
+
+- **Families, not names.** `open` and `accept` are separately allowlisted libc
+  near-neighbours, so a module reaching the kernel through `syscall(SYS_open,
+  ...)` leaves `openat` at its baseline and a name-wise ceiling never moves.
+- **The denominator is responses served BY THE TRACED WORKER.** `strace` attaches
+  to one pid, and `-f` does not follow a replacement worker (the master forks it,
+  not the tracee). Counting any status line credits responses whose syscalls were
+  never traced, inflating the denominator while the numerator holds only the
+  tracee's calls.
+- **An absent family is RED, never zero.** If no member of a budgeted family
+  appears at all, the capture is not what the code thinks it is, and answering 0
+  gives the most comfortable possible answer to a question that could not be
+  evaluated.
+
+`readlink` and `getdents64` are deliberately NOT budgeted: both scale with the
+worker's FD population rather than the request count, so a ceiling over either is
+a flake generator.
 
 ## Clock hostility (`scenarios/clock-jump`)
 
