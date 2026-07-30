@@ -216,13 +216,35 @@ mutate "send_slow: inter-chunk sleep zeroed" http.c \
         if (off < len) {
             long  slept = sleep_ms(ms * 0);' http_test
 
-mutate "send_slow: leading stall dropped" http.c \
+# NAME FIXED s177: this zeroes the ms handed to write_paced_units(), i.e. the
+# INTER-UNIT pacing, not the leading stall -- the leading sleep is the separate
+# sleep_ms(pauses[i].ms) above the pacer call. CodeRabbit caught the mismatch on
+# #164. The leading stall has its own row below.
+mutate "send_slow_chunks: inter-unit pacing zeroed at the call site" http.c \
     'if (pauses[i].unit) {
                 rc = write_paced_units(fd, req + off, upto_next - off,
                                        pauses[i].ms, slept_ms);' \
     'if (pauses[i].unit) {
                 rc = write_paced_units(fd, req + off, upto_next - off,
                                        pauses[i].ms * 0, slept_ms);' http_test
+
+# The leading stall the row above was misnamed for: the sleep taken BEFORE a
+# paced span begins, which every paced entry performs regardless of pacer.
+mutate "send_slow: leading stall dropped" http.c \
+    'slept = sleep_ms(pauses[i].ms);
+
+            if (slept_ms != NULL) {
+                *slept_ms += slept;
+            }
+
+            /* `unit` first,' \
+    'slept = sleep_ms(pauses[i].ms * 0);
+
+            if (slept_ms != NULL) {
+                *slept_ms += slept;
+            }
+
+            /* `unit` first,' http_test
 
 # The S-5 defect class one level up: the sleep is gutted but the counter is
 # credited from the INTENT (`ms`) instead of sleep_ms()'s return, so the
