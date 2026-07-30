@@ -308,14 +308,25 @@ fi
 #
 # Reuse the already-parsed `-c` summary table rather than re-deriving counts:
 # the OBSERVED awk above already isolated the syscall-NAME column ($NF); here we
-# want the COUNT column, which in the same table is the second-to-last field
-# ($(NF-1)) on every data row (header/separator/total already excluded by the
-# same guards).
+# additionally want the CALLS column.
+#
+# Take calls as $4, counting from the LEFT. Counting from the right ($(NF-1))
+# is wrong and fails in the dangerous direction: the table's `errors` column is
+# only PRESENT on rows that had errors, so a clean row is
+#     % time  seconds  usecs/call  calls  syscall              (NF=5)
+# while a row with failures is
+#     % time  seconds  usecs/call  calls  errors  syscall      (NF=6)
+# and $(NF-1) reads ERRORS, not calls, on exactly those rows. A budgeted
+# openat that starts erroring would then be compared as (say) 7 instead of 200
+# and the ceiling would PASS while massively breached -- a vacuous gate, which
+# is the failure class this scenario exists to catch. The leading four columns
+# are fixed-width in strace's -c output whether or not `errors` is populated,
+# so $4 is stable for both shapes; verified against both here.
 COUNTS="$(awk '
     /^[[:space:]]*-+/ { next }
     /% time/          { next }
     /total/           { next }
-    NF >= 2 && $NF ~ /^[a-z][a-z0-9_]*$/ { print $NF, $(NF-1) }
+    NF >= 5 && $NF ~ /^[a-z][a-z0-9_]*$/ && $4 ~ /^[0-9]+$/ { print $NF, $4 }
 ' "$STRACE_OUT")"
 
 _count_of() {
