@@ -112,8 +112,8 @@ if grep -qiE 'operation not permitted|ptrace|could not attach|permission denied'
     exit 0
 fi
 
-# Every precondition holds: from here the scenario runs its two real assertions.
-echo "1..2"
+# Every precondition holds: from here the scenario runs its three real assertions.
+echo "1..3"
 
 # The worker, not the master: the master accepts no connections and answers no
 # probe, so its syscall set is a boot-and-signal surface, not the request path.
@@ -166,16 +166,13 @@ if [ "$ATTACHED" -ne 1 ]; then
 fi
 
 # A fixed burst -- enough requests that the full per-request surface is exercised
-# (accept, read, write, close on each), few enough to stay fast. Count is not
-# asserted on; only the set of names is. Each request goes to /__probe, the
-# location wired to the MODULE handler: a burst to a `return 200` location would
-# exercise only nginx core and never touch the syscalls a module makes.
-#
-# Over /dev/tcp (bash's own client), not curl -- the same client lib.sh uses, so
-# the scenario carries no dependency the rest of the harness does not already
-# have. Read to EOF (Connection: close) so each exchange completes -- accept
-# through close -- before the next, keeping the per-request surface intact.
-for _r in $(seq 1 20); do
+# (accept, read, write, close on each), few enough to stay fast. The SET gate
+# (assertion 2) does not care about this count, but the BUDGET gate (assertion
+# 3, below) is expressed per-request as a multiple of it -- so BURST is a real
+# variable, not a magic number repeated at the call site, or the two would
+# drift apart silently if one were edited and not the other.
+BURST=20
+for _r in $(seq 1 "$BURST"); do
     if exec 3<>"/dev/tcp/$HOST/$PORT"; then
         # trap '' PIPE + a `timeout`-bounded read, the load-bearing pattern
         # lib.sh uses on this same transport: a `Connection: close` server can
@@ -216,8 +213,9 @@ if [ -z "$OBSERVED" ]; then
     echo "# strace stderr:"
     sed 's/^/# /' "$STRACE_OUT.err"
     FAILED=1
-    # Still emit test 2's line so the plan count holds.
+    # Still emit test 2 and 3's lines so the plan count holds.
     echo "not ok 2 - no observed set to check against the allowlist"
+    echo "not ok 3 - no observed set to check against the budget"
     exit "$FAILED"
 fi
 
@@ -243,6 +241,7 @@ if [ -n "$MISSING" ]; then
     printf '%s\n' "$OBSERVED" | sed 's/^/#   /'
     FAILED=1
     echo "not ok 2 - no request-path trace to check against the allowlist"
+    echo "not ok 3 - no request-path trace to check against the budget"
     exit "$FAILED"
 fi
 echo "ok 1 - traced the request path on the worker (accept+read+write present)"
@@ -256,6 +255,7 @@ echo "ok 1 - traced the request path on the worker (accept+read+write present)"
 ALLOWED="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$ALLOWLIST" | grep -E '^[a-z][a-z0-9_]*$' | sort -u || true)"
 if [ -z "$ALLOWED" ]; then
     echo "not ok 2 - allowlist $ALLOWLIST is empty or unreadable"
+    echo "not ok 3 - no allowlist, budget check skipped"
     exit 1
 fi
 
@@ -276,6 +276,73 @@ if [ -n "$UNKNOWN" ]; then
     FAILED=1
 else
     echo "ok 2 - every request-path syscall is in the allowlist"
+fi
+
+# --- the budget gate -------------------------------------------------------
+#
+# The SET gate above is one-directional by design (baseline.syscalls:11-16) and
+# baseline.syscalls:52-60 names its own hole: openat MUST be allowlisted because
+# the reference probe walks /proc/self/fd every request, so a module that opens
+# ONE FILE OF ITS OWN per request is invisible to the set gate -- it still shows
+# up as "openat", already on the list. Only a per-request COUNT ceiling closes
+# that gap.
+#
+# Measured (s171, memory/labs/nginx-test-harness/issues.md): across 5 runs and
+# burst sizes 5/10/20/40 these four names are EXACT multiples of BURST, zero
+# variance --
+#     openat=3N accept4=N getdents64=4N readlink=11N
+# -- so the ceiling is set to exactly the measured multiple, no headroom. Any
+# slack here would let a mutant's extra per-request openat (3N -> 4N) hide
+# inside the gap, which defeats the point of a budget.
+#
+# epoll_wait and recvfrom are deliberately EXCLUDED: they wobbled +/-1 across
+# otherwise-identical runs in the same measurement (kernel coalescing the
+# readiness loop, not module behaviour) -- budgeting them would flake the gate
+# on roughly half of all runs, exactly the kind of gate that gets "fixed" by
+# widening it into uselessness.
+#
+# Expressed as `count <= K * BURST`, never a bare absolute -- an absolute
+# silently re-scales (goes slack or starts flaking) the moment someone edits
+# BURST above without touching this table, which is the same failure mode this
+# whole oracle exists to catch, just one level up.
+#
+# Reuse the already-parsed `-c` summary table rather than re-deriving counts:
+# the OBSERVED awk above already isolated the syscall-NAME column ($NF); here we
+# want the COUNT column, which in the same table is the second-to-last field
+# ($(NF-1)) on every data row (header/separator/total already excluded by the
+# same guards).
+COUNTS="$(awk '
+    /^[[:space:]]*-+/ { next }
+    /% time/          { next }
+    /total/           { next }
+    NF >= 2 && $NF ~ /^[a-z][a-z0-9_]*$/ { print $NF, $(NF-1) }
+' "$STRACE_OUT")"
+
+_count_of() {
+    # First match wins; the table has one row per syscall name so there is
+    # exactly one to find.
+    awk -v n="$1" '$1 == n { print $2; found=1; exit } END { if (!found) print 0 }' <<<"$COUNTS"
+}
+
+BUDGET_BREACH=""
+for pair in "openat:3" "accept4:1" "getdents64:4" "readlink:11"; do
+    name="${pair%%:*}"
+    mult="${pair##*:}"
+    ceiling=$((mult * BURST))
+    got="$(_count_of "$name")"
+    if [ "$got" -gt "$ceiling" ]; then
+        BUDGET_BREACH="${BUDGET_BREACH:+$BUDGET_BREACH }$name=$got(>$ceiling)"
+    fi
+done
+
+if [ -n "$BUDGET_BREACH" ]; then
+    echo "not ok 3 - per-request syscall budget exceeded: $BUDGET_BREACH"
+    echo "# burst=$BURST; ceilings are openat<=3N accept4<=N getdents64<=4N readlink<=11N"
+    echo "# a module opening its own file per request hides inside the SET gate (it"
+    echo "# still reads as openat) but crosses this per-request ceiling instead"
+    FAILED=1
+else
+    echo "ok 3 - per-request syscall counts stay at or under budget (burst=$BURST)"
 fi
 
 exit "$FAILED"
