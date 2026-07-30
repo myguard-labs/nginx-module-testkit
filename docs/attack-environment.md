@@ -118,15 +118,6 @@ second, a VM resumed from a snapshot. A module computing an interval from
 interval silently extended by the size of the step: nothing logs, nothing errors,
 and a one-second timer sits an hour in the future.
 
-> **Status, 2026-07-30: the rebuild described below is NOT in `main` yet.** It
-> is open as [#158](https://github.com/myguard-labs/nginx-test-harness/pull/158),
-> where its keepalive probe fails on every nginx flavour (`OSError: [Errno 22]`
-> out of the driver's inline Python, not out of nginx — the clock does step and
-> the worker does survive). What is in the tree today is still the vacuous
-> four-case rule this section describes as the BEFORE state. Read the rest as
-> the design and the reasoning behind it, not as a description of shipped
-> behaviour.
-
 ### What it was until 2026-07-29, and why it is recorded
 
 The scenario shipped an `nginx.conf` and a four-case `clock-jump.rule` and
