@@ -151,16 +151,16 @@ ok "$st" "a zero-length value is framed correctly on the wire"
 # that the daemon keeps reading after answering, which a one-shot reply loop
 # would fail.
 out="$(talk "$PORT" 'set k 0 0 3\r\nabc\r\nget k\r\n')"
-if printf '%s' "$out" | grep -q 'STORED'; then st=0; else st=1; fi
+if grep -q 'STORED' <<<"$out"; then st=0; else st=1; fi
 ok "$st" "a set is acknowledged"
-if printf '%s' "$out" | grep -q 'VALUE k 0 3'; then st=0; else st=1; fi
+if grep -q 'VALUE k 0 3' <<<"$out"; then st=0; else st=1; fi
 ok "$st" "a value set on one connection is readable on the same connection"
 
 # Pipelining: two commands in one write must draw two replies.
 out="$(talk "$PORT" 'get hello\r\nversion\r\n')"
-if printf '%s' "$out" | grep -q 'VALUE hello'; then st=0; else st=1; fi
+if grep -q 'VALUE hello' <<<"$out"; then st=0; else st=1; fi
 ok "$st" "the first of two pipelined commands is answered"
-if printf '%s' "$out" | grep -q 'VERSION'; then st=0; else st=1; fi
+if grep -q 'VERSION' <<<"$out"; then st=0; else st=1; fi
 ok "$st" "the second of two pipelined commands is answered"
 
 # A set whose data block arrives in a SEPARATE write, and therefore in a later
@@ -177,9 +177,9 @@ out="$(
     printf 'get sp\r\n' >&3
     timeout 2 cat <&3 || true
 )"
-if printf '%s' "$out" | grep -q 'STORED'; then st=0; else st=1; fi
+if grep -q 'STORED' <<<"$out"; then st=0; else st=1; fi
 ok "$st" "a set split across two writes is acknowledged"
-if printf '%s' "$out" | grep -q 'VALUE sp 0 3'; then st=0; else st=1; fi
+if grep -q 'VALUE sp 0 3' <<<"$out"; then st=0; else st=1; fi
 ok "$st" "a set split across two writes actually stores its value"
 
 stop_srv
@@ -320,7 +320,7 @@ start_srv "$WORK/rst.backend"
 # the exit status of the TEST, not of the grep, so it is always true and the
 # assertion passes no matter what the daemon sent.
 out="$(talk "$PORT" 'get hello\r\n' 2>/dev/null || true)"
-if printf '%s' "$out" | grep -q 'VALUE'; then
+if grep -q 'VALUE' <<<"$out"; then
     ok 1 "an rst fault suppresses the reply"
 else
     ok 0 "an rst fault suppresses the reply"
@@ -408,7 +408,7 @@ stop_srv
 # followed by a stray byte (not LF) must be rejected, not stored-and-STORED.
 start_srv "$WORK/mc.backend"
 out="$(talk "$PORT" 'set bad 0 0 3\r\nabc\rX\r\n')"
-if printf '%s' "$out" | grep -q 'STORED'; then st=1; else st=0; fi
+if grep -q 'STORED' <<<"$out"; then st=1; else st=0; fi
 ok "$st" "a memcached set with a CR+wrong-byte terminator is rejected (AUD-04)"
 stop_srv
 
@@ -463,7 +463,7 @@ out="$(talk "$PORT" '*2\r\n$3\r\nGET\r\n$5\r\nhello\r\n' 2>/dev/null || true)"
 # logged applied:true while sending the correct $5 would pass a journal-only
 # assertion. delta=2 on a 5-byte value rewrites the declared length to 7.
 # shellcheck disable=SC2016
-if printf '%s' "$out" | grep -q '\$7'; then st=0; else st=1; fi
+if grep -q '\$7' <<<"$out"; then st=0; else st=1; fi
 ok "$st" "an applied lie_bytes rewrites the declared length on the wire (AUD-05)"
 
 if grep -q '"ev":"fault".*"action":"lie_bytes","applied":true' \
@@ -485,7 +485,7 @@ EOF
 start_srv "$WORK/lieset.backend"
 # shellcheck disable=SC2016
 out="$(talk "$PORT" '*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n' 2>/dev/null || true)"
-if printf '%s' "$out" | grep -q 'OK'; then st=1; else st=0; fi
+if grep -q 'OK' <<<"$out"; then st=1; else st=0; fi
 ok "$st" "lie_bytes on a length-less reply does NOT run the happy path (AUD-05)"
 
 if grep -q '"ev":"fault".*"action":"lie_bytes","applied":false' \

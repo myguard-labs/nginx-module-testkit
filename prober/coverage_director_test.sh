@@ -195,8 +195,8 @@ s2=$?
 set -e
 other_ok=1
 [ "$s2" -eq 0 ] || other_ok=0
-printf '%s\n' "$out2" | grep -q '^other_test' || other_ok=0
-printf '%s\n' "$out2" | grep -q '^json_test' && other_ok=0
+grep -q '^other_test' <<<"$out2" || other_ok=0
+grep -q '^json_test' <<<"$out2" && other_ok=0
 ok "$((other_ok == 1 ? 0 : 1))" \
     "re-mapping the same line to a different test name selects THAT test (proves it reads the map, not a fixed name)"
 

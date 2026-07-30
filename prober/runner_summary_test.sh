@@ -99,7 +99,7 @@ fi
 # not merely a count.
 summary=$(printf '%s\n' "$out" | grep 'self-test suites failed' || true)
 
-if printf '%s' "$summary" | grep -q 'planmismatch_test\.sh'; then
+if grep -q 'planmismatch_test\.sh' <<<"$summary"; then
     ok 0 "the summary names the failing suite"
 else
     ok 1 "the summary omits the failing suite's name (summary: $summary)"
@@ -107,7 +107,7 @@ fi
 
 # ...and must not name the suite that passed, which is what separates
 # "reports the failures" from "prints the discovery list".
-if printf '%s' "$summary" | grep -q 'clean_test\.sh'; then
+if grep -q 'clean_test\.sh' <<<"$summary"; then
     ok 1 "the summary names a suite that passed (summary: $summary)"
 else
     ok 0 "the summary names only the suites that failed"
@@ -117,7 +117,7 @@ fi
 # `not ok` line. If a future fixture edit makes the planted suite emit one,
 # the other assertions would still pass while no longer testing the case the
 # summary exists for.
-if printf '%s\n' "$out" | grep -q '^not ok'; then
+if grep -q '^not ok' <<<"$out"; then
     ok 1 "the fixture emitted a 'not ok' line, so it no longer models the case"
 else
     ok 0 "the failing suite emits no 'not ok' line, as the summary warns"

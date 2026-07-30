@@ -195,10 +195,10 @@ esac
 set_rows "$(printf 'scenarios/reload-soak\tslow')"
 run_prm --budget 45
 line="$(tap_line_matching 'scenarios/reload-soak')"
-if printf '%s' "$line" | grep -q '^ok' \
-   && printf '%s' "$line" | grep -q 'REFUSED' \
-   && printf '%s' "$line" | grep -q 'test-scenarios.sh' \
-   && printf '%s' "$line" | grep -q 'valgrind-scenarios.sh'; then
+if grep -q '^ok' <<<"$line" \
+   && grep -q 'REFUSED' <<<"$line" \
+   && grep -q 'test-scenarios.sh' <<<"$line" \
+   && grep -q 'valgrind-scenarios.sh' <<<"$line"; then
     ok 0 "a boot-required scenario is REFUSED (ok) and names native oracle + weekly owner"
 else
     ok 1 "a boot-required scenario is REFUSED (ok) and names native oracle + weekly owner"
@@ -229,8 +229,8 @@ esac
 set_rows "$(printf 'clean_test\tfast')"
 run_prm --budget 0
 line="$(tap_line_matching 'clean_test')"
-if printf '%s' "$line" | grep -q '^not ok' \
-   && printf '%s' "$line" | grep -qi 'budget'; then
+if grep -q '^not ok' <<<"$line" \
+   && grep -qi 'budget' <<<"$line"; then
     ok 0 "a zero budget reds the target with a budget-exhausted classification"
 else
     ok 1 "a zero budget reds the target with a budget-exhausted classification"
@@ -243,7 +243,7 @@ set_rows ""
 run_prm --budget 45
 plan_ran="$(printf '%s\n' "$LAST_OUT" | grep -cE '^(ok|not ok) ')"
 line="$(printf '%s\n' "$LAST_OUT" | grep -E '^ok 1 ' || true)"
-if [ "$plan_ran" -eq 1 ] && printf '%s' "$line" | grep -qi 'nothing to run or refuse'; then
+if [ "$plan_ran" -eq 1 ] && grep -qi 'nothing to run or refuse' <<<"$line"; then
     ok 0 "an empty selection emits exactly one explained ok line"
 else
     ok 1 "an empty selection emits exactly one explained ok line"
@@ -269,8 +269,8 @@ printf 'seed\n' >"$REPO/fuzz/corpus/lib/seed"
 set_rows "$(printf 'fuzz/fuzz_lib\tfast')"
 run_prm --budget 45
 line="$(tap_line_matching 'fuzz/fuzz_lib')"
-if printf '%s' "$line" | grep -q '^ok' \
-   && ! printf '%s' "$line" | grep -q 'REFUSED'; then
+if grep -q '^ok' <<<"$line" \
+   && ! grep -q 'REFUSED' <<<"$line"; then
     ok 0 "a fuzz target is memchecked directly (ok, not refused)"
 else
     ok 1 "a fuzz target is memchecked directly (ok, not refused)"
@@ -291,8 +291,8 @@ LAST_OUT="$( cd "$REPO"; ./pr-memcheck --budget 45 2>/dev/null )" || prm_rc=$?
 set_vi_rc 0
 vi_line="$(printf '%s\n' "$LAST_OUT" | grep -E '^(ok|not ok) 1 ' || true)"
 if [ "$prm_rc" -ne 0 ] \
-   && printf '%s' "$vi_line" | grep -q '^not ok' \
-   && printf '%s' "$vi_line" | grep -qi 'verify-impact failed'; then
+   && grep -q '^not ok' <<<"$vi_line" \
+   && grep -qi 'verify-impact failed' <<<"$vi_line"; then
     ok 0 "verify-impact fail-closed exits nonzero AND emits a not_ok (not a green 'nothing selected')"
 else
     ok 1 "verify-impact fail-closed exits nonzero AND emits a not_ok (not a green 'nothing selected')"
