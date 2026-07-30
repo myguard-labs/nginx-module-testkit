@@ -118,7 +118,12 @@ Concretely:
   binary either. The sanitizer legs cost multi-minute wall-clock on a shared
   builder and were a steady source of flakes; the selftest suites, the
   mutation gates, and the scenario oracles are what actually prove this tool
-  works. Decided 2026-07-28.
+  works. Decided 2026-07-28, removed from `ci.yml` 2026-07-30 — the decision
+  sat in this file for two days while the legs kept running, so a red
+  sanitizer job was still gating PRs against a rule that had already retired
+  it. The one remaining `SAN=1` build in CI is the `hygiene` job's
+  gitignore-drift check, which reports no sanitizer findings; see the comment
+  there.
 
 The known cost of that last rule, recorded so nobody has to rediscover it:
 `prober/rules.c` and `prober/json.c` are parsers, and dropping the sanitizer

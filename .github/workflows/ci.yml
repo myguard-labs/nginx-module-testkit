@@ -16,32 +16,30 @@ concurrency:
 jobs:
   # The harness's own parsers and assertion evaluators, as pure functions. No
   # server involved, so this is fast and is the gate that actually blocks.
-  # Four legs: gcc and clang, each with and without ASan+UBSan.
+  # Two legs: gcc and clang, both uninstrumented.
   #
-  # The two no-san legs were dropped 2026-07-26 on the argument that a plain
-  # leg's coverage is a strict subset of its sanitizer sibling's, since both
-  # run the same *_test.c suite. Restored 2026-07-28 (user decision) because
-  # that argument concedes the gap in its own next clause: what a bare `SAN=0`
-  # leg adds is a miscompile / optimizer-divergence canary -- a bug that only
-  # exists in the codegen the sanitizers do not produce. The jobs it was
-  # handed off to do not cover it. `analyzers` is static, so it never executes
-  # anything; `reproducible-build` compares two builds of the same flags to
-  # each other, which is silent about whether either one is correct; and
-  # `build-flags-canary` asserts the flags, not the behaviour of the binary
-  # they produce. Nothing else in this workflow RUNS the assertions against an
-  # uninstrumented build.
+  # Why a bare `SAN=0` leg is the one worth keeping: it is the miscompile /
+  # optimizer-divergence canary -- a bug that only exists in the codegen the
+  # sanitizers do not produce. No other job here covers that. `analyzers` is
+  # static, so it never executes anything; `reproducible-build` compares two
+  # builds of the same flags to each other, which is silent about whether
+  # either one is correct; and `build-flags-canary` asserts the flags, not the
+  # behaviour of the binary they produce. Nothing else in this workflow RUNS
+  # the assertions against an uninstrumented build.
   #
-  # The wall-clock premise behind the 2026-07-26 cut was also refuted: the CI
-  # waves are slot QUEUEING, not compute (s145), and these legs run in
-  # 0-3 min. Two more of them buys the canary back for close to nothing.
+  # The ASan+UBSan legs were dropped 2026-07-30 to implement the 2026-07-28
+  # policy (README "What this repo is -- and what it is not"): no sanitizer
+  # legs in this repo's CI, on nginx or on our own binary. They had been
+  # written into README.md and AGENTS.md on 2026-07-28 but never removed from
+  # this file. `SAN=1 prober/test.sh` remains for a one-off local run when a
+  # parser bug is suspected -- that, not a permanent CI leg, is the move.
   selftest:
     runs-on: [self-hosted, builder02, lxc]
     strategy:
       fail-fast: false
       matrix:
         cc: [gcc, clang]
-        san: ["0", "1"]
-    name: selftest (${{ matrix.cc }}${{ matrix.san == '1' && ' +asan/ubsan' || '' }})
+    name: selftest (${{ matrix.cc }})
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -50,7 +48,7 @@ jobs:
       - name: build + run self-tests
         env:
           CC: ${{ matrix.cc }}
-          SAN: ${{ matrix.san }}
+          SAN: "0"
         run: prober/test.sh
 
   # The selftest job above proves the tests RUN. This one proves they ASSERT.
@@ -524,34 +522,21 @@ jobs:
             version: 1.28.0
             url: https://nginx.org/download/nginx-1.28.0.tar.gz
             sha256: c6b5c6b086c0df9d3ca3ff5e084c1d0ef909e6038279c71c1c3e985f576ff76a
-            san: ""
-            sanid: none
           - flavor: nginx
             version: 1.29.0
             url: https://nginx.org/download/nginx-1.29.0.tar.gz
             sha256: 109754dfe8e5169a7a0cf0db6718e7da2db495753308f933f161e525a579a664
-            san: ""
-            sanid: none
           - flavor: angie
             version: 1.12.0
             url: https://download.angie.software/files/angie-1.12.0.tar.gz
             sha256: cd7867d200b22a80165b93696c30a1ac3a28c1162544b7f43c71232b19814ef6
-            san: ""
-            sanid: none
-          # A live server built with AddressSanitizer + UBSan. This is the only
-          # leg where a sanitizer-instrumented server actually boots and serves
-          # the scenario tree, so it is where a module use-after-free / overflow
-          # / undefined-behaviour in a request path is caught rather than merely
-          # compiled. The C unit-test SAN=1 leg (self-tests) never boots a
-          # server, so this closes that gap. nginx only -- an ASan angie build
-          # is untested ground and the nginx leg already exercises the module.
-          - flavor: nginx
-            version: 1.29.0
-            url: https://nginx.org/download/nginx-1.29.0.tar.gz
-            sha256: 109754dfe8e5169a7a0cf0db6718e7da2db495753308f933f161e525a579a664
-            san: "address,undefined"
-            sanid: asan-ubsan
-    name: scenarios (${{ matrix.flavor }} ${{ matrix.version }}${{ matrix.san && ' san' || '' }})
+          # There is deliberately no sanitizer leg here. A live ASan+UBSan
+          # server instruments nginx core, and this repo does not test nginx's
+          # memory safety -- nginx is the fixture, never the subject (README
+          # "What this repo is -- and what it is not", decided 2026-07-28,
+          # implemented here 2026-07-30). Do not add one back without the user
+          # asking for it.
+    name: scenarios (${{ matrix.flavor }} ${{ matrix.version }})
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -578,7 +563,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: /tmp/srv
-          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-san-${{ matrix.sanid }}-${{ hashFiles('t/module/**') }}-v1
+          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-${{ hashFiles('t/module/**') }}-v1
 
       - name: install build deps
         run: |
@@ -614,31 +599,7 @@ jobs:
           echo "${{ matrix.sha256 }}  /tmp/srv.tar.gz" | sha256sum -c -
           tar -xzf /tmp/srv.tar.gz -C /tmp/srv --strip-components=1
           cd /tmp/srv
-          # A sanitizer leg instruments BOTH nginx core and the reference module
-          # through --with-cc-opt/--with-ld-opt: the module is dynamic, so its
-          # objects inherit the core cc-opt, and only a whole-tree instrumentation
-          # gives the sanitizer runtime enough context to fault on a cross-object
-          # request-path bug. -g keeps the report readable.
-          #
-          # Two UBSan sub-checks are turned OFF because nginx core trips them
-          # BY DESIGN, at `nginx -t` before any scenario runs, so leaving them on
-          # makes every scenario bail on a core false positive rather than a
-          # module bug:
-          #   - nonnull-attribute: ngx_string.c passes (NULL,NULL,0) to memcpy
-          #     (a legal zero-length copy) which the builtin declares nonnull;
-          #   - pointer-overflow: nginx's arena/pointer arithmetic computes
-          #     one-past and wrap-guard addresses UBSan reports as overflow.
-          # Everything else in the `undefined` group -- signed overflow, bad
-          # shifts, misalignment, bool/enum load, VLA bound -- stays on and
-          # still fires on a genuine module defect.
-          SAN_CC=""; SAN_LD=""
-          if [ -n "${{ matrix.san }}" ]; then
-              SAN_CC="-fsanitize=${{ matrix.san }} -fno-sanitize=nonnull-attribute,pointer-overflow -fno-omit-frame-pointer -g"
-              SAN_LD="-fsanitize=${{ matrix.san }}"
-          fi
           ./configure --with-compat \
-              ${SAN_CC:+--with-cc-opt="$SAN_CC"} \
-              ${SAN_LD:+--with-ld-opt="$SAN_LD"} \
               --add-dynamic-module="$GITHUB_WORKSPACE/t/module" >/dev/null
           eatmydata make -j"$(nproc)" >/dev/null
 
@@ -673,12 +634,6 @@ jobs:
           PROBER_MODULE: ngx_http_test_ref_module.so
           PROBER_DIRECTIVE: test_ref_probe
           PROBER_PROBE: "test_ref_probe;"
-          # UBSan prints by default but does NOT abort; halt_on_error makes a
-          # violation terminate the worker so prober_scrape_log sees the report
-          # in the redirected error_log rather than a worker limping on. ASan's
-          # detect_leaks=0 is set by prober_heap_env (nginx never frees its
-          # config pool). Harmless on the plain leg -- no sanitizer reads it.
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: prober/test-scenarios.sh ${{ matrix.flavor }} ${{ matrix.version }}
 
       # A scenario tree that cannot fail is worth nothing, and this job is the
@@ -893,6 +848,13 @@ jobs:
       # it has to actually build and run the suite first, then look. Both the
       # plain and the sanitizer build are checked because SAN=1 is a distinct
       # set of outputs.
+      #
+      # This SAN=1 build is NOT a sanitizer gate and does not contradict the
+      # no-sanitizer-legs policy: nothing here is instrumented for a finding to
+      # be reported against, no server is built, and a sanitizer diagnostic
+      # cannot fail this step -- only a file appearing that .gitignore misses.
+      # `SAN=1 prober/test.sh` stays supported for local runs, so its artifact
+      # set still needs the drift check.
       - name: build + test leaves the tree clean
         run: |
           for san in 0 1; do
