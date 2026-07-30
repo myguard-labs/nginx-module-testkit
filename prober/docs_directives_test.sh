@@ -175,7 +175,7 @@ undocumented_removals() {
 
     while IFS= read -r word; do
         [ -n "$word" ] || continue
-        printf '%s\n' "$known" | grep -qx "$word" && continue
+        grep -qx "$word" <<<"$known" && continue
         out="$out $word"
     done < <(printf '%s\n' "$fenced" \
         | grep -oE '^[[:lower:]_]+[[:space:]]+[^[:space:]]' \

@@ -113,7 +113,7 @@ out="$(run_vi 2>"$WORK/vi_err2")"
 s=$?
 set -e
 ok "$s" "the same file, once mapped in impact.map, no longer fails"
-if [ "$s" -eq 0 ] && ! printf '%s\n' "$out" | grep -q "newthing_test"; then
+if [ "$s" -eq 0 ] && ! grep -q "newthing_test" <<<"$out"; then
     diag "expected newthing_test in output, got: $out"
     failures=$((failures + 1))
 fi
@@ -154,7 +154,7 @@ out="$(run_vi)"
 s=$?
 set -e
 clean_no_rules=1
-printf '%s\n' "$out" | grep -q "rules_test" && clean_no_rules=0
+grep -q "rules_test" <<<"$out" && clean_no_rules=0
 ok "$((s == 0 && clean_no_rules == 1 ? 0 : 1))" \
     "deleting rules.c exits 0 and selects no orphan target"
 
@@ -207,7 +207,7 @@ errout="$(cd "$REPO" && ./prober/verify-impact --base "$NODEP_BASE" 2>&1 >/dev/n
 s=$?
 set -e
 warned=1
-printf '%s\n' "$errout" | grep -qi "WARNING" || warned=0
+grep -qi "WARNING" <<<"$errout" || warned=0
 # The header has no direct impact.map row AND no .d evidence exists to compute
 # its dependents -- the tool cannot prove what it reaches, so it must both WARN
 # and FAIL-CLOSED (nonzero). Asserting only the WARNING would let the inverse
@@ -301,7 +301,7 @@ s=$?
 set -e
 bigdiff_ok=1
 [ "$s" -eq 0 ] || bigdiff_ok=0
-printf '%s\n' "$out" | grep -q json_test || bigdiff_ok=0
+grep -q json_test <<<"$out" || bigdiff_ok=0
 [ "$bigdiff_ok" -eq 1 ] || diag "large diff: exit=$s out=$(printf '%s' "$out" | head -c 200)"
 ok "$((bigdiff_ok == 1 ? 0 : 1))" \
     "a 40k-line executable diff selects json_test instead of dying on SIGPIPE"
