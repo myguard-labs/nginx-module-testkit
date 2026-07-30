@@ -21,12 +21,26 @@
 # framing perfectly and still allocate once per read event, which is what this
 # case is built to surface.
 #
-# WHY THE DELTAS ARE THE POINT. The status is the weaker half: a 200 only says
-# the body eventually reassembled. `delta fds == 0` and
-# `delta pool.cycle_used == 0` are what catch the real failure mode -- a module
-# that allocates per READ rather than per REQUEST looks identical on a body that
-# arrives in one packet and leaks once per chunk here. Nine units at 20 ms is
-# the cheapest way to make that class of bug observable on a body path.
+# WHAT THESE CASES ACTUALLY PROVE, AND WHAT THEY DO NOT. Read this before
+# trusting a green run. The reference module answers `/__probe` for GET and HEAD
+# only -- `ngx_http_test_ref_handler()` returns NGX_HTTP_NOT_ALLOWED at
+# `t/module/ngx_http_test_ref_module.c:139`, which is BEFORE the
+# `ngx_http_discard_request_body()` call at `:149`. So against the reference
+# consumer a POST here is rejected on the method, and the trickled body is never
+# handed to a body reader at all.
+#
+# That does not make the cases vacuous, but it does narrow them. What they cover
+# against any consumer is the connection and harness side: the prober's own
+# paced writer walks real framing and puts one complete unit per write on the
+# wire, and the server survives a body arriving that way -- accepting the bytes,
+# answering, and releasing every fd and pool block it took. A module that leaks
+# per read event on the connection path still shows up in the deltas.
+#
+# The STRONGER claim -- that a per-READ rather than per-REQUEST allocation in a
+# body READER is caught -- needs a location that actually reads the body. Point
+# this file at a proxy_pass or return-after-body location on a consumer that has
+# one, and the same deltas cover that path too. On `/__probe` they do not, and a
+# green run here must not be read as evidence that they do.
 #
 # THE PACE IS DELIBERATELY MODEST. The interval only has to exceed the loopback
 # round-trip to guarantee a separate read event per unit. It does NOT approach
@@ -41,12 +55,6 @@
 # rejected when the rule file loads rather than reported as a harness timeout
 # later. The bodies here are far under it.
 #
-# CONFIG DEPENDENCE, same caveat as short-body.rule. The location must actually
-# read the request body for the delta oracles to cover the body path. A GET-only
-# /__probe may answer with a method rejection before the body is touched, in
-# which case these still assert that the HARNESS's own paced writer and the
-# server's read loop survive a trickled body -- the module-agnostic floor this
-# file promises. Point it at a body-reading location for the strong assertion.
 
 name              a chunked body trickled one unit at a time still completes
 send              POST /__probe HTTP/1.1\r\n
@@ -76,19 +84,28 @@ send_slow_chunks  20
 send              2;a=1\r\nhi\r\n2;b=2\r\nyo\r\n0\r\n\r\n
 delta             fds == 0
 delta             pool.cycle_used == 0
+delta             pool.cycle_large == 0
 
-# Zero-sized chunks are the smallest unit the wire allows and the one the
-# load-time cost estimate is built on. A body made entirely of them sends no
-# data at all, so any per-read allocation shows up with nothing to hide behind.
-name              a run of zero-sized chunks is still one unit per write
+# The 5-byte zero-sized chunk is what the load-time cost estimate is charged at
+# (MIN_CHUNK_UNIT_BYTES), so it is worth one case of its own -- but a RUN of them
+# is not a thing a valid request can contain. Per RFC 9112 the first `0\r\n\r\n`
+# ENDS the body; anything after it is trailer or the next message, not a fourth
+# unit. The smallest legal non-terminal unit is `1\r\nX\r\n`, six bytes. So the
+# floor the estimator uses is real but reachable only once per body, which is
+# exactly why costing at it overestimates and is the safe direction.
+#
+# This case is therefore the minimum-width body: two 6-byte units and the 5-byte
+# terminator, three writes, the smallest multi-unit walk the pacer can perform.
+name              a minimum-width chunked body is still one unit per write
 send              POST /__probe HTTP/1.1\r\n
 send              Host: prober\r\n
 send              Transfer-Encoding: chunked\r\n
 send              Connection: close\r\n\r\n
 send_slow_chunks  20
-send              0\r\n\r\n0\r\n\r\n0\r\n\r\n
+send              1\r\nX\r\n1\r\nY\r\n0\r\n\r\n
 delta             fds == 0
 delta             pool.cycle_used == 0
+delta             pool.cycle_large == 0
 
 name              worker survives the chunked-trickle battery
 send              GET /__probe HTTP/1.1\r\n
@@ -97,3 +114,4 @@ expect            status=200
 probe             zone.present == true
 delta             fds == 0
 delta             pool.cycle_used == 0
+delta             pool.cycle_large == 0
