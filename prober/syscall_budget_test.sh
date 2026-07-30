@@ -34,7 +34,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=16
+PLANNED=32
 tests_run=0
 failures=0
 
@@ -232,6 +232,104 @@ refute "a malformed family (trailing separator) is an error" \
 
 refute "a non-syscall-shaped member name is an error" \
     prober_strace_family_sum "$counts" "Openat"
+
+# THE PARTIAL-MALFORM REGRESSION. Each case pairs a VALID member with one that
+# is not syscall-SHAPED, which is what the first version of the validator could
+# not see: `case "$name" in [a-z]*)` tested only the first character, so "open!"
+# and "open*" passed it, and family-wide `seen` then let the valid openat row
+# satisfy the whole family -- rc=0 with the sum 60, openat's count alone,
+# silently re-creating the name-wise budget the family form replaced. The status
+# is the assertion: a caller doing `|| red` must red.
+#
+# "Openat" above catches only the first-character rule, which is exactly why it
+# passed while these did not; the two together pin both ends of the name.
+#
+# SCOPE, stated so this is not read as more than it is: shape validation cannot
+# catch a typo that is itself syscall-shaped. "openat+opemat" is indistinguishable
+# from a family whose second member simply did not appear in this capture, and
+# absent-member-contributes-zero is a rule this suite pins deliberately two
+# assertions up. What the validator closes is the class where a member could
+# never match ANY row because it is not a syscall name at all; a well-formed
+# misspelling is caught by the scenario going red on a budget it cannot meet, not
+# here.
+for _bad in "openat+open!" "openat+open*" "openat+ open" "openat+open-at" "openat+OPEN"; do
+    refute "a partially-malformed family is an error, not the valid member's count ($_bad)" \
+        prober_strace_family_sum "$counts" "$_bad"
+done
+
+# The paired positive, so the rule above cannot be over-tightened into rejecting
+# every family: the legitimate names it must still accept, including the
+# underscore and digit forms real syscalls use.
+assert_eq "a valid multi-member family is still accepted" \
+    "80" "$(prober_strace_family_sum "$aliascounts" "openat+open" || echo FAILED)"
+assert_eq "digits and underscores are valid inside a member name" \
+    "20" "$(prober_strace_family_sum $'accept4 20\nepoll_wait 9' "accept4+epoll_pwait" || echo FAILED)"
+
+# A glob metacharacter must never reach pathname expansion. Run from a directory
+# holding a file that "open*" would match: an unquoted `set -- $family` expands
+# it to that filename, so the member the validator sees is not the member the
+# caller wrote. The refute above proves the status; this proves the mechanism,
+# and would pass vacuously without the fixture file.
+#
+# NOT in a subshell: ok() increments tests_run, and a subshell's copy of that
+# variable dies with it -- the assertion reports but the count does not carry,
+# so the plan reconciliation at the bottom reds with an off-by-one that has
+# nothing to do with the code under test. Save and restore the cwd instead.
+: >"$WORK/open_glob_bait"
+_prevpwd="$PWD"
+cd "$WORK"
+refute "a glob member is not pathname-expanded against the cwd" \
+    prober_strace_family_sum "$counts" "openat+open*"
+cd "$_prevpwd"
+
+# --- prober_served_by ----------------------------------------------------
+#
+# The budget's DENOMINATOR predicate, and the second route to the same
+# vacuous-gate shape the family sum closed. strace attaches to one pid; a
+# replacement worker is forked by the MASTER, so it is not followed even under
+# -f. The first version counted any line matching `^HTTP/1\.[01] [0-9]{3}`, which
+# binds a counted response to no pid at all: a worker retiring mid-burst let its
+# successor serve the rest off-tracee, all 20 counted, the mutant's extra opens
+# landed where nothing was counting, and all three assertions passed.
+#
+# These run against fixtures for the same reason as everything above -- a healthy
+# local run never retires a worker mid-burst, so the scenario cannot produce the
+# case that breaks this.
+
+TRACED=1111
+
+assert_eq "a 200 from the TRACED worker is served" \
+    "yes" "$(prober_served_by $'HTTP/1.1 200 OK\r\n\r\n{"pid":1111,"ppid":1}' "$TRACED" && echo yes || echo no)"
+
+# THE BLOCKER. Same status line, different worker: this is the response that
+# inflated the denominator while contributing none of the counted syscalls.
+assert_eq "a 200 from a REPLACEMENT worker is NOT served" \
+    "no" "$(prober_served_by $'HTTP/1.1 200 OK\r\n\r\n{"pid":2222,"ppid":1}' "$TRACED" && echo yes || echo no)"
+
+# Absent must not read as a value. prober_probe_field returns non-zero on a
+# missing field precisely so a caller cannot silently treat absent as 0/match.
+assert_eq "a body with no pid field is NOT served" \
+    "no" "$(prober_served_by $'HTTP/1.1 200 OK\r\n\r\n{"ppid":1}' "$TRACED" && echo yes || echo no)"
+
+# The overbroad-matcher cases. Each matched the original [0-9]{3} pattern and
+# counted as a served response; none is one. The 103 is the sharpest: it is an
+# INTERIM line that precedes the real response, so it could double-count a single
+# request.
+for _st in '103 Early Hints' '500 Internal Server Error' '204 No Content'; do
+    assert_eq "a '${_st%% *}' response is NOT served" \
+        "no" "$(prober_served_by $'HTTP/1.1 '"$_st"$'\r\n\r\n{"pid":1111}' "$TRACED" && echo yes || echo no)"
+done
+
+# `2000` is not a status code; a bare three-digit match accepted its first three
+# characters. The trailing-context guard is what rejects it.
+assert_eq "a malformed '2000' status is NOT served" \
+    "no" "$(prober_served_by $'HTTP/1.1 2000 Bogus\r\n\r\n{"pid":1111}' "$TRACED" && echo yes || echo no)"
+
+# The paired negative for the anchor, kept from the s173 review: a status-like
+# line in the BODY must not count, but a real status line must still be found
+# even though it is not the only line in the document.
+assert_eq "a status-like line in the BODY does not make an unserved response served" \
+    "no" "$(prober_served_by $'HTTP/1.1 500 Internal\r\n\r\nX: HTTP/1.1 200 OK\n{"pid":1111}' "$TRACED" && echo yes || echo no)"
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
     echo "not ok $((tests_run + 1)) - plan said $PLANNED, ran $tests_run"

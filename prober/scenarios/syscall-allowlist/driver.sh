@@ -66,7 +66,7 @@ FAILED=0
 # A precondition that is not met SKIPs the whole scenario the harness-native way:
 # a lone `1..0 # SKIP <reason>` plan line, which test-scenarios.sh renders as
 # `ok N - <scenario> # SKIP <reason>` (same idiom as run-scenario.sh's requires
-# gate). The real `1..2` plan is emitted only once every precondition holds, so a
+# gate). The real `1..3` plan is emitted only once every precondition holds, so a
 # skipped leg reports as SKIPPED, not as two vacuous passes.
 #
 # A sanitizer-instrumented server pollutes the request-path syscall set with the
@@ -192,6 +192,12 @@ fi
 # openat per request totals 60 and sits exactly ON a 3x20 ceiling, passing while
 # every single served request breaches it. So count the responses that were
 # actually read back, and gate on that.
+#
+# And "read back" is not enough on its own: the response must have come from the
+# TRACED worker. A response served by a replacement worker spends its syscalls
+# where strace is not looking, so counting it inflates the denominator without
+# contributing to the numerator -- the same vacuous-gate shape by a second route.
+# See the pid check in the loop.
 BURST=20
 SERVED=0
 for _r in $(seq 1 "$BURST"); do
@@ -204,13 +210,36 @@ for _r in $(seq 1 "$BURST"); do
         # or hang it.
         (trap '' PIPE
          printf 'GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' >&3 2>/dev/null) || true
-        # A response line is the proof of service. Reading the whole body and
-        # matching its status is what distinguishes "the worker answered" from
-        # "the connect succeeded and then nothing came back" -- only the former
-        # spent the syscalls the budget is about to divide by.
+        # Read the WHOLE response, headers and body: the body is where the
+        # answering worker's pid is, and that pid -- not the status line alone --
+        # is what makes this response countable. A status line only distinguishes
+        # "something answered" from "the connect succeeded and nothing came
+        # back"; it says nothing about WHICH worker spent the syscalls the budget
+        # is about to divide by.
         _resp="$(timeout "${PROBER_PROBE_TIMEOUT:-2}" cat <&3 2>/dev/null || true)"
         exec 3>&- 3<&- || true
-        if grep -qE '^HTTP/1\.[01] [0-9]{3}' <<<"$_resp"; then
+        # ...AND that the worker which answered is the one being TRACED. A
+        # status line alone is not that proof. strace is attached to a single pid
+        # (-f follows that pid's children, but a replacement worker is forked by
+        # the MASTER, not by the tracee). If the traced worker retires mid-burst
+        # -- it exits, it is killed, it hits worker_shutdown_timeout -- the master
+        # forks a successor that serves the remaining requests off-tracee, and
+        # every one of those responses would still be counted here. The
+        # denominator then inflates to the full burst while the numerator holds
+        # only the syscalls of the handful the tracee actually answered, so the
+        # ceiling is compared against a burst the tracee never served and a
+        # mutant's extra opens land on a pid nothing is counting. All three
+        # assertions pass on precisely the behaviour they exist to catch, and
+        # `worker_processes 1` does not prevent it -- sequential replacement is
+        # still one worker at a time.
+        #
+        # The predicate lives in lib.sh as prober_served_by rather than inline
+        # here, for the same reason the summary parser does: a rule that only
+        # ever runs inside a scenario can only be tested by booting a server, and
+        # the shapes that matter -- a response from a REPLACEMENT worker, a body
+        # with no pid, an interim 103 -- are precisely the ones a healthy run
+        # never produces. Extracted, syscall_budget_test.sh feeds it all of them.
+        if prober_served_by "$_resp" "$WORKER"; then
             SERVED=$((SERVED + 1))
         fi
     fi

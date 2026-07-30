@@ -2024,9 +2024,6 @@ into a generator of concrete adversarial scenarios instead of a number to chase.
 
 **Sharper oracles on what we already do.**
 
-- `syscall-allowlist` observes syscalls; it does not yet assert a *budget*
-  (this operation must not exceed N `openat` calls), which would catch a
-  module that works but does so via a per-request file open.
 - The `delta` oracles pin fds, pool bytes and slab. A module can still leak in
   places nothing snapshots — timers, cleanup handlers, resolver state. Each is
   a probe field somebody has to add before an oracle can assert on it.

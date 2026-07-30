@@ -846,6 +846,31 @@ mutate "syscall budget: an absent family sums to zero instead of erroring" lib.s
     '    [ "$seen" -eq 1 ] || sum=0' \
     syscall_budget_test.sh
 
+# First-character-only member validation. `case "$name" in [a-z]*)` tests the
+# first character and nothing else, so "open!", "open*" and "open-at" all pass
+# it -- and family-wide `seen` then lets the one VALID member (openat) satisfy
+# the whole family, returning rc=0 with openat's count alone. That is the
+# name-wise budget the family form exists to replace, restored silently by any
+# future edit to a family string. The "Openat" assertion does not catch it: that
+# one tests the first-character rule, which this mutation keeps intact.
+# shellcheck disable=SC2016
+mutate "syscall budget: family member validated by first character only" lib.sh \
+    "            '' | [!a-z]* | *[!a-z0-9_]*) return 1 ;;" \
+    "            [a-z]*) ;; *) return 1 ;;" \
+    syscall_budget_test.sh
+
+# The pid-blind denominator. strace attaches to ONE pid and -f does not follow a
+# replacement worker (the MASTER forks it, not the tracee), so counting any
+# status line credits responses whose syscalls were never traced. The denominator
+# inflates to the full burst while the numerator holds only the tracee's calls,
+# and the mutant's extra opens land off-tracee -- every assertion passes on the
+# exact behaviour they exist to catch. This restores the original matcher.
+# shellcheck disable=SC2016
+mutate "syscall budget: served counted without binding the response to the traced pid" lib.sh \
+    "    grep -qE '^HTTP/1\.[01] 200( |\$)' <<<\"\$resp\" || return 1" \
+    "    grep -qE '^HTTP/1\.[01] [0-9]{3}' <<<\"\$resp\" && return 0 || return 1" \
+    syscall_budget_test.sh
+
 
 # ---- probe_baseline --------------------------------------------------------
 

@@ -1658,16 +1658,27 @@ prober_strace_family_sum() {
         '' | *'++'* | '+'* | *'+') return 1 ;;
     esac
 
-    local name sum=0 seen=0 got
-    local IFS='+'
-    # shellcheck disable=SC2086
-    set -- $family
-    unset IFS
+    # Split on `+` WITHOUT letting the shell glob the members. Unquoted `set --
+    # $family` word-splits correctly but also pathname-expands, so a member
+    # containing a glob metacharacter ("openat+open*") either expands against the
+    # cwd or -- finding no match -- survives verbatim, and either way the caller's
+    # typo becomes something other than what it wrote. `read -r -a` under IFS
+    # splits with no expansion at all.
+    local -a names=()
+    IFS='+' read -r -a names <<<"$family"
 
-    for name in "$@"; do
+    local name sum=0 seen=0 got
+    for name in "${names[@]}"; do
+        # Validate the WHOLE name, not its first character. `case "$name" in
+        # [a-z]*)` accepted "opemat", "open!", "open_at" and "open*" alike: each
+        # starts with a lowercase letter, so each passed, and family-wide `seen`
+        # then let the one VALID member (openat) mask its typo'd sibling -- the
+        # sum came back rc=0 at openat's count alone. That is the name-wise
+        # bypass this function exists to close, silently recreated by any future
+        # edit to a family string. A member must be syscall-shaped end to end, or
+        # the family is unevaluable and the caller must red.
         case "$name" in
-            [a-z]*) ;;
-            *) return 1 ;;
+            '' | [!a-z]* | *[!a-z0-9_]*) return 1 ;;
         esac
         # Every matching row is summed, not just the first: a table carrying the
         # same name twice (an -f capture that did not fold two threads, a
@@ -1682,6 +1693,38 @@ prober_strace_family_sum() {
 
     [ "$seen" -eq 1 ] || return 1
     printf '%s\n' "$sum"
+}
+
+# prober_served_by RESPONSE PID
+#
+# True when RESPONSE is a final 200 whose probe body reports it was answered by
+# PID. This is the syscall budget's denominator predicate: it decides whether a
+# response counts toward the SERVED figure the per-request ceilings scale with.
+#
+# WHY THE PID, NOT JUST A STATUS LINE. strace attaches to ONE pid. `-f` follows
+# that tracee's children, but a replacement worker is forked by the MASTER, not
+# by the tracee -- so if the traced worker retires mid-burst, its successor
+# serves the remainder entirely off-tracee. Counting those responses inflates the
+# denominator while the numerator still holds only the tracee's syscalls: the
+# ceiling is then compared against a burst the traced worker never served, and a
+# mutant's extra opens land on a pid nothing is counting. Every assertion passes
+# on exactly the behaviour they exist to catch. `worker_processes 1` does not
+# prevent this -- sequential replacement is still one worker at a time.
+#
+# WHY 200 AND NOT ANY THREE DIGITS. The status is matched as a final 200
+# specifically. An interim `103`, a `500`, and the malformed `2000` all matched a
+# bare `[0-9]{3}` pattern and each counted as a served response, none of which
+# spent a served request's worth of syscalls.
+#
+# Absent or unparseable pid is NOT served for this purpose: prober_probe_field
+# returns non-zero on a missing field precisely so absent cannot read as a value,
+# and here that fails closed (uncounted) rather than crediting the denominator.
+prober_served_by() {
+    local resp="$1" want="$2" got
+
+    grep -qE '^HTTP/1\.[01] 200( |$)' <<<"$resp" || return 1
+    got="$(prober_probe_field "$resp" pid 2>/dev/null)" || return 1
+    [ "$got" = "$want" ]
 }
 
 # prober_cleanup

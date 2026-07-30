@@ -69,6 +69,15 @@ PRIMARY	prober/stale_so_test.sh	stale_so_test.sh	fast
 PRIMARY	prober/check_conf_test.sh	check_conf_test.sh	fast
 PRIMARY	prober/docs_directives_test.sh	docs_directives_test.sh	fast
 
+# The strace summary parser (prober_strace_counts, prober_strace_family_sum)
+# lives in lib.sh but is only exercised end-to-end by the syscall-allowlist
+# scenario, which cannot produce the shapes that broke it -- an errors row, an
+# absent family, a duplicated name. syscall_budget_test.sh feeds those from
+# committed fixtures, so a lib.sh edit has to select it or the parser's hostile
+# cases go unrun.
+PRIMARY	prober/lib.sh	syscall_budget_test.sh	fast
+PRIMARY	prober/syscall_budget_test.sh	syscall_budget_test.sh	fast
+
 # test.sh is the RUNNER, not a suite: it discovers *_test.c and *_test.sh and
 # aggregates their exit codes. runner_summary_test.sh drives a COPY of it in a
 # fixture directory, so it is the suite that actually proves the runner's
