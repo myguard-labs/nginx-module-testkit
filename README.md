@@ -68,6 +68,17 @@ has already shipped by accident several times and now hunts on purpose. A
 mutation-proven test that covers one line beats a suite that touches every line
 and cannot fail. Chase the coverage, never the percentage.
 
+The policy in full — the four reachability classes, the control-mutation rule
+every new test has to pass, how to annotate a line that really is unreachable,
+and the constraints that keep the resulting tests contributable to the module's
+own repository — is [docs/COVERAGE.md](docs/COVERAGE.md).
+[docs/COVERAGE-HOWTO.md](docs/COVERAGE-HOWTO.md) is the procedure with commands:
+find the drivable core, baseline it, classify the uncovered lines, write the
+case, break the code to prove the case, ship it. Worked end to end on
+[nginx-strip-filter-module](https://github.com/myguard-labs/nginx-strip-filter-module),
+which went 77.21% → 99.79% that way, with two tests caught being vacuous by
+their own controls.
+
 ## What this repo's own CI is for — and what it is not
 
 The section above is what the tool does to a *consumer's* module. This one is a
