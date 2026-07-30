@@ -786,6 +786,16 @@ mutate "schema: emitter renames a field" ../src/ngx_test_probe.c \
     '"\"descriptors\":%i,"' \
     schema_emitter_test.sh
 
+# The timers gauge specifically. It shares the -1-on-failure discipline of the
+# fd counters, so the mutation that matters is not "the field vanished" (the
+# rename row above already covers that shape) but the field going quiet while
+# still being emitted -- a walk that reports a constant is exactly what a
+# leak oracle cannot distinguish from a worker that leaks nothing.
+mutate "schema: timers gauge renamed" ../src/ngx_test_probe.c \
+    '"\"timers\":%i,"' \
+    '"\"event_timers\":%i,"' \
+    schema_emitter_test.sh
+
 # The other direction: a member the schema does not name. Without the reverse
 # sweep the schema decays into a subset that passes forever while describing
 # less and less of the document.

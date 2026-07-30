@@ -24,6 +24,11 @@
  * dependency this translation unit did not already have. */
 #include <stddef.h>
 
+/* ngx_event_timer_rbtree, for the "timers" gauge. ngx_core.h does not pull the
+ * event headers in, and this is inside NGX_TEST_HARNESS for the same reason
+ * stddef.h is: the disabled build must not acquire a dependency it lacked. */
+#include <ngx_event.h>
+
 
 extern ngx_test_probe_hooks_t  ngx_test_probe_hooks;
 
@@ -384,12 +389,75 @@ ngx_test_probe_pool_stats(ngx_pool_t *pool, size_t *used, ngx_uint_t *blocks,
 }
 
 
+/*
+ * Armed entries in this worker's event-timer rbtree.
+ *
+ * The leak this names is one nothing else here can see. A module that arms an
+ * ngx_event_t timer per request and fails to disarm it on an ABORTED request
+ * (client reset, 499, reload mid-flight) leaves a live timer behind while fds,
+ * cycle-pool bytes and slab pages all stay flat -- so every delta oracle we
+ * ship reads clean while the worker accumulates callbacks that will fire
+ * against freed request state.
+ *
+ * ngx_event_timer_rbtree is a plain extern ngx_rbtree_t in both nginx and
+ * angie, which is why it is read directly. Deliberately NOT ngx_event_find_timer()
+ * (it answers "how long until the next one", not "how many"), and deliberately
+ * not gated on NGX_STAT_STUB the way ngx_stat_active would be -- the same
+ * reasoning the connection counters above are documented with.
+ *
+ * The tree is PER WORKER and lives in the event loop, so this is only meaningful
+ * read from the worker that owns it -- the probe request runs in that worker,
+ * which is what makes the count attributable at all. It is also a point-in-time
+ * reading taken while the probe request is itself in flight: nginx's own timers
+ * (resolver, upstream, keepalive, the probe connection) are counted too, so the
+ * oracle a consumer writes is a DELTA back to baseline across a burst, never an
+ * absolute value.
+ *
+ * -1 on an uninitialised tree rather than 0, sharing the sentinel discipline of
+ * ngx_test_probe_fd_count(): before ngx_event_timer_init() runs, root and
+ * sentinel are both NULL, and reporting that as a genuine zero would let a
+ * delta over it cancel to a passing zero.
+ */
+static ngx_int_t
+ngx_test_probe_timer_count(void)
+{
+    ngx_rbtree_node_t  *root, *sentinel, *node;
+    ngx_int_t           n;
+
+    root = ngx_event_timer_rbtree.root;
+    sentinel = ngx_event_timer_rbtree.sentinel;
+
+    if (root == NULL || sentinel == NULL) {
+        return -1;
+    }
+
+    if (root == sentinel) {
+        return 0;
+    }
+
+    /* Ordered walk via ngx_rbtree_next(), the same traversal
+     * ngx_event_expire_timers() uses, rather than a hand-rolled recursion:
+     * the tree can be deep and this runs inside a request. */
+    n = 0;
+
+    for (node = ngx_rbtree_min(root, sentinel);
+         node != NULL;
+         node = ngx_rbtree_next(&ngx_event_timer_rbtree, node))
+    {
+        n++;
+    }
+
+    return n;
+}
+
+
 u_char *
 ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
 {
     size_t           pool_used;
     u_char          *p;
     ngx_int_t        fds, fd_sock, fd_file, fd_anon, fd_other, pss, priv_dirty;
+    ngx_int_t        timers;
     ngx_uint_t       pages_free, present, pool_blocks, pool_large, pool_cleanup;
     ngx_slab_pool_t *shpool;
 
@@ -397,6 +465,7 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
     present = 0;
 
     fds = ngx_test_probe_fd_count();
+    timers = ngx_test_probe_timer_count();
     ngx_test_probe_fd_kinds(&fd_sock, &fd_file, &fd_anon, &fd_other);
     ngx_test_probe_smaps(&pss, &priv_dirty);
     ngx_test_probe_pool_stats(ngx_cycle->pool, &pool_used, &pool_blocks,
@@ -427,6 +496,7 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                      "\"page_size\":%uz,"
                      "\"connections\":{\"total\":%ui,\"free\":%ui},"
                      "\"fds\":%i,"
+                     "\"timers\":%i,"
                      "\"fds_by_kind\":{\"socket\":%i,\"file\":%i,"
                      "\"anon\":%i,\"other\":%i},"
                      "\"smaps\":{\"pss\":%i,\"private_dirty\":%i},"
@@ -441,6 +511,7 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                      (ngx_uint_t) ngx_cycle->connection_n,
                      (ngx_uint_t) ngx_cycle->free_connection_n,
                      fds,
+                     timers,
                      fd_sock, fd_file, fd_anon, fd_other,
                      pss, priv_dirty,
                      pool_used,

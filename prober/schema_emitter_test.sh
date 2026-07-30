@@ -20,7 +20,7 @@ cd "$(dirname "$0")"
 EMITTER=../src/ngx_test_probe.c
 SCHEMA=../probe-schema.json
 
-PLANNED=32
+PLANNED=33
 tests_run=0
 failures=0
 
@@ -53,6 +53,7 @@ connections:connections
 connections.total:total
 connections.free:free
 fds:fds
+timers:timers
 fds_by_kind:fds_by_kind
 fds_by_kind.socket:socket
 fds_by_kind.file:file

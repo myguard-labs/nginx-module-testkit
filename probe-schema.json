@@ -37,6 +37,7 @@
     "connections.total":      { "type": "number", "required": true },
     "connections.free":       { "type": "number", "required": true },
     "fds":                    { "type": "number", "required": true },
+    "timers":                 { "type": "number", "required": true },
     "fds_by_kind":            { "type": "object", "required": true },
     "fds_by_kind.socket":     { "type": "number", "required": true },
     "fds_by_kind.file":       { "type": "number", "required": true },

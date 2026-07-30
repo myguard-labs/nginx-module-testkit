@@ -1,0 +1,114 @@
+# Scenario: event timers armed during a request are disarmed again by the time
+# it ends, including on the paths where the request does NOT end normally.
+#
+# WHAT THIS ADDS OVER EVERY OTHER DELTA SCENARIO. conn-delta watches
+# connections.free and fds; alloc-per-request watches the three cycle-pool
+# counters. A leaked ngx_event_t timer moves NONE of them. The connection is
+# closed, its fd is returned, its request pool is freed -- and an entry the
+# module armed on that request is still sitting in the worker's event-timer
+# rbtree, holding a callback that will fire against freed request state. Every
+# oracle this repo shipped before the `timers` field read clean through exactly
+# that bug.
+#
+# WHY THE ABORTED CASES ARE THE POINT. A request that completes normally runs
+# the disarm path every request runs, which every other scenario exercises
+# thousands of times. The interesting shape is a request that is torn down
+# EARLY -- RST mid-header, FIN while the server still owes a response -- because
+# a module that disarms its timer from the response path and not from a cleanup
+# handler leaks on precisely those and on nothing else. That is the teardown
+# path almost nobody tests.
+#
+# WHY probe_baseline AND NOT ONLY delta. `delta` is case-local (prober.c:327
+# fetches the before-snapshot per case), so a leak of exactly one timer per
+# request satisfies every per-case `delta timers == 0` while the rbtree grows
+# monotonically -- both snapshots already include the drift. `probe_baseline`
+# compares against the fixed origin read before case 1, which is the only
+# assertion here that can see cumulative growth. This is the same trap
+# conn-delta documents for connection slots, and the reason its closing case
+# needs an absolute floor.
+#
+# WHY == 0 IS PORTABLE HERE, UNLIKE cycle_used. The absolute cycle-pool numbers
+# depend on build and conf, so alloc-per-request can only assert relative zero.
+# The timer count does not: with keepalive off and no request in flight but the
+# probe's own, a healthy worker parks at zero armed timers, and the probe
+# request itself is answered from the content handler without arming one. That
+# was measured, not assumed -- see NON-VACUITY below, where the baseline reads 0
+# and a stalled client reads 3.
+#
+# WHY keepalive_timeout 0 IN THE CONF. A kept-alive connection holds an armed
+# timer between requests on purpose. That is not a leak, but it is
+# indistinguishable from one at the closing baseline, so the conf takes it off
+# the board rather than teaching the assertion to tolerate it.
+#
+# NON-VACUITY (measured locally against nginx 1.29.0, ref module loaded).
+# The gauge distinguishes the states it has to distinguish:
+#   - idle worker, no clients            -> "timers":0
+#   - three clients stalled mid-header   -> "timers":3   (connections.free 64->58)
+#   - the same three gone                -> "timers":0
+# A gauge that returned a constant would have read 0 in the middle case, and a
+# broken walk would have read 0 everywhere -- which is why the middle reading is
+# the one that matters. The mutate.sh row pins the emitter side.
+
+name    baseline before the batch
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   timers == 0
+probe   fds >= 1
+
+# A dribbled header block: the read path is re-entered once per chunk and
+# client_header_timeout is re-armed on each re-entry, so this case arms and
+# disarms a timer several times over. A module re-arming per read without
+# disarming leaks here in proportion to the chunk count.
+name       dribbled header block completes
+send       GET /__probe HTTP/1.1\r\n
+send_slow  4 20
+send       Host: prober\r\nConnection: close\r\n\r\n
+expect     status=200
+delta      timers == 0
+delta      fds == 0
+
+# A client that vanishes mid-header, with a header timeout armed at the moment
+# it does. No `expect`: the connection is destroyed before the server can write
+# a response, so the deltas are the assertion.
+name    aborted mid-header with a timer armed
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+abort   24
+delta   timers == 0
+delta   fds == 0
+
+name    aborted again, immediately after
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+abort   24
+delta   timers == 0
+delta   fds == 0
+
+# FIN while the server still owes a response: a graceful EOF where the event
+# loop expects one, which unwinds through a different path from a reset.
+name     half-closed before the response
+send     GET /__probe HTTP/1.1\r\n
+send     Host: prober\r\nConnection: close\r\n\r\n
+shutdown 1
+delta    timers == 0
+delta    fds == 0
+
+name     half-closed again, immediately after
+send     GET /__probe HTTP/1.1\r\n
+send     Host: prober\r\nConnection: close\r\n\r\n
+shutdown 1
+delta    timers == 0
+delta    fds == 0
+
+# The closing case. Its `delta` lines say nothing the earlier ones did not; the
+# BASELINE line is what this case exists for. Six requests have run by now, four
+# of them torn down early, so a module leaking one timer per aborted request
+# sits at four armed timers with every per-case delta above still reading zero.
+name    timers returned to baseline after the batch
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   timers == 0
+delta   fds == 0
+probe_baseline timers == 0
