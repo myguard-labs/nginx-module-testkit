@@ -119,7 +119,7 @@ interval silently extended by the size of the step: nothing logs, nothing errors
 and a one-second timer sits an hour in the future.
 
 > **Status, 2026-07-30: the rebuild described below is NOT in `main` yet.** It
-> is open as [#150](https://github.com/myguard-labs/nginx-test-harness/pull/150),
+> is open as [#158](https://github.com/myguard-labs/nginx-test-harness/pull/158),
 > where its keepalive probe fails on every nginx flavour (`OSError: [Errno 22]`
 > out of the driver's inline Python, not out of nginx — the clock does step and
 > the worker does survive). What is in the tree today is still the vacuous
