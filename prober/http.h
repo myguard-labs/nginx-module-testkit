@@ -105,6 +105,18 @@ typedef struct {
      * remains this process's own account of its own behaviour. */
     long long  paced_sleep_ms;
 
+    /* Milliseconds this client deliberately slept while WRITING the request,
+     * to honour `pause`/`send_slow`/`send_slow_chunks`. 0 whenever the caller
+     * passed no pacing. The send-side twin of `paced_sleep_ms` above -- same
+     * rationale, same defect it exists to catch: a wall-clock floor on
+     * elapsed time degrades vacuously on a loaded runner (scheduling delay
+     * alone satisfies it while the sleep does nothing), so this is
+     * ACCUMULATED FROM sleep_ms()'s RETURN VALUE, never from the `ms` value
+     * sitting beside the call. A counter incremented from intent stays green
+     * even after the sleep is deleted; crediting the return couples the
+     * number to the operation that actually happened. */
+    long long  send_paced_ms;
+
     /* How the read loop ended, and how long after the request went out.
      *
      * `close_ms` is measured from the moment the last request byte is written

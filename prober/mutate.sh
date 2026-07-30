@@ -211,20 +211,77 @@ mutate "send_slow: inter-chunk sleep zeroed" http.c \
     'off += n;
 
         if (off < len) {
-            sleep_ms(ms);
+            long  slept = sleep_ms(ms);' 'off += n;
+
+        if (off < len) {
+            long  slept = sleep_ms(ms * 0);' http_test
+
+# NAME FIXED s177: this zeroes the ms handed to write_paced_units(), i.e. the
+# INTER-UNIT pacing, not the leading stall -- the leading sleep is the separate
+# sleep_ms(pauses[i].ms) above the pacer call. CodeRabbit caught the mismatch on
+# #164. The leading stall has its own row below.
+mutate "send_slow_chunks: inter-unit pacing zeroed at the call site" http.c \
+    'if (pauses[i].unit) {
+                rc = write_paced_units(fd, req + off, upto_next - off,
+                                       pauses[i].ms, slept_ms);' \
+    'if (pauses[i].unit) {
+                rc = write_paced_units(fd, req + off, upto_next - off,
+                                       pauses[i].ms * 0, slept_ms);' http_test
+
+# The leading stall the row above was misnamed for: the sleep taken BEFORE a
+# paced span begins, which every paced entry performs regardless of pacer.
+#
+# SC2016: the anchors are literal C source to match, not shell to expand. This
+# row needs the disable where its neighbours do not because `pauses[i]` reads as
+# an array subscript to shellcheck; the other send-side anchors open on a line
+# that carries no subscript.
+# shellcheck disable=SC2016
+mutate "send_slow: leading stall dropped" http.c \
+    'slept = sleep_ms(pauses[i].ms);
+
+            if (slept_ms != NULL) {
+                *slept_ms += slept;
+            }
+
+            /* `unit` first,' \
+    'slept = sleep_ms(pauses[i].ms * 0);
+
+            if (slept_ms != NULL) {
+                *slept_ms += slept;
+            }
+
+            /* `unit` first,' http_test
+
+# The S-5 defect class one level up: the sleep is gutted but the counter is
+# credited from the INTENT (`ms`) instead of sleep_ms()'s return, so the
+# accounted number stays exactly right while the sleep never happens. An
+# equality assertion on send_paced_ms alone cannot catch this -- the whole
+# point of the defect is that the count is correct -- so this can only be
+# caught by an assertion that corroborates the count against an independent
+# witness of elapsed time (http_test.c's "corroborated by elapsed wall time"
+# case). Kept as its own row rather than folded into the sleep-zeroed row
+# above: that row changes the SLEEP call, this one changes the CREDIT site,
+# and conflating them would leave either half able to regress unnoticed.
+mutate "send_slow: inter-chunk sleep zeroed but intent credited anyway" http.c \
+    'off += n;
+
+        if (off < len) {
+            long  slept = sleep_ms(ms);
+
+            if (slept_ms != NULL) {
+                *slept_ms += slept;
+            }
         }' 'off += n;
 
         if (off < len) {
-            sleep_ms(ms * 0);
-        }' http_test
+            long  slept = sleep_ms(ms * 0);
 
-mutate "send_slow: leading stall dropped" http.c \
-    'if (pauses[i].unit) {
-                rc = write_paced_units(fd, req + off, upto_next - off,
-                                       pauses[i].ms);' \
-    'if (pauses[i].unit) {
-                rc = write_paced_units(fd, req + off, upto_next - off,
-                                       pauses[i].ms * 0);' http_test
+            (void) slept;
+
+            if (slept_ms != NULL) {
+                *slept_ms += ms;
+            }
+        }' http_test
 
 mutate "send_slow: chunk ignored" http.c \
     'if (n > chunk) {
@@ -239,12 +296,10 @@ mutate "send_slow_chunks: inter-unit sleep zeroed" http.c \
     'off += unit;
 
         if (off < len) {
-            sleep_ms(ms);
-        }' 'off += unit;
+            long  slept = sleep_ms(ms);' 'off += unit;
 
         if (off < len) {
-            sleep_ms(ms * 0);
-        }' http_test
+            long  slept = sleep_ms(ms * 0);' http_test
 
 # The pacer selection itself: a unit entry falling through to the byte-count
 # pacer is the defect the directive exists to prevent, and chunk 0 there means

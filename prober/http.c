@@ -1133,10 +1133,14 @@ sleep_ms(long ms)
  * Write `len` bytes `chunk` at a time, sleeping `ms` between writes. The sleep
  * goes BETWEEN chunks only -- a trailing sleep after the final chunk would
  * delay the response rather than the request, which is a different test.
+ *
+ * `*slept_ms` is credited with sleep_ms()'s RETURN at every inter-chunk sleep,
+ * not with `ms` itself -- see sleep_ms()'s comment. `slept_ms` may be NULL for
+ * a caller that does not account send-side pacing.
  */
 static int
 write_paced(int fd, const unsigned char *buf, size_t len,
-            size_t chunk, long ms)
+            size_t chunk, long ms, long long *slept_ms)
 {
     size_t  off = 0;
 
@@ -1154,7 +1158,11 @@ write_paced(int fd, const unsigned char *buf, size_t len,
         off += n;
 
         if (off < len) {
-            sleep_ms(ms);
+            long  slept = sleep_ms(ms);
+
+            if (slept_ms != NULL) {
+                *slept_ms += slept;
+            }
         }
     }
 
@@ -1183,9 +1191,13 @@ write_paced(int fd, const unsigned char *buf, size_t len,
  *     offset the framing does not have, which is what the byte-count pacer
  *     already does. The bytes are always identical to an unpaced write; only
  *     the timing of the tail changes.
+ *
+ * `*slept_ms` is credited with sleep_ms()'s RETURN at every inter-unit sleep,
+ * the send-side counterpart of write_paced() above. `slept_ms` may be NULL.
  */
 static int
-write_paced_units(int fd, const unsigned char *buf, size_t len, long ms)
+write_paced_units(int fd, const unsigned char *buf, size_t len, long ms,
+                  long long *slept_ms)
 {
     size_t  off = 0;
 
@@ -1226,7 +1238,11 @@ write_paced_units(int fd, const unsigned char *buf, size_t len, long ms)
         off += unit;
 
         if (off < len) {
-            sleep_ms(ms);
+            long  slept = sleep_ms(ms);
+
+            if (slept_ms != NULL) {
+                *slept_ms += slept;
+            }
         }
     }
 
@@ -1242,10 +1258,17 @@ write_paced_units(int fd, const unsigned char *buf, size_t len, long ms)
  * Write the request, stalling at each pause offset. With no pauses this is a
  * single write_all() of the whole buffer -- byte-identical to what this
  * function did before pauses existed.
+ *
+ * `*slept_ms`, if non-NULL, is credited with sleep_ms()'s RETURN at every
+ * sleep this function or its two pacing helpers perform -- the leading stall
+ * before a paced span, the plain-pause sleep, and every inter-chunk/inter-unit
+ * sleep inside write_paced()/write_paced_units(). Never the `ms`/`pauses[i].ms`
+ * value beside the call: see sleep_ms()'s comment for why that distinction is
+ * the whole point.
  */
 static int
 write_request(int fd, const unsigned char *req, size_t req_len,
-              const http_pause *pauses, size_t n_pauses)
+              const http_pause *pauses, size_t n_pauses, long long *slept_ms)
 {
     size_t  off = 0, i;
 
@@ -1270,6 +1293,7 @@ write_request(int fd, const unsigned char *req, size_t req_len,
              * plain pause, so the two read alike in a rule file. */
             size_t  upto_next = req_len;
             int     rc;
+            long    slept;
 
             if (i + 1 < n_pauses && pauses[i + 1].offset < upto_next) {
                 upto_next = pauses[i + 1].offset;
@@ -1279,7 +1303,11 @@ write_request(int fd, const unsigned char *req, size_t req_len,
                 upto_next = off;
             }
 
-            sleep_ms(pauses[i].ms);
+            slept = sleep_ms(pauses[i].ms);
+
+            if (slept_ms != NULL) {
+                *slept_ms += slept;
+            }
 
             /* `unit` first, so an entry carrying both paces by framing rather
              * than silently by byte count -- the same precedence http.h
@@ -1287,10 +1315,10 @@ write_request(int fd, const unsigned char *req, size_t req_len,
              * this only decides what http_test.c and any future caller get. */
             if (pauses[i].unit) {
                 rc = write_paced_units(fd, req + off, upto_next - off,
-                                       pauses[i].ms);
+                                       pauses[i].ms, slept_ms);
             } else {
                 rc = write_paced(fd, req + off, upto_next - off,
-                                 pauses[i].chunk, pauses[i].ms);
+                                 pauses[i].chunk, pauses[i].ms, slept_ms);
             }
 
             if (rc != 0) {
@@ -1301,7 +1329,13 @@ write_request(int fd, const unsigned char *req, size_t req_len,
             continue;
         }
 
-        sleep_ms(pauses[i].ms);
+        {
+            long  slept = sleep_ms(pauses[i].ms);
+
+            if (slept_ms != NULL) {
+                *slept_ms += slept;
+            }
+        }
     }
 
     if (off < req_len) {
@@ -1515,7 +1549,7 @@ http_exchange(int fd,
      */
     if (write_request(fd, req,
                       abort_at < req_len ? abort_at : req_len,
-                      pauses, n_pauses) != 0)
+                      pauses, n_pauses, &resp->send_paced_ms) != 0)
     {
         snprintf(errbuf, errlen, "write: %s", strerror(errno));
         return -1;
@@ -2560,7 +2594,8 @@ http_exchange_concurrent(const char *host, int port, int n,
         size_t             leg_n_pauses = (i == 0) ? n_pauses : 0;
 
         if (write_request(fds[i], req, req_len,
-                          leg_pauses, leg_n_pauses) != 0)
+                          leg_pauses, leg_n_pauses,
+                          &resps[i].send_paced_ms) != 0)
         {
             snprintf(errbuf, errlen, "concurrent leg %d/%d: write: %s",
                      i + 1, n, strerror(errno));

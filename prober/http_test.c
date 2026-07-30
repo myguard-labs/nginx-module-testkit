@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  183
+#define PLANNED  185
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -193,6 +193,13 @@ typedef struct {
      * client_reads gates the chunk cap, this gates the SLEEP the cap paces the
      * reads apart with. Neither can be moved by a loaded box. */
     long long  paced_sleep_ms;
+
+    /* Milliseconds the CLIENT deliberately slept while WRITING the request,
+     * lifted off the response like paced_sleep_ms above -- the send-side
+     * twin. send_slow's deterministic witness: unlike elapsed_ms, a loaded
+     * box cannot inflate or shrink it, because it is credited from
+     * sleep_ms()'s return rather than measured off a wall clock. */
+    long long  send_paced_ms;
 } echo_result;
 
 
@@ -394,6 +401,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
     int            effective_rcvbuf = 0;
     size_t         client_reads = 0;
     long long      paced_sleep_ms = 0;
+    long long      send_paced_ms = 0;
 
     if (pipe(fds) != 0) {
         return -1;
@@ -416,6 +424,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
         effective_rcvbuf = resp.effective_rcvbuf;
         client_reads = resp.reads;
         paced_sleep_ms = resp.paced_sleep_ms;
+        send_paced_ms = resp.send_paced_ms;
         http_response_free(&resp);
     }
 
@@ -436,6 +445,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
     out->effective_rcvbuf = effective_rcvbuf;
     out->client_reads = client_reads;
     out->paced_sleep_ms = paced_sleep_ms;
+    out->send_paced_ms = send_paced_ms;
 
     return rc;
 }
@@ -2108,15 +2118,34 @@ main(void)
         /*
          * send_slow: pace the whole request in 8-byte chunks, 10 ms apart.
          *
-         * req_len is 18, so this is 3 chunks: one leading sleep, then two
-         * BETWEEN the three chunks (none after the last). The fixture's clock
-         * starts at accept(), which can return after the leading sleep is
-         * already underway, so only the two inter-chunk sleeps are reliably
-         * inside the measured window -- the floor is 20 ms, not 30. Measuring
-         * against the nominal 30 leaves no margin at all: gcc lands on 30-31
-         * and clang+ASan on 29, which is a broken test rather than a real
-         * regression. The floor still cannot be reached by a write that never
-         * slept, and case 52's chunk bound covers segmentation separately.
+         * req_len is 18, so this is 3 chunks (8, 8, 2): one leading sleep
+         * before the paced span, then two BETWEEN the three chunks (none
+         * after the last) -- 3 sleeps of 10 ms each, 30 ms accounted in all.
+         *
+         * Two assertions, because the equality alone is not enough. The
+         * equality catches a sleep gutted to a no-op, but NOT the other half
+         * of the S-5 defect class: a counter credited from `ms`/`pauses[i].ms`
+         * (the INTENT) beside a gutted sleep_ms() call still reports 30 --
+         * the number stays right while the sleep never happens, which is
+         * exactly the vacuous oracle this accounting exists to rule out. An
+         * accounting number alone cannot distinguish "credited from the
+         * return" from "credited from the intent"; only comparing it against
+         * an INDEPENDENT witness of real elapsed time can.
+         *
+         * So the second assertion derives its floor from `send_paced_ms`
+         * itself rather than a hardcoded constant, and checks `elapsed_ms`
+         * against it with a one-sided tolerance: the fixture's clock starts
+         * at accept(), before the connect() and the leading sleep at offset 0
+         * fully overlap it (see the offset-0 case above, which uses a
+         * separate margin for the same reason), so `elapsed_ms` can read
+         * slightly under 30 even when every sleep genuinely happened.
+         * Measured at 30 across dozens of runs, including under artificial
+         * CPU load, so a 10 ms tolerance (floor of 20) is generous rather than
+         * tight. It stays one-sided and load-immune in the safe direction: a
+         * loaded runner can only STRETCH elapsed_ms, never shrink it, so this
+         * can never fail on a real pass. A sleep gutted with intent credited
+         * intact collapses elapsed_ms to ~10 ms (the untouched leading stall
+         * alone) against an accounted 30, which fails `10 >= 20` and reds.
          */
         p[0].offset = 0;
         p[0].ms = 10;
@@ -2131,8 +2160,24 @@ main(void)
         ok(rc == 0 && er.reads > 1 && er.max_read <= 8,
            "send_slow splits the request into chunks no larger than asked");
 
-        ok(rc == 0 && er.elapsed_ms >= 20,
-           "send_slow paces the chunks apart in time");
+        ok(rc == 0 && er.send_paced_ms == 30,
+           "send_slow accounts the leading stall plus both inter-chunk sleeps");
+
+        ok(rc == 0 && er.elapsed_ms >= er.send_paced_ms - 10,
+           "send_slow's accounted sleep is corroborated by elapsed wall time, "
+           "not merely credited from intent");
+
+        /* A cheap guard, not a load-immunity control: with no pauses,
+         * write_request() takes the single write_all() path and every
+         * crediting site sits inside the pause loop or the pacing helpers, so
+         * none of them run -- send_paced_ms reads 0 by CONTROL FLOW, not
+         * because any accounting logic was exercised and found correct. Worth
+         * keeping anyway, as a guard against a future refactor that hoists a
+         * credit above the loop and would otherwise start crediting an
+         * unpaced request as a side effect. */
+        ok(run_echo(req, req_len, NULL, 0, &er) == 0
+           && er.send_paced_ms == 0,
+           "an unpaced request accounts zero send-side sleep");
 
         /* A chunk at or above the request length degrades to one write, but
          * still honours the leading sleep -- the pacing knob must not become a
