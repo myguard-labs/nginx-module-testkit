@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  184
+#define PLANNED  185
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -2122,16 +2122,30 @@ main(void)
          * before the paced span, then two BETWEEN the three chunks (none
          * after the last) -- 3 sleeps of 10 ms each, 30 ms accounted in all.
          *
-         * Asserted on `send_paced_ms`, not on elapsed wall-clock time: a wall
-         * floor here degrades vacuously on a loaded CI runner, where
-         * scheduling delay alone can exceed 20 ms even with the sleep gutted
-         * to a no-op (issues.md OPEN 2026-07-30 s174 -- the mutate.sh
-         * `send_slow: leading stall dropped` row survived on exactly this
-         * floor). `send_paced_ms` is credited from sleep_ms()'s RETURN at
-         * each of the three sleeps, so it reports 30 only when all three
-         * actually happened and 0 when this path is deleted -- a loaded box
-         * cannot move it either way, and an EQUALITY assertion (not a floor)
-         * catches a regression that leaves some sleeps in but drops others.
+         * Two assertions, because the equality alone is not enough. The
+         * equality catches a sleep gutted to a no-op, but NOT the other half
+         * of the S-5 defect class: a counter credited from `ms`/`pauses[i].ms`
+         * (the INTENT) beside a gutted sleep_ms() call still reports 30 --
+         * the number stays right while the sleep never happens, which is
+         * exactly the vacuous oracle this accounting exists to rule out. An
+         * accounting number alone cannot distinguish "credited from the
+         * return" from "credited from the intent"; only comparing it against
+         * an INDEPENDENT witness of real elapsed time can.
+         *
+         * So the second assertion derives its floor from `send_paced_ms`
+         * itself rather than a hardcoded constant, and checks `elapsed_ms`
+         * against it with a one-sided tolerance: the fixture's clock starts
+         * at accept(), before the connect() and the leading sleep at offset 0
+         * fully overlap it (see the offset-0 case above, which uses a
+         * separate margin for the same reason), so `elapsed_ms` can read
+         * slightly under 30 even when every sleep genuinely happened.
+         * Measured at 30 across dozens of runs, including under artificial
+         * CPU load, so a 10 ms tolerance (floor of 20) is generous rather than
+         * tight. It stays one-sided and load-immune in the safe direction: a
+         * loaded runner can only STRETCH elapsed_ms, never shrink it, so this
+         * can never fail on a real pass. A sleep gutted with intent credited
+         * intact collapses elapsed_ms to ~10 ms (the untouched leading stall
+         * alone) against an accounted 30, which fails `10 >= 20` and reds.
          */
         p[0].offset = 0;
         p[0].ms = 10;
@@ -2149,12 +2163,18 @@ main(void)
         ok(rc == 0 && er.send_paced_ms == 30,
            "send_slow accounts the leading stall plus both inter-chunk sleeps");
 
-        /* The load-immunity control: an unpaced run accounts EXACTLY ZERO
-         * send-side sleep. Without this, a build that credits every write
-         * with a fixed nonzero amount regardless of pacing would still pass
-         * the equality assertion above by coincidence for req_len 18 -- this
-         * is what makes the accounting load-immune rather than merely
-         * differently-shaped. */
+        ok(rc == 0 && er.elapsed_ms >= er.send_paced_ms - 10,
+           "send_slow's accounted sleep is corroborated by elapsed wall time, "
+           "not merely credited from intent");
+
+        /* A cheap guard, not a load-immunity control: with no pauses,
+         * write_request() takes the single write_all() path and every
+         * crediting site sits inside the pause loop or the pacing helpers, so
+         * none of them run -- send_paced_ms reads 0 by CONTROL FLOW, not
+         * because any accounting logic was exercised and found correct. Worth
+         * keeping anyway, as a guard against a future refactor that hoists a
+         * credit above the loop and would otherwise start crediting an
+         * unpaced request as a side effect. */
         ok(run_echo(req, req_len, NULL, 0, &er) == 0
            && er.send_paced_ms == 0,
            "an unpaced request accounts zero send-side sleep");

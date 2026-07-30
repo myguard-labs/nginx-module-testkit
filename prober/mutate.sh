@@ -224,6 +224,37 @@ mutate "send_slow: leading stall dropped" http.c \
                 rc = write_paced_units(fd, req + off, upto_next - off,
                                        pauses[i].ms * 0, slept_ms);' http_test
 
+# The S-5 defect class one level up: the sleep is gutted but the counter is
+# credited from the INTENT (`ms`) instead of sleep_ms()'s return, so the
+# accounted number stays exactly right while the sleep never happens. An
+# equality assertion on send_paced_ms alone cannot catch this -- the whole
+# point of the defect is that the count is correct -- so this can only be
+# caught by an assertion that corroborates the count against an independent
+# witness of elapsed time (http_test.c's "corroborated by elapsed wall time"
+# case). Kept as its own row rather than folded into the sleep-zeroed row
+# above: that row changes the SLEEP call, this one changes the CREDIT site,
+# and conflating them would leave either half able to regress unnoticed.
+mutate "send_slow: inter-chunk sleep zeroed but intent credited anyway" http.c \
+    'off += n;
+
+        if (off < len) {
+            long  slept = sleep_ms(ms);
+
+            if (slept_ms != NULL) {
+                *slept_ms += slept;
+            }
+        }' 'off += n;
+
+        if (off < len) {
+            long  slept = sleep_ms(ms * 0);
+
+            (void) slept;
+
+            if (slept_ms != NULL) {
+                *slept_ms += ms;
+            }
+        }' http_test
+
 mutate "send_slow: chunk ignored" http.c \
     'if (n > chunk) {
             n = chunk;
