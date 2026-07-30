@@ -22,29 +22,39 @@ that is `nginx.pm`'s job. This tool exists to find the leak, the corruption, the
 descriptor that never closes, the allocation that is never checked, the state
 that survives a reload it should not have survived.
 
-The attack surface it works, and the machinery already here for each:
+The attack surface it works, and the machinery already here for each. Each
+bullet has a document of its own under [docs/](docs/README.md#attack-surfaces),
+naming the oracle that decides a verdict and the ways that class can produce a
+green run proving nothing:
 
-- **Hostile and malformed input** — `property-fuzz` and `stateful-property-fuzz`
+- **[Hostile and malformed input](docs/attack-hostile-input.md)** — `property-fuzz` and `stateful-property-fuzz`
   generate request shapes the module's author did not think of, including
   pipelined and split-framing cases (`keepalive-bleed` is the negative control
   for the reader that makes those honest).
-- **Allocation-failure injection** — `fault_slab=`, `fault_palloc=`,
+- **[Allocation-failure injection](docs/attack-fault-injection.md)** — `fault_slab=`, `fault_palloc=`,
   `fault_tempfile=`, `fault_accept=` (`src/ngx_test_probe_arm.c`) make the
   allocator fail on demand, on the Nth call. Most module bugs live on the error
   path that nobody exercises, because in a healthy test the allocator never
   fails. `fault-matrix` drives these.
-- **Resource exhaustion and leak pressure** — repeated-operation deltas on
+- **[Resource exhaustion and leak pressure](docs/attack-leak-pressure.md)** — repeated-operation deltas on
   cycle-pool bytes, file descriptors and slab accounting. A leak of one
   descriptor per request is invisible in a functional test and fatal in
   production; `rss-slope` and the `delta` oracles pin total growth, not a
   per-operation average that truncates to zero.
-- **Lifecycle attacks** — reload, binary upgrade, worker death, signal storms
-  mid-transfer (`reload-*`, `usr2-*`, `hup-storm-mid-transfer`,
-  `worker-death`). Reloads are where module leaks surface, because that is when
-  a cycle is torn down and every unbalanced allocation becomes visible.
-- **Environmental hostility** — `clock-jump` walks the clock with libfaketime,
-  `locale-hostility` attacks locale-dependent parsing, `syscall-allowlist`
-  traces what the worker actually does rather than what it claims.
+- **[Lifecycle attacks](docs/attack-lifecycle.md)** — reload, binary upgrade,
+  worker death, signal storms mid-transfer (`reload-*`, `usr2-*`,
+  `hup-storm-mid-transfer`, `worker-death`). Reloads are where module leaks
+  surface, because that is when a cycle is torn down and every unbalanced
+  allocation becomes visible.
+- **[Concurrency](docs/attack-concurrency.md)** — `concurrent N` holds N requests
+  in flight at once (`concurrent-fan`), `open_conns` parks bare connections,
+  `backpressure` attacks the write path with a reader that will not drain.
+- **[Environmental hostility](docs/attack-environment.md)** — the
+  `locale-hostility` CI job re-runs the self-tests under `tr_TR.UTF-8` and
+  `de_DE.UTF-8` (both have caught a real bug), and `syscall-allowlist` traces
+  what the worker actually does rather than what it claims. `clock-jump`
+  LD_PRELOADs libfaketime to step the worker's wall clock backwards mid-run and
+  requires its timers to be unmoved by it.
 
 If you can think of another way to break a module, it belongs here. New attack
 ideas are welcome as scenarios; see "Ideas and opportunities" below for the
@@ -152,8 +162,12 @@ our own C names them as the thing that proves it. `keepalive-bleed` is the
 negative control for the prober's framing-aware reader — `prober/http.c` points
 at it for the conn-reuse split, and it is the shape `stateful-property-fuzz`
 builds its pipeline kind on. `clock-jump` LD_PRELOADs libfaketime on purpose, to
-prove `now_ms()` really is on `CLOCK_MONOTONIC` and cannot be walked backwards
-by a stepping wall clock.
+prove a timer parked before a backward wall-clock step still fires on schedule
+after it — i.e. that elapsed time is measured on `CLOCK_MONOTONIC` and cannot be
+walked backwards by a stepping wall clock. It runs with
+`FAKETIME_DONT_FAKE_MONOTONIC=1`, because faking the monotonic clock too would
+measure libfaketime rather than the server; see
+[docs/attack-environment.md](docs/attack-environment.md).
 
 `zone-exhaustion` went on the same date for a worse reason. Its name promised
 zone exhaustion; its `nginx.conf` set `worker_connections 10`; its rule sent two
@@ -2404,6 +2418,8 @@ harness, so a new module opts in explicitly.
 
 ## See also
 
+- [docs/](docs/README.md) — the long-form documentation: one document per attack
+  surface, plus the coverage policy and procedure.
 - [nginx-http-shield-module](https://github.com/myguard-labs/nginx-http-shield-module)
   — first consumer; its `t/prober/` rules and probe-hooks file are a worked
   example.
