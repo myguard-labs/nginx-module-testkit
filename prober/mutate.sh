@@ -1482,6 +1482,26 @@ mutate "framed: disagreeing Content-Length accepted" http.c \
 # length wrap `hdr_bytes + content_length` to a small `need`, so `len < need`
 # is false and the classifier forges COMPLETE with a truncated resp_len -- the
 # near-SIZE_MAX Content-Length test flips from INCOMPLETE to COMPLETE.
+# Restores the loose status walk the classifier used to carry: first space
+# anywhere in the header block, strtol whatever follows. That reads a bodiless
+# 204 out of a header value and strands the declared body on the socket for the
+# next pipelined read -- a response desync. Mutating the SHARED helper would red
+# half the suite through http_parse_response() and prove nothing about the
+# classifier, so the mutation re-introduces the divergence at the call site,
+# which is exactly where the two parsers drifted apart before.
+mutate "framed: status read loosely instead of by the shared strict walk" http.c \
+    '    status = status_line_code(buf, (size_t) (hdr_end - buf));' \
+    '    {
+        const char *sp = (len > 5 && memcmp(buf, "HTTP/", 5) == 0)
+                         ? memchr(buf, 0x20, (size_t) (hdr_end - buf)) : NULL;
+        if (sp != NULL) {
+            char *cend; long code = strtol(sp + 1, &cend, 10);
+            if (cend != sp + 1 && code >= 0 && code <= INT_MAX) {
+                status = (int) code;
+            }
+        }
+    }' http_test
+
 mutate "framed: Content-Length overflow guard removed" http.c \
     '        if (content_length > SIZE_MAX - hdr_bytes) {
             return HTTP_FRAMED_INCOMPLETE;

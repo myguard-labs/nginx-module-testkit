@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  185
+#define PLANNED  188
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -3318,6 +3318,44 @@ main(void)
         s = FRAMED("HTTP/1.1 204 No Content\r\nContent-Length: 9\r\n\r\n");
         ok(s == HTTP_FRAMED_COMPLETE && n == 46,
            "a 204 with a spurious Content-Length still ends at the terminator");
+
+        /*
+         * A malformed status line must NOT yield a bodiless status.
+         *
+         * The classifier used to take the first space anywhere in the header
+         * block and strtol whatever followed it, while its comment claimed it
+         * matched http_parse_response()'s strict walk. It did not. Each input
+         * below scored a bodiless 204 from bytes that are not a status line, so
+         * the response was declared to end at the header terminator while the 9
+         * bytes its Content-Length declares stayed on the socket -- and the next
+         * pipelined block read them as ITS response head. A desync of exactly
+         * the kind this harness exists to detect in someone else's server.
+         *
+         * The assertion is `n == sizeof(lit) - 1`, i.e. the classifier consumed
+         * the WHOLE buffer and left nothing behind. Asserting only "not
+         * bodiless" would pass on a wrong-but-nonzero split; the leftover byte
+         * count is the thing that actually smuggles.
+         *
+         * The third case is the sharpest: there is no status line at all, and
+         * the loose walk read "204" out of a header VALUE.
+         */
+        n = 0;
+        s = FRAMED("HTTP/xyz 204 Nope\r\nContent-Length: 9\r\n\r\nbodybody!");
+        ok(s == HTTP_FRAMED_COMPLETE && n == 49,
+           "a malformed version token is not bodiless: the declared body is "
+           "consumed, not left on the wire");
+
+        n = 0;
+        s = FRAMED("HTTP/2 204 x\r\nContent-Length: 9\r\n\r\nbodybody!");
+        ok(s == HTTP_FRAMED_COMPLETE && n == 44,
+           "a versionless HTTP/2 status line is not bodiless: the declared "
+           "body is consumed, not left on the wire");
+
+        n = 0;
+        s = FRAMED("HTTP/1.1\r\nX: 204 y\r\nContent-Length: 9\r\n\r\nbodybody!");
+        ok(s == HTTP_FRAMED_COMPLETE && n == 50,
+           "a status code appearing in a header value is not read as the "
+           "response's status");
 
         n = 0;
         s = FRAMED("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
