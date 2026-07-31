@@ -32,9 +32,27 @@
 # is equivalent to "server closed the connection", not a proxy for it. The
 # negative control (assertion 1) additionally proves the converse direction
 # that matters for calibration: absent a reload, with a 3600s keepalive
-# timeout, the connection does NOT close on its own within the same settle
-# window used later -- so a close seen after the reload is attributable to
-# the reload, not to some other timer or accident of this harness.
+# timeout, the connection does NOT close on its own within a settle window
+# far longer than a healthy drain takes -- so a close seen after the reload
+# is attributable to the reload, not to some other timer or accident of this
+# harness.
+#
+# THE DEADLINE IS AN EVENT, NOT A CLOCK (s181). Assertion 4 used to wait a
+# fixed 100 * 50 ms for the close, and that ceiling was crossed once on a
+# loaded builder (s169) by a scenario with no defect. A promptness claim
+# denominated in wall-clock is not assertable on a shared runner, and the
+# repair is NOT a bigger number: the same constant also bounds assertion 1's
+# negative control, which requires the conn to STAY open, so widening it
+# weakens the control in exact proportion (the disable-the-oracle shape this
+# repo keeps re-learning). Instead assertion 4 now asserts the ORDERING that
+# the close actually owes: the draining old worker must close the idle conn
+# no later than its own exit. That deadline is derived from the subject's own
+# progress (the master's child set returning to the configured worker count),
+# so it stretches exactly as far as a loaded box makes the drain take, and it
+# still fails hard on the defect this scenario exists to catch -- an idle
+# client keepalive conn carried past the old worker into the new cycle. The
+# remaining fixed count is a hang-guard, not the deadline, and it is no longer
+# shared with the control.
 set -euo pipefail
 
 # shellcheck source=lib.sh
@@ -43,6 +61,8 @@ set -euo pipefail
 HOST=127.0.0.1
 PORT="$PROBER_RESOLVED_PORT"
 ELOG="$PROBER_PREFIX/logs/error.log"
+MASTER="$PROBER_SERVER_PID"
+WORKERS=1                # matches worker_processes in nginx.conf (drain target)
 
 # The prober leg's no_error_log directive needs this; run-scenario.sh exports
 # it only for a rules run, so a driver that runs the prober exports it itself.
@@ -158,21 +178,56 @@ open_keepalive_conn() {
     printf -v "$pidvar" '%s' "$!"
 }
 
-# Fixed-step counted settle: same iteration count used for both the negative
-# control (assertion 1) and the real close-wait (assertion 4), so the two are
-# directly comparable and neither depends on wall-clock timing (same
-# discipline as prober_signal_wait / prober_wait_listen).
+# Fixed-step counted settle for the two things that ARE wall-clock questions:
+# readiness (has the conn become idle yet) and the negative control's liveness
+# window (does an idle conn stay open on its own). Counted iterations, never a
+# wall-clock diff -- same discipline as prober_signal_wait / prober_wait_listen.
+#
+# This constant NO LONGER bounds assertion 4. It used to, and that coupling was
+# the s169 finding: one number could not simultaneously be a floor for the
+# control ("stay open at least this long") and a ceiling for the close ("close
+# within this long"), because moving it to relieve one weakens the other.
+# Assertion 4 now waits on an event (see DRAIN_* below), so this number is free
+# to mean only what its name says.
 SETTLE_ITERS=100     # 100 * 50 ms = 5 s
+
+# Assertion 4's hang-guard, NOT its deadline. In a healthy run the ordering
+# wait ends in milliseconds, when the reader sees EOF; this budget exists only
+# so a genuinely stuck drain terminates the scenario instead of hanging the
+# suite. Deliberately far larger than the old 5 s ceiling, which it is safe to
+# be precisely because it is no longer the thing being asserted -- crossing it
+# means the old worker neither closed the conn nor finished draining for a
+# minute, which is a real failure on any box under any load.
+DRAIN_CEILING_ITERS=1200        # 1200 * 50 ms = 60 s hang-guard
+
+# Once the master's child set is back to WORKERS the old worker is gone, and
+# its fds went with it -- so the reader's EOF is already in flight and this is
+# pure observation lag, not waiting on the server. Bounded small: an idle conn
+# that is STILL open a second after the worker holding it exited was not being
+# held by that worker, which is the carried-into-the-new-cycle defect.
+POST_DRAIN_GRACE_ITERS=20       # 20 * 50 ms = 1 s
 
 # --- assertion 1: NEGATIVE CONTROL -- an idle conn must NOT close itself ----
 # Runs FIRST, fully reaped before the real conn is opened (mirrors
 # reload-mid-upload: its fast neg-control upload runs and is reaped before
 # the real slow upload starts -- never concurrently). Opens an idle
-# keepalive conn, sends NO signal, and polls the same settle window used
-# later for the real close-wait. With keepalive_timeout 3600s, nothing in
-# this harness should close it. If it closes anyway, the close oracle in
-# assertion 4 would not discriminate a reload-caused close from ambient
-# noise, and this scenario would prove nothing.
+# keepalive conn, sends NO signal, and holds it for SETTLE_ITERS. With
+# keepalive_timeout 3600s, nothing in this harness should close it. If it
+# closes anyway, the close oracle in assertion 4 would not discriminate a
+# reload-caused close from ambient noise, and this scenario would prove
+# nothing.
+#
+# WHY 5 s IS THE RIGHT CALIBRATION WINDOW NOW THAT ASSERTION 4 NO LONGER
+# SHARES IT. The close that assertion 4 credits is one that happened while
+# the old worker was still draining -- milliseconds, on a healthy run. This
+# control shows that an idle conn survives three orders of magnitude longer
+# than that with no reload in play, which is what "the close came from the
+# reload" needs. It is a calibration ratio, not an equality: the two windows
+# do not have to match, they have to be far apart in the right direction.
+# Assertion 4 prints a TAP diagnostic (never a failure) if a run ever
+# inverts that -- a close observed later than this control window is still a
+# correct close, but it is one this control no longer covers, and that is
+# worth seeing in the log rather than silently crediting.
 CONTROL_MARKER="$PROBER_PREFIX/control.ready"
 CONTROL_CLOSED="$PROBER_PREFIX/control.closed"
 open_keepalive_conn "$CONTROL_MARKER" CONTROL_PID "$CONTROL_CLOSED"
@@ -291,33 +346,106 @@ fi
 # --- assertion 4: THE CLOSE ORACLE ------------------------------------------
 # After the reload has landed, the draining old worker must close the idle
 # client keepalive connection it was still holding -- it cannot carry that
-# connection into the new worker's accept cycle. Poll (bounded, counted,
-# generous 100 * 50 ms = 5 s ceiling) for the real subshell to exit. It
-# should close near-immediately once graceful shutdown starts, well inside
-# the ceiling; the ceiling only exists to bound a genuine failure.
+# connection into the new worker's accept cycle. The deadline for that close
+# is the old worker's OWN EXIT, observed as the master's direct-child count
+# returning to WORKERS (the same oracle prober_drain_wait uses; open-coded
+# here because this loop must watch the reader and the child set in the SAME
+# iteration, and prober_drain_wait blocks until one of them alone resolves).
+#
+# The loop ends on whichever comes first:
+#   - the reader exits            -> the conn closed; classify it below;
+#   - the old worker is gone      -> keep looking POST_DRAIN_GRACE_ITERS more,
+#                                    since the exit itself closes the fd and
+#                                    the EOF is merely in flight, then stop;
+#   - DRAIN_CEILING_ITERS         -> hang-guard; a drain that has neither
+#                                    closed the conn nor finished in 60 s.
+# The reader is checked FIRST each iteration so a close observed during the
+# grace window is credited, not raced away.
+#
+# WITHOUT pgrep the child set cannot be observed at all (the return-2 case in
+# prober_drain_wait). That does not make this assertion skippable -- it only
+# removes the early verdict, leaving the hang-guard as the bound. A conn still
+# open at the ceiling is a failure on any host; the message names the fallback
+# so a reader of the log knows which bound actually fired.
 #
 # The subshell writes REAL_CLOSED only on a CLEAN EOF (`cat` exit 0 -- a FIN
 # from a graceful worker shutdown). Gating `ok 4` on that marker, not merely
 # on the subshell being gone, means a subshell that exited because its read
 # FAILED (a nonzero `cat`, e.g. an RST or a bad fd) does NOT certify the
 # close/EOF path this oracle exists to prove.
+have_pgrep=1
+command -v pgrep >/dev/null 2>&1 || have_pgrep=0
+
 closed=0
-for ((i = 0; i < SETTLE_ITERS; i++)); do
+closed_at=-1
+drained_at=-1
+for ((i = 0; i < DRAIN_CEILING_ITERS; i++)); do
     if ! kill -0 "$REAL_PID" 2>/dev/null; then
         closed=1
+        closed_at=$i
         break
     fi
+
+    if [ "$have_pgrep" -eq 1 ] && [ "$drained_at" -lt 0 ]; then
+        # `|| kids=0`: pgrep exits 1 when it matches nothing, and under
+        # `pipefail` that would propagate out of the substitution and abort the
+        # driver on `set -e`. Zero children is data here (the master itself
+        # died), not an error to die on -- it simply never equals WORKERS.
+        kids="$(pgrep -P "$MASTER" 2>/dev/null | wc -l)" || kids=0
+        # Spelled as if/then, not `[ ... ] && drained_at=$i`: the && form is
+        # the LAST command of this if-block, so on the (usual) not-yet-drained
+        # iteration it would make the block exit nonzero and `set -e` would
+        # abort the driver mid-wait.
+        if [ "$kids" -eq "$WORKERS" ]; then
+            drained_at=$i
+        fi
+    fi
+
+    if [ "$drained_at" -ge 0 ] && [ $((i - drained_at)) -ge "$POST_DRAIN_GRACE_ITERS" ]; then
+        break
+    fi
+
     sleep 0.05
 done
-wait "$REAL_PID" 2>/dev/null || true
+
+# Reap ONLY on the close path. `wait` on a child that is still blocked in its
+# read never returns, so the timeout path must kill the subtree BEFORE waiting
+# (it does, in the else branch below) -- reaping unconditionally here would
+# hang the driver on exactly the failure this assertion exists to report.
+if [ "$closed" -eq 1 ]; then
+    wait "$REAL_PID" 2>/dev/null || true
+fi
 
 if [ "$closed" -eq 1 ] && [ -e "$REAL_CLOSED" ]; then
     echo "ok 4 - the draining old worker closed the idle client keepalive conn (clean EOF)"
+    # Non-fatal calibration note: the close is correct either way, but past
+    # SETTLE_ITERS it sits outside the window assertion 1 measured, so say so
+    # in the log rather than crediting it silently. See assertion 1's header.
+    if [ "$closed_at" -ge "$SETTLE_ITERS" ]; then
+        # Counted in ITERATIONS, and reported as such: a loaded box makes each
+        # 50 ms step take longer, so the nominal figure is a floor on the real
+        # wall-clock, not a measurement of it. Both sides of the comparison are
+        # the same counted unit, which is the only reason it is meaningful.
+        echo "# note: close observed at iteration $closed_at (>= ${SETTLE_ITERS}," \
+             "the window assertion 1 calibrated); still a correct close, but one" \
+             "the negative control no longer covers"
+    fi
 elif [ "$closed" -eq 1 ]; then
     echo "not ok 4 - the idle conn's reader exited without a clean EOF (read error, not a graceful close)"
     FAILED=$((FAILED + 1))
 else
-    echo "not ok 4 - the idle client keepalive conn was still open $((SETTLE_ITERS * 50))ms after the reload"
+    if [ "$drained_at" -ge 0 ]; then
+        echo "not ok 4 - the idle client keepalive conn outlived the draining worker:" \
+             "still open $((POST_DRAIN_GRACE_ITERS * 50))ms after the master's child set" \
+             "returned to $WORKERS, so it was carried past the old cycle"
+    elif [ "$have_pgrep" -eq 0 ]; then
+        echo "not ok 4 - the idle client keepalive conn was still open" \
+             "$((DRAIN_CEILING_ITERS * 50))ms after the reload (no pgrep on this host," \
+             "so the hang-guard bound this wait, not the old worker's exit)"
+    else
+        echo "not ok 4 - the old worker neither closed the idle client keepalive conn nor" \
+             "finished draining within $((DRAIN_CEILING_ITERS * 50))ms of the reload"
+    fi
     # Kill the subtree so nothing lingers past this driver's exit.
     pkill -P "$REAL_PID" 2>/dev/null || true
     kill "$REAL_PID" 2>/dev/null || true
