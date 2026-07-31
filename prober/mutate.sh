@@ -1327,8 +1327,8 @@ mutate "backend: memcached args point into a parser local" backend.c \
 # it discarded makes the NEXT get a miss, which reads as a cache bug in whatever
 # module is under test rather than as a defect in the fake.
 mutate "backend: a memcached set is acknowledged but not stored" backend.c \
-    '        if (cmd->n_args >= 1 && cmd->data != NULL && cmd->data_len >= 0) {' \
-    '        if (0) {' \
+    '        if (cmd->n_args >= 1 && cmd->data != NULL && cmd->data_len >= 0' \
+    '        if (0 && cmd->n_args >= 1 && cmd->data != NULL && cmd->data_len >= 0' \
     fakesrv_test.sh
 
 # A malformed data length is a protocol error, not a fatal one: these bytes come
