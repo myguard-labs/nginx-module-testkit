@@ -336,7 +336,16 @@ summarise () {
 
     echo
     if [ "$MUT_CHECK" != "0" ]; then
-        echo "anchors: $pass live, $broken disarmed or ambiguous (MUT_CHECK=$MUT_CHECK)"
+        # Name the filter when one is set, for the same reason the skipped count
+        # below names its mode: a run that covered a SUBSET must not read like a
+        # run that covered everything. "anchors: 10 live" after a filtered run
+        # would be true and completely misleading.
+        if [ -n "$FILTER" ]; then
+            echo "anchors: $pass live, $broken disarmed or ambiguous" \
+                 "(MUT_CHECK, filter=\"$FILTER\" -- SUBSET, not every row)"
+        else
+            echo "anchors: $pass live, $broken disarmed or ambiguous (MUT_CHECK)"
+        fi
         [ "$broken" -gt 0 ] && rc=1
         rm -rf "$work"
         exit "$rc"
