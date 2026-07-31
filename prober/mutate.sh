@@ -520,6 +520,15 @@ mutate "recv_slow: chunk cap ignored" http.c \
                 want = st->recv_opt->chunk;
             }' http_test
 
+# This row used to be credited by TIMEOUT, not by an assertion: the mutant gates
+# without ever reading, and the gate width is discounted from both deadlines, so
+# nothing in the exchange could ever cut it off. The gate-owes-a-read guard in
+# http.c turns that hang into a named failure; seven assertions red on it now
+# (109-112, 117, 179, 180), in seconds rather than the 120 s bound.
+#
+# There is deliberately NO row mutating that guard out. It is unreachable in
+# correct code -- reaching it needs a defect like this row's -- so disarming it
+# would report SURVIVED, which is the truth and not a coverage gap to close.
 mutate "recv_slow: gates before the EOF read" http.c \
     'if (st->paced_full) {' 'if (st->paced_full || 1) {' http_test
 

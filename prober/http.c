@@ -139,6 +139,12 @@ typedef struct {
     long long         not_before;
     long long         gate_start;
 
+    /* The value of resp->reads when the pacing gate was last armed. A gate is
+     * owed a read; see the guard at the gate. 0 is the never-gated state and
+     * cannot collide with a legitimate arm, which needs a chunk-filling read
+     * first and so sees reads >= 1. */
+    size_t            gate_reads;
+
     /* The per-read idle deadline: the instant this leg gives up waiting for the
      * NEXT byte. Restamped after every read that delivered data, so it bounds
      * silence between reads rather than the exchange as a whole.
@@ -2152,6 +2158,31 @@ http_read_state_step(http_read_state *st, int readable,
                  * public entry point and the parser is not the only way in.
                  * Assertion 108 drives it directly from C. */
                 if (st->recv_opt->ms > 0) {
+                    /* Every gate must be paid for by a read. `paced_full` is
+                     * set only by a read that filled its chunk and cleared
+                     * here, so in correct code the reads counter has advanced
+                     * between any two gates on this leg. If it has not, the
+                     * gate is re-arming without collecting anything, and that
+                     * state is unrecoverable rather than slow: the gate width
+                     * is discounted from BOTH deadlines above (whole-exchange
+                     * via paced_sleep_ms, idle via the restamp on the far
+                     * side), so a leg that only ever gates advances no clock
+                     * that could ever cut it off. Left unguarded it is an
+                     * unbounded loop that the harness can only end by being
+                     * killed from outside -- a 120 s timeout with no assertion
+                     * behind it, indistinguishable from a hang anywhere else.
+                     * Fail here instead, naming the invariant. */
+                    if (st->resp->reads == st->gate_reads) {
+                        snprintf(errbuf, errlen,
+                                 "recv pacing gate re-armed after %zu reads "
+                                 "without collecting any bytes; a gate that "
+                                 "never reads discounts both deadlines and "
+                                 "never completes",
+                                 st->gate_reads);
+                        goto fail;
+                    }
+
+                    st->gate_reads = st->resp->reads;
                     st->gate_start = now;
                     st->not_before = now + st->recv_opt->ms;
                     st->paced_full = 0;
