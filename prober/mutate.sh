@@ -42,6 +42,26 @@ cd "$(dirname "$0")" || exit 1
 
 FILTER="${1:-}"
 
+# Which rows to run, selected by the KIND of suite that has to catch them:
+#
+#   all       (default) every row
+#   c         rows whose suite is a compiled test binary
+#   scenario  rows whose suite boots a real server (scenarios/*/mutate-suite.sh)
+#
+# The split exists because the two kinds need different environments. A scenario
+# suite needs .build/<flavor>-<version>/objs staged by the `scenarios` job; the
+# `mutation` job is a bare checkout and cannot run one. Before this selector the
+# scenario rows ran there anyway, bailed on the absent tree, and were reported
+# `caught` on a nonzero exit that no mutation caused -- 11 rows that asserted
+# nothing while printing the tally that says they did.
+MUT_KIND="${MUT_KIND:-all}"
+
+case "$MUT_KIND" in
+    all|c|scenario) ;;
+    *) echo "mutate.sh: MUT_KIND must be all, c or scenario (got \"$MUT_KIND\")" >&2
+       exit 2 ;;
+esac
+
 # Per-mutant wall-clock ceiling. A mutation that removes a loop bound or a wait
 # ceiling can make its suite spin forever; without this the mutation job runs to
 # GitHub's 360 min cap. Overridable for a slow runner.
@@ -52,6 +72,7 @@ work=$(mktemp -d)
 pass=0
 fail=0
 broken=0
+skipped=0
 
 #
 # One mutation: name, file, python replacement (old -> new), suite that must
@@ -70,10 +91,72 @@ broken=0
 # red on the sanitizer's own report exactly as the CI asan leg would catch it.
 # The clean rebuild in the restore path is plain again, so the next mutant is
 # not silently sanitized. (TODO Pack 3; proven s65 on the probe_baseline free.)
+# Answers "can this suite report at all?" -- run once per distinct suite, on
+# PRISTINE source, before any mutation is applied. Cached in $work because the
+# scenario suites boot real servers and the answer cannot change between two
+# rows that run back to back.
+#
+# The cache stores the verdict, not just its absence, so a suite proven red is
+# not silently re-run once per row. Build environment is part of the key: a san
+# suite and a plain suite are different programs.
+baseline_ok () {
+    local suite="$1" buildenv="$2"
+    local key stamp rc=0
+
+    key=$(printf '%s|%s' "$suite" "$buildenv" | tr -c 'A-Za-z0-9' '_')
+    stamp="$work/baseline.$key"
+
+    if [ -f "$stamp" ]; then
+        read -r rc < "$stamp"
+        [ "$rc" -eq 0 ]
+        return
+    fi
+
+    # Build first. On a fresh checkout the suite binaries do not exist yet --
+    # mutate() builds after patching, so before the first mutation there is
+    # nothing to run and `timeout` reports "No such file or directory". That is
+    # a nonzero exit, which this function would then read as "the suite is
+    # already red" and refuse every row: a false BROKEN in exactly the shape of
+    # the false `caught` it was written to prevent. The scenario suites are
+    # shell and need no build, but build.sh is idempotent and cheap here.
+    #
+    # shellcheck disable=SC2086  # $buildenv is VAR=value words for env; see mutate().
+    if ! env $buildenv ./build.sh >"$work/baseline-build.log" 2>&1; then
+        echo "          the tree does not build unmutated:"
+        sed -n '1,3p' "$work/baseline-build.log" | sed 's/^/          /'
+        echo "1" > "$stamp"
+        return 1
+    fi
+
+    # shellcheck disable=SC2086  # $buildenv is VAR=value words for env; see mutate().
+    env $buildenv timeout "$MUT_SUITE_TIMEOUT" ./"$suite" >"$work/baseline.log" 2>&1 || rc=$?
+    echo "$rc" > "$stamp"
+
+    if [ "$rc" -ne 0 ]; then
+        sed -n '1,3p' "$work/baseline.log" | sed 's/^/          /'
+    fi
+
+    [ "$rc" -eq 0 ]
+}
+
+
 mutate () {
     local name="$1" file="$2" old="$3" new="$4" suite="$5" san="${6:-}"
 
     if [ -n "$FILTER" ] && [[ "$name" != *"$FILTER"* ]]; then
+        return
+    fi
+
+    # Selected on the suite PATH rather than the row name: the path is what
+    # decides which environment the row needs, and a name-based rule would
+    # silently mis-sort the next row somebody adds.
+    local kind="c"
+    case "$suite" in
+        scenarios/*) kind="scenario" ;;
+    esac
+
+    if [ "$MUT_KIND" != "all" ] && [ "$MUT_KIND" != "$kind" ]; then
+        skipped=$((skipped + 1))
         return
     fi
 
@@ -85,6 +168,24 @@ mutate () {
         # as SURVIVED. exitcode=1 is what turns the leak report into the red
         # verdict this opt-in exists to produce.
         buildenv="$buildenv ASAN_OPTIONS=detect_leaks=1:exitcode=1"
+    fi
+
+    # Failure mode 4: the suite was ALREADY red before anything was mutated.
+    # Every verdict below is read off the mutant run's exit status alone, so a
+    # suite that cannot run -- a `Bail out!` on a stale or absent .so, a missing
+    # fixture, a busy port -- exits nonzero for its own reasons and every row
+    # pointed at it reports `caught` without the mutation having been consulted.
+    # That is this repo's worst failure shape: the gate that exists to catch
+    # vacuous gates, itself vacuous, and silent about it.
+    #
+    # Measured once per distinct suite rather than per row: the scenario suites
+    # are the slow ones and the answer cannot change between two rows that run
+    # back to back. A suite that passes here is proven capable of reporting; a
+    # suite that does not is BROKEN, which already forces a nonzero exit.
+    if ! baseline_ok "$suite" "$buildenv"; then
+        echo "BROKEN  $name -- $suite is red BEFORE mutation; its verdict would be meaningless"
+        broken=$((broken + 1))
+        return
     fi
 
     cp "$file" "$work/orig"
@@ -187,7 +288,16 @@ summarise () {
     fi
 
     echo
-    echo "caught $pass, survived $fail, broken $broken"
+    # The skipped count is printed even when it is zero, and names the mode that
+    # produced it. A run that silently covers a subset reads exactly like a run
+    # that covered everything -- which is the reporting failure this whole file
+    # exists to prevent, so it must not be reintroduced by its own selector.
+    if [ "$skipped" -gt 0 ]; then
+        echo "caught $pass, survived $fail, broken $broken," \
+             "skipped $skipped (MUT_KIND=$MUT_KIND)"
+    else
+        echo "caught $pass, survived $fail, broken $broken"
+    fi
 
     # A broken mutation is a failure of THIS SCRIPT, not a verdict about the
     # code, and must never be reported as either a pass or a coverage gap.
@@ -1217,8 +1327,8 @@ mutate "backend: memcached args point into a parser local" backend.c \
 # it discarded makes the NEXT get a miss, which reads as a cache bug in whatever
 # module is under test rather than as a defect in the fake.
 mutate "backend: a memcached set is acknowledged but not stored" backend.c \
-    '        if (cmd->n_args >= 1 && cmd->data != NULL && cmd->data_len >= 0) {' \
-    '        if (0) {' \
+    '        if (cmd->n_args >= 1 && cmd->data != NULL && cmd->data_len >= 0' \
+    '        if (0 && cmd->n_args >= 1 && cmd->data != NULL && cmd->data_len >= 0' \
     fakesrv_test.sh
 
 # A malformed data length is a protocol error, not a fatal one: these bytes come
@@ -1388,6 +1498,26 @@ mutate "framed: disagreeing Content-Length accepted" http.c \
 # length wrap `hdr_bytes + content_length` to a small `need`, so `len < need`
 # is false and the classifier forges COMPLETE with a truncated resp_len -- the
 # near-SIZE_MAX Content-Length test flips from INCOMPLETE to COMPLETE.
+# Restores the loose status walk the classifier used to carry: first space
+# anywhere in the header block, strtol whatever follows. That reads a bodiless
+# 204 out of a header value and strands the declared body on the socket for the
+# next pipelined read -- a response desync. Mutating the SHARED helper would red
+# half the suite through http_parse_response() and prove nothing about the
+# classifier, so the mutation re-introduces the divergence at the call site,
+# which is exactly where the two parsers drifted apart before.
+mutate "framed: status read loosely instead of by the shared strict walk" http.c \
+    '    status = status_line_code(buf, (size_t) (hdr_end - buf));' \
+    '    {
+        const char *sp = (len > 5 && memcmp(buf, "HTTP/", 5) == 0)
+                         ? memchr(buf, 0x20, (size_t) (hdr_end - buf)) : NULL;
+        if (sp != NULL) {
+            char *cend; long code = strtol(sp + 1, &cend, 10);
+            if (cend != sp + 1 && code >= 0 && code <= INT_MAX) {
+                status = (int) code;
+            }
+        }
+    }' http_test
+
 mutate "framed: Content-Length overflow guard removed" http.c \
     '        if (content_length > SIZE_MAX - hdr_bytes) {
             return HTTP_FRAMED_INCOMPLETE;

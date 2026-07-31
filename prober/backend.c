@@ -40,8 +40,15 @@ void
 backend_set(backend_script *s, const char *key, const unsigned char *value,
             size_t len)
 {
-    size_t i, slot = BACKEND_MAX_ENTRIES;
-
+    /* Fatal for a SCRIPT-supplied key: a .backend file naming an over-long key
+     * is an authoring mistake, and dying names the file and line while a silent
+     * skip would surface much later as a mystery cache miss. Input off the WIRE
+     * goes through backend_set_checked() instead, which reports rather than
+     * exits -- see the note there.
+     *
+     * The three refusal reasons are distinguished rather than merged into one
+     * message: a script that fills the store told "the key is too long" sends
+     * its author looking at the wrong line entirely. */
     if (strlen(key) >= BACKEND_MAX_KEY) {
         die("backend: key \"%s\" is longer than %d bytes", key,
             BACKEND_MAX_KEY - 1);
@@ -50,6 +57,38 @@ backend_set(backend_script *s, const char *key, const unsigned char *value,
     if (len > BACKEND_MAX_VALUE) {
         die("backend: value for \"%s\" is %zu bytes, over the %d byte limit",
             key, len, BACKEND_MAX_VALUE);
+    }
+
+    if (backend_set_checked(s, key, value, len) != 0) {
+        die("backend: store is full (max %d entries)", BACKEND_MAX_ENTRIES);
+    }
+}
+
+
+/*
+ * The same store, but reporting a refusal instead of exiting: returns 0 on
+ * success and -1 if the key or value is over its limit.
+ *
+ * Exists because the memcached and RESP command handlers take the key straight
+ * off the socket. backend_set()'s die() is right for a script author and wrong
+ * for wire input: fakesrv is one process serving every connection in a scenario
+ * (and, for the shared fixtures, several scenarios), so a peer sending a
+ * 300-byte key -- a module under test with a key-derivation bug, or a fuzz case
+ * doing its job -- exited the whole daemon and took every other live connection
+ * with it. The scenario then failed with a connection error far from the cause,
+ * which reads as harness flakiness rather than as the module bug it is.
+ *
+ * The caller answers with the protocol's own error token, which is what a real
+ * memcached or redis does with an over-long key.
+ */
+int
+backend_set_checked(backend_script *s, const char *key,
+                    const unsigned char *value, size_t len)
+{
+    size_t i, slot = BACKEND_MAX_ENTRIES;
+
+    if (strlen(key) >= BACKEND_MAX_KEY || len > BACKEND_MAX_VALUE) {
+        return -1;
     }
 
     /* Overwrite in place when the key exists; otherwise take the first free
@@ -68,8 +107,11 @@ backend_set(backend_script *s, const char *key, const unsigned char *value,
         }
     }
 
+    /* Also reported rather than fatal: a peer can fill the store by sending
+     * BACKEND_MAX_ENTRIES distinct keys, so exiting here is the same
+     * wire-reachable daemon kill as an over-long key. */
     if (slot == BACKEND_MAX_ENTRIES) {
-        die("backend: store is full (max %d entries)", BACKEND_MAX_ENTRIES);
+        return -1;
     }
 
     if (!s->entries[slot].used) {
@@ -80,6 +122,8 @@ backend_set(backend_script *s, const char *key, const unsigned char *value,
     memcpy(s->entries[slot].value, value, len);
     s->entries[slot].value_len = len;
     s->entries[slot].used = 1;
+
+    return 0;
 }
 
 
@@ -1021,7 +1065,14 @@ buf_appendf(unsigned char **buf, size_t *len, size_t *cap, const char *fmt, ...)
     int     n;
 
     va_start(ap, fmt);
-    n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    /*
+     * CWE-134 is about an ATTACKER-CONTROLLED format string. Every caller
+     * passes a string literal; `fmt` never comes from the wire or from a
+     * script. The buffer is fixed-size, bounded by sizeof, and the return is
+     * checked below for both the error and the truncation case, which is the
+     * other half of what the rule warns about.
+     */
+    n = vsnprintf(tmp, sizeof(tmp), fmt, ap); /* flawfinder: ignore */
     va_end(ap);
 
     if (n < 0 || (size_t) n >= sizeof(tmp)) {
@@ -1067,11 +1118,17 @@ backend_reply_memcached(backend_script *s, const backend_cmd *cmd,
         /* Actually store it. Acknowledging a set whose payload was discarded
          * makes the NEXT get answer a miss, which reads as a cache bug in the
          * module under test rather than as a defect in the fake. */
-        if (cmd->n_args >= 1 && cmd->data != NULL && cmd->data_len >= 0) {
-            backend_set(s, cmd->args[0], cmd->data, (size_t) cmd->data_len);
+        if (cmd->n_args >= 1 && cmd->data != NULL && cmd->data_len >= 0
+            && backend_set_checked(s, cmd->args[0], cmd->data,
+                                   (size_t) cmd->data_len) != 0)
+        {
+            /* What a real memcached answers for a key or value over its limit.
+             * Refusing the store but staying up: the alternative was exiting
+             * the daemon and killing every other connection in the scenario. */
+            buf_append(&buf, &len, &cap, "SERVER_ERROR object too large for cache\r\n", 41);
+        } else {
+            buf_append(&buf, &len, &cap, "STORED\r\n", 8);
         }
-
-        buf_append(&buf, &len, &cap, "STORED\r\n", 8);
 
     } else if (memcached_is_storage(cmd->name)) {
         /* add/replace/append/prepend: correct shape, no store semantics. The
@@ -1407,9 +1464,17 @@ backend_reply_resp(backend_script *s, const backend_cmd *cmd,
          * three bytes. strlen truncated it to "a" (AUD-03), so a module sending
          * a binary value was tested against a different, shorter one.
          */
-        backend_set(s, cmd->args[0], (const unsigned char *) cmd->args[1],
-                    cmd->args_len[1]);
-        buf_append(&buf, &len, &cap, "+OK\r\n", 5);
+        if (backend_set_checked(s, cmd->args[0],
+                                (const unsigned char *) cmd->args[1],
+                                cmd->args_len[1]) != 0)
+        {
+            /* A RESP error reply, for the reason given at the memcached `set`
+             * site: an over-long key off the wire must not exit a daemon that
+             * is serving every other connection in the scenario. */
+            buf_append(&buf, &len, &cap, "-ERR value too large\r\n", 22);
+        } else {
+            buf_append(&buf, &len, &cap, "+OK\r\n", 5);
+        }
 
     } else if (strcmp(cmd->name, "del") == 0) {
         long n = 0;

@@ -1196,7 +1196,15 @@ the named suite to go red each time.
 ```sh
 prober/mutate.sh              # every mutation
 prober/mutate.sh SO_LINGER    # only those matching a substring
+MUT_KIND=c prober/mutate.sh   # only rows whose suite is a compiled test binary
 ```
+
+`MUT_KIND` is `all` (default), `c`, or `scenario`. The split is by the KIND of
+suite a row needs, because the two need different environments: a `scenario`
+suite boots a real server and needs `.build/<flavor>-<version>/objs` staged,
+which a bare checkout does not have. CI runs `MUT_KIND=c` in the `mutation` job
+and `MUT_KIND=scenario` in the `scenarios` job, where that tree exists. A run
+that skips rows says so, with the mode that produced it.
 
 A `SURVIVED` line means the suite passed with the code deliberately broken —
 that behaviour is untested, whatever the coverage number says. It has found a
@@ -1204,7 +1212,7 @@ real gap on every pass so far, including a directive whose entire effect was
 untested behind assertions that read as thorough.
 
 Doing this by hand is where the danger is, and the script exists mostly to
-remove three failure modes that each *look* like a caught mutation:
+remove four failure modes that each *look* like a caught mutation:
 
 - **the mutation did not compile** — the build fails, the stale binary re-runs,
   the suite goes red anyway. The `-Werror` wall makes this common: zeroing a
@@ -1215,8 +1223,18 @@ remove three failure modes that each *look* like a caught mutation:
   strings and must match exactly once.
 - **the wrong suite was run** — a transport mutation checked against the parser
   tests survives trivially.
+- **the suite was already red before the mutation** — every verdict is read off
+  the mutant run's exit status, so a suite that cannot RUN (a `Bail out!` on a
+  stale or absent build tree, a missing fixture, a busy port) exits nonzero for
+  its own reasons and credits every row pointed at it. Each suite is therefore
+  run once, unmutated, before any row using it is scored.
 
 Any of those is reported as `BROKEN`, never as a result, and fails the run.
+
+The test for whether a mutation harness has this property at all is a **no-op
+mutation**: a row whose replacement changes nothing observable must report
+`SURVIVED`. If it reports `caught`, the verdict does not depend on the mutation
+and no other row's result means anything either.
 
 ## Stock rules
 

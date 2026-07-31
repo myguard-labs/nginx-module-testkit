@@ -684,6 +684,85 @@ write_all(int fd, const unsigned char *buf, size_t len)
 }
 
 
+/*
+ * The status code of a well-formed "HTTP/<digit>+.<digit>+ <code> <reason>"
+ * status line, or -1 for anything else.
+ *
+ * A bare "HTTP/" prefix check followed by "find the first space anywhere" would
+ * accept "HTTP/xyz 200 OK" -- the garbage after the slash never gets looked at,
+ * so it parses a real status out of a malformed version line. Worse, with no
+ * status line at all it finds the first space inside a HEADER VALUE:
+ * "HTTP/1.1\r\nX: 204 y\r\n..." yields 204. That is a false PASS for any rule
+ * asserting a status, the worst failure mode for a harness -- it reports
+ * success on input the server (or an attacker) never sent as valid HTTP. So the
+ * version token is walked byte by byte and the terminating space must be the
+ * one that ends *that* token, not merely the first space in the buffer.
+ *
+ * What is required is the SHAPE `HTTP/<digits>.<digits> `, not a specific
+ * version number: the walk is digit-run based, so "HTTP/10.99 200" parses (
+ * pinned by http_test.c "multi-digit major.minor still parses") while a bare
+ * major-only "HTTP/2 200" does not, because it has no minor version. nginx and
+ * angie only ever put HTTP/1.0 or HTTP/1.1 on the wire for the framing this
+ * prober reads -- h2/h3 are negotiated, not spelled out in a text status line --
+ * so a well-formed but implausible version is left to the rules to assert on
+ * rather than rejected here.
+ *
+ * Version-number filtering would add nothing to framing safety: a status code is
+ * bodiless (or not) by RFC 9110 regardless of the version token that preceded
+ * it, and a 204 carrying a Content-Length is a lying server whose declared body
+ * this code correctly refuses to consume for HTTP/1.1 exactly as for HTTP/2.0.
+ *
+ * SHARED by http_parse_response() and http_framed_state() on purpose. The
+ * classifier used to keep its own looser copy of this walk while its comment
+ * claimed it matched this one; the two disagreed, and a response the strict
+ * parser scored -1 was classified as bodiless 204 by the loose one -- ending
+ * the response at the header terminator and leaving its declared body on the
+ * socket for the next pipelined read to consume as a response head. One
+ * definition, so they cannot drift apart again.
+ */
+static int
+status_line_code(const char *raw, size_t raw_len)
+{
+    size_t  i = 5;
+    int     saw_major = 0;
+    int     saw_minor = 0;
+
+    if (raw == NULL || raw_len <= 5 || memcmp(raw, "HTTP/", 5) != 0) {
+        return -1;
+    }
+
+    while (i < raw_len && raw[i] >= '0' && raw[i] <= '9') {
+        i++;
+        saw_major = 1;
+    }
+
+    if (saw_major && i < raw_len && raw[i] == '.') {
+        i++;
+
+        while (i < raw_len && raw[i] >= '0' && raw[i] <= '9') {
+            i++;
+            saw_minor = 1;
+        }
+    }
+
+    if (saw_major && saw_minor && i < raw_len && raw[i] == ' ') {
+        char *end;
+        long  code = strtol(raw + i + 1, &end, 10);
+
+        /* strtol reports "no digits" by leaving end at the start, and returns 0
+         * for it -- indistinguishable from a literal "0" status unless the end
+         * pointer is checked. The contract promises -1 for anything
+         * unparseable, so a non-numeric token must not surface as a status a
+         * rule could match on. */
+        if (end != raw + i + 1 && code >= 0 && code <= INT_MAX) {
+            return (int) code;
+        }
+    }
+
+    return -1;
+}
+
+
 void
 http_parse_response(http_response *resp)
 {
@@ -716,43 +795,7 @@ http_parse_response(http_response *resp)
      * "HTTP/2" with no minor version is exactly the kind of malformed input
      * this fix exists to reject, not a real case to special-case for.
      */
-    if (resp->raw_len > 5 && memcmp(resp->raw, "HTTP/", 5) == 0) {
-        size_t  i = 5;
-        int     saw_major = 0;
-        int     saw_minor = 0;
-
-        while (i < resp->raw_len && resp->raw[i] >= '0' && resp->raw[i] <= '9') {
-            i++;
-            saw_major = 1;
-        }
-
-        if (saw_major && i < resp->raw_len && resp->raw[i] == '.') {
-            i++;
-
-            while (i < resp->raw_len
-                   && resp->raw[i] >= '0' && resp->raw[i] <= '9')
-            {
-                i++;
-                saw_minor = 1;
-            }
-        }
-
-        if (saw_major && saw_minor
-            && i < resp->raw_len && resp->raw[i] == ' ')
-        {
-            char *end;
-            long  code = strtol(resp->raw + i + 1, &end, 10);
-
-            /* strtol reports "no digits" by leaving end at the start, and
-             * returns 0 for it -- indistinguishable from a literal "0" status
-             * unless the end pointer is checked. The header promises -1 for
-             * anything unparseable, so a non-numeric token must not surface
-             * as a status a rule could match on. */
-            if (end != resp->raw + i + 1 && code >= 0 && code <= INT_MAX) {
-                resp->status = (int) code;
-            }
-        }
-    }
+    resp->status = status_line_code(resp->raw, resp->raw_len);
 
     /*
      * Split on the header terminator. A response with no CRLFCRLF is left with
@@ -1018,22 +1061,14 @@ http_framed_state(const char *buf, size_t len, size_t *resp_len)
     hdr_end = sep;          /* end of the header field lines (before CRLFCRLF) */
     body = sep + 4;
 
-    /* Pull the status code the same way http_parse_response() does, but only far
-     * enough to recognise a bodiless code. A malformed status line leaves status
-     * -1, which is not bodiless, so such a response is classified by its length
-     * headers or judged unframeable -- never silently treated as empty. */
-    if (len > 5 && memcmp(buf, "HTTP/", 5) == 0) {
-        const char  *sp = memchr(buf, ' ', (size_t) (hdr_end - buf));
-
-        if (sp != NULL) {
-            char  *cend;
-            long   code = strtol(sp + 1, &cend, 10);
-
-            if (cend != sp + 1 && code >= 0 && code <= INT_MAX) {
-                status = (int) code;
-            }
-        }
-    }
+    /* The same walk http_parse_response() uses -- literally the same function,
+     * so the two cannot disagree about what a status line is. A malformed one
+     * leaves status -1, which is not bodiless, so such a response is classified
+     * by its length headers or judged unframeable, never silently treated as
+     * empty. Bounded to the header block: a status line cannot span the
+     * terminator, and letting the walk see the body would let body bytes decide
+     * the framing of the response that carries them. */
+    status = status_line_code(buf, (size_t) (hdr_end - buf));
 
     if (scan_framing(buf, hdr_end, &content_length, &have_cl, &chunked) != 0) {
         return HTTP_FRAMED_MALFORMED;

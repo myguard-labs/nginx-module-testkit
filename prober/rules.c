@@ -144,17 +144,41 @@ parse_expect(expectation *list, size_t *count, char *arg,
                 file, lineno, value);
         }
 
+    /*
+     * The empty pattern is refused on the POSITIVE forms for the same reason it
+     * already is on `expect_not` and `raw_response_headers_like~`: it cannot
+     * fail. `memmem(hay, len, "", 0)` returns the haystack for any input, so
+     * `expect body~` with a value lost to an edit or an unexpanded variable
+     * passes against every response the module can return -- a green line
+     * asserting nothing, which is the one defect class this harness may not
+     * contain. The negative forms were guarded and these were not; the hazard
+     * is identical and the positive forms are the higher-traffic direction.
+     */
     } else if (strncmp(arg, "body~", 5) == 0) {
         e->kind = EXPECT_BODY_CONTAINS;
         e->text = xstrdup(trim(arg + 5));
+
+        if (*e->text == '\0') {
+            die("%s:%d: expect body~ needs a non-empty pattern "
+                "(an empty one matches every response)", file, lineno);
+        }
 
     } else if (strncmp(arg, "body_sha256=", 12) == 0) {
         e->kind = EXPECT_BODY_SHA256;
         e->text = xstrdup(trim(arg + 12));
 
+        if (*e->text == '\0') {
+            die("%s:%d: expect body_sha256= needs a digest", file, lineno);
+        }
+
     } else if (strncmp(arg, "header~", 7) == 0) {
         e->kind = EXPECT_HEADER_CONTAINS;
         e->text = xstrdup(trim(arg + 7));
+
+        if (*e->text == '\0') {
+            die("%s:%d: expect header~ needs a non-empty pattern "
+                "(an empty one matches every response)", file, lineno);
+        }
 
     } else if (strncmp(arg, "raw_response_headers_like~", 26) == 0) {
         char *pattern = trim(arg + 26);
@@ -421,9 +445,15 @@ parse_assert(probe_assert *list, size_t *count, const char *directive,
             MAX_ASSERTS);
     }
 
-    path = strtok(arg, " \t");
-    op = strtok(NULL, " \t");
-    lit = strtok(NULL, "");
+    /* nosem: insecure-use-strtok-fn -- the rule is about strtok's static state
+     * being clobbered by a concurrent or interleaved tokenisation. The prober's
+     * rule loader is single-threaded and each directive consumes its tokens to
+     * completion inside one arm, so no second walk is ever live across these
+     * three calls. Destroying `arg` in place is intended: it is the loader's own
+     * mutable line buffer. */
+    path = strtok(arg, " \t");  /* nosem: insecure-use-strtok-fn */
+    op = strtok(NULL, " \t");   /* nosem: insecure-use-strtok-fn */
+    lit = strtok(NULL, "");     /* nosem: insecure-use-strtok-fn */
 
     if (path == NULL || op == NULL || lit == NULL) {
         die("%s:%d: %s needs <path> <op> <value>", file, lineno, directive);
@@ -1414,8 +1444,10 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
             }
 
         } else if (strcmp(directive, "repeat") == 0) {
-            char   *count_s = strtok(arg, " \t");
-            char   *text = strtok(NULL, "");
+            /* nosem: insecure-use-strtok-fn -- single-threaded loader, tokens
+             * consumed to completion in this arm; see the note at parse_assert. */
+            char   *count_s = strtok(arg, " \t");  /* nosem: insecure-use-strtok-fn */
+            char   *text = strtok(NULL, "");        /* nosem: insecure-use-strtok-fn */
             char   *stop;
             long    count;
             long    k;

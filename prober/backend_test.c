@@ -36,7 +36,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  105
+#define PLANNED  117
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -469,6 +469,82 @@ test_store(void)
     ok(s.n_entries == 0 && backend_get(&s, "a") == NULL,
        "flush_all empties the store");
 
+    /*
+     * An over-limit key or value off the WIRE must be refused, not fatal.
+     * backend_set() die()s -- correct for a .backend authoring mistake, fatal
+     * in the wrong sense for input a peer controls: fakesrv is one process
+     * behind every connection in a scenario, so a module sending a 300-byte key
+     * used to exit the daemon and take every other live connection with it.
+     *
+     * Asserting the store is UNCHANGED as well as the return value: a refusal
+     * that still wrote a truncated key would satisfy `!= 0` while corrupting
+     * the store the rest of the scenario reads.
+     */
+    {
+        char           bigkey[BACKEND_MAX_KEY + 64];
+        unsigned char  bigval[BACKEND_MAX_VALUE + 64];
+        size_t         before = s.n_entries;
+
+        memset(bigkey, 'A', sizeof(bigkey) - 1);
+        bigkey[sizeof(bigkey) - 1] = '\0';
+        memset(bigval, 'B', sizeof(bigval));
+
+        ok(backend_set_checked(&s, bigkey, (const unsigned char *) "v", 1) != 0,
+           "a key over BACKEND_MAX_KEY is refused rather than fatal");
+        ok(s.n_entries == before && backend_get(&s, bigkey) == NULL,
+           "a refused over-long key leaves the store untouched");
+
+        ok(backend_set_checked(&s, "okkey", bigval, sizeof(bigval)) != 0,
+           "a value over BACKEND_MAX_VALUE is refused rather than fatal");
+        ok(s.n_entries == before && backend_get(&s, "okkey") == NULL,
+           "a refused over-long value leaves the store untouched");
+
+        ok(backend_set_checked(&s, "okkey", (const unsigned char *) "v", 1) == 0
+           && backend_get(&s, "okkey") != NULL,
+           "the checked store still accepts a key and value within limits");
+
+        backend_delete(&s, "okkey");
+
+        /* Capacity exhaustion is the third refusal reason and is reachable from
+         * the wire (a peer sending BACKEND_MAX_ENTRIES distinct keys), so it
+         * must report like the other two rather than exit. Without this a
+         * mutation removing the full-store branch survives. */
+        {
+            char    k[32];
+            size_t  i;
+            int     filled_ok = 1;
+
+            backend_flush_all(&s);
+
+            for (i = 0; i < BACKEND_MAX_ENTRIES; i++) {
+                snprintf(k, sizeof(k), "fill%zu", i);
+                if (backend_set_checked(&s, k, (const unsigned char *) "v", 1)
+                    != 0)
+                {
+                    filled_ok = 0;
+                    break;
+                }
+            }
+
+            ok(filled_ok == 1 && s.n_entries == BACKEND_MAX_ENTRIES,
+               "the checked store accepts exactly BACKEND_MAX_ENTRIES keys");
+
+            ok(backend_set_checked(&s, "onemore",
+                                   (const unsigned char *) "v", 1) != 0
+               && backend_get(&s, "onemore") == NULL,
+               "a full store refuses the next key rather than exiting");
+
+            /* An overwrite must still succeed at capacity: it takes the
+             * existing slot, so refusing it would break every scenario that
+             * re-sets a seeded key. */
+            ok(backend_set_checked(&s, "fill0",
+                                   (const unsigned char *) "w", 1) == 0,
+               "a full store still accepts an overwrite of an existing key");
+
+            backend_flush_all(&s);
+        }
+    }
+
     /* A value with an embedded NUL survives, since the store is length-based
      * rather than NUL-terminated -- the shape a cache client mishandles. */
     backend_set(&s, "n", (const unsigned char *) "a\0b", 3);
@@ -644,6 +720,35 @@ test_memcached_codec(void)
         free(out);
     }
 
+    /*
+     * An over-long key ON THE WIRE must draw a protocol error and leave the
+     * daemon running. This is the path that used to die(): fakesrv serves every
+     * connection in a scenario from one process, so exiting here took every
+     * other live connection down with it and the scenario failed far from the
+     * cause. Reaching the assertion at all is most of the proof -- a die() here
+     * ends the test process -- but the reply bytes are asserted too, so a
+     * mutation that refuses the store and still answers STORED is caught.
+     */
+    {
+        unsigned char *out = NULL;
+        size_t         out_len = 0;
+        char           big[BACKEND_MAX_KEY + 64];
+
+        memset(big, 'A', sizeof(big) - 1);
+        big[sizeof(big) - 1] = '\0';
+
+        snprintf((char *) buf, sizeof(buf), "set %s 0 0 1\r\nx\r\n", big);
+        (void) backend_parse_memcached(buf, strlen((char *) buf), &cmd);
+        backend_reply_memcached(&s, &cmd, &out, &out_len);
+
+        ok(out != NULL && out_len == 41
+           && memcmp(out, "SERVER_ERROR object too large for cache\r\n", 41) == 0,
+           "memcached set with an over-long key answers SERVER_ERROR, not STORED");
+        ok(backend_get(&s, big) == NULL,
+           "the refused memcached set stored nothing");
+        free(out);
+    }
+
     {
         unsigned char *out = NULL;
         size_t         out_len = 0;
@@ -797,6 +902,32 @@ test_resp_codec(void)
         }
     }
 
+    /* The RESP half of the wire-refusal path -- see the memcached case for why
+     * this must answer rather than exit. The key is 300 bytes, which the RESP
+     * parser accepts (it bounds a bulk arg at BACKEND_MAX_VALUE, far above
+     * BACKEND_MAX_KEY) and the store must then refuse. */
+    {
+        unsigned char *out = NULL;
+        size_t         out_len = 0;
+        size_t         n;
+        char           big[301];
+
+        memset(big, 'A', sizeof(big) - 1);
+        big[sizeof(big) - 1] = '\0';
+
+        n = (size_t) snprintf((char *) buf, sizeof(buf),
+                              "*3\r\n$3\r\nSET\r\n$%zu\r\n%s\r\n$1\r\nv\r\n",
+                              sizeof(big) - 1, big);
+        (void) backend_parse_resp(buf, n, &cmd);
+        backend_reply_resp(&s, &cmd, &out, &out_len);
+
+        ok(out != NULL && out_len == 22
+           && memcmp(out, "-ERR value too large\r\n", 22) == 0,
+           "a RESP set with an over-long key answers -ERR, not +OK");
+        ok(backend_get(&s, big) == NULL, "the refused RESP set stored nothing");
+        free(out);
+    }
+
     /* AUD-03: a RESP bulk string is binary-safe. A value of "a\0b" must persist
      * all three bytes; strlen truncated it to "a". The frame is
      * *3 SET binkey $3 a\0b. */
@@ -889,7 +1020,9 @@ test_lie_bytes(void)
                             &out_len);
     ok(out != NULL && memcmp(out, "$3\r\n", 4) == 0,
        "lie_bytes rewrites the RESP declared length");
-    free(out);
+    /* nosem: double-free -- `out` is REASSIGNED by the backend_apply_lie() call
+     * above between the two frees, so these release two distinct allocations. */
+    free(out);  /* nosem: double-free */
 
     /* A reply carrying no declared length cannot be falsified. Returning NULL
      * rather than mangling it is what lets the server send it untouched

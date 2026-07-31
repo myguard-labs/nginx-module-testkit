@@ -205,6 +205,20 @@ const backend_fault *backend_fault_for(const backend_script *s,
 const backend_entry *backend_get(const backend_script *s, const char *key);
 void backend_set(backend_script *s, const char *key,
                  const unsigned char *value, size_t len);
+
+/*
+ * backend_set() for input that came off the SOCKET rather than out of a
+ * .backend file: returns 0 stored, -1 refused (key or value over its limit, or
+ * the store is full) instead of exiting the process. Callers answer with their
+ * protocol's error token.
+ *
+ * The distinction matters because fakesrv is one process behind every
+ * connection in a scenario: an over-long key from a peer used to die() and take
+ * every other live connection down with it, turning a module bug into what
+ * looked like harness flakiness.
+ */
+int  backend_set_checked(backend_script *s, const char *key,
+                         const unsigned char *value, size_t len);
 int  backend_delete(backend_script *s, const char *key);
 void backend_flush_all(backend_script *s);
 
