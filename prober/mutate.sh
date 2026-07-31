@@ -1719,6 +1719,31 @@ mutate "stateful-property-fuzz: step plan not persisted to the replay path" \
     'build_plan "$SEED"          > "$PLAN.decoy"
 ' scenarios/stateful-property-fuzz/mutate-suite.sh
 
+# --- scenarios/reload-idle-keepalive (drain ordering, not module code) ------
+#
+# Claim: assertion 4's ORDERING oracle -- the idle keepalive conn must be
+# closed no later than the old worker's exit -- is load-bearing. It is not
+# reached on a healthy run: the reader observes the close and the poll loop
+# breaks on `closed=1` before `drained_at` is ever consulted, so ordinary CI
+# never executes the outlived-the-draining-worker branch. Deleting the drain
+# observation outright therefore leaves a healthy run green, which is exactly
+# what makes this row necessary rather than decorative.
+#
+# The mutant makes the reader never observe the close: `sleep 999` replaces the
+# `cat` that blocks on the peer's FIN, and the `if false` keeps the CLOSED
+# marker unwritten while leaving the block syntactically whole. The subshell
+# then outlives the draining worker, `drained_at` is set when the master's
+# child set returns to WORKERS, and assertion 4 reds BY NAME roughly one second
+# (POST_DRAIN_GRACE_ITERS) later -- an assertion verdict, not a wall-clock
+# timeout, which is the distinction the timeout-credited rows of #167/#168
+# turned out to hide. The driver's failure path pkills the subtree, so the
+# sleeping child does not linger past the mutant run.
+mutate "reload-idle-keepalive: drain-ordering oracle vacuous (reader never observes the close)" \
+    scenarios/reload-idle-keepalive/driver.sh \
+    'if cat <&3 >/dev/null 2>/dev/null; then' \
+    'sleep 999; if false; then' \
+    scenarios/reload-idle-keepalive/mutate-suite.sh
+
 # --- scenarios/fault-matrix (P2-G6 named fault matrix, not module code) ------
 #
 # The branch under test is nginx's own upstream cleanup, which this repo cannot
