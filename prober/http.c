@@ -1172,6 +1172,19 @@ sleep_ms(long ms)
  * `*slept_ms` is credited with sleep_ms()'s RETURN at every inter-chunk sleep,
  * not with `ms` itself -- see sleep_ms()'s comment. `slept_ms` may be NULL for
  * a caller that does not account send-side pacing.
+ *
+ * `chunk == 0` means NO CLAMP: the whole span goes out in one write, with no
+ * inter-chunk sleep to perform. Two other places already read it that way --
+ * rules.c's pause_cost_ms_raw() charges a chunk-0 entry as a plain stall, and
+ * mutate.sh's byte-count mutant is commented "chunk 0 there means no clamp, so
+ * the whole span goes out in one write". This function did not implement that
+ * reading: it clamped `n` to 0, so `off` never advanced and the loop spun
+ * forever. write_request() never passes 0 (it routes chunk-0 entries to the
+ * plain-pause path) and rules.c rejects `send_slow` below 1, so no rule file
+ * could reach it -- but the mutation that flips the unit/byte-count dispatch
+ * did, and hung for the full 120 s suite timeout instead of failing an
+ * assertion. A contract three places state and one implements is a defect in
+ * the one.
  */
 static int
 write_paced(int fd, const unsigned char *buf, size_t len,
@@ -1182,7 +1195,7 @@ write_paced(int fd, const unsigned char *buf, size_t len,
     while (off < len) {
         size_t  n = len - off;
 
-        if (n > chunk) {
+        if (chunk > 0 && n > chunk) {
             n = chunk;
         }
 

@@ -819,6 +819,18 @@ jobs:
       - name: generated consumer scenarios are up to date
         run: tools/gen-consumer-scenarios.sh --check
 
+      # Every mutate.sh row's anchor must still match its target file exactly
+      # once. A row whose anchor was edited away by ordinary work is disarmed:
+      # it tests nothing, and the `mutation` job only notices for the rows that
+      # job actually runs -- never for the scenario rows, which run elsewhere.
+      #
+      # Here rather than in `mutation` on purpose. It builds nothing and runs no
+      # suite (~1 s for 124 rows), so a disarmed row fails in the fast job
+      # instead of 25-30 min into the CI long pole, and it covers the rows that
+      # the long pole's own MUT_KIND selector skips.
+      - name: mutate.sh anchors are all live
+        run: MUT_CHECK=1 prober/mutate.sh
+
       # Downloaded and hash-checked, same as the server tarballs above: a
       # linter that gates the build is as much a supply-chain dependency as
       # the code it lints.
