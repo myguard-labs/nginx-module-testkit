@@ -30,8 +30,10 @@
 # that the build succeeded, and that the named suite -- not merely some suite --
 # went red. Anything else is reported as a BROKEN mutation, never as a result.
 #
-# Usage:  ./mutate.sh            run every mutation
-#         ./mutate.sh SO_LINGER  run those whose name matches a substring
+# Usage:  ./mutate.sh              run every mutation
+#         ./mutate.sh SO_LINGER    run those whose name matches a substring
+#         MUT_CHECK=1 ./mutate.sh  check anchors only -- no build, no suite, ~1 s
+#                                  (run this after ANY diff to a mutated file)
 #
 # Each mutant's suite is bounded by MUT_SUITE_TIMEOUT seconds (default 120); a
 # timeout counts as a caught mutation. Exit status is 0 only when every mutation
@@ -61,6 +63,25 @@ case "$MUT_KIND" in
     *) echo "mutate.sh: MUT_KIND must be all, c or scenario (got \"$MUT_KIND\")" >&2
        exit 2 ;;
 esac
+
+# Anchor-parity mode: check that every row's `old` string still appears EXACTLY
+# ONCE in the file it targets, then exit. Builds nothing, runs no suite, needs
+# no staged tree -- seconds, not the 25-30 min the real run costs.
+#
+# It exists because ORDINARY work disarms rows. mutate() replaces a literal
+# string, so a diff that edits an anchored line leaves the anchor matching zero
+# times, and one that copies it (an extract-and-reuse refactor, a fuzz wrapper)
+# leaves it matching twice. Neither author has any reason to open this file.
+# Both have happened here: #166's backend rewrite deleted one anchor, and the
+# fix in this same commit deleted another in `write_paced`.
+#
+# Two things the real run cannot do:
+#   - it checks rows it never RUNS. Under MUT_KIND=c the scenario rows' anchors
+#     are never consulted at all, so a scenario row can sit disarmed for as long
+#     as nobody runs the scenario half.
+#   - it answers in the `shell` job instead of at the end of the CI long pole,
+#     which is the difference between a 30-second round trip and a 30-minute one.
+MUT_CHECK="${MUT_CHECK:-0}"
 
 # Per-mutant wall-clock ceiling. A mutation that removes a loop bound or a wait
 # ceiling can make its suite spin forever; without this the mutation job runs to
@@ -144,6 +165,32 @@ mutate () {
     local name="$1" file="$2" old="$3" new="$4" suite="$5" san="${6:-}"
 
     if [ -n "$FILTER" ] && [[ "$name" != *"$FILTER"* ]]; then
+        return
+    fi
+
+    # Deliberately BEFORE the MUT_KIND gate: a row skipped by the selector still
+    # has to have a live anchor, and those are the rows nothing else checks.
+    if [ "$MUT_CHECK" != "0" ]; then
+        local n
+        n=$(MUT_FILE="$file" MUT_OLD="$old" python3 -c '
+import os, sys
+try:
+    s = open(os.environ["MUT_FILE"]).read()
+except OSError as e:
+    sys.exit("unreadable: %s" % e)
+print(s.count(os.environ["MUT_OLD"]))
+') || { echo "ANCHOR ?  $name -- cannot read $file"; broken=$((broken + 1)); return; }
+
+        if [ "$n" -eq 1 ]; then
+            pass=$((pass + 1))
+        else
+            if [ "$n" -eq 0 ]; then
+                echo "ANCHOR MISSING    $name ($file) -- the row is disarmed"
+            else
+                echo "ANCHOR AMBIGUOUS  $name ($file) -- matches $n times"
+            fi
+            broken=$((broken + 1))
+        fi
         return
     fi
 
@@ -288,6 +335,22 @@ summarise () {
     fi
 
     echo
+    if [ "$MUT_CHECK" != "0" ]; then
+        # Name the filter when one is set, for the same reason the skipped count
+        # below names its mode: a run that covered a SUBSET must not read like a
+        # run that covered everything. "anchors: 10 live" after a filtered run
+        # would be true and completely misleading.
+        if [ -n "$FILTER" ]; then
+            echo "anchors: $pass live, $broken disarmed or ambiguous" \
+                 "(MUT_CHECK, filter=\"$FILTER\" -- SUBSET, not every row)"
+        else
+            echo "anchors: $pass live, $broken disarmed or ambiguous (MUT_CHECK)"
+        fi
+        [ "$broken" -gt 0 ] && rc=1
+        rm -rf "$work"
+        exit "$rc"
+    fi
+
     # The skipped count is printed even when it is zero, and names the mode that
     # produced it. A run that silently covers a subset reads exactly like a run
     # that covered everything -- which is the reporting failure this whole file
@@ -394,7 +457,7 @@ mutate "send_slow: inter-chunk sleep zeroed but intent credited anyway" http.c \
         }' http_test
 
 mutate "send_slow: chunk ignored" http.c \
-    'if (n > chunk) {
+    'if (chunk > 0 && n > chunk) {
             n = chunk;
         }' 'if (0) {
             n = chunk;
