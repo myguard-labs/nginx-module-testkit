@@ -1481,10 +1481,11 @@ mutate "backend: lie_bytes RESP sum sign-tested instead of overflow-checked" \
         lied = bytes + delta; if (lied < 0) {' \
     backend_test
 
-# R-6: the store is keyed by LENGTH, not by C string. Five rows, because the
-# defect had five separate ways back in -- the comparison, the copy, and the
-# three RESP call sites that hand the key over. Reverting any one of them
-# re-collapses two keys that differ only after a NUL into a single entry.
+# R-6: the store is keyed by LENGTH, not by C string. Seven rows, because the
+# defect had seven separate ways back in -- the comparison, the copy, and the
+# five RESP call sites that hand the key over (SET, GET, SCAN, DEL, EXISTS).
+# Reverting any one of them re-collapses two keys that differ only after a NUL
+# into a single entry.
 #
 # key_eq() casts key_len to void rather than dropping the parameter: -Wextra
 # -Werror makes an unused parameter a build failure, which mutate.sh reports as
@@ -1523,6 +1524,16 @@ mutate "backend: SCAN emits keys with strlen" backend.c \
             buf_append(&buf, &len, &cap, "\r\n", 2);' \
     '            buf_appendf(&buf, &len, &cap, "$%zu\r\n%s\r\n",
                         strlen(s->entries[i].key), s->entries[i].key);' \
+    backend_test
+
+mutate "backend: RESP del passes the key as a C string" backend.c \
+    '            n += backend_delete_n(s, cmd->args[i], cmd->args_len[i]);' \
+    '            n += backend_delete(s, cmd->args[i]);' \
+    backend_test
+
+mutate "backend: RESP exists looks the key up as a C string" backend.c \
+    '            n += (backend_get_n(s, cmd->args[i], cmd->args_len[i]) != NULL);' \
+    '            n += (backend_get(s, cmd->args[i]) != NULL);' \
     backend_test
 
 # The header-field parser. Three rows, one per rejection it is the only thing

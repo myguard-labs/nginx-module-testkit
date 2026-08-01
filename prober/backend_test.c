@@ -37,7 +37,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  136
+#define PLANNED  138
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1013,6 +1013,10 @@ test_resp_codec(void)
         static const unsigned char get_a[] = "*2\r\n$3\r\nGET\r\n$1\r\na\r\n";
         static const unsigned char del_x[] =
             "*2\r\n$3\r\nDEL\r\n$3\r\na\x00""x\r\n";
+        static const unsigned char exists_x[] =
+            "*2\r\n$6\r\nEXISTS\r\n$3\r\na\x00""x\r\n";
+        static const unsigned char exists_a[] =
+            "*2\r\n$6\r\nEXISTS\r\n$1\r\na\r\n";
         static const unsigned char scan[] = "*2\r\n$4\r\nSCAN\r\n$1\r\n0\r\n";
         unsigned char *out = NULL;
         size_t         out_len = 0;
@@ -1053,6 +1057,20 @@ test_resp_codec(void)
         ok(out != NULL && out_len > 0
            && memmem(out, out_len, "$3\r\na\x00""x\r\n", 9) != NULL,
            "SCAN emits a binary key at its full length");
+        free(out);  /* nosem: double-free */
+
+        /* EXISTS is a fourth handler that hands the key over, and it answers a
+         * COUNT rather than a value -- so a C-string lookup there reports the
+         * binary key as absent while every value-returning assertion above
+         * still passes. It gets its own row for that reason. */
+        REPLAY(exists_x);
+        ok(out_len == 4 && memcmp(out, ":1\r\n", 4) == 0,
+           "a RESP exists of a binary key counts that key");
+        free(out);  /* nosem: double-free */
+
+        REPLAY(exists_a);
+        ok(out_len == 4 && memcmp(out, ":0\r\n", 4) == 0,
+           "a RESP exists of the prefix of a binary key counts nothing");
         free(out);  /* nosem: double-free */
 
         REPLAY(del_x);
