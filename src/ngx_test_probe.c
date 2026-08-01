@@ -222,7 +222,14 @@ ngx_test_probe_fd_kinds(ngx_int_t *sockets, ngx_int_t *files, ngx_int_t *anon,
                            ngx_de_name(&dir));
         *end = '\0';
 
-        len = readlink((const char *) path, (char *) target,
+        /* path is /proc/self/fd/<N> built from our own readdir() walk above,
+         * not attacker-controlled, and target[len] is explicitly
+         * NUL-terminated right below using the length readlink() itself
+         * returns (never assumed via strlen()). The race the tool flags is
+         * the one the comment below already documents and treats as benign:
+         * our own fd table changing under us mid-walk, not a symlink an
+         * attacker can redirect. */
+        len = readlink((const char *) path, (char *) target,  /* flawfinder: ignore */
                        sizeof(target) - 1);
 
         if (len < 0) {
@@ -458,11 +465,8 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
     u_char          *p;
     ngx_int_t        fds, fd_sock, fd_file, fd_anon, fd_other, pss, priv_dirty;
     ngx_int_t        timers;
-    ngx_uint_t       pages_free, present, pool_blocks, pool_large, pool_cleanup;
+    ngx_uint_t       pages_free, pool_blocks, pool_large, pool_cleanup;
     ngx_slab_pool_t *shpool;
-
-    pages_free = 0;
-    present = 0;
 
     fds = ngx_test_probe_fd_count();
     timers = ngx_test_probe_timer_count();
@@ -548,28 +552,40 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
      */
     shpool = (ngx_slab_pool_t *) zone->shm.addr;
 
-    if (shpool != NULL) {
-        present = 1;
-
-        ngx_shmtx_lock(&shpool->mutex);
-
-        /* pfree is the free-page count the slab allocator maintains
-         * unconditionally. pool->stats[] is the richer source but is only
-         * populated under NGX_DEBUG_MALLOC-style builds, so it is not a
-         * portable signal for a harness that must run on release-ish CI
-         * builds of both nginx and angie. */
-        pages_free = shpool->pfree;
-
-        ngx_shmtx_unlock(&shpool->mutex);
+    if (shpool == NULL) {
+        /*
+         * Same "present":false tail as the zone == NULL case above, and for
+         * the same reason: probe-schema.json promises that when present is
+         * false, name/size/slab_pages_free are not rendered at all, not that
+         * they are rendered as a fabricated 0/empty. Emitting them here would
+         * let a probe that legitimately races a reload (see the comment
+         * above) return slab_pages_free:0, and a delta oracle over it would
+         * subtract that fabricated zero and pass -- exactly the R-10 failure
+         * mode. Module-specific zone members (zone_render, below) only run
+         * past this point, so returning here also correctly skips them.
+         */
+        return ngx_slprintf(p, last, ",\"zone\":{\"present\":false}}");
     }
 
+    ngx_shmtx_lock(&shpool->mutex);
+
+    /* pfree is the free-page count the slab allocator maintains
+     * unconditionally. pool->stats[] is the richer source but is only
+     * populated under NGX_DEBUG_MALLOC-style builds, so it is not a
+     * portable signal for a harness that must run on release-ish CI
+     * builds of both nginx and angie. */
+    pages_free = shpool->pfree;
+
+    ngx_shmtx_unlock(&shpool->mutex);
+
+    /* Reaching here means present is unconditionally true: both false cases
+     * (zone == NULL, shpool == NULL) already returned above. */
     p = ngx_slprintf(p, last,
                      ",\"zone\":{"
-                     "\"present\":%s,"
+                     "\"present\":true,"
                      "\"name\":\"%V\","
                      "\"size\":%uz,"
                      "\"slab_pages_free\":%ui",
-                     (u_char *) (present ? "true" : "false"),
                      &zone->shm.name,
                      (size_t) zone->shm.size,
                      pages_free);
@@ -579,7 +595,7 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
      * module's rules can assert on "zone.nodes" alongside the generic
      * "zone.slab_pages_free" without knowing which side rendered which.
      */
-    if (present && ngx_test_probe_hooks.zone_render != NULL) {
+    if (ngx_test_probe_hooks.zone_render != NULL) {
         p = ngx_test_probe_hooks.zone_render(p, last, zone);
     }
 

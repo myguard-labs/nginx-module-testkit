@@ -20,7 +20,7 @@ cd "$(dirname "$0")"
 EMITTER=../src/ngx_test_probe.c
 SCHEMA=../probe-schema.json
 
-PLANNED=33
+PLANNED=34
 tests_run=0
 failures=0
 
@@ -91,6 +91,37 @@ for entry in $FIELDS; do
     fi
 done
 
+# R-10: zone.present == false must mean name/size/slab_pages_free are not
+# rendered AT ALL, on every path that reaches "present":false, not just the
+# zone == NULL one. The emitter has two such paths -- zone == NULL, and
+# zone->shm.addr == NULL (a probe racing a reload, which the emitter's own
+# comment above ngx_test_probe_json() calls legitimate) -- and both share the
+# exact same ",\"zone\":{\"present\":false}}" literal tail, via two separate
+# early returns. Before the fix, the shm.addr == NULL path fell through
+# instead of returning, and rendered name/size/slab_pages_free with a
+# fabricated slab_pages_free of 0 -- so a `delta zone.slab_pages_free == 0`
+# rule racing a reload would subtract that fabricated zero and pass. Counting
+# the literal's occurrences catches a regression to one early return (the
+# old, buggy shape) without needing to parse the C control flow: two returns,
+# two copies of the literal; collapse either one away and the count drops.
+#
+# The grep is anchored to `return ngx_slprintf(` immediately preceding the
+# literal, not just the literal's text: a mutation that keeps both copies of
+# the string but turns one `return ngx_slprintf(...)` into a fall-through
+# `p = ngx_slprintf(...)` (the exact pre-fix shape) leaves the literal count
+# at 2 while dropping the return count to 1.
+# `|| true`: grep -c prints 0 and exits 1 when nothing matches, and under
+# `set -euo pipefail` that status kills the suite at this assignment -- so the
+# ONE case that matters most, both returns gone, would abort before ok() could
+# report it. Same guard as the bad_ranges count below.
+present_false_returns=$(grep -c 'return ngx_slprintf(p, last, ",\\"zone\\":{\\"present\\":false}}");' "$EMITTER" || true)
+
+if [ "$present_false_returns" -eq 2 ]; then
+    ok 0 "the emitter has two present:false early returns (zone==NULL and shm.addr==NULL)"
+else
+    ok 1 "the emitter has two present:false early returns (zone==NULL and shm.addr==NULL), saw $present_false_returns"
+fi
+
 # The reverse sweep: any member the emitter renders that the schema never
 # mentions. Without this the schema decays into a passing subset -- every
 # check above stays green while the document grows fields nobody wrote down.
@@ -144,7 +175,7 @@ fi
 # Only grep/sed lines are examined, and this check's own line is excluded:
 # a guard whose pattern matches itself can never pass, which is a worse failure
 # than the one it is meant to prevent.
-bad_ranges=$(grep -nE '(grep|sed)[^|]*\[[^]]*[a-y]-[a-z]' "$0" \
+bad_ranges=$(grep -nE '(grep|sed)[^|]*\[[^]]*[a-y]-[a-z]' "$(basename "$0")" \
     | grep -cv 'bad_ranges=' || true)
 
 if [ "$bad_ranges" -eq 0 ]; then

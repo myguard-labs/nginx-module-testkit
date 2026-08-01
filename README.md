@@ -343,9 +343,10 @@ works for any zone because every nginx shm zone begins with an
 `ngx_slab_pool_t`.
 
 The `/proc`-derived fields (`fds`, every `fds_by_kind` bucket, both `smaps`
-figures) render **-1** where `/proc` cannot be read — a fail-loud sentinel, not
-a fabricated zero. The `delta` / `probe_baseline` / slope oracles reject it
-rather than subtracting `-1 − -1 = 0` into a passing result.
+figures) and `timers` (uninitialised timer tree) render **-1** where the
+underlying reading cannot be taken — a fail-loud sentinel, not a fabricated
+zero. The `delta` / `probe_baseline` / slope oracles reject it rather than
+subtracting `-1 − -1 = 0` into a passing result.
 
 **Buffer sizing in the HTTP handler.** When you allocate a buffer for the
 response, size it as:
@@ -2366,9 +2367,14 @@ the compile-against-real-nginx/angie jobs and the live prober run.
 
 ## Gotchas worth knowing before you hit them
 
-- **An "unavailable" sentinel cancels under a delta.** `fds` is `-1` when
-  `/proc` is unreadable. Direct assertions on it fail loudly; `delta fds == 0`
-  would subtract `-1` from `-1` and pass. The prober rejects it explicitly.
+- **An "unavailable" sentinel cancels under a delta.** `fds`, every
+  `fds_by_kind.*` bucket, both `smaps.*` figures and `timers` are `-1` when
+  `/proc` is unreadable (or, for `timers`, the timer tree is uninitialised).
+  Direct assertions on it fail loudly; `delta fds == 0` would subtract `-1`
+  from `-1` and pass. The prober rejects it explicitly — the rejection list
+  is `path_is_proc_sentinel_field()` in `prober/assert.c`, kept in step with
+  the emitter's own sentinel-documented functions by
+  `prober/sentinel_fields_test.sh`.
 - **A delta rule fails loudly when the probe lacks the field** — running new
   rules against an older server gives "delta path not present", not a silent
   pass.
@@ -2376,7 +2382,8 @@ the compile-against-real-nginx/angie jobs and the live prober run.
   loud failure above only fires for a field some rule references. One that is
   renamed, retyped or dropped while nothing references it stays invisible until
   someone writes a rule against it and reads the failure as a bug in their rule.
-  `schema_test.c` checks both document variants against that file, and
+  `schema_test.c` checks all three document variants (zone present, zone
+  absent, zone present but shm not yet mapped) against that file, and
   `schema_emitter_test.sh` checks the file against the format strings in
   `ngx_test_probe.c` — including the reverse direction, so a field the emitter
   gains without being declared is also red. Adding a member to the probe means

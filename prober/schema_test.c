@@ -66,6 +66,34 @@ static const char doc_zone_absent[] =
     "\"zone\":{\"present\":false}}";
 
 /*
+ * R-10's regression fixture: a zone that is not NULL (a module passed one to
+ * ngx_test_probe_json()) but whose shared memory is not mapped yet --
+ * zone->shm.addr == NULL, the reload race the emitter's own comment above
+ * ngx_test_probe_json() documents as legitimate. The emitter renders the
+ * exact same "present":false tail as the zone == NULL case here (both early
+ * returns share one ngx_slprintf call), so this fixture is BYTE-IDENTICAL to
+ * doc_zone_absent.
+ *
+ * Be honest about what that means: these fixtures are hand-written literals,
+ * not the emitter's output, so this block CANNOT catch R-10 regressing and it
+ * is not what caught the R-10 mutation row -- schema_emitter_test.sh is, by
+ * checking the emitter source itself carries the present:false tail on both
+ * early returns. What this document pins is the CONSUMER side: it states, in
+ * the same place the other two variants are stated, that a present:false zone
+ * from the shm.addr == NULL path promises no siblings either, so a future
+ * edit that starts treating the two present:false cases as different shapes
+ * has to change this file and confront the claim.
+ */
+static const char doc_zone_shm_unmapped[] =
+    "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
+    "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
+    "\"fds\":9,\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
+    "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
+    "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
+    "\"cycle_large\":0,\"cycle_cleanup\":2},"
+    "\"zone\":{\"present\":false}}";
+
+/*
  * What the schema promises, transcribed. Keeping this beside the fixtures
  * rather than parsing probe-schema.json into a generic validator is the
  * smaller of two evils: a hand-rolled schema-language interpreter would be a
@@ -123,11 +151,12 @@ static const char *CLOSED_LEVELS[] = {
 
 /*
  * SCHEMA_N schema fields against the zone-present document, SCHEMA_N against
- * the zone-absent one (the three zone-present-only members are asserted ABSENT
- * there instead, which is the same count either way), CLOSED_N closed levels,
- * SCHEMA_N schema-file agreement checks, plus the two parses.
+ * the zone-absent one and SCHEMA_N again against the shm-unmapped one (the
+ * three zone-present-only members are asserted ABSENT in the latter two,
+ * which is the same count either way), CLOSED_N closed levels, SCHEMA_N
+ * schema-file agreement checks, plus the three parses.
  */
-#define PLANNED  (SCHEMA_N + SCHEMA_N + CLOSED_N + SCHEMA_N + 2)
+#define PLANNED  (SCHEMA_N + SCHEMA_N + SCHEMA_N + CLOSED_N + SCHEMA_N + 3)
 
 static int tests_run = 0;
 static int failures  = 0;
@@ -149,8 +178,12 @@ ok(int cond, const char *fmt, ...)
         printf("ok %d - ", tests_run);
     }
 
+    /* fmt is not attacker-controlled: the __attribute__((format(printf, 2,
+     * 3))) above makes the compiler check every call site against a literal
+     * format string (this is a self-test binary with no external input in
+     * the first place). */
     va_start(ap, fmt);
-    vprintf(fmt, ap);
+    vprintf(fmt, ap);  /* flawfinder: ignore */
     va_end(ap);
     printf("\n");
 }
@@ -198,6 +231,7 @@ main(void)
 {
     json_value *present;
     json_value *absent;
+    json_value *shm_unmapped;
     const char *err = NULL;
     char       *schema_text;
     int         i;
@@ -214,7 +248,12 @@ main(void)
     ok(absent != NULL, "the zone-absent document parses%s%s",
        err ? ": " : "", err ? err : "");
 
-    if (present == NULL || absent == NULL) {
+    err = NULL;
+    shm_unmapped = json_parse(doc_zone_shm_unmapped, &err);
+    ok(shm_unmapped != NULL, "the shm-unmapped document parses%s%s",
+       err ? ": " : "", err ? err : "");
+
+    if (present == NULL || absent == NULL || shm_unmapped == NULL) {
         printf("Bail out! the fixtures do not parse\n");
         return 1;
     }
@@ -246,6 +285,24 @@ main(void)
         } else {
             ok(v != NULL && v->type == SCHEMA[i].type,
                "zone-absent: \"%s\" is %s", SCHEMA[i].path,
+               json_type_name(SCHEMA[i].type));
+        }
+    }
+
+    /* ---- FORWARD: shm-unmapped variant (R-10 regression) --------------- */
+
+    for (i = 0; i < SCHEMA_N; i++) {
+        const json_value *v = json_get(shm_unmapped, SCHEMA[i].path);
+
+        if (SCHEMA[i].zone_present_only) {
+            /* Same reasoning as the zone-absent block above: shm.addr ==
+             * NULL is a legitimate present:false case, and none of its
+             * siblings may be rendered -- that is R-10 itself. */
+            ok(v == NULL, "shm-unmapped: \"%s\" is not rendered",
+               SCHEMA[i].path);
+        } else {
+            ok(v != NULL && v->type == SCHEMA[i].type,
+               "shm-unmapped: \"%s\" is %s", SCHEMA[i].path,
                json_type_name(SCHEMA[i].type));
         }
     }
@@ -326,6 +383,7 @@ main(void)
 
     json_free(present);
     json_free(absent);
+    json_free(shm_unmapped);
 
     if (tests_run != PLANNED) {
         printf("# ran %d tests but the plan says %d\n", tests_run, PLANNED);

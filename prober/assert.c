@@ -501,12 +501,22 @@ eval_probe(const json_value *doc, const probe_assert *pa, char *why,
 
 
 /*
- * The probe fields whose -1 is an "unreadable /proc" sentinel rather than a
- * real value. Kept as an explicit list rather than a "-1 is always unavailable"
- * blanket: a module hook could legitimately render a signed field that reaches
- * -1, and silently swallowing a delta over it would be the very fail-open this
- * check exists to prevent. Every entry here is a generic field this file's own
- * probe renders, so the list cannot drift out from under a consumer.
+ * The probe fields whose -1 is an "unreadable /proc" (or, for "timers", an
+ * "uninitialised tree") sentinel rather than a real value. Kept as an explicit
+ * list rather than a "-1 is always unavailable" blanket: a module hook could
+ * legitimately render a signed field that reaches -1, and silently swallowing
+ * a delta over it would be the very fail-open this check exists to prevent.
+ *
+ * This list is NOT structurally pinned to ../src/ngx_test_probe.c -- prober/
+ * and src/ are on opposite sides of the module/harness boundary, with no
+ * shared header, and src/ngx_test_probe.c needs real nginx headers to compile
+ * so it cannot be #included here. What keeps the two from drifting apart is
+ * prober/sentinel_fields_test.sh, which greps the emitter for every function
+ * whose doc comment claims the -1-sentinel discipline and fails if this array
+ * is missing the field that function renders (this is exactly how "timers"
+ * went missing: PR #165 added ngx_test_probe_timer_count() with that
+ * discipline, PR #130 was the last to touch this array, and nothing cross-
+ * checked the two).
  */
 static int
 path_is_proc_sentinel_field(const char *path)
@@ -519,6 +529,7 @@ path_is_proc_sentinel_field(const char *path)
         "fds_by_kind.other",
         "smaps.pss",
         "smaps.private_dirty",
+        "timers",
     };
     size_t i;
 
