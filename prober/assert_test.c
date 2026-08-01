@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  152
+#define PLANNED  156
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -570,6 +570,21 @@ main(void)
              "fds_by_kind.file", "==", "-5", 0,
              "an unavailable file fd kind in the after snapshot fails");
 
+    /*
+     * "timers" shares the same /proc-unreadable-style -1 sentinel as the
+     * fields above, on ngx_test_probe_timer_count()'s uninitialised-rbtree
+     * case rather than an unreadable /proc file -- but the failure mode a
+     * delta oracle sees is identical: a fabricated zero passing where a
+     * leaked timer should have failed loudly. This is R-2's regression case:
+     * "timers" was missing from path_is_proc_sentinel_field()'s list.
+     */
+    delta_is("{\"timers\":-1}", "{\"timers\":-1}", "timers", "==", "0", 0,
+             "an unavailable timer count fails rather than cancelling to zero");
+    delta_is("{\"timers\":-1}", "{\"timers\":9}", "timers", "==", "10", 0,
+             "an unavailable timer count in the before snapshot fails");
+    delta_is("{\"timers\":9}", "{\"timers\":-1}", "timers", "==", "-10", 0,
+             "an unavailable timer count in the after snapshot fails");
+
     /* A real reading of these fields still deltas normally -- the guard rejects
      * ONLY the -1 sentinel, not every value. */
     delta_is("{\"smaps\":{\"pss\":184}}", "{\"smaps\":{\"pss\":184}}",
@@ -577,6 +592,8 @@ main(void)
     delta_is("{\"fds_by_kind\":{\"socket\":4}}",
              "{\"fds_by_kind\":{\"socket\":5}}",
              "fds_by_kind.socket", "==", "1", 1, "a leaked socket fd is +1");
+    delta_is("{\"timers\":3}", "{\"timers\":3}", "timers", "==", "0", 1,
+             "a steady timer count is a zero delta");
 
     /*
      * -1 is special ONLY for the generic /proc-derived fields above; a module

@@ -621,6 +621,24 @@ mutate "close_within: want_close ignored" http.c \
     '                > HTTP_MAX_EXCHANGE_MS(st->timeout_ms)) {
             if (st->want_close < 0) {' http_test
 
+# ---- delta: -1-sentinel rejection list --------------------------------------
+
+# R-2: "timers" dropped from the fields path_is_proc_sentinel_field() rejects.
+# Without it, `delta timers == 0` cancels -1 - -1 to a passing zero on an
+# uninitialised event-timer rbtree -- exactly the fail-open the sentinel list
+# exists to prevent, and exactly what shipped until this fix (ngx_test_probe.c
+# grew the field in #165; nobody updated this array to match). assert_test.c's
+# three "timers" delta_is() rows (unavailable in either snapshot, and in both)
+# are what catch it.
+mutate "delta: timers dropped from the sentinel-rejection list" assert.c \
+    '        "smaps.pss",
+        "smaps.private_dirty",
+        "timers",
+    };' \
+    '        "smaps.pss",
+        "smaps.private_dirty",
+    };' assert_test
+
 # The comparison itself, in both directions. `>=` passes a close that missed the
 # deadline by exactly nothing; inverting it fails every prompt close.
 mutate "close_within: deadline comparison inverted" assert.c \
@@ -1043,10 +1061,47 @@ mutate "schema: emitter adds an undeclared field" ../src/ngx_test_probe.c \
 
 # The fixture side: schema_test.c is what proves the DOCUMENT still carries
 # what the schema promises, independently of the emitter's text.
+# doc_zone_shm_unmapped (R-10's regression fixture) is deliberately
+# byte-identical to doc_zone_absent's tail, so the anchor needs the
+# `static const char doc_zone_absent[] =` line above it to stay unique --
+# without that prefix this mutation would match twice and MUT_CHECK would
+# call it ambiguous rather than run it.
 mutate "schema: zone-absent variant leaks a zone member" schema_test.c \
-    '"\"zone\":{\"present\":false}}";' \
-    '"\"zone\":{\"present\":false,\"name\":\"stale\"}}";' \
+    'static const char doc_zone_absent[] =
+    "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
+    "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
+    "\"fds\":9,\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
+    "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
+    "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
+    "\"cycle_large\":0,\"cycle_cleanup\":2},"
+    "\"zone\":{\"present\":false}}";' \
+    'static const char doc_zone_absent[] =
+    "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
+    "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
+    "\"fds\":9,\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
+    "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
+    "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
+    "\"cycle_large\":0,\"cycle_cleanup\":2},"
+    "\"zone\":{\"present\":false,\"name\":\"stale\"}}";' \
     schema_test
+
+# R-10: the shm.addr == NULL early return removed, reverting to the buggy
+# fall-through shape where "present":false still emits name/size and a
+# fabricated slab_pages_free:0 for a zone whose memory is not mapped yet (a
+# legitimate reload race). schema_emitter_test.sh's present:false-return-count
+# check is what notices: collapsing this branch's return drops the emitter
+# from two present:false early returns to one.
+mutate "schema: shm-unmapped zone falls through instead of returning present:false" \
+    ../src/ngx_test_probe.c \
+    '        return ngx_slprintf(p, last, ",\"zone\":{\"present\":false}}");
+    }
+
+    ngx_shmtx_lock(&shpool->mutex);' \
+    '        (void) p;
+    }
+
+    ngx_shmtx_lock(&shpool->mutex);' \
+    schema_emitter_test.sh
 
 # The reverse sweep's anchor. Without it the needle is a bare suffix match, so
 # a stray member hides behind any declared key ending in the same text --
