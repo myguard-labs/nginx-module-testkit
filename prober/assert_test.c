@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  137
+#define PLANNED  152
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -462,6 +462,36 @@ main(void)
              "a numeric literal with trailing junk fails");
     probe_is(doc, "zone.nodes", "==", "", 0,
              "an empty literal against a number fails");
+
+    /*
+     * strtod() accepts these; the document grammar does not, and neither may a
+     * rule literal. `!= nan` is the sharp one: every comparison against a NaN
+     * is false, so the != arm reports PASS for every finite value the field can
+     * hold -- an assertion that cannot fail, printed as ok. `< inf` is the same
+     * hole in the other direction, and "0x7"/"+2"/".5"/"2." are the family of
+     * literals that would compare as something nobody wrote.
+     */
+    probe_is(doc, "zone.nodes", "!=", "nan", 0,
+             "a nan literal is refused, not answered true");
+    probe_is(doc, "zone.nodes", "==", "nan", 0, "== nan is refused too");
+    probe_is(doc, "zone.nodes", "<", "inf", 0, "an inf literal is refused");
+    probe_is(doc, "zone.nodes", ">", "-inf", 0, "a -inf literal is refused");
+    probe_is(doc, "zone.nodes", "==", "0x2", 0, "a hex literal is refused");
+    probe_is(doc, "zone.nodes", "==", "+2", 0, "a leading + is refused");
+    probe_is(doc, "zone.nodes", "==", "02", 0, "a leading zero is refused");
+    probe_is(doc, "pool.cycle_large", "==", ".0", 0,
+             "a bare .0 is refused");
+    probe_is(doc, "zone.nodes", "==", "2.", 0, "a trailing point is refused");
+    probe_is(doc, "zone.nodes", "==", "1e999", 0,
+             "an overflowing exponent is refused, not rounded to inf");
+    probe_is(doc, "zone.nodes", "==", " 2", 0, "a leading space is refused");
+
+    /* The grammar it does accept is JSON's, not a subset of it: the forms a
+     * rule legitimately uses must still work. */
+    probe_is(doc, "zone.nodes", "==", "2.0", 1, "2.0 still equals 2");
+    probe_is(doc, "zone.nodes", "==", "2e0", 1, "an exponent form still works");
+    probe_is(doc, "zone.nodes", "==", "0.2e1", 1, "a fraction+exponent works");
+    probe_is(doc, "pool.cycle_large", ">", "-1", 1, "a negative literal works");
     probe_is(doc, "zone", "==", "1", 0,
              "an object cannot be compared");
     probe_is("{\"a\":[1,2]}", "a", "==", "1", 0,

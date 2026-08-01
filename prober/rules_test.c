@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  295
+#define PLANNED  298
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -987,6 +987,25 @@ main(void)
     expect_die("name t\nprobe fds\n", "probe with only a path dies");
     expect_die("name t\nprobe fds == \t\n",
                "probe with a whitespace-only literal dies");
+
+    /*
+     * The QUOTED empty pattern is the one the bare-literal check above lets
+     * through: `""` unquotes to "" and the evaluator is strstr(hay, ""), which
+     * returns the haystack for any input. Refused for the same reason
+     * `expect body~` is -- a line that cannot fail is worse than no line.
+     */
+    expect_die("name t\nprobe zone.name ~ \"\"\n",
+               "probe ~ with a quoted empty pattern dies");
+
+    n = load_str("name t\nprobe zone.name ~ \"\"\"\n");
+    ok(n == 1 && cases[0].n_probes == 1,
+       "a quoted pattern that is not empty is still accepted");
+    free_all(n);
+
+    n = load_str("name t\nprobe zone.name == \"\"\n");
+    ok(n == 1 && cases[0].n_probes == 1,
+       "the empty literal is refused only for ~, where it cannot fail");
+    free_all(n);
 
     /* ---- expect_not parsing -------------------------------------------- */
 

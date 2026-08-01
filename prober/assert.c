@@ -59,24 +59,22 @@ unquote(const char *lit, char *scratch, size_t scratchlen)
 
 
 /*
- * Parse a rule literal as a number, rejecting anything with trailing text.
+ * Parse a rule literal as a number, under the SAME grammar the document side
+ * enforces -- by calling it, so the two cannot drift.
  *
  * strtod() stops at the first character it cannot use and reports success for
  * the prefix, so "1x" would otherwise compare as 1 and a mistyped expectation
- * would quietly assert something nobody wrote.
+ * would quietly assert something nobody wrote. It is also far more permissive
+ * than JSON: it takes "nan", "inf", "0x7", "+1" and ".5". Those are worse than
+ * a typo -- `probe fds != nan` is TRUE for every finite value, and `probe fds <
+ * inf` is true for every value at all, so a line that reads like an assertion
+ * cannot fail. json_number_parse() rejects all of them, and pins the radix
+ * point to '.' whatever LC_NUMERIC the run inherits.
  */
 static int
 literal_number(const char *want, double *out)
 {
-    char *stop;
-
-    if (*want == '\0') {
-        return 0;
-    }
-
-    *out = strtod(want, &stop);
-
-    return (stop != want && *stop == '\0');
+    return json_number_parse(want, out);
 }
 
 

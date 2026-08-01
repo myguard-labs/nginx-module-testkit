@@ -1898,3 +1898,48 @@ mutate "prober_boot: a server logging somewhere else is accepted (every log orac
     'error_log @PREFIX@/logs/error.log info;' \
     'error_log @PREFIX@/logs/somewhere-else.log info;' \
     scenarios/log-oracle-fails-closed/mutate-suite.sh
+
+
+# ---------------------------------------------------------------------------
+# Rule-literal grammar (R-3) and the empty `~` pattern (R-4).
+#
+# Both defects had the same shape: a rule line that reads like an assertion but
+# cannot fail. `probe fds != nan` is true for every finite value because every
+# comparison against a NaN is false, and `probe x ~ ""` is strstr(hay, ""),
+# which returns the haystack. The tests below have to red on each half
+# SEPARATELY -- the grammar gate and the finiteness gate are two checks, and one
+# silently doing the other's work is how a later refactor drops a live one.
+
+# The grammar half. Without it strtod_l still parses, so "nan"/"inf" are caught
+# by the isfinite check below -- but "0x7", "+1", ".5" and "01" sail through and
+# compare as numbers nobody wrote.
+mutate "rule literals: JSON number grammar not enforced (hex/+1/.5 accepted)" json.c \
+    '    if (!number_token_is_json(token)) {' \
+    '    if (token == NULL) {' \
+    json_test
+
+# The finiteness half, checked on its own: with the grammar gate still in place,
+# "1e999" is grammatical JSON that strtod turns into infinity, and every
+# ordering operator against it returns a confident wrong verdict.
+mutate "rule literals: non-finite literal accepted (1e999 compares as infinity)" json.c \
+    "    if (!loc_ok || stop == token || *stop != '\\0' || !isfinite(v)) {" \
+    "    if (!loc_ok || stop == token || *stop != '\\0') {" \
+    json_test
+
+# The quoted empty pattern. The bare-empty check above it in parse_assert does
+# NOT cover this one -- `\"\"` is two characters, so it reaches unquote() and
+# comes back empty.
+mutate "probe ~: quoted empty pattern accepted (matches every value)" rules.c \
+    '    if (strcmp(op, "~") == 0 && strcmp(lit, "\"\"") == 0) {' \
+    '    if (strcmp(op, "~") == 0 && lit == NULL) {' \
+    rules_test
+
+# The delegation itself. The two grammars can only stay in sync while the rule
+# side actually CALLS the document side; a well-meaning "avoid the dependency"
+# edit that reinstates a local strtod() reintroduces R-3 whole, and json_test
+# would stay green through it because json.c is untouched.
+mutate "rule literals: assert.c stops sharing the document grammar" assert.c \
+    '    return json_number_parse(want, out);' \
+    '    { char *stop; if (*want == 0) return 0;
+      *out = strtod(want, &stop); return stop != want && *stop == 0; }' \
+    assert_test
