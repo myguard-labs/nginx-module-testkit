@@ -482,6 +482,20 @@ parse_assert(probe_assert *list, size_t *count, const char *directive,
         die("%s:%d: %s needs <path> <op> <value>", file, lineno, directive);
     }
 
+    /*
+     * A bare empty literal is already gone (above), but the QUOTED one is not:
+     * `""` survives unquote() as the empty string and the evaluator is
+     * strstr(hay, ""), which returns the haystack for any input. `probe
+     * zone.state ~ ""` then reports ok against every document -- the same
+     * cannot-fail hole refused on `expect body~` for the same reason (see the
+     * comment above that check). Refused here rather than at evaluation time so
+     * the failure names the line that caused it.
+     */
+    if (strcmp(op, "~") == 0 && strcmp(lit, "\"\"") == 0) {
+        die("%s:%d: %s: \"~\" needs a non-empty pattern "
+            "(an empty one matches every value)", file, lineno, directive);
+    }
+
     pa = &list[*count];
     pa->path = xstrdup(path);
     pa->op = xstrdup(op);

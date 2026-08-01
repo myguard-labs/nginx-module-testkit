@@ -512,6 +512,34 @@ json_strtod(const char *buf, char **stop, int *ok)
 }
 
 
+/*
+ * The shared number gate -- see json.h. The document parser does not call this
+ * because it needs to tell "malformed" apart from "no C locale" in its own
+ * error string; it applies the same three checks in the same order, and
+ * `parse_number` says so at each one.
+ */
+int
+json_number_parse(const char *token, double *out)
+{
+    char  *stop;
+    double v;
+    int    loc_ok;
+
+    if (!number_token_is_json(token)) {
+        return 0;
+    }
+
+    v = json_strtod(token, &stop, &loc_ok);
+
+    if (!loc_ok || stop == token || *stop != '\0' || !isfinite(v)) {
+        return 0;
+    }
+
+    *out = v;
+    return 1;
+}
+
+
 static json_value *
 parse_number(jparse *s)
 {

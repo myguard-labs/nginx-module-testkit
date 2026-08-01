@@ -75,6 +75,20 @@ struct json_value {
 json_value *json_parse(const char *text, const char **err);
 
 /*
+ * Parse a bare number token under the document's own rules: the RFC 8259
+ * grammar (no "+1", ".5", "0x10", "inf", "nan", leading zeros or trailing
+ * text), a radix point that is '.' whatever LC_NUMERIC says, and a finite
+ * result. Returns 1 and stores the value in *out on success, 0 otherwise.
+ *
+ * Exported so the RULE side can be held to the same grammar as the DOCUMENT
+ * side by calling the same code. Two hand-written validators for one grammar
+ * drift, and the direction that drifted here accepted `!= nan` -- an assertion
+ * true for every finite value, which is the one defect class this harness may
+ * not contain.
+ */
+int json_number_parse(const char *token, double *out);
+
+/*
  * Parse a document of exactly `len` bytes, which MAY contain embedded NULs.
  *
  * json_parse() length-delimits with strlen and so silently truncates at the

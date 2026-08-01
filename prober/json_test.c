@@ -26,7 +26,7 @@
 
 /* Bumped by hand rather than computed, so that a test accidentally deleted or
  * short-circuited shows up as a plan mismatch instead of a smaller green run. */
-#define PLANNED  67
+#define PLANNED  81
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -479,6 +479,45 @@ main(void)
         /* NULL guard */
         ok(json_canonicalize(NULL, &out, &out_len) == -1,
            "canonicalize rejects a NULL value");
+    }
+
+    /* ---- json_number_parse: the gate the RULE side shares --------------- */
+    {
+        double d;
+
+        ok(json_number_parse("2", &d) == 1 && d == 2.0,
+           "json_number_parse takes a plain integer");
+        ok(json_number_parse("-0.5", &d) == 1 && d == -0.5,
+           "json_number_parse takes a negative fraction");
+        ok(json_number_parse("2e1", &d) == 1 && d == 20.0,
+           "json_number_parse takes an exponent");
+
+        /* Everything strtod() would accept and the document grammar does not.
+         * These are the literals that made a rule assertion unable to fail. */
+        ok(json_number_parse("nan", &d) == 0, "json_number_parse rejects nan");
+        ok(json_number_parse("inf", &d) == 0, "json_number_parse rejects inf");
+        ok(json_number_parse("-inf", &d) == 0,
+           "json_number_parse rejects -inf");
+        ok(json_number_parse("0x7", &d) == 0, "json_number_parse rejects hex");
+        ok(json_number_parse("+1", &d) == 0,
+           "json_number_parse rejects a leading +");
+        ok(json_number_parse(".5", &d) == 0,
+           "json_number_parse rejects a bare fraction");
+        ok(json_number_parse("01", &d) == 0,
+           "json_number_parse rejects a leading zero");
+        ok(json_number_parse("1x", &d) == 0,
+           "json_number_parse rejects trailing text");
+        ok(json_number_parse("", &d) == 0,
+           "json_number_parse rejects an empty token");
+        ok(json_number_parse("1e999", &d) == 0,
+           "json_number_parse rejects a value that overflows to inf");
+
+        /* An accepted token never leaves *out untouched, and a rejected one
+         * never writes it: a caller reading a stale double on a 0 return would
+         * assert against the PREVIOUS literal. */
+        d = 12345.0;
+        ok(json_number_parse("nope", &d) == 0 && d == 12345.0,
+           "a rejected token leaves the output untouched");
     }
 
     if (tests_run != PLANNED) {

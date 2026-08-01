@@ -381,7 +381,12 @@ delta   pool.cycle_used == 0
 ```
 
 `probe` lines assert on a single snapshot, `delta` lines on the change across
-the case. `probe_baseline` lines subtract like `delta`, but from a snapshot
+the case. A numeric literal must be a JSON number — the same grammar the probe
+document is held to, enforced by the same code. `nan`, `inf`, `0x7`, `+1`, `.5`
+and `1e999` are rejected at load time rather than compared: `probe fds != nan`
+is true for every finite value, and a line that cannot fail is worse than no
+line. `~` is a substring test and its pattern may not be empty, quoted (`""`)
+or otherwise, for the same reason. `probe_baseline` lines subtract like `delta`, but from a snapshot
 taken once before the first case of the run — see
 [Catching a slow leak](#catching-a-slow-leak). `from` binds the source
 address — load-bearing for anything keyed on the peer: without varying it, a per-IP fault never fires and the case
