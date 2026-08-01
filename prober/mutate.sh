@@ -1451,12 +1451,16 @@ mutate "backend: lie_bytes accepts delta=0" backend.c \
 # reported AMBIGUOUS and the row is disarmed.
 mutate "backend: lie_bytes memcached sum sign-tested instead of overflow-checked" \
     backend.c \
-    '        if (sscanf(head, "VALUE %255s %ld %ld", key, &flags, &bytes) != 3) {
+    '        if (!lie_parse_long(flags_s, &flags)
+            || !lie_parse_long(bytes_s, &bytes))
+        {
             return NULL;
         }
 
         if (__builtin_add_overflow(bytes, delta, &lied) || lied < 0) {' \
-    '        if (sscanf(head, "VALUE %255s %ld %ld", key, &flags, &bytes) != 3) {
+    '        if (!lie_parse_long(flags_s, &flags)
+            || !lie_parse_long(bytes_s, &bytes))
+        {
             return NULL;
         }
 
@@ -1465,12 +1469,57 @@ mutate "backend: lie_bytes memcached sum sign-tested instead of overflow-checked
 
 mutate "backend: lie_bytes RESP sum sign-tested instead of overflow-checked" \
     backend.c \
-    '        bytes = strtol(head + 1, NULL, 10);
+    '        if (!lie_parse_long(head + 1, &bytes)) {
+            return NULL;
+        }
 
         if (__builtin_add_overflow(bytes, delta, &lied) || lied < 0) {' \
-    '        bytes = strtol(head + 1, NULL, 10);
+    '        if (!lie_parse_long(head + 1, &bytes)) {
+            return NULL;
+        }
 
         lied = bytes + delta; if (lied < 0) {' \
+    backend_test
+
+# The header-field parser. Three rows, one per rejection it is the only thing
+# performing: ERANGE, a non-numeric or empty token, and trailing garbage after
+# the number. Reverting any one of them is exactly the strtol()/sscanf shape
+# this replaced, so each mutant is a faithful restoration of the old code
+# rather than an invented break.
+#
+# The ERANGE row cannot simply drop the check and return the strtol() result:
+# on an out-of-range field that value is LONG_MAX, and LONG_MAX + a positive
+# delta is caught by the overflow guard downstream, so the row would be caught
+# for the wrong reason. It returns 0 instead -- a header whose length parses as
+# a plausible small number is precisely the silent-wrong-answer the check
+# prevents.
+mutate "backend: lie_bytes accepts an out-of-range header field" backend.c \
+    '    if (stop == s || errno == ERANGE) {
+        return 0;
+    }' \
+    '    if (stop == s) {
+        return 0;
+    }
+    if (errno == ERANGE) { v = 0; }' \
+    backend_test
+
+mutate "backend: lie_bytes accepts a non-numeric header field" backend.c \
+    '    if (s == NULL || (*s != '"'"'-'"'"' && !isdigit((unsigned char) *s))) {
+        return 0;
+    }' \
+    '    if (s == NULL) {
+        return 0;
+    }' \
+    backend_test
+
+mutate "backend: lie_bytes accepts trailing garbage after a header field" \
+    backend.c \
+    '    if (*stop != '"'"'\0'"'"') {
+        return 0;
+    }' \
+    '    if (0) {
+        return 0;
+    }' \
     backend_test
 
 # 1-based occurrences. Accepting 0 gives a fault that reads as configured in the

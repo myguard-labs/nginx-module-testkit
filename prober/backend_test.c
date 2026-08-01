@@ -37,7 +37,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  121
+#define PLANNED  127
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1114,6 +1114,73 @@ test_lie_bytes(void)
                                 (const unsigned char *) resp_min,
                                 strlen(resp_min), -1, &out_len);
         ok(out == NULL, "lie_bytes refuses a RESP length whose sum overflows");
+        free(out);  /* nosem: double-free */
+    }
+
+    /*
+     * The header fields are parsed before they are added to, and the parse has
+     * to be checked for the same reason the addition is.
+     *
+     * These rows cover an exported function's input domain rather than a
+     * production regression: fakesrv hands backend_apply_lie() a reply it built
+     * itself, so a real declared length is a small non-negative number bounded
+     * by BACKEND_MAX_VALUE and none of these headers can arrive from it. What
+     * they pin is that the only two ways in -- this function's signature, which
+     * backend.h publishes -- cannot reach undefined behaviour.
+     *
+     * The pre-change code read the memcached fields with sscanf "%ld", whose
+     * behaviour is undefined when the converted value does not fit the
+     * destination, and the RESP field with a bare strtol() that discarded both
+     * ERANGE and the end pointer. The out-of-range rows are therefore the
+     * regression detectors; the garbage and leading-token rows pin the
+     * rejections strtol() alone would not have made.
+     */
+    {
+        const char *mc_huge = "VALUE k 0 99999999999999999999\r\nhello\r\n";
+        const char *resp_huge = "$99999999999999999999\r\nhello\r\n";
+
+        out = backend_apply_lie(BACKEND_PROTO_MEMCACHED,
+                                (const unsigned char *) mc_huge,
+                                strlen(mc_huge), 1, &out_len);
+        ok(out == NULL, "lie_bytes refuses a memcached length outside long");
+        free(out);  /* nosem: double-free */
+
+        out = backend_apply_lie(BACKEND_PROTO_REDIS,
+                                (const unsigned char *) resp_huge,
+                                strlen(resp_huge), 1, &out_len);
+        ok(out == NULL, "lie_bytes refuses a RESP length outside long");
+        free(out);  /* nosem: double-free */
+
+        /* Trailing garbage: strtol() stops at the `a` and reports 12. */
+        out = backend_apply_lie(BACKEND_PROTO_REDIS,
+                                (const unsigned char *) "$12abc\r\nhello\r\n",
+                                15, 1, &out_len);
+        ok(out == NULL, "lie_bytes refuses a RESP length with trailing garbage");
+        free(out);  /* nosem: double-free */
+
+        /* strtol() accepts a leading `+` and leading whitespace. A declared
+         * length is a bare decimal in both protocols, so neither is a length
+         * this injector should agree to rewrite. */
+        out = backend_apply_lie(BACKEND_PROTO_REDIS,
+                                (const unsigned char *) "$+5\r\nhello\r\n",
+                                12, 1, &out_len);
+        ok(out == NULL, "lie_bytes refuses a RESP length spelled with a sign");
+        free(out);  /* nosem: double-free */
+
+        out = backend_apply_lie(BACKEND_PROTO_REDIS,
+                                (const unsigned char *) "$ 5\r\nhello\r\n",
+                                12, 1, &out_len);
+        ok(out == NULL,
+           "lie_bytes refuses a RESP length behind leading whitespace");
+        free(out);  /* nosem: double-free */
+
+        /* A non-numeric memcached field. sscanf "%ld" failed this one too, so
+         * this row is a contract pin rather than a regression detector -- it
+         * holds while the fields are captured as strings and parsed after. */
+        out = backend_apply_lie(BACKEND_PROTO_MEMCACHED,
+                                (const unsigned char *) "VALUE k x 5\r\nhello\r\n",
+                                20, 1, &out_len);
+        ok(out == NULL, "lie_bytes refuses a non-numeric memcached flags field");
         free(out);  /* nosem: double-free */
     }
 }
