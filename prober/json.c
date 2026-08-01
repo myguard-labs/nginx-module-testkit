@@ -94,11 +94,133 @@ literal(jparse *s, const char *word)
 
 
 /*
+ * How many CONTINUATION bytes a UTF-8 lead byte announces, or -1 if the byte
+ * cannot start a sequence. 0xC0 and 0xC1 are excluded because the only code
+ * points they can encode are overlong forms of ASCII, and 0xF5..0xFF because
+ * they encode above U+10FFFF -- both are rejected at the lead byte rather than
+ * after decoding, which is the cheaper half of the same check.
+ */
+static int
+utf8_tail_len(unsigned char lead)
+{
+    if (lead < 0xC2) {
+        return -1;              /* a bare continuation byte, or an overlong lead */
+    }
+    if (lead < 0xE0) {
+        return 1;
+    }
+    if (lead < 0xF0) {
+        return 2;
+    }
+    if (lead < 0xF5) {
+        return 3;
+    }
+    return -1;
+}
+
+
+/*
+ * Grow-and-append one byte. parse_string_raw() appends a whole multi-byte
+ * sequence at a time, so the growth check cannot stay inlined at a single
+ * call site the way it used to be. Returns 0 on allocation failure with the
+ * caller's buffer left intact and still owned by the caller.
+ */
+static int
+str_push(char **out, size_t *len, size_t *cap, char c)
+{
+    if (*len + 1 >= *cap) {
+        char *bigger;
+
+        *cap *= 2;
+        bigger = realloc(*out, *cap);
+        if (bigger == NULL) {
+            return 0;
+        }
+        *out = bigger;
+    }
+
+    (*out)[(*len)++] = c;
+    return 1;
+}
+
+
+/*
+ * Validate one UTF-8 sequence at s->p-1 (its lead byte already consumed and
+ * passed in) and append every byte of it to the caller's buffer, advancing
+ * s->p past the continuation bytes. Returns NULL on success, or the error
+ * string to report -- the caller owns the buffer and frees it.
+ *
+ * The bytes are copied VERBATIM rather than re-encoded from the decoded code
+ * point: json_canonicalize re-emits this buffer and body_sha256 hashes it, so
+ * a decode/re-encode round trip would be an opportunity to change the document
+ * for no benefit.
+ */
+static const char *
+utf8_copy_sequence(jparse *s, unsigned char lead, char **out, size_t *len,
+                   size_t *cap)
+{
+    int           tail = utf8_tail_len(lead);
+    unsigned int  cp;
+    int           i;
+
+    if (tail < 0) {
+        return "invalid UTF-8 in string";
+    }
+
+    cp = (unsigned int) (lead & (0xFF >> (unsigned) (tail + 2)));
+
+    if (!str_push(out, len, cap, (char) lead)) {
+        return "out of memory";
+    }
+
+    for (i = 0; i < tail; i++) {
+        unsigned char t;
+
+        if (s->p >= s->end) {
+            return "truncated UTF-8 sequence in string";
+        }
+
+        t = (unsigned char) *s->p;
+
+        if ((t & 0xC0) != 0x80) {
+            return "invalid UTF-8 in string";
+        }
+
+        s->p++;
+        cp = (cp << 6) | (unsigned int) (t & 0x3F);
+
+        if (!str_push(out, len, cap, (char) t)) {
+            return "out of memory";
+        }
+    }
+
+    /* The two checks the lead byte cannot make on its own: an overlong three-
+     * or four-byte form (the shape that smuggles an ASCII byte past a
+     * byte-comparing filter), and the UTF-16 surrogate halves, which are not
+     * characters and which RFC 8259 s.8.1 excludes. */
+    if ((tail == 2 && cp < 0x800)
+        || (tail == 3 && cp < 0x10000)
+        || (cp >= 0xD800 && cp <= 0xDFFF)
+        || cp > 0x10FFFF)
+    {
+        return "invalid UTF-8 in string";
+    }
+
+    return NULL;
+}
+
+
+/*
  * Strings: the probe emits plain ASCII plus the two-character escapes below.
  * \u is rejected rather than silently mishandled -- a harness that quietly
  * mangles input it does not understand produces wrong verdicts, and the
  * producer is ours, so an unexpected \u means the document changed and the
  * parser should be updated to match.
+ *
+ * Bytes at or above 0x80 are validated as UTF-8 (RFC 8259 s.8.1) instead of
+ * being copied through. json_sort() re-emits whatever the parser accepted, so
+ * a parser that passes 0xC0 through canonicalizes a document that is not JSON
+ * into another document that is not JSON -- and body_sha256 then certifies it.
  */
 static char *
 parse_string_raw(jparse *s)
@@ -149,22 +271,25 @@ parse_string_raw(jparse *s)
             s->err = "raw control character in string";
             free(out);
             return NULL;
-        }
 
-        if (len + 1 >= cap) {
-            char *bigger;
+        } else if ((unsigned char) c >= 0x80) {
+            const char *bad = utf8_copy_sequence(s, (unsigned char) c,
+                                                 &out, &len, &cap);
 
-            cap *= 2;
-            bigger = realloc(out, cap);
-            if (bigger == NULL) {
-                s->err = "out of memory";
+            if (bad != NULL) {
+                s->err = bad;
                 free(out);
                 return NULL;
             }
-            out = bigger;
+
+            continue;
         }
 
-        out[len++] = c;
+        if (!str_push(&out, &len, &cap, c)) {
+            s->err = "out of memory";
+            free(out);
+            return NULL;
+        }
     }
 
     if (s->p >= s->end || *s->p != '"') {
@@ -548,8 +673,19 @@ parse_number(jparse *s)
     size_t      n = 0;
     json_value *v;
 
+    /*
+     * The byte set is spelled out rather than looked up with strchr(), because
+     * strchr() answers for the search string's own terminator: strchr("-+.eE",
+     * '\0') is non-NULL, so a NUL adjacent to a number was consumed into the
+     * token as if it were a digit. The token is then a C string, so the NUL
+     * ENDED it and "12\0 34" read as the number 12 -- the document parsed, and
+     * json_parse_n's whole purpose is to refuse a body that was truncated or
+     * spliced. It is the one byte in the document that must never be part of
+     * a token.
+     */
     while (s->p < s->end
-           && (strchr("-+.eE", *s->p) != NULL
+           && (*s->p == '-' || *s->p == '+' || *s->p == '.'
+               || *s->p == 'e' || *s->p == 'E'
                || (*s->p >= '0' && *s->p <= '9')))
     {
         /* Truncating the token and parsing the prefix would turn an absurd

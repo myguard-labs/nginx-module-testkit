@@ -26,7 +26,7 @@
 
 /* Bumped by hand rather than computed, so that a test accidentally deleted or
  * short-circuited shows up as a plan mismatch instead of a smaller green run. */
-#define PLANNED  81
+#define PLANNED  100
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -322,6 +322,146 @@ main(void)
             v = json_parse_n(in, inlen, &err);
             ok(v == NULL, "json_parse_n reaches a raw NUL inside a string and "
                "rejects it as a control byte, not truncating at it (AUD-11)");
+            json_free(v);
+        }
+
+        /*
+         * R-11: the number scanner used strchr("-+.eE", *p), and strchr
+         * answers for its own terminator -- so a NUL beside a number was
+         * consumed into the token, which then ENDED at that NUL and read as a
+         * plain number. This is the one hole left in AUD-11: the two cases
+         * above cover a NUL after `}` and inside a string, neither of which
+         * goes through the number scanner.
+         */
+        /*
+         * The NUL has to be followed by a VALID continuation, or the row is
+         * vacuous: `{"n":12\0 34}` is rejected with the bug present too, since
+         * the stray `34` fails the next structural check and the NUL never
+         * decides anything. The mutation harness caught exactly that draft.
+         * With the NUL sitting where the token legitimately ends, the pre-fix
+         * scanner swallowed it and the document PARSED.
+         */
+        {
+            static const char in[] = "{\"n\":12\0}";
+            size_t inlen = sizeof(in) - 1;
+
+            err = NULL;
+            v = json_parse_n(in, inlen, &err);
+            ok(v == NULL, "a NUL between a number and the closing brace is "
+               "not swallowed into the token (R-11)");
+            json_free(v);
+        }
+
+        {
+            static const char in[] = "{\"n\":12\0,\"m\":1}";
+            size_t inlen = sizeof(in) - 1;
+
+            err = NULL;
+            v = json_parse_n(in, inlen, &err);
+            ok(v == NULL, "a NUL spliced between a number and the next member "
+               "is not swallowed into the token (R-11)");
+            json_free(v);
+        }
+    }
+
+    /*
+     * R-8: RFC 8259 s.8.1 requires JSON text to be valid UTF-8. The parser
+     * rejected C0 controls but copied any byte at or above 0x80 straight
+     * through, and json_sort re-emitted it -- so `body_sha256` and every body
+     * assertion returned a confident verdict about a document that is not
+     * JSON. The reject rows below are one per class the decoder distinguishes,
+     * because a validator that catches only the lead byte still admits the
+     * overlong and surrogate forms, which are the ones that smuggle an ASCII
+     * byte or a non-character past a byte-comparing filter.
+     */
+    {
+        const char *err;
+        json_value *v;
+        size_t      i;
+
+        static const struct {
+            const char *doc;
+            const char *what;
+        } bad[] = {
+            { "{\"k\":\"\xC0\"}", "an overlong two-byte lead (0xC0)" },
+            { "{\"k\":\"\xC1\xAF\"}", "an overlong two-byte form of '/'" },
+            { "{\"k\":\"\x80\"}", "a bare continuation byte" },
+            { "{\"k\":\"\xC2\"}", "a truncated two-byte sequence" },
+            { "{\"k\":\"\xE2\x82\"}", "a truncated three-byte sequence" },
+            { "{\"k\":\"\xE2\x28\xA1\"}", "a bad continuation byte mid-sequence" },
+            { "{\"k\":\"\xE0\x80\xAF\"}", "an overlong three-byte form of '/'" },
+            { "{\"k\":\"\xF0\x80\x80\xAF\"}", "an overlong four-byte form of '/'" },
+            { "{\"k\":\"\xED\xA0\x80\"}", "a UTF-16 surrogate half (U+D800)" },
+            { "{\"k\":\"\xF4\x90\x80\x80\"}", "a code point above U+10FFFF" },
+            { "{\"k\":\"\xF5\x80\x80\x80\"}", "a lead byte above 0xF4" },
+        };
+
+        static const struct {
+            const char *doc;
+            const char *what;
+        } good[] = {
+            { "{\"k\":\"\xC2\xA9\"}", "U+00A9, two bytes" },
+            { "{\"k\":\"\xE2\x82\xAC\"}", "U+20AC, three bytes" },
+            { "{\"k\":\"\xF0\x9F\x92\xA9\"}", "U+1F4A9, four bytes" },
+            { "{\"k\":\"\xEF\xBF\xBD\"}", "U+FFFD, the replacement char" },
+        };
+
+        for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            char name[128];
+
+            err = NULL;
+            v = json_parse_n(bad[i].doc, strlen(bad[i].doc), &err);
+            snprintf(name, sizeof(name),
+                     "a string containing %s is rejected AS BAD UTF-8",
+                     bad[i].what);
+
+            /* The reason matters: every one of these documents is also
+             * rejectable by accident once the parser stops copying the
+             * sequence (the closing quote lands mid-token and the string reads
+             * as unterminated). A row that accepts any rejection would then
+             * pass against a validator that only truncates. */
+            if (v != NULL || err == NULL || strstr(err, "UTF-8") == NULL) {
+                printf("# %s: got %s (\"%s\")\n", bad[i].what,
+                       v == NULL ? "rejection" : "acceptance", err ? err : "-");
+            }
+
+            ok(v == NULL && err != NULL && strstr(err, "UTF-8") != NULL, name);
+            json_free(v);
+        }
+
+        for (i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+            char name[128];
+
+            err = NULL;
+            v = json_parse_n(good[i].doc, strlen(good[i].doc), &err);
+            snprintf(name, sizeof(name), "a string containing %s is accepted",
+                     good[i].what);
+            ok(v != NULL, name);
+            json_free(v);
+        }
+
+        /* The multi-byte sequence must survive canonicalization BYTE for byte:
+         * a validator that decodes and re-encodes, or one that stops copying
+         * after the lead byte, would still pass every reject row above while
+         * corrupting the document json_sort hands to body_sha256. */
+        {
+            static const char in[]  = "{\"b\":\"\xF0\x9F\x92\xA9\",\"a\":1}";
+            static const char want[] = "{\"a\":1,\"b\":\"\xF0\x9F\x92\xA9\"}";
+            char  *outp = NULL;
+            int    rc = -1;
+
+            err = NULL;
+            v = json_parse_n(in, sizeof(in) - 1, &err);
+            ok(v != NULL, "a document with a four-byte character parses");
+
+            if (v != NULL) {
+                rc = json_canonicalize(v, &outp, NULL);
+            }
+
+            ok(rc == 0 && outp != NULL && strcmp(outp, want) == 0,
+               "canonicalization re-emits the four-byte character unchanged");
+
+            free(outp);
             json_free(v);
         }
     }

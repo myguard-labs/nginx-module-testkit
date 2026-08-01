@@ -1400,6 +1400,59 @@ mutate "json_sort: exponent left un-normalized" json.c \
     "out[o++] = *t;" \
     json_test
 
+# R-8: UTF-8 validation. Four rows, because the validator is four decisions and
+# only the first is visible at the lead byte. Row 1 is the faithful restoration
+# of the pre-fix code -- the whole branch gone, every byte >= 0x80 copied
+# through. Rows 2-4 revert one check each, which is how a "simplification"
+# actually arrives: the lead-byte table admits 0xC0/0xC1, the continuation-byte
+# check goes away, or the decoded code point stops being range-checked. Each
+# leaves the other three intact, so each needs its own reject row in json_test
+# to die.
+mutate "json.c: no UTF-8 validation, bytes >= 0x80 copied through" json.c \
+    '        } else if ((unsigned char) c >= 0x80) {
+            const char *bad = utf8_copy_sequence(s, (unsigned char) c,' \
+    '        } else if (0) {
+            const char *bad = utf8_copy_sequence(s, (unsigned char) c,' \
+    json_test
+
+mutate "json.c: 0xC0 and 0xC1 accepted as lead bytes" json.c \
+    '    if (lead < 0xC2) {
+        return -1;              /* a bare continuation byte, or an overlong lead */
+    }' \
+    '    if (lead < 0x80) {
+        return -1;
+    }' \
+    json_test
+
+mutate "json.c: continuation bytes not checked" json.c \
+    '        if ((t & 0xC0) != 0x80) {
+            return "invalid UTF-8 in string";
+        }' \
+    '        if (0) {
+            return "invalid UTF-8 in string";
+        }' \
+    json_test
+
+mutate "json.c: overlong and surrogate forms not rejected" json.c \
+    '    if ((tail == 2 && cp < 0x800)
+        || (tail == 3 && cp < 0x10000)
+        || (cp >= 0xD800 && cp <= 0xDFFF)
+        || cp > 0x10FFFF)' \
+    '    if (0)' \
+    json_test
+
+# R-11: the number scanner. strchr() answers for its own terminator, so the
+# pre-fix spelling consumed a NUL into the token and the document parsed --
+# which is the truncation json_parse_n exists to refuse. The mutant is the
+# original line verbatim.
+mutate "json.c: number scanner accepts a NUL via strchr" json.c \
+    '           && (*s->p == '"'"'-'"'"' || *s->p == '"'"'+'"'"' || *s->p == '"'"'.'"'"'
+               || *s->p == '"'"'e'"'"' || *s->p == '"'"'E'"'"'
+               || (*s->p >= '"'"'0'"'"' && *s->p <= '"'"'9'"'"')))' \
+    '           && (strchr("-+.eE", *s->p) != NULL
+               || (*s->p >= '"'"'0'"'"' && *s->p <= '"'"'9'"'"')))' \
+    json_test
+
 # The body-gate classifier. If expect_reads_body stops recognizing a body kind,
 # the case-loop gate stops skipping it on a failed transform -- the exact "body
 # oracle runs against a rejected lower tier" regression. assert_test's
