@@ -1550,6 +1550,55 @@ done:
 
 /* ---- lie_bytes ------------------------------------------------------------ */
 
+/*
+ * Parse one decimal field out of a reply header, refusing everything strtol()
+ * would otherwise wave through: an empty or non-numeric token, a value outside
+ * `long` (ERANGE), and trailing characters other than the CR/LF that ends the
+ * line. Leading whitespace and a leading `+` are refused too -- a declared
+ * length is a bare decimal, and accepting sloppier spellings here would make
+ * the injector disagree with the parsers it is meant to feed.
+ *
+ * This exists because the alternatives are undefined rather than merely
+ * permissive. sscanf's "%ld" has no defined behaviour when the converted value
+ * does not fit the destination, and a bare strtol() returns LONG_MAX with
+ * errno set and no way for the caller to notice. xstrtol() in util.c checks
+ * both but die()s, which is right for a command-line flag and wrong here:
+ * backend_apply_lie() reports a header it cannot rewrite by returning NULL, and
+ * fakesrv turns that into a journalled fault rather than a dead daemon.
+ *
+ * Returns 1 and stores the value on success, 0 on any rejection.
+ */
+static int
+lie_parse_long(const char *s, long *out)
+{
+    char *stop;
+    long  v;
+
+    if (s == NULL || (*s != '-' && !isdigit((unsigned char) *s))) {
+        return 0;
+    }
+
+    errno = 0;
+    v = strtol(s, &stop, 10);
+
+    if (stop == s || errno == ERANGE) {
+        return 0;
+    }
+
+    while (*stop == '\r' || *stop == '\n') {
+        stop++;
+    }
+
+    if (*stop != '\0') {
+        return 0;
+    }
+
+    *out = v;
+
+    return 1;
+}
+
+
 unsigned char *
 backend_apply_lie(backend_proto proto, const unsigned char *in, size_t in_len,
                   long delta, size_t *out_len)
@@ -1584,35 +1633,56 @@ backend_apply_lie(backend_proto proto, const unsigned char *in, size_t in_len,
     memcpy(head, in, head_len);
     head[head_len] = '\0';
 
+    /*
+     * `lied` is computed with __builtin_add_overflow() rather than by testing
+     * `bytes + delta < 0`. `bytes` is read out of a reply header and `delta`
+     * out of a .backend file, so the two arrive independently:
+     * `delta=9223372036854775807` parses (xstrtol only
+     * refuses ERANGE, and LONG_MAX is in range) and the addition overflows
+     * BEFORE any comparison can inspect it. Signed overflow is UB, so in a
+     * -Werror build with optimisation the guard can be deleted outright by the
+     * compiler -- the fault injector's own arithmetic must not be the
+     * undefined part of the test.
+     */
     if (proto == BACKEND_PROTO_MEMCACHED) {
         char   key[BACKEND_MAX_KEY];
-        long   flags, bytes;
+        char   flags_s[BACKEND_MAX_KEY], bytes_s[BACKEND_MAX_KEY];
+        long   flags, bytes, lied;
 
-        if (sscanf(head, "VALUE %255s %ld %ld", key, &flags, &bytes) != 3) {
+        if (sscanf(head, "VALUE %255s %255s %255s", key, flags_s, bytes_s)
+            != 3)
+        {
             return NULL;
         }
 
-        if (bytes + delta < 0) {
+        if (!lie_parse_long(flags_s, &flags)
+            || !lie_parse_long(bytes_s, &bytes))
+        {
             return NULL;
         }
 
-        buf_appendf(&out, &len, &cap, "VALUE %s %ld %ld\r\n", key, flags,
-                    bytes + delta);
+        if (__builtin_add_overflow(bytes, delta, &lied) || lied < 0) {
+            return NULL;
+        }
+
+        buf_appendf(&out, &len, &cap, "VALUE %s %ld %ld\r\n", key, flags, lied);
 
     } else {
-        long bytes;
+        long bytes, lied;
 
         if (head[0] != '$') {
             return NULL;
         }
 
-        bytes = strtol(head + 1, NULL, 10);
-
-        if (bytes + delta < 0) {
+        if (!lie_parse_long(head + 1, &bytes)) {
             return NULL;
         }
 
-        buf_appendf(&out, &len, &cap, "$%ld\r\n", bytes + delta);
+        if (__builtin_add_overflow(bytes, delta, &lied) || lied < 0) {
+            return NULL;
+        }
+
+        buf_appendf(&out, &len, &cap, "$%ld\r\n", lied);
     }
 
     buf_append(&out, &len, &cap, in + head_len, in_len - head_len);
