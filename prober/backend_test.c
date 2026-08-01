@@ -37,7 +37,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  119
+#define PLANNED  121
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1042,30 +1042,72 @@ test_lie_bytes(void)
     /*
      * AUD-R7: the sum must be tested for OVERFLOW, not merely for sign.
      *
-     * The declared length here is LONG_MIN and the delta is -1, which is the
-     * one input shape that separates the two guards. A positive+positive
-     * overflow always wraps to a negative value, so the old `bytes + delta < 0`
-     * test caught it by accident and asserts nothing about overflow; a
-     * negative+negative overflow wraps to LONG_MAX, sails past a sign test, and
-     * makes the rewriter emit a declared length larger than any reply it could
-     * describe. `delta=-1` is spellable in a .backend file and a negative
-     * declared length is on the wire in RESP already (`$-1` is the nil bulk
-     * string), so neither half of the input is exotic.
+     * Two directions, and they are NOT the same test.
+     *
+     * The REACHABLE one is a valid reply plus delta=LONG_MAX. fakesrv builds
+     * the reply itself, so a real declared length is a small non-negative
+     * number, and `delta` is the only half a .backend author controls --
+     * xstrtol() refuses trailing garbage and ERANGE, and LONG_MAX is neither.
+     * These rows are a CONTRACT PIN, not a regression detector: the pre-fix
+     * `bytes + delta < 0` also answered NULL there, because two's-complement
+     * wrapping happens to land negative. What they pin is that the reachable
+     * input stays refused.
+     *
+     * They are not rescued by SAN=1 either, and the reason is worth knowing.
+     * The pre-fix addition IS undefined behaviour and -fsanitize=undefined does
+     * report it -- but UBSan defaults to printing and continuing, so the row
+     * still prints `ok` and the suite still exits 0 on that assertion alone.
+     * build.sh sets UBSAN_OPTIONS=halt_on_error=1, which does work when it is
+     * in the environment; it is `export`ed inside build.sh, a different process
+     * from the test run, so it never reaches one. Filed as its own ledger row
+     * -- fixing it belongs with the sanitizer job, not with this change.
+     *
+     * The UNREACHABLE one is a negative declared length plus a negative delta,
+     * which wraps to LONG_MAX and sails straight past a sign test. fakesrv
+     * cannot emit that header, so it is defensive coverage of an exported
+     * function's input domain rather than production regression coverage --
+     * but it is the only shape that separates the two guards in a plain build.
+     *
+     * The header is built with snprintf from LONG_MIN rather than spelled out:
+     * the literal -9223372036854775808 is unrepresentable in a 32-bit long, and
+     * the memcached branch parses it with sscanf "%ld", whose behaviour when
+     * the converted value does not fit the destination is undefined. The
+     * arch-32bit workflow builds and RUNS this suite under -m32, so a
+     * hard-coded LP64 value would put undefined behaviour inside the test for
+     * a fix about undefined behaviour.
      */
     {
-        const char *mc_min   = "VALUE k 0 -9223372036854775808\r\nhello\r\n";
-        const char *resp_min = "$-9223372036854775808\r\nhello\r\n";
+        char mc_min[64], resp_min[64];
+
+        /* Reachable direction: a valid reply, an extreme delta. */
+        out = backend_apply_lie(BACKEND_PROTO_MEMCACHED,
+                                (const unsigned char *) mc, strlen(mc),
+                                LONG_MAX, &out_len);
+        ok(out == NULL,
+           "lie_bytes refuses delta=LONG_MAX on a valid memcached reply");
+        /* nosem: double-free -- `out` is REASSIGNED by each backend_apply_lie()
+         * call between these frees, so they release distinct allocations. All
+         * are NULL on the passing path; the frees exist so a regression that
+         * starts returning a buffer shows up as a failed assertion rather than
+         * as an LSan leak in the sanitizer job. */
+        free(out);  /* nosem: double-free */
+
+        out = backend_apply_lie(BACKEND_PROTO_REDIS,
+                                (const unsigned char *) resp, strlen(resp),
+                                LONG_MAX, &out_len);
+        ok(out == NULL,
+           "lie_bytes refuses delta=LONG_MAX on a valid RESP reply");
+        free(out);  /* nosem: double-free */
+
+        /* Unreachable direction: a negative declared length, delta=-1. */
+        snprintf(mc_min, sizeof(mc_min), "VALUE k 0 %ld\r\nhello\r\n", LONG_MIN);
+        snprintf(resp_min, sizeof(resp_min), "$%ld\r\nhello\r\n", LONG_MIN);
 
         out = backend_apply_lie(BACKEND_PROTO_MEMCACHED,
                                 (const unsigned char *) mc_min, strlen(mc_min),
                                 -1, &out_len);
         ok(out == NULL,
            "lie_bytes refuses a memcached length whose sum overflows");
-        /* nosem: double-free -- `out` is REASSIGNED by the backend_apply_lie()
-         * call below between the two frees, so these release two distinct
-         * allocations. Both are NULL on the passing path; the frees exist so a
-         * regression that starts returning a buffer shows up as a failed
-         * assertion rather than as an LSan leak in the sanitizer job. */
         free(out);  /* nosem: double-free */
 
         out = backend_apply_lie(BACKEND_PROTO_REDIS,
@@ -1074,14 +1116,6 @@ test_lie_bytes(void)
         ok(out == NULL, "lie_bytes refuses a RESP length whose sum overflows");
         free(out);  /* nosem: double-free */
     }
-
-    /*
-     * There is deliberately no `delta=LONG_MAX against a 5-byte reply` row.
-     * It passes identically with the guard and without it -- positive+positive
-     * overflow wraps to a negative value, which the old sign test rejected by
-     * accident -- so it would assert nothing while reading like overflow
-     * coverage.
-     */
 }
 
 
