@@ -113,35 +113,57 @@ error_log_mark(void)
  *
  * Sliced by offset rather than re-grepping the whole file so that a line
  * logged by an EARLIER case can neither satisfy this case's grep_error_log
- * nor trip its no_error_log. Returns a malloc'd buffer (caller frees) and its
- * length; an unreadable or unchanged file is an empty slice, which is a valid
- * answer -- "nothing was logged" -- not an error.
+ * nor trip its no_error_log.
+ *
+ * Two outcomes that used to look identical are now distinct, because they mean
+ * opposite things:
+ *
+ *   UNCHANGED file  -- a valid empty slice. "Nothing was logged" is exactly
+ *                      what every no_error_log hopes for, so it is EVALUATED.
+ *   UNREADABLE file -- the oracle could not run at all. Reporting that as an
+ *                      empty slice made every no_error_log in the run pass
+ *                      without reading anything: the consumer was
+ *                      `if (slice != NULL && matched)`, so a NULL skipped the
+ *                      assertion entirely, while grep_error_log's
+ *                      `if (slice == NULL || !matched)` failed closed. That
+ *                      asymmetry is what this split removes.
+ *
+ * Returns 0 on success and -1 when the log could not be read. On success
+ * *out is a malloc'd buffer (caller frees) or NULL for a zero-length slice --
+ * callers must key on the return value, never on *out.
  */
-static char *
-read_log_slice(long mark, size_t *out_len)
+static int
+read_log_slice(long mark, char **out, size_t *out_len)
 {
     char   *buf;
     long    end;
     size_t  len;
     FILE   *fp;
 
+    *out = NULL;
     *out_len = 0;
 
     fp = fopen(opt_error_log, "rb");
     if (fp == NULL) {
-        return NULL;
+        return -1;
     }
 
     if (fseek(fp, 0L, SEEK_END) != 0) {
         fclose(fp);
-        return NULL;
+        return -1;
     }
 
     end = ftell(fp);
 
-    if (end < 0 || end <= mark || fseek(fp, mark, SEEK_SET) != 0) {
+    if (end < 0 || fseek(fp, mark, SEEK_SET) != 0) {
         fclose(fp);
-        return NULL;
+        return -1;
+    }
+
+    /* Nothing appended since the mark: a real, empty slice. */
+    if (end <= mark) {
+        fclose(fp);
+        return 0;
     }
 
     len = (size_t) (end - mark);
@@ -156,7 +178,9 @@ read_log_slice(long mark, size_t *out_len)
     *out_len = fread(buf, 1, len, fp);
     fclose(fp);
 
-    return buf;
+    *out = buf;
+
+    return 0;
 }
 
 
@@ -897,25 +921,34 @@ run_case(const test_case *tc, const json_value *baseline)
      */
     if (want_log) {
         size_t  slice_len = 0;
-        char   *slice = read_log_slice(log_mark, &slice_len);
+        char   *slice = NULL;
+        int     readable = (read_log_slice(log_mark, &slice, &slice_len) == 0);
 
-        for (i = 0; i < tc->n_no_logs; i++) {
-            if (slice != NULL
-                && log_lines_match(slice, slice_len, &tc->no_logs[i].re))
-            {
-                printf("# error log matches /%s/, expected no line to\n",
-                       tc->no_logs[i].pattern);
+        /* An unreadable log fails BOTH directions once, loudly, rather than
+         * silently satisfying every no_error_log in the case. Neither oracle
+         * ran, so neither may report a verdict. */
+        if (!readable) {
+            if (tc->n_no_logs > 0 || tc->n_grep_logs > 0) {
+                printf("# error log %s could not be read, so %zu log assertion(s)"
+                       " could not run\n",
+                       opt_error_log, tc->n_no_logs + tc->n_grep_logs);
                 ok = 0;
             }
-        }
+        } else {
+            for (i = 0; i < tc->n_no_logs; i++) {
+                if (log_lines_match(slice, slice_len, &tc->no_logs[i].re)) {
+                    printf("# error log matches /%s/, expected no line to\n",
+                           tc->no_logs[i].pattern);
+                    ok = 0;
+                }
+            }
 
-        for (i = 0; i < tc->n_grep_logs; i++) {
-            if (slice == NULL
-                || !log_lines_match(slice, slice_len, &tc->grep_logs[i].re))
-            {
-                printf("# no error-log line matches /%s/ during this case\n",
-                       tc->grep_logs[i].pattern);
-                ok = 0;
+            for (i = 0; i < tc->n_grep_logs; i++) {
+                if (!log_lines_match(slice, slice_len, &tc->grep_logs[i].re)) {
+                    printf("# no error-log line matches /%s/ during this case\n",
+                           tc->grep_logs[i].pattern);
+                    ok = 0;
+                }
             }
         }
 

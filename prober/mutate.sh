@@ -1843,3 +1843,58 @@ mutate "deploy-canary: O7 growth oracle vacuous (slope bound corrupted, suite mu
     '    SLOPE_CEIL_ADJUST=0' \
     '    SLOPE_CEIL_ADJUST=-1' \
     scenarios/deploy-canary/mutate-suite.sh
+
+# --- scenarios/log-oracle-fails-closed (the log oracle's own fail-open) ------
+#
+# Two rows, one per half of the fix. Both are anchored on code a healthy run
+# never executes -- the whole point of the scenario is that it manufactures the
+# one condition (a log the oracle cannot read) that reaches them -- so without
+# these rows a reader has no evidence either branch is load-bearing. That is the
+# #169 lesson: an oracle branch the healthy path never reaches is not proven by
+# CI however thorough the run looks.
+#
+# ROW 1 restores the exact defect in one edit. `if (!readable)` becomes
+# `if (readable && 0)`, which never fires, so an unreadable log stops failing
+# the case and falls through to the evaluation branch with a NULL, zero-length
+# slice -- and log_lines_match() returns 0 for a zero length. That reproduces
+# the original asymmetry precisely: no_error_log passes (nothing "matched"),
+# grep_error_log still fails (nothing matched). The scenario's assertion 2 then
+# reds BY NAME ("no_error_log fails when the log cannot be read") while 1, 3 and
+# 4 stay green -- caught by the assertion written for it, not by a boot failure,
+# a timeout or a broken rule.
+#
+# `readable && 0` rather than a bare `0` because this file is built behind the
+# -Werror wall: dropping the variable's only use trips -Werror=unused-variable,
+# the mutant does not compile, and a stale binary reds the suite for a reason
+# that has nothing to do with the oracle. That is failure mode 1 in this
+# script's own header, and it is what the first draft of this row did.
+mutate "prober: no_error_log fails open on an unreadable log (the log-slice asymmetry)" \
+    prober.c \
+    '        if (!readable) {' \
+    '        if (readable && 0) {' \
+    scenarios/log-oracle-fails-closed/mutate-suite.sh
+
+# ROW 2 covers the OTHER half: prober_boot's gate on the error log existing at
+# the path every oracle reads. Without it, a scenario whose server logs
+# ELSEWHERE leaves that scenario's crit gate, its no_error_log assertions and
+# its driver's $ELOG crash check all silently dead, and nothing else in the tree
+# notices (prober_check_conf gates daemon and worker_processes, not this).
+#
+# THE MUTANT IS A REDIRECTED LOG, NOT A MISSING DIRECTIVE, and the difference is
+# worth writing down because the first draft of this row got it wrong and the
+# mutation SURVIVED. Omitting `error_log` entirely does NOT reproduce the
+# hazard: nginx's compiled-in default is the RELATIVE path logs/error.log, which
+# it resolves against the prefix given by -p -- and lib.sh always passes -p
+# "$PROBER_PREFIX". So the file lands in the sandbox anyway and the gate
+# correctly stays quiet. What actually kills the oracles is a conf that opens
+# the log somewhere the prober does not read, which is what this mutant does.
+#
+# The suite must red on the BAIL, and it does: prober_boot exits 1 naming the
+# missing file before any case runs. That is a legitimate catch rather than the
+# environmental false-caught #170 was about -- the bail message is the gate's
+# own verdict about the tree, not a port collision or an absent build.
+mutate "prober_boot: a server logging somewhere else is accepted (every log oracle then dead)" \
+    scenarios/log-oracle-fails-closed/nginx.conf \
+    'error_log @PREFIX@/logs/error.log info;' \
+    'error_log @PREFIX@/logs/somewhere-else.log info;' \
+    scenarios/log-oracle-fails-closed/mutate-suite.sh

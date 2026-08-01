@@ -1,0 +1,10 @@
+# One case carrying ONE no_error_log, used twice by the driver against two
+# different -e paths. The pattern is deliberately one a healthy run never logs,
+# so on the readable log the case passes on the MERITS -- which is what makes
+# the unreadable-log run's verdict attributable to the log path and nothing
+# else.
+name    the worker did not die during this case
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+no_error_log  worker process .* exited on signal

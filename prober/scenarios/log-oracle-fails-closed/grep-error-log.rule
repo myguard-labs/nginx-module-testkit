@@ -1,0 +1,14 @@
+# The opposite direction, same two -e paths. `grep_error_log` already failed
+# closed on an unreadable log before this scenario existed; it is here as the
+# PARITY half, so the suite states both directions rather than leaving a reader
+# to assume the one it does not exercise.
+#
+# /gone is rooted at a directory that does not exist, so nginx writes an
+# [error] line naming the failed open() while serving THIS case -- a line that
+# is genuinely inside the case's own offset slice, not a startup line an
+# earlier case could have supplied.
+name    the failed open this case provoked is visible in the error log
+send    GET /gone/x HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=404
+grep_error_log  No such file or directory
