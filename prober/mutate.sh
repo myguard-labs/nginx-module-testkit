@@ -1481,6 +1481,61 @@ mutate "backend: lie_bytes RESP sum sign-tested instead of overflow-checked" \
         lied = bytes + delta; if (lied < 0) {' \
     backend_test
 
+# R-6: the store is keyed by LENGTH, not by C string. Seven rows, because the
+# defect had seven separate ways back in -- the comparison, the copy, and the
+# five RESP call sites that hand the key over (SET, GET, SCAN, DEL, EXISTS).
+# Reverting any one of them re-collapses two keys that differ only after a NUL
+# into a single entry.
+#
+# key_eq() casts key_len to void rather than dropping the parameter: -Wextra
+# -Werror makes an unused parameter a build failure, which mutate.sh reports as
+# BROKEN rather than as caught.
+mutate "backend: store keys compared with strcmp, not by length" backend.c \
+    '    return e->key_len == key_len && memcmp(e->key, key, key_len) == 0;' \
+    '    (void) key_len; return strcmp(e->key, key) == 0;' \
+    backend_test
+
+mutate "backend: store copies the key with a NUL-terminated write" backend.c \
+    '    memcpy(s->entries[slot].key, key, key_len);
+    s->entries[slot].key[key_len] = '"'"'\0'"'"';
+    s->entries[slot].key_len = key_len;' \
+    '    snprintf(s->entries[slot].key, sizeof(s->entries[slot].key), "%s", key);
+    s->entries[slot].key_len = strlen(s->entries[slot].key);' \
+    backend_test
+
+mutate "backend: RESP set passes the key as a C string" backend.c \
+    '        if (backend_set_checked_n(s, cmd->args[0], cmd->args_len[0],
+                                  (const unsigned char *) cmd->args[1],
+                                  cmd->args_len[1]) != 0)' \
+    '        if (backend_set_checked(s, cmd->args[0],
+                                (const unsigned char *) cmd->args[1],
+                                cmd->args_len[1]) != 0)' \
+    backend_test
+
+mutate "backend: RESP get looks the key up as a C string" backend.c \
+    '        e = backend_get_n(s, cmd->args[0], cmd->args_len[0]);' \
+    '        e = backend_get(s, cmd->args[0]);' \
+    backend_test
+
+mutate "backend: SCAN emits keys with strlen" backend.c \
+    '            buf_appendf(&buf, &len, &cap, "$%zu\r\n", s->entries[i].key_len);
+            buf_append(&buf, &len, &cap, (const unsigned char *) s->entries[i].key,
+                       s->entries[i].key_len);
+            buf_append(&buf, &len, &cap, "\r\n", 2);' \
+    '            buf_appendf(&buf, &len, &cap, "$%zu\r\n%s\r\n",
+                        strlen(s->entries[i].key), s->entries[i].key);' \
+    backend_test
+
+mutate "backend: RESP del passes the key as a C string" backend.c \
+    '            n += backend_delete_n(s, cmd->args[i], cmd->args_len[i]);' \
+    '            n += backend_delete(s, cmd->args[i]);' \
+    backend_test
+
+mutate "backend: RESP exists looks the key up as a C string" backend.c \
+    '            n += (backend_get_n(s, cmd->args[i], cmd->args_len[i]) != NULL);' \
+    '            n += (backend_get(s, cmd->args[i]) != NULL);' \
+    backend_test
+
 # The header-field parser. Three rows, one per rejection it is the only thing
 # performing: ERANGE, a non-numeric or empty token, and trailing garbage after
 # the number. Reverting any one of them is exactly the strtol()/sscanf shape
