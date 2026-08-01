@@ -1441,6 +1441,30 @@ mutate "json.c: overlong and surrogate forms not rejected" json.c \
     '    if (0)' \
     json_test
 
+# The three boundary regressions the reject rows above cannot see, because each
+# turns a LEGAL scalar into NOT_JSON rather than admitting a malformed one. A
+# false reject fails the case instead of passing it, so it never reaches a wrong
+# verdict -- but it breaks a document the probe may legitimately emit, and only
+# the accept rows at the range endpoints kill these.
+mutate "json.c: U+10FFFF rejected (range check off by one)" json.c \
+    '        || cp > 0x10FFFF)' \
+    '        || cp >= 0x10FFFF)' \
+    json_test
+
+mutate "json.c: the 0xF4 lead byte rejected" json.c \
+    '    if (lead < 0xF5) {
+        return 3;
+    }' \
+    '    if (lead < 0xF4) {
+        return 3;
+    }' \
+    json_test
+
+mutate "json.c: U+0800 rejected as overlong (threshold off by one)" json.c \
+    '    if ((tail == 2 && cp < 0x800)' \
+    '    if ((tail == 2 && cp <= 0x800)' \
+    json_test
+
 # R-11: the number scanner. strchr() answers for its own terminator, so the
 # pre-fix spelling consumed a NUL into the token and the document parsed --
 # which is the truncation json_parse_n exists to refuse. The mutant is the

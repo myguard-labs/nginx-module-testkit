@@ -26,7 +26,7 @@
 
 /* Bumped by hand rather than computed, so that a test accidentally deleted or
  * short-circuited shows up as a plan mismatch instead of a smaller green run. */
-#define PLANNED  100
+#define PLANNED  107
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -383,9 +383,9 @@ main(void)
             const char *doc;
             const char *what;
         } bad[] = {
-            { "{\"k\":\"\xC0\"}", "an overlong two-byte lead (0xC0)" },
+            { "{\"k\":\"\xC0\x80\"}", "an overlong two-byte lead (0xC0)" },
             { "{\"k\":\"\xC1\xAF\"}", "an overlong two-byte form of '/'" },
-            { "{\"k\":\"\x80\"}", "a bare continuation byte" },
+            { "{\"k\":\"\x80\x80\"}", "a bare continuation byte as lead" },
             { "{\"k\":\"\xC2\"}", "a truncated two-byte sequence" },
             { "{\"k\":\"\xE2\x82\"}", "a truncated three-byte sequence" },
             { "{\"k\":\"\xE2\x28\xA1\"}", "a bad continuation byte mid-sequence" },
@@ -404,6 +404,21 @@ main(void)
             { "{\"k\":\"\xE2\x82\xAC\"}", "U+20AC, three bytes" },
             { "{\"k\":\"\xF0\x9F\x92\xA9\"}", "U+1F4A9, four bytes" },
             { "{\"k\":\"\xEF\xBF\xBD\"}", "U+FFFD, the replacement char" },
+
+            /* The legal ENDPOINTS of each range. Without these the suite stays
+             * green through a one-character regression in exactly the code this
+             * PR adds: `lead < 0xF5` becoming `< 0xF4`, `cp > 0x10FFFF` becoming
+             * `>=`, or an overlong threshold flipping `<` to `<=`. Each of those
+             * turns a legal document into NOT_JSON, which fails the case rather
+             * than passing it -- a false reject, not a false accept, but still a
+             * verdict about a document the probe may legitimately emit. */
+            { "{\"k\":\"\xC2\x80\"}", "U+0080, the lowest two-byte scalar" },
+            { "{\"k\":\"\xDF\xBF\"}", "U+07FF, the highest two-byte scalar" },
+            { "{\"k\":\"\xE0\xA0\x80\"}", "U+0800, the lowest three-byte scalar" },
+            { "{\"k\":\"\xED\x9F\xBF\"}", "U+D7FF, just below the surrogates" },
+            { "{\"k\":\"\xEE\x80\x80\"}", "U+E000, just above the surrogates" },
+            { "{\"k\":\"\xF0\x90\x80\x80\"}", "U+10000, the lowest four-byte scalar" },
+            { "{\"k\":\"\xF4\x8F\xBF\xBF\"}", "U+10FFFF, the highest legal scalar" },
         };
 
         for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
