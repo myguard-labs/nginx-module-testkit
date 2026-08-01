@@ -110,7 +110,11 @@ done
 # the string but turns one `return ngx_slprintf(...)` into a fall-through
 # `p = ngx_slprintf(...)` (the exact pre-fix shape) leaves the literal count
 # at 2 while dropping the return count to 1.
-present_false_returns=$(grep -c 'return ngx_slprintf(p, last, ",\\"zone\\":{\\"present\\":false}}");' "$EMITTER")
+# `|| true`: grep -c prints 0 and exits 1 when nothing matches, and under
+# `set -euo pipefail` that status kills the suite at this assignment -- so the
+# ONE case that matters most, both returns gone, would abort before ok() could
+# report it. Same guard as the bad_ranges count below.
+present_false_returns=$(grep -c 'return ngx_slprintf(p, last, ",\\"zone\\":{\\"present\\":false}}");' "$EMITTER" || true)
 
 if [ "$present_false_returns" -eq 2 ]; then
     ok 0 "the emitter has two present:false early returns (zone==NULL and shm.addr==NULL)"

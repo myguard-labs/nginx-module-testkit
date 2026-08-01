@@ -137,7 +137,12 @@ while IFS= read -r line; do
     # inside the window (e.g. a local variable literally named "sentinel",
     # as ngx_test_probe_timer_count's rbtree walk has) reads as this
     # function's doc comment claiming the discipline.
-    block=$(sed -n "${start},$((lineno - 1))p" "$EMITTER" | grep -E '^\s*(/?\*|//)')
+    # `|| true`: a function with no preceding comment lines is the normal case
+    # for most of the emitter, and grep's exit 1 there would kill the suite
+    # mid-plan under `set -euo pipefail` -- turning "this function claims no
+    # discipline" into "the sweep stopped early", which is the failure this
+    # whole file exists to prevent. An empty block falls through the case below.
+    block=$(sed -n "${start},$((lineno - 1))p" "$EMITTER" | grep -E '^\s*(/?\*|//)' || true)
 
     case $block in
         *sentinel*|*"fabricated zero"*)
