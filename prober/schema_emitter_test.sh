@@ -104,7 +104,13 @@ done
 # the literal's occurrences catches a regression to one early return (the
 # old, buggy shape) without needing to parse the C control flow: two returns,
 # two copies of the literal; collapse either one away and the count drops.
-present_false_returns=$(grep -c ',\\"zone\\":{\\"present\\":false}}"' "$EMITTER")
+#
+# The grep is anchored to `return ngx_slprintf(` immediately preceding the
+# literal, not just the literal's text: a mutation that keeps both copies of
+# the string but turns one `return ngx_slprintf(...)` into a fall-through
+# `p = ngx_slprintf(...)` (the exact pre-fix shape) leaves the literal count
+# at 2 while dropping the return count to 1.
+present_false_returns=$(grep -c 'return ngx_slprintf(p, last, ",\\"zone\\":{\\"present\\":false}}");' "$EMITTER")
 
 if [ "$present_false_returns" -eq 2 ]; then
     ok 0 "the emitter has two present:false early returns (zone==NULL and shm.addr==NULL)"
@@ -165,7 +171,7 @@ fi
 # Only grep/sed lines are examined, and this check's own line is excluded:
 # a guard whose pattern matches itself can never pass, which is a worse failure
 # than the one it is meant to prevent.
-bad_ranges=$(grep -nE '(grep|sed)[^|]*\[[^]]*[a-y]-[a-z]' "$0" \
+bad_ranges=$(grep -nE '(grep|sed)[^|]*\[[^]]*[a-y]-[a-z]' "$(basename "$0")" \
     | grep -cv 'bad_ranges=' || true)
 
 if [ "$bad_ranges" -eq 0 ]; then

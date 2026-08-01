@@ -468,8 +468,6 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
     ngx_uint_t       pages_free, pool_blocks, pool_large, pool_cleanup;
     ngx_slab_pool_t *shpool;
 
-    pages_free = 0;
-
     fds = ngx_test_probe_fd_count();
     timers = ngx_test_probe_timer_count();
     ngx_test_probe_fd_kinds(&fd_sock, &fd_file, &fd_anon, &fd_other);

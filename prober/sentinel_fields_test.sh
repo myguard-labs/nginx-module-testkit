@@ -28,6 +28,20 @@ cd "$(dirname "$0")"
 EMITTER=../src/ngx_test_probe.c
 ASSERT=assert.c
 
+# The array body ONLY -- path_is_proc_sentinel_field()'s `fields[]` initializer,
+# between its opening brace and the closing `};`. Grepping the whole file for
+# `"$path",` is satisfied by prose that happens to contain the same quoted
+# text followed by a comma: the doc comment above the array says `"fds", every
+# "fds_by_kind.*" bucket…`, and a later comment says `(or, for "timers", an`
+# -- both would keep this test green even with the field deleted from the
+# actual array. Anchoring to the array body means a membership check only
+# passes when the field is a live entry, not a stray mention.
+sentinel_array=$(awk '
+    /static const char \*const fields\[\] = \{/ { in_array = 1; next }
+    in_array && /};/ { exit }
+    in_array { print }
+' "$ASSERT")
+
 # Every emitter function whose preceding doc comment claims the -1-sentinel
 # discipline, mapped to the schema path(s) it renders. This map is the part a
 # human maintains; the check below is what catches a maintained-but-forgotten
@@ -98,7 +112,7 @@ while IFS= read -r entry; do
     esac
 
     for path in $paths; do
-        if grep -q "\"$path\"," "$ASSERT"; then
+        if printf '%s\n' "$sentinel_array" | grep -q "\"$path\","; then
             ok 0 "assert.c's sentinel list names \"$path\" ($func)"
         else
             ok 1 "assert.c's sentinel list names \"$path\" ($func)"

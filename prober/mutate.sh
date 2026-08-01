@@ -1103,6 +1103,25 @@ mutate "schema: shm-unmapped zone falls through instead of returning present:fal
     ngx_shmtx_lock(&shpool->mutex);' \
     schema_emitter_test.sh
 
+# R-10, precise shape: only the `return` keyword dropped, so the branch falls
+# through to `p = ngx_slprintf(...)` instead of returning it -- the exact
+# pre-fix control flow, and the one shape the literal-count check (before this
+# PR's fix) could not tell apart from the correct two-return form, because the
+# literal ",\"zone\":{\"present\":false}}" is still written twice either way.
+# What has to notice is the return-anchored check: only one of the two
+# occurrences is still a `return`.
+mutate "schema: shm-unmapped zone's return demoted to a fall-through assignment" \
+    ../src/ngx_test_probe.c \
+    '        return ngx_slprintf(p, last, ",\"zone\":{\"present\":false}}");
+    }
+
+    ngx_shmtx_lock(&shpool->mutex);' \
+    '        p = ngx_slprintf(p, last, ",\"zone\":{\"present\":false}}");
+    }
+
+    ngx_shmtx_lock(&shpool->mutex);' \
+    schema_emitter_test.sh
+
 # The reverse sweep's anchor. Without it the needle is a bare suffix match, so
 # a stray member hides behind any declared key ending in the same text --
 # "pages_free" behind "slab_pages_free" -- and is reported as covered.
