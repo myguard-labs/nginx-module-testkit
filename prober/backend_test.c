@@ -28,6 +28,7 @@
 #include "backend.h"
 #include "util.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,7 +37,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  117
+#define PLANNED  119
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1037,6 +1038,50 @@ test_lie_bytes(void)
                             (const unsigned char *) resp, strlen(resp), -99,
                             &out_len);
     ok(out == NULL, "lie_bytes refuses a delta that would go negative");
+
+    /*
+     * AUD-R7: the sum must be tested for OVERFLOW, not merely for sign.
+     *
+     * The declared length here is LONG_MIN and the delta is -1, which is the
+     * one input shape that separates the two guards. A positive+positive
+     * overflow always wraps to a negative value, so the old `bytes + delta < 0`
+     * test caught it by accident and asserts nothing about overflow; a
+     * negative+negative overflow wraps to LONG_MAX, sails past a sign test, and
+     * makes the rewriter emit a declared length larger than any reply it could
+     * describe. `delta=-1` is spellable in a .backend file and a negative
+     * declared length is on the wire in RESP already (`$-1` is the nil bulk
+     * string), so neither half of the input is exotic.
+     */
+    {
+        const char *mc_min   = "VALUE k 0 -9223372036854775808\r\nhello\r\n";
+        const char *resp_min = "$-9223372036854775808\r\nhello\r\n";
+
+        out = backend_apply_lie(BACKEND_PROTO_MEMCACHED,
+                                (const unsigned char *) mc_min, strlen(mc_min),
+                                -1, &out_len);
+        ok(out == NULL,
+           "lie_bytes refuses a memcached length whose sum overflows");
+        /* nosem: double-free -- `out` is REASSIGNED by the backend_apply_lie()
+         * call below between the two frees, so these release two distinct
+         * allocations. Both are NULL on the passing path; the frees exist so a
+         * regression that starts returning a buffer shows up as a failed
+         * assertion rather than as an LSan leak in the sanitizer job. */
+        free(out);  /* nosem: double-free */
+
+        out = backend_apply_lie(BACKEND_PROTO_REDIS,
+                                (const unsigned char *) resp_min,
+                                strlen(resp_min), -1, &out_len);
+        ok(out == NULL, "lie_bytes refuses a RESP length whose sum overflows");
+        free(out);  /* nosem: double-free */
+    }
+
+    /*
+     * There is deliberately no `delta=LONG_MAX against a 5-byte reply` row.
+     * It passes identically with the guard and without it -- positive+positive
+     * overflow wraps to a negative value, which the old sign test rejected by
+     * accident -- so it would assert nothing while reading like overflow
+     * coverage.
+     */
 }
 
 

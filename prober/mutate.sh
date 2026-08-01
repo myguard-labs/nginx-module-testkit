@@ -1440,6 +1440,39 @@ mutate "backend: truncate accepts a missing after=" backend.c \
 mutate "backend: lie_bytes accepts delta=0" backend.c \
     '        if (f->delta == 0) {' '        if (0) {' backend_test
 
+# Both rows swap the overflow-checked sum back for the sign test it replaced.
+# The replacement assigns `lied` BEFORE the branch rather than inside it: the
+# obvious `if (bytes + delta < 0) { lied = bytes + delta;` leaves `lied`
+# uninitialised on the fall-through and dies on -Werror=maybe-uninitialized,
+# which mutate.sh reports as BROKEN, not as caught.
+#
+# The anchors carry the line above the guard because the guard itself is
+# byte-identical in the two protocol branches -- an anchor matching twice is
+# reported AMBIGUOUS and the row is disarmed.
+mutate "backend: lie_bytes memcached sum sign-tested instead of overflow-checked" \
+    backend.c \
+    '        if (sscanf(head, "VALUE %255s %ld %ld", key, &flags, &bytes) != 3) {
+            return NULL;
+        }
+
+        if (__builtin_add_overflow(bytes, delta, &lied) || lied < 0) {' \
+    '        if (sscanf(head, "VALUE %255s %ld %ld", key, &flags, &bytes) != 3) {
+            return NULL;
+        }
+
+        lied = bytes + delta; if (lied < 0) {' \
+    backend_test
+
+mutate "backend: lie_bytes RESP sum sign-tested instead of overflow-checked" \
+    backend.c \
+    '        bytes = strtol(head + 1, NULL, 10);
+
+        if (__builtin_add_overflow(bytes, delta, &lied) || lied < 0) {' \
+    '        bytes = strtol(head + 1, NULL, 10);
+
+        lied = bytes + delta; if (lied < 0) {' \
+    backend_test
+
 # 1-based occurrences. Accepting 0 gives a fault that reads as configured in the
 # file and never matches at run time -- configured and absent at once.
 mutate "backend: a 0 occurrence is accepted" backend.c \

@@ -1584,23 +1584,33 @@ backend_apply_lie(backend_proto proto, const unsigned char *in, size_t in_len,
     memcpy(head, in, head_len);
     head[head_len] = '\0';
 
+    /*
+     * `lied` is computed with __builtin_add_overflow() rather than by testing
+     * `bytes + delta < 0`. The declared length comes off the wire and `delta`
+     * out of a .backend file, so the two are independently attacker- and
+     * author-controlled: `delta=9223372036854775807` parses (xstrtol only
+     * refuses ERANGE, and LONG_MAX is in range) and the addition overflows
+     * BEFORE any comparison can inspect it. Signed overflow is UB, so in a
+     * -Werror build with optimisation the guard can be deleted outright by the
+     * compiler -- the fault injector's own arithmetic must not be the
+     * undefined part of the test.
+     */
     if (proto == BACKEND_PROTO_MEMCACHED) {
         char   key[BACKEND_MAX_KEY];
-        long   flags, bytes;
+        long   flags, bytes, lied;
 
         if (sscanf(head, "VALUE %255s %ld %ld", key, &flags, &bytes) != 3) {
             return NULL;
         }
 
-        if (bytes + delta < 0) {
+        if (__builtin_add_overflow(bytes, delta, &lied) || lied < 0) {
             return NULL;
         }
 
-        buf_appendf(&out, &len, &cap, "VALUE %s %ld %ld\r\n", key, flags,
-                    bytes + delta);
+        buf_appendf(&out, &len, &cap, "VALUE %s %ld %ld\r\n", key, flags, lied);
 
     } else {
-        long bytes;
+        long bytes, lied;
 
         if (head[0] != '$') {
             return NULL;
@@ -1608,11 +1618,11 @@ backend_apply_lie(backend_proto proto, const unsigned char *in, size_t in_len,
 
         bytes = strtol(head + 1, NULL, 10);
 
-        if (bytes + delta < 0) {
+        if (__builtin_add_overflow(bytes, delta, &lied) || lied < 0) {
             return NULL;
         }
 
-        buf_appendf(&out, &len, &cap, "$%ld\r\n", bytes + delta);
+        buf_appendf(&out, &len, &cap, "$%ld\r\n", lied);
     }
 
     buf_append(&out, &len, &cap, in + head_len, in_len - head_len);
