@@ -72,13 +72,17 @@ static const char doc_zone_absent[] =
  * ngx_test_probe_json() documents as legitimate. The emitter renders the
  * exact same "present":false tail as the zone == NULL case here (both early
  * returns share one ngx_slprintf call), so this fixture is BYTE-IDENTICAL to
- * doc_zone_absent -- and that identity is the point: before the fix, this
- * path instead fell through and rendered name/size/slab_pages_free with a
- * fabricated pages_free of 0, which is exactly what schema_test.c's
- * zone_present_only checks below would have caught had this fixture existed
- * at the time. Kept as its own document (not merely reusing doc_zone_absent)
- * so a future change that special-cases zone == NULL without also fixing the
- * shm.addr == NULL path is caught here rather than assumed identical.
+ * doc_zone_absent.
+ *
+ * Be honest about what that means: these fixtures are hand-written literals,
+ * not the emitter's output, so this block CANNOT catch R-10 regressing and it
+ * is not what caught the R-10 mutation row -- schema_emitter_test.sh is, by
+ * checking the emitter source itself carries the present:false tail on both
+ * early returns. What this document pins is the CONSUMER side: it states, in
+ * the same place the other two variants are stated, that a present:false zone
+ * from the shm.addr == NULL path promises no siblings either, so a future
+ * edit that starts treating the two present:false cases as different shapes
+ * has to change this file and confront the claim.
  */
 static const char doc_zone_shm_unmapped[] =
     "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
