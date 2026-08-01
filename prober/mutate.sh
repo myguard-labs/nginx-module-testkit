@@ -1664,6 +1664,24 @@ mutate "framed: status read loosely instead of by the shared strict walk" http.c
         }
     }' http_test
 
+# The status-code token's own shape, in the SHARED walk: 3DIGIT terminated by
+# SP, CR or end-of-buffer, and either half of that removed brings back a numeric
+# PREFIX parse -- "204junk" scored 204, was classified bodiless, and its declared
+# body was left on the socket for the next pipelined read.
+#
+# The two rows red through different assertions. The delimiter row restores
+# exactly that desync, so it reds the framed 48-byte regression as well as the
+# parser cases. The digit row does not reach the framed side: it makes "20  x"
+# score 184 rather than -1, which no framed fixture exercises, so the direct
+# parser assertion is its only witness.
+mutate "status: the delimiter after the three digits is unchecked" http.c \
+    '        if (d == raw_len || raw[d] == '"'"' '"'"' || raw[d] == '"'"'\r'"'"') {' \
+    '        if (d <= raw_len || raw[d] == '"'"' '"'"' || raw[d] == '"'"'\r'"'"') {' http_test
+
+mutate "status: the three positions are not required to be digits" http.c \
+    '            if (raw[d + k] < '"'"'0'"'"' || raw[d + k] > '"'"'9'"'"') {' \
+    '            if (raw[d + k] < '"'"'0'"'"' && raw[d + k] > '"'"'9'"'"') {' http_test
+
 mutate "framed: Content-Length overflow guard removed" http.c \
     '        if (content_length > SIZE_MAX - hdr_bytes) {
             return HTTP_FRAMED_INCOMPLETE;

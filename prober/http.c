@@ -704,6 +704,10 @@ write_all(int fd, const unsigned char *buf, size_t len)
  * version token is walked byte by byte and the terminating space must be the
  * one that ends *that* token, not merely the first space in the buffer.
  *
+ * The code that follows the version token is held to RFC 9110's `3DIGIT`,
+ * terminated by SP, CR or the end of the buffer -- see the comment at the parse
+ * itself for why a numeric PREFIX is a framing bug and not a leniency.
+ *
  * What is required is the SHAPE `HTTP/<digits>.<digits> `, not a specific
  * version number: the walk is digit-run based, so "HTTP/10.99 200" parses (
  * pinned by http_test.c "multi-digit major.minor still parses") while a bare
@@ -752,16 +756,46 @@ status_line_code(const char *raw, size_t raw_len)
     }
 
     if (saw_major && saw_minor && i < raw_len && raw[i] == ' ') {
-        char *end;
-        long  code = strtol(raw + i + 1, &end, 10);
+        size_t  d = i + 1;
+        int     code;
 
-        /* strtol reports "no digits" by leaving end at the start, and returns 0
-         * for it -- indistinguishable from a literal "0" status unless the end
-         * pointer is checked. The contract promises -1 for anything
-         * unparseable, so a non-numeric token must not surface as a status a
-         * rule could match on. */
-        if (end != raw + i + 1 && code >= 0 && code <= INT_MAX) {
-            return (int) code;
+        /*
+         * RFC 9110 status-code is exactly 3DIGIT, and the SP that follows it
+         * ends the token. strtol enforces neither: it skips leading whitespace,
+         * takes a sign, accepts any digit count, and stops wherever the digits
+         * stop -- so "HTTP/1.1 204junk" scored 204. That is not a cosmetic
+         * looseness, because status_is_bodiless(204) then ends the response at
+         * the header terminator and leaves "junk" plus the declared body on the
+         * socket for the next pipelined read to parse as a response head: body
+         * bytes decide the framing of the response carrying them, the one thing
+         * the comment above says must not happen.
+         *
+         * strtol is also a C-string scan over a byte-counted buffer -- raw is
+         * not guaranteed NUL-terminated, so it could read past raw_len. The
+         * walk below is bounded by raw_len like every other scan in this
+         * function.
+         */
+        if (raw_len - d < 3) {
+            return -1;
+        }
+
+        code = 0;
+
+        for (size_t k = 0; k < 3; k++) {
+            if (raw[d + k] < '0' || raw[d + k] > '9') {
+                return -1;
+            }
+            code = code * 10 + (raw[d + k] - '0');
+        }
+
+        d += 3;
+
+        /* The reason phrase is optional, so end-of-buffer and CR both end the
+         * token as legitimately as the SP that normally precedes the phrase.
+         * A fourth digit, a letter, or anything else fused onto the code is a
+         * malformed status line, not a status. */
+        if (d == raw_len || raw[d] == ' ' || raw[d] == '\r') {
+            return code;
         }
     }
 
