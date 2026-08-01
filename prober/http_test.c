@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  188
+#define PLANNED  198
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -1890,31 +1890,82 @@ main(void)
     ok(r.status == -1, "a non-numeric status is unparseable, not 0");
     http_response_free(&r);
 
-    /* The other side of that check: a real zero must still parse as zero. */
+    /* A one-digit token is not a status-code: RFC 9110 spells it 3DIGIT. This
+     * used to parse as 0 because strtol takes any digit count. */
     PARSE(&r, "HTTP/1.1 0 Zero\r\n\r\n");
-    ok(r.status == 0, "a literal 0 status is not confused with unparseable");
+    ok(r.status == -1, "a one-digit status token is unparseable, not 0");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/1.1 000 Zero\r\n\r\n");
+    ok(r.status == 0, "a three-digit 000 is a status and is not confused with unparseable");
     http_response_free(&r);
 
     PARSE(&r, "HTTP/1.1_200_OK\r\n\r\n");
     ok(r.status == -1, "a response with no space anywhere has no status");
     http_response_free(&r);
 
+    /* A doubled space is a malformed status line. strtol used to skip it
+     * silently, which is the same looseness that made "204junk" a 204. */
     PARSE(&r, "HTTP/1.1  200 OK\r\n\r\n");
-    ok(r.status == 200, "strtol skips a doubled space before the code");
+    ok(r.status == -1, "a doubled space before the code yields no status");
     http_response_free(&r);
 
     /* The old ">12 bytes" guard existed only to make sure a status line
      * fragment had room for "HTTP/1.1 200". That magic number is gone: the
      * version-token walk itself proves there is a well-formed "HTTP/x.y "
-     * prefix, and strtol needs only digits after it -- not a trailing space
-     * or a byte count -- so a buffer that ends right after the code still
-     * parses. Length is no longer what gates this; token well-formedness is. */
+     * prefix, and the three digits may be ended by end-of-buffer as well as by
+     * a delimiter, so a buffer that stops right after the code still parses.
+     * Length is no longer what gates this; token well-formedness is. */
     PARSE(&r, "HTTP/1.1 200");
     ok(r.status == 200, "the buffer may end right after the code, no trailing byte needed");
     http_response_free(&r);
 
     PARSE(&r, "HTTP/1.1 200 ");
     ok(r.status == 200, "a trailing space after the code also parses fine");
+    http_response_free(&r);
+
+    /* ---- the status token must be exactly three digits ----------------- */
+
+    /* The framing defect this section exists for: a numeric PREFIX used to
+     * parse, so a lying "204junk" was classified bodiless and its declared
+     * body was left on the socket for the next pipelined read. */
+    PARSE(&r, "HTTP/1.1 204junk\r\nContent-Length: 4\r\n\r\nbody");
+    ok(r.status == -1, "a status code with garbage fused onto it yields no status");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/1.1 2000 OK\r\n\r\n");
+    ok(r.status == -1, "a four-digit status token yields no status");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/1.1 20 OK\r\n\r\n");
+    ok(r.status == -1, "a two-digit status token yields no status");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/1.1 +200 OK\r\n\r\n");
+    ok(r.status == -1, "a signed status token yields no status");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/1.1 -200 OK\r\n\r\n");
+    ok(r.status == -1, "a negative status token yields no status");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/1.1 20\r\n\r\n");
+    ok(r.status == -1, "a short status token ended by CR yields no status");
+    http_response_free(&r);
+
+    /* Two digits followed by a SP that is then followed by another SP: the
+     * third position holds a delimiter, and the position after it holds one
+     * too. Only checking that all three positions are digits rejects this --
+     * dropping the third-digit check alone leaves the shape looking terminated
+     * and scores a code computed from a space. */
+    PARSE(&r, "HTTP/1.1 20  x\r\n\r\n");
+    ok(r.status == -1,
+       "a two-digit code padded to three positions by a space yields no status");
+    http_response_free(&r);
+
+    /* CR ends the token as legitimately as SP: the reason phrase is optional. */
+    PARSE(&r, "HTTP/1.1 204\r\nContent-Length: 0\r\n\r\n");
+    ok(r.status == 204, "a status line with no reason phrase parses");
     http_response_free(&r);
 
     PARSE(&r, "SMTP/1.1 200 OK\r\nX: y\r\n\r\nbody");
@@ -3344,6 +3395,18 @@ main(void)
         ok(s == HTTP_FRAMED_COMPLETE && n == 49,
            "a malformed version token is not bodiless: the declared body is "
            "consumed, not left on the wire");
+
+        /* The status-code token itself, not the version: "204junk" used to
+         * score 204 because the parse stopped wherever the digits stopped. The
+         * response is then declared over at the header terminator and "junk"
+         * plus nine body bytes stay in the buffer, so the next pipelined read
+         * starts mid-body -- body bytes framing the response that carries them.
+         * All 48 bytes must be consumed. */
+        n = 0;
+        s = FRAMED("HTTP/1.1 204junk\r\nContent-Length: 9\r\n\r\nbodybody!");
+        ok(s == HTTP_FRAMED_COMPLETE && n == 48,
+           "a status code with garbage fused onto it is not bodiless: the "
+           "declared body is consumed, not left on the wire");
 
         n = 0;
         s = FRAMED("HTTP/2 204 x\r\nContent-Length: 9\r\n\r\nbodybody!");
