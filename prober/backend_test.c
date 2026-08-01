@@ -37,7 +37,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  127
+#define PLANNED  136
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -555,6 +555,46 @@ test_store(void)
            "a value containing NUL is stored by length");
     }
 
+    /*
+     * R-6: the KEY is length-based for the same reason the value is.
+     *
+     * The store used strcmp/strlen throughout, so "a\0x" and "a\0y" were both
+     * the one-byte key "a": the second set overwrote the first, and a get for
+     * either answered the same entry. A module with binary-key corruption then
+     * passed against a fake that had the corruption built in.
+     *
+     * The lengths must match exactly, which is the second row here: a shorter
+     * key is not a prefix of a longer one, it is a different key.
+     */
+    {
+        const backend_entry *e;
+        size_t               before;
+
+        backend_flush_all(&s);
+
+        ok(backend_set_checked_n(&s, "a\0x", 3,
+                                 (const unsigned char *) "1", 1) == 0
+           && backend_set_checked_n(&s, "a\0y", 3,
+                                    (const unsigned char *) "2", 1) == 0
+           && s.n_entries == 2,
+           "two keys differing only after a NUL are two entries");
+
+        e = backend_get_n(&s, "a\0x", 3);
+        ok(e != NULL && e->key_len == 3 && memcmp(e->key, "a\0x", 3) == 0
+           && e->value_len == 1 && e->value[0] == '1',
+           "a binary key is stored whole and finds its own value");
+
+        ok(backend_get_n(&s, "a", 1) == NULL,
+           "a key is not found by a prefix of itself");
+
+        before = s.n_entries;
+        ok(backend_delete_n(&s, "a\0x", 3) == 1 && s.n_entries == before - 1
+           && backend_get_n(&s, "a\0y", 3) != NULL,
+           "deleting a binary key leaves its NUL-sharing neighbour alone");
+
+        backend_flush_all(&s);
+    }
+
     backend_free(&s);
 }
 
@@ -952,6 +992,78 @@ test_resp_codec(void)
         ok(e != NULL && e->value_len == 3
            && memcmp(e->value, "a\x00""b", 3) == 0,
            "a RESP set stores the full binary value, NUL included");
+    }
+
+    /*
+     * R-6, the same defect one argument to the left: the KEY was passed to the
+     * store as a C string while the value correctly used args_len[1]. So
+     * SET "a\0x" and SET "a\0y" were one key, and GET "a" found it.
+     *
+     * These rows go through backend_reply_resp() rather than the store API
+     * because that is where the defect lived -- the store's own strcmp was
+     * only reachable as a key collapse through this handler.
+     */
+    {
+        static const unsigned char set_x[] =
+            "*3\r\n$3\r\nSET\r\n$3\r\na\x00""x\r\n$1\r\n1\r\n";
+        static const unsigned char set_y[] =
+            "*3\r\n$3\r\nSET\r\n$3\r\na\x00""y\r\n$1\r\n2\r\n";
+        static const unsigned char get_x[] =
+            "*2\r\n$3\r\nGET\r\n$3\r\na\x00""x\r\n";
+        static const unsigned char get_a[] = "*2\r\n$3\r\nGET\r\n$1\r\na\r\n";
+        static const unsigned char del_x[] =
+            "*2\r\n$3\r\nDEL\r\n$3\r\na\x00""x\r\n";
+        static const unsigned char scan[] = "*2\r\n$4\r\nSCAN\r\n$1\r\n0\r\n";
+        unsigned char *out = NULL;
+        size_t         out_len = 0;
+
+#define REPLAY(frame)                                                         \
+        do {                                                                  \
+            memcpy(buf, (frame), sizeof(frame) - 1);                          \
+            (void) backend_parse_resp(buf, sizeof(frame) - 1, &cmd);          \
+            backend_reply_resp(&s, &cmd, &out, &out_len);                     \
+        } while (0)
+
+        backend_flush_all(&s);
+
+        REPLAY(set_x);
+        free(out);
+        REPLAY(set_y);
+        free(out);  /* nosem: double-free -- REPLAY reassigns `out` each time */
+
+        ok(s.n_entries == 2,
+           "two RESP sets differing only after a NUL store two keys");
+
+        REPLAY(get_x);
+        ok(out_len == 7 && memcmp(out, "$1\r\n1\r\n", 7) == 0,
+           "a RESP get of a binary key answers that key's own value");
+        free(out);  /* nosem: double-free */
+
+        /* The collapse, from the other side: before the fix this found the
+         * entry, because both were stored under the one-byte key "a". */
+        REPLAY(get_a);
+        ok(out_len == 5 && memcmp(out, "$-1\r\n", 5) == 0,
+           "a RESP get of the prefix of a binary key misses");
+        free(out);  /* nosem: double-free */
+
+        /* SCAN must report the key whole. A printf("%s") stops at the NUL and
+         * would announce a 3-byte key as the 1-byte key "a", so a client
+         * enumerating the keyspace gets a name it cannot then GET. */
+        REPLAY(scan);
+        ok(out != NULL && out_len > 0
+           && memmem(out, out_len, "$3\r\na\x00""x\r\n", 9) != NULL,
+           "SCAN emits a binary key at its full length");
+        free(out);  /* nosem: double-free */
+
+        REPLAY(del_x);
+        ok(out_len == 4 && memcmp(out, ":1\r\n", 4) == 0
+           && s.n_entries == 1 && backend_get_n(&s, "a\0y", 3) != NULL,
+           "a RESP del of a binary key removes only that key");
+        free(out);  /* nosem: double-free */
+
+#undef REPLAY
+
+        backend_flush_all(&s);
     }
 
     /* AUD-04: the trailing CRLF of a bulk string is mandatory. A frame whose

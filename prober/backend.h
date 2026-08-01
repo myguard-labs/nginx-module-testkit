@@ -144,6 +144,15 @@ typedef struct {
 
 typedef struct {
     char            key[BACKEND_MAX_KEY];
+    /*
+     * Length of `key` in bytes, for the same reason `value_len` exists: a RESP
+     * key is a binary-safe bulk string, so "a\0b" is a three-byte key and NOT
+     * the one-byte key "a". Everything that compares or emits a key must use
+     * this rather than strlen(). `key` is still NUL-terminated at
+     * key[key_len] so the memcached and inline text paths, whose keys cannot
+     * contain a NUL, can keep printing it with "%s".
+     */
+    size_t          key_len;
     unsigned char   value[BACKEND_MAX_VALUE];
     size_t          value_len;
     int             used;
@@ -201,8 +210,23 @@ const backend_fault *backend_fault_for(const backend_script *s,
                                        const char *cmd, long nth);
 
 
-/* The in-memory store. `get` returns NULL when the key is absent. */
+/*
+ * The in-memory store. `get` returns NULL when the key is absent.
+ *
+ * Each operation comes in two spellings. The `_n` form takes an explicit key
+ * length and is the binary-safe one: RESP keys arrive as bulk strings and may
+ * contain a NUL, so the RESP command handlers must use it or two distinct keys
+ * collapse into one. The plain form takes a C string, derives the length with
+ * strlen(), and exists for the memcached and inline text paths, whose grammar
+ * is whitespace-delimited and therefore cannot express an embedded NUL, and
+ * for .backend script keys.
+ *
+ * A key is `key_len` bytes compared with memcmp, so "a" and "a\0b" are
+ * different keys and neither prefixes the other.
+ */
 const backend_entry *backend_get(const backend_script *s, const char *key);
+const backend_entry *backend_get_n(const backend_script *s, const char *key,
+                                   size_t key_len);
 void backend_set(backend_script *s, const char *key,
                  const unsigned char *value, size_t len);
 
@@ -219,7 +243,10 @@ void backend_set(backend_script *s, const char *key,
  */
 int  backend_set_checked(backend_script *s, const char *key,
                          const unsigned char *value, size_t len);
+int  backend_set_checked_n(backend_script *s, const char *key, size_t key_len,
+                           const unsigned char *value, size_t len);
 int  backend_delete(backend_script *s, const char *key);
+int  backend_delete_n(backend_script *s, const char *key, size_t key_len);
 void backend_flush_all(backend_script *s);
 
 

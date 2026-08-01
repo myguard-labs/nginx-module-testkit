@@ -21,18 +21,40 @@
 
 /* ---- the store ------------------------------------------------------------ */
 
+/*
+ * One key comparison, used by get/set/delete alike.
+ *
+ * Length first, then memcmp: strcmp() stops at the first NUL in either operand,
+ * so a stored "a\0b" and a queried "a" compared equal and the two keys shared
+ * one slot. The lengths must match exactly -- a shorter key is not a prefix
+ * match, it is a different key.
+ */
+static int
+key_eq(const backend_entry *e, const char *key, size_t key_len)
+{
+    return e->key_len == key_len && memcmp(e->key, key, key_len) == 0;
+}
+
+
 const backend_entry *
-backend_get(const backend_script *s, const char *key)
+backend_get_n(const backend_script *s, const char *key, size_t key_len)
 {
     size_t i;
 
     for (i = 0; i < BACKEND_MAX_ENTRIES; i++) {
-        if (s->entries[i].used && strcmp(s->entries[i].key, key) == 0) {
+        if (s->entries[i].used && key_eq(&s->entries[i], key, key_len)) {
             return &s->entries[i];
         }
     }
 
     return NULL;
+}
+
+
+const backend_entry *
+backend_get(const backend_script *s, const char *key)
+{
+    return backend_get_n(s, key, strlen(key));
 }
 
 
@@ -85,9 +107,21 @@ int
 backend_set_checked(backend_script *s, const char *key,
                     const unsigned char *value, size_t len)
 {
+    return backend_set_checked_n(s, key, strlen(key), value, len);
+}
+
+
+int
+backend_set_checked_n(backend_script *s, const char *key, size_t key_len,
+                      const unsigned char *value, size_t len)
+{
     size_t i, slot = BACKEND_MAX_ENTRIES;
 
-    if (strlen(key) >= BACKEND_MAX_KEY || len > BACKEND_MAX_VALUE) {
+    /*
+     * `>=`, not `>`: one byte of the buffer is reserved for the NUL that keeps
+     * `key` printable with "%s" on the text paths.
+     */
+    if (key_len >= BACKEND_MAX_KEY || len > BACKEND_MAX_VALUE) {
         return -1;
     }
 
@@ -97,7 +131,7 @@ backend_set_checked(backend_script *s, const char *key,
      * one a later get() found would depend on slot order rather than on which
      * set() came last. */
     for (i = 0; i < BACKEND_MAX_ENTRIES; i++) {
-        if (s->entries[i].used && strcmp(s->entries[i].key, key) == 0) {
+        if (s->entries[i].used && key_eq(&s->entries[i], key, key_len)) {
             slot = i;
             break;
         }
@@ -118,7 +152,11 @@ backend_set_checked(backend_script *s, const char *key,
         s->n_entries++;
     }
 
-    snprintf(s->entries[slot].key, sizeof(s->entries[slot].key), "%s", key);
+    /* memcpy, not snprintf("%s"): the key may contain a NUL. The terminator is
+     * written past the last byte so the text paths can still print it. */
+    memcpy(s->entries[slot].key, key, key_len);
+    s->entries[slot].key[key_len] = '\0';
+    s->entries[slot].key_len = key_len;
     memcpy(s->entries[slot].value, value, len);
     s->entries[slot].value_len = len;
     s->entries[slot].used = 1;
@@ -130,11 +168,19 @@ backend_set_checked(backend_script *s, const char *key,
 int
 backend_delete(backend_script *s, const char *key)
 {
+    return backend_delete_n(s, key, strlen(key));
+}
+
+
+int
+backend_delete_n(backend_script *s, const char *key, size_t key_len)
+{
     size_t i;
 
     for (i = 0; i < BACKEND_MAX_ENTRIES; i++) {
-        if (s->entries[i].used && strcmp(s->entries[i].key, key) == 0) {
+        if (s->entries[i].used && key_eq(&s->entries[i], key, key_len)) {
             s->entries[i].used = 0;
+            s->entries[i].key_len = 0;
             s->entries[i].value_len = 0;
             s->n_entries--;
             return 1;
@@ -152,6 +198,7 @@ backend_flush_all(backend_script *s)
 
     for (i = 0; i < BACKEND_MAX_ENTRIES; i++) {
         s->entries[i].used = 0;
+        s->entries[i].key_len = 0;
         s->entries[i].value_len = 0;
     }
 
@@ -1436,7 +1483,12 @@ backend_reply_resp(backend_script *s, const backend_cmd *cmd,
             goto done;
         }
 
-        e = backend_get(s, cmd->args[0]);
+        /*
+         * args_len[0], not the C string: a RESP key is a binary-safe bulk
+         * string, so GET "a\0b" must miss a stored "a" rather than find it.
+         * The same applies to set/del/exists below.
+         */
+        e = backend_get_n(s, cmd->args[0], cmd->args_len[0]);
 
         if (e == NULL) {
             /* The nil bulk string. Distinct from an empty one ($0\r\n\r\n),
@@ -1459,14 +1511,16 @@ backend_reply_resp(backend_script *s, const backend_cmd *cmd,
         }
 
         /*
-         * Store the exact value length carried by the frame, not strlen: a RESP
-         * bulk string is binary-safe, so a value like "a\0b" must persist all
+         * Store the exact lengths carried by the frame, not strlen: RESP bulk
+         * strings are binary-safe, so a value like "a\0b" must persist all
          * three bytes. strlen truncated it to "a" (AUD-03), so a module sending
-         * a binary value was tested against a different, shorter one.
+         * a binary value was tested against a different, shorter one. The KEY
+         * had the same defect one argument over (R-6): it was passed as a C
+         * string, so SET "a\0x" and SET "a\0y" overwrote each other.
          */
-        if (backend_set_checked(s, cmd->args[0],
-                                (const unsigned char *) cmd->args[1],
-                                cmd->args_len[1]) != 0)
+        if (backend_set_checked_n(s, cmd->args[0], cmd->args_len[0],
+                                  (const unsigned char *) cmd->args[1],
+                                  cmd->args_len[1]) != 0)
         {
             /* A RESP error reply, for the reason given at the memcached `set`
              * site: an over-long key off the wire must not exit a daemon that
@@ -1481,7 +1535,7 @@ backend_reply_resp(backend_script *s, const backend_cmd *cmd,
         size_t i;
 
         for (i = 0; i < cmd->n_args; i++) {
-            n += backend_delete(s, cmd->args[i]);
+            n += backend_delete_n(s, cmd->args[i], cmd->args_len[i]);
         }
 
         buf_appendf(&buf, &len, &cap, ":%ld\r\n", n);
@@ -1491,7 +1545,7 @@ backend_reply_resp(backend_script *s, const backend_cmd *cmd,
         size_t i;
 
         for (i = 0; i < cmd->n_args; i++) {
-            n += (backend_get(s, cmd->args[i]) != NULL);
+            n += (backend_get_n(s, cmd->args[i], cmd->args_len[i]) != NULL);
         }
 
         buf_appendf(&buf, &len, &cap, ":%ld\r\n", n);
@@ -1532,8 +1586,12 @@ backend_reply_resp(backend_script *s, const backend_cmd *cmd,
                 continue;
             }
 
-            buf_appendf(&buf, &len, &cap, "$%zu\r\n%s\r\n",
-                        strlen(s->entries[i].key), s->entries[i].key);
+            /* key_len and a raw append, not "%s": SCAN must report a binary
+             * key whole, and printf stops at its first NUL. */
+            buf_appendf(&buf, &len, &cap, "$%zu\r\n", s->entries[i].key_len);
+            buf_append(&buf, &len, &cap, (const unsigned char *) s->entries[i].key,
+                       s->entries[i].key_len);
+            buf_append(&buf, &len, &cap, "\r\n", 2);
         }
 
     } else {
