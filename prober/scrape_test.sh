@@ -23,7 +23,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-PLANNED=7
+PLANNED=9
 tests_run=0
 failures=0
 
@@ -109,6 +109,34 @@ if PROBER_ALLOW_LOG='some other pattern' prober_scrape_log >/dev/null 2>&1; then
 else
     ok 0 "an unexempted [crit] is still fatal"
 fi
+
+# 8 -- an ABSENT error log is a broken gate, not a clean one.
+#      This used to `return 0`: with no file to read, the alert/crit/emerg gate
+#      reported every run clean, which is indistinguishable from a run that
+#      genuinely logged nothing. It is the shell twin of the C prober's
+#      no_error_log fail-open, and of the 25 drivers whose `grep -q SIGSEGV
+#      "$ELOG"` takes the "no worker died" branch when grep exits 2 on a missing
+#      file. prober_boot now bails before any case runs if the log is absent, so
+#      reaching this state means it vanished mid-run -- still a gate that saw
+#      nothing, and still not a pass.
+mkprefix
+if prober_scrape_log >/dev/null 2>&1; then
+    ok 1 "an absent error log is not reported clean"
+else
+    ok 0 "an absent error log is not reported clean"
+fi
+
+# 9 -- and the sanitizer scan does not mask case 8: with BOTH logs absent the
+#      verdict must still be a failure, from the absent-log branch rather than
+#      from a sanitizer hit that was never found.
+mkprefix
+rm -f "$PROBER_PREFIX/logs/server.err"
+out="$(prober_scrape_log 2>&1 || true)"
+case "$out" in
+    *"is absent"*) ok 0 "the absent-log branch is what reports it" ;;
+    *)             ok 1 "the absent-log branch is what reports it"
+                   diag "got: $out" ;;
+esac
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
     diag "planned $PLANNED tests, ran $tests_run"

@@ -1314,6 +1314,33 @@ prober_boot() {
         fi
         exit 1
     fi
+
+    # The error log must EXIST once the server is up, and this is the only place
+    # that can tell. Every log oracle in the tree reads this one path: the C
+    # prober's no_error_log/grep_error_log, prober_scrape_log's alert/crit/emerg
+    # gate, and the $ELOG crash check in 25 scenario drivers. All of them read a
+    # missing file as "nothing was logged", which is indistinguishable from a
+    # clean run -- so a conf that never opens this path disables the whole
+    # log-oracle layer, greenly and permanently.
+    #
+    # A conf without an `error_log` directive is exactly that case: nginx falls
+    # back to its COMPILED-IN prefix, outside this sandbox, and every crit line
+    # the run was supposed to catch lands somewhere nobody reads. Nothing else
+    # enforces the directive -- prober_check_conf gates daemon/worker_processes,
+    # not this -- so gate it on the artefact rather than on parsing the conf,
+    # which also covers an error_log pointed at some other path.
+    #
+    # Safe as a hard bail because the server always writes its startup lines
+    # here before the listener answers, and the listener has answered by now.
+    if [ ! -f "$PROBER_PREFIX/logs/error.log" ]; then
+        echo "Bail out! server is up but $PROBER_PREFIX/logs/error.log does not" \
+             "exist -- every log oracle would read as clean. The conf almost" \
+             "certainly lacks 'error_log logs/error.log ...;'."
+        if [ -f "$PROBER_PREFIX/logs/server.err" ]; then
+            sed 's/^/# /' "$PROBER_PREFIX/logs/server.err"
+        fi
+        exit 1
+    fi
 }
 
 # prober_stop
@@ -1412,7 +1439,16 @@ prober_scrape_log() {
         return 1
     fi
 
-    [ -f "$log" ] || return 0
+    # An absent log is a BROKEN gate, not a clean one. This used to `return 0`,
+    # which reported every run clean the moment the file was missing -- the same
+    # fail-open the C prober's slice reader had. prober_boot now bails before any
+    # case runs if the file is absent, so reaching this branch means the log
+    # disappeared mid-run (a driver removing the prefix, a conf reload pointing
+    # error_log elsewhere); either way this gate saw nothing and must say so.
+    if [ ! -f "$log" ]; then
+        echo "# error log $log is absent -- the alert/crit/emerg gate could not run"
+        return 1
+    fi
 
     scrape="$(grep -E '\[(alert|crit|emerg)\]' "$log" || true)"
 
