@@ -21,6 +21,19 @@
 # one of them documents it in its preceding comment block, either with the
 # word "sentinel" outright or with the same "fabricated zero" phrase this
 # repo's own review vocabulary uses for the failure the discipline prevents.
+#
+# R-14: the emitter -> schema-path mapping used to be a hand-maintained FUNCS
+# table living in THIS file, one hop removed from the code it was meant to
+# check. A hand-written table can itself drift from the emitter (e.g. mapping
+# a function to the wrong path) without any test catching it, because nothing
+# re-derives the table from the source. The mapping is now a machine-parsable
+# `@sentinel-schema: <space-separated schema paths>` marker inside each
+# function's own doc comment in ngx_test_probe.c, parsed below as the single
+# source of truth. Both directions are still compared: every annotated path
+# must be in assert.c's rejection list (a missing annotation-follow-up), and
+# every function whose comment claims the sentinel discipline via "sentinel"
+# or "fabricated zero" prose must carry the @sentinel-schema marker (a
+# function that documents the discipline but forgot to machine-annotate it).
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -42,20 +55,35 @@ sentinel_array=$(awk '
     in_array { print }
 ' "$ASSERT")
 
-# Every emitter function whose preceding doc comment claims the -1-sentinel
-# discipline, mapped to the schema path(s) it renders. This map is the part a
-# human maintains; the check below is what catches a maintained-but-forgotten
-# entry (a function gets the sentinel comment, but nobody added its field to
-# assert.c) as well as the reverse (assert.c's list keeps a field that no
-# longer exists).
+# Every `@sentinel-schema:` marker in the emitter, paired with the function
+# name whose definition follows it. The marker lives inside the function's own
+# doc comment (so adding, removing or editing it is a one-file change in
+# ngx_test_probe.c, not a second hand-maintained list here); this loop derives
+# FUNCS from the source instead of carrying it as a literal table.
 #
 #   <function name>:<space-separated schema paths it renders>
-FUNCS="
-ngx_test_probe_fd_count:fds
-ngx_test_probe_fd_kinds:fds_by_kind.socket fds_by_kind.file fds_by_kind.anon fds_by_kind.other
-ngx_test_probe_smaps:smaps.pss smaps.private_dirty
-ngx_test_probe_timer_count:timers
-"
+FUNCS=$(awk '
+    /@sentinel-schema:/ {
+        line = $0
+        sub(/^.*@sentinel-schema:[ \t]*/, "", line)
+        sub(/[ \t]*\*\/[ \t]*$/, "", line)
+        gsub(/[ \t]+$/, "", line)
+        pending = line
+        next
+    }
+    pending != "" && /^[a-zA-Z0-9_]+\(/ {
+        fn = $0
+        sub(/\(.*/, "", fn)
+        print fn ":" pending
+        pending = ""
+    }
+' "$EMITTER")
+
+if [ -z "$FUNCS" ]; then
+    echo "1..1"
+    echo "not ok 1 - found at least one @sentinel-schema marker in $EMITTER"
+    exit 1
+fi
 
 PLANNED=0
 while IFS= read -r entry; do
@@ -67,9 +95,9 @@ while IFS= read -r entry; do
 done <<< "$FUNCS"
 
 # Plus one row for the reverse sweep: every function in ngx_test_probe.c whose
-# comment claims the sentinel discipline must be a key in FUNCS above, so a
-# NEW sentinel-documented function that this test's map was never updated for
-# is caught rather than silently passing.
+# comment claims the sentinel discipline in prose must carry the
+# @sentinel-schema marker, so a newly sentinel-documented function that nobody
+# annotated is caught rather than silently passing.
 PLANNED=$((PLANNED + 1))
 
 tests_run=0
@@ -93,8 +121,9 @@ while IFS= read -r entry; do
     paths=${entry#*:}
 
     # The function's doc comment (the ~26 lines above its definition) must
-    # actually claim the sentinel discipline -- otherwise this map is stale
-    # and the drift it exists to catch is invisible.
+    # actually claim the sentinel discipline in prose -- otherwise the marker
+    # was added to a function that doesn't document why, and the drift this
+    # test exists to catch (code and doc disagreeing) is invisible.
     doc=$(awk -v fn="$func" '
         { buf[NR] = $0 }
         $0 ~ ("^" fn "\\(") {
@@ -121,8 +150,9 @@ while IFS= read -r entry; do
 done <<< "$FUNCS"
 
 # The reverse sweep: any function in the emitter whose comment claims the
-# sentinel discipline but that FUNCS above never names is a maintenance gap in
-# THIS test, and would let a future field repeat the "timers" miss silently.
+# sentinel discipline in prose but carries no @sentinel-schema marker is a
+# maintenance gap -- annotation forgotten on a function that needs one -- and
+# would let a future field repeat the "timers" miss silently.
 known_funcs=$(printf '%s\n' "$FUNCS" | sed -n 's/^\([a-zA-Z0-9_]*\):.*/\1/p' | tr '\n' ' ')
 unmapped=""
 
@@ -155,9 +185,9 @@ while IFS= read -r line; do
 done < <(grep -nE '^[a-zA-Z0-9_]+\(' "$EMITTER")
 
 if [ -z "$unmapped" ]; then
-    ok 0 "no emitter function claims the sentinel discipline without a FUNCS entry"
+    ok 0 "no emitter function claims the sentinel discipline without an @sentinel-schema marker"
 else
-    ok 1 "emitter functions claim the sentinel discipline with no FUNCS entry:$unmapped"
+    ok 1 "emitter functions claim the sentinel discipline with no @sentinel-schema marker:$unmapped"
 fi
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
