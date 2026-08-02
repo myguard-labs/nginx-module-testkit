@@ -47,8 +47,14 @@ LLVMFuzzerInitialize(int *argc, char ***argv)
     return 0;
 }
 
+/* Both run_file() and run_path() report how many files were actually handed
+ * to LLVMFuzzerTestOneInput via *nfiles (added to, never reset), and return
+ * 0/-1 for I/O success/failure the same as before. main()'s completion count
+ * must reflect files processed, not argv entries -- an argv that is a
+ * directory is one entry but zero-to-many files, and an emptied corpus
+ * directory must count as zero, not one. */
 static int
-run_file(const char *path)
+run_file(const char *path, long *nfiles)
 {
     FILE    *f;
     long     len;
@@ -93,11 +99,12 @@ run_file(const char *path)
 
     LLVMFuzzerTestOneInput(buf, (size_t) len);
     free(buf);
+    (*nfiles)++;
     return 0;
 }
 
 static int
-run_path(const char *path)
+run_path(const char *path, long *nfiles)
 {
     struct stat  st;
 
@@ -138,7 +145,7 @@ run_path(const char *path)
                 rc = -1;
                 continue;
             }
-            if (run_path(sub) != 0) {
+            if (run_path(sub, nfiles) != 0) {
                 rc = -1;
             }
         }
@@ -146,15 +153,15 @@ run_path(const char *path)
         return rc;
     }
 
-    return run_file(path);
+    return run_file(path, nfiles);
 }
 
 int
 main(int argc, char **argv)
 {
-    int  i;
-    int  rc = 0;
-    int  n = 0;
+    int   i;
+    int   rc = 0;
+    long  nfiles = 0;
 
     LLVMFuzzerInitialize(&argc, &argv);
 
@@ -168,12 +175,36 @@ main(int argc, char **argv)
     }
 
     for (i = 1; i < argc; i++) {
-        if (run_path(argv[i]) != 0) {
+        if (run_path(argv[i], &nfiles) != 0) {
             rc = 1;   /* an I/O problem with the corpus, not a target crash */
         }
-        n++;
     }
 
-    fprintf(stderr, "fuzz-replay: %d path(s) processed clean\n", n);
+    /* nfiles counts files actually handed to LLVMFuzzerTestOneInput, not argv
+     * entries -- an argv that is a directory recurses to zero-to-many files.
+     * A corpus that resolves to zero files (emptied directory, or every path
+     * an I/O failure) ran nothing, so it must not report clean: that would
+     * make an emptied corpus a silent, permanent pass. */
+    if (nfiles == 0) {
+        fprintf(stderr,
+                "fuzz-replay: 0 files processed -- empty or unreadable corpus, "
+                "treating as failure\n");
+        return rc != 0 ? rc : 1;
+    }
+
+    /* "clean" is a claim about the whole replay, so it may only be printed
+     * when rc is 0. A partial corpus -- some files replayed, others
+     * unreadable -- exits nonzero either way, but saying "processed clean"
+     * next to a nonzero rc sends whoever reads the log looking for a crash
+     * that did not happen, when the real fault is the corpus. */
+    if (rc == 0) {
+        fprintf(stderr, "fuzz-replay: %ld file(s) processed clean, rc=0\n",
+                nfiles);
+    } else {
+        fprintf(stderr,
+                "fuzz-replay: %ld file(s) processed, corpus I/O failed on at "
+                "least one path, rc=%d\n", nfiles, rc);
+    }
+
     return rc;
 }
