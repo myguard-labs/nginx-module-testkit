@@ -29,7 +29,11 @@ export PROBER_LIB
 # shellcheck source=lib.sh
 . ./lib.sh
 
-echo "1..9"
+PLANNED=9
+tests_run=0
+failures=0
+
+echo "1..$PLANNED"
 
 n=0
 FAILED=0
@@ -37,12 +41,14 @@ FAILED=0
 # ok NAME EXPECTED ACTUAL -- one comparison, one TAP line.
 check() {
     n=$((n + 1))
+    tests_run=$((tests_run + 1))
     if [ "$2" = "$3" ]; then
         echo "ok $n - $1"
     else
         echo "not ok $n - $1"
         echo "# expected [$2], got [$3]"
         FAILED=$((FAILED + 1))
+        failures=$((failures + 1))
     fi
 }
 
@@ -85,5 +91,16 @@ check "\"pid\" is not satisfied by a preceding \"ppid\"" "3719177" \
 # path.
 check "an empty body returns nonzero"        "RC1"     "$(prober_probe_field "" fds || echo RC1)"
 
-[ "$FAILED" -eq 0 ] || exit 1
+# plan reconciliation
+
+if [ "$tests_run" -ne "$PLANNED" ]; then
+    echo "# ran $tests_run tests but the plan says $PLANNED"
+    failures=$((failures + 1))
+fi
+
+if [ "$failures" -gt 0 ]; then
+    echo "# $failures of $tests_run self-tests failed" >&2
+    exit 1
+fi
+
 exit 0
