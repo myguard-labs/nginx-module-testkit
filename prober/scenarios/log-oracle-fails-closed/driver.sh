@@ -84,7 +84,14 @@ run_prober() {
     # at all -- caught in development, where an unbound-variable typo in this
     # very function made cases 2 and 4 report ok while the binary was never
     # executed. A TAP plan line proves it got as far as emitting one.
-    if ! printf '%s' "$out" | grep -q '^1\.\.'; then
+    # HERESTRING, NOT `printf | grep -q`. `grep -q` exits on its first match
+    # and closes the pipe while `printf` may still be writing; under this
+    # file's `set -euo pipefail` that SIGPIPEs printf, `!` inverts the nonzero
+    # status to true, and this reports "no TAP plan" for a prober that in fact
+    # emitted one -- observed on run 30708134364, `not ok 2` on a long $out
+    # where printf lost the race. Same class here: prober/lib.sh (s143,
+    # `find | head -1`) and scenarios/deploy-canary/driver.sh.
+    if ! grep -q '^1\.\.' <<<"$out"; then
         echo "# the prober emitted no TAP plan, so its exit status judges nothing" >&2
         return 125
     fi
