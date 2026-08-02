@@ -217,8 +217,12 @@ proxy. A module keeping its own `CLOCK_REALTIME` deadline is caught only if the
 consumer exposes it via `zone_render` and adds a case. That is the honest limit of
 a generic clock oracle.
 
-`prober/http.c`'s and `prober/fakesrv.c`'s own `now_ms()` are on `CLOCK_MONOTONIC`
-for the same reason.
+`prober/http.c` and `prober/fakesrv.c` both time their deadlines with
+`prober_monotonic_ms()` (`prober/util.c`) for the same reason: `CLOCK_MONOTONIC`,
+and a 64-bit millisecond count so a host up 24.9 days does not wrap a deadline
+negative under `-m32`. One implementation rather than two, because the two
+hand-written copies it replaced had already drifted -- only one carried the
+width fix.
 
 ## How this class produces a green run that proves nothing
 

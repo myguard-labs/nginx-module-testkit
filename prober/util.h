@@ -11,6 +11,8 @@
 
 #include <setjmp.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <time.h>
 
 /*
  * Fatal, with a "prober: " prefix on stderr and exit status 2.
@@ -67,6 +69,35 @@ char *trim(char *s);
  * check, shared, instead of open-coded a fourth time.
  */
 long xstrtol(const char *s, const char *what);
+
+/*
+ * Milliseconds since an unspecified epoch, as a 64-bit count.
+ *
+ * The width is the whole point and is why this is int64_t rather than long.
+ * `long` is 32 bits on every ILP32 target, and this repo supports one: the
+ * arch-32bit workflow builds AND RUNS these suites under -m32. There,
+ * tv_sec * 1000 overflows after ~24.9 days of host uptime -- signed overflow,
+ * so undefined behaviour, and in practice a NEGATIVE millisecond count. Every
+ * consumer of this clock is a deadline: fakesrv's close_after arms
+ * `close_at_ms = now + ms` and disarms on the `>= 0` sentinel, so a wrapped
+ * clock reads as "no deadline armed" and the fault silently never fires --
+ * a fake server that answers a test by not doing the thing the test asked
+ * for. CI runs start near zero uptime, so no amount of green CI on either
+ * arch exposes it; the width is a contract, pinned by the endpoint rows in
+ * util_test.c rather than by a run that reaches the wrap.
+ *
+ * Returns 0 when the clock is unavailable, matching the caller's pre-existing
+ * behaviour: fakesrv treats that as "no time has passed", which stalls its
+ * deadlines rather than firing them early.
+ */
+int64_t prober_monotonic_ms(void);
+
+/*
+ * The conversion prober_monotonic_ms() performs, separated from the syscall so
+ * a test can hand it a timespec no test host will ever have been up for. Pure:
+ * no clock read, no global state.
+ */
+int64_t prober_timespec_ms(const struct timespec *ts);
 
 /*
  * Decode this repo's text escapes -- \r \n \t \\ \" \0 \xNN -- into raw bytes

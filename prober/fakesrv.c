@@ -47,6 +47,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <netinet/in.h>
 #include <stdarg.h>
 #include <netinet/tcp.h>
@@ -98,15 +99,22 @@ typedef struct {
     long            id;          /* journal connection id */
     long            cmds;        /* commands seen on this connection */
 
-    /* Deferred actions, armed by a fault and serviced by the loop. */
-    long            close_at_ms; /* close_after: absolute deadline, or -1 */
+    /*
+     * Deferred actions, armed by a fault and serviced by the loop.
+     *
+     * Every absolute time here is int64_t rather than long: they are all
+     * derived from prober_monotonic_ms(), whose header explains why 32 bits
+     * is not enough (a wrapped deadline reads as "disarmed" through the
+     * `close_at_ms >= 0` sentinel below).
+     */
+    int64_t         close_at_ms; /* close_after: absolute deadline, or -1 */
     long            drip_bytes;  /* drip: piece size, or 0 for "write it all" */
-    long            drip_ms;
-    long            drip_next_ms;/* absolute time the next piece may go */
+    int64_t         drip_ms;
+    int64_t         drip_next_ms;/* absolute time the next piece may go */
     int             close_after_write;
     int             rst_after_write;
 
-    long            last_active_ms;
+    int64_t         last_active_ms;
 } conn;
 
 
@@ -142,22 +150,16 @@ on_signal(int sig)
 }
 
 
-static long
+/*
+ * The clock itself lives in util.c so a self-test can reach it: this file has
+ * a main() and links into no test binary, so a helper defined here is testable
+ * only through the daemon, and the property that matters (the width of the
+ * millisecond count) cannot be observed from outside at all.
+ */
+static int64_t
 now_ms(void)
 {
-    struct timespec ts;
-
-    /*
-     * CLOCK_MONOTONIC, not the wall clock: one of the scenarios this daemon
-     * exists to serve drives libfaketime, and a fault deadline measured on a
-     * clock the test is deliberately moving would fire at a time nobody asked
-     * for.
-     */
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        return 0;
-    }
-
-    return (long) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return prober_monotonic_ms();
 }
 
 
@@ -175,7 +177,12 @@ jlog(const char *fmt, ...)
     }
 
     va_start(ap, fmt);
-    vfprintf(journal, fmt, ap);
+    /* Same reasoning as die()'s vfprintf in util.c: jlog() is
+     * __attribute__((format(printf, 1, 2))) and -Wformat=2 -Werror rejects a
+     * non-literal format at every call site, so flawfinder's CWE-134 case
+     * cannot arise. Journal VALUES are attacker-shaped and go through jstrn(),
+     * which is a different check. */
+    vfprintf(journal, fmt, ap);  /* flawfinder: ignore */
     va_end(ap);
 
     fputc('\n', journal);
@@ -663,7 +670,7 @@ main(int argc, char **argv)
     const char        *opt_portfile = NULL;
     const char        *opt_journal = NULL;
     const char        *opt_errfile = NULL;
-    long               opt_idle_ms = DEFAULT_IDLE_MS;
+    int64_t            opt_idle_ms = DEFAULT_IDLE_MS;
 
     int                lfd, i;
     struct sockaddr_in addr;
@@ -797,7 +804,7 @@ main(int argc, char **argv)
         struct pollfd  pfd[MAX_CONNS + 1];
         int            nfd = 0, idx[MAX_CONNS + 1];
         int            timeout = 100;
-        long           t = now_ms();
+        int64_t        t = now_ms();
 
         pfd[nfd].fd = lfd;
         pfd[nfd].events = POLLIN;
@@ -822,7 +829,7 @@ main(int argc, char **argv)
                 if (c->drip_bytes == 0 || t >= c->drip_next_ms) {
                     pfd[nfd].events |= POLLOUT;
                 } else {
-                    long wait = c->drip_next_ms - t;
+                    int64_t wait = c->drip_next_ms - t;
 
                     if (wait < timeout) {
                         timeout = (int) wait;
@@ -887,7 +894,7 @@ main(int argc, char **argv)
                                           &one, sizeof(one));
                     }
 
-                    jlog("{\"ev\":\"accept\",\"conn\":%ld,\"t_ms\":%ld}",
+                    jlog("{\"ev\":\"accept\",\"conn\":%ld,\"t_ms\":%" PRId64 "}",
                          c->id, t);
 
                     nth = bump_counter("connect");

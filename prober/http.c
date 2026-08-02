@@ -11,6 +11,7 @@
 
 #include "http.h"
 #include "json.h"
+#include "util.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -1441,27 +1442,21 @@ write_request(int fd, const unsigned char *req, size_t req_len,
  * and a wall clock can step (NTP, an operator, libfaketime -- which the
  * clock-jump scenario LD_PRELOADs on purpose) and make a correct server look
  * like it answered before it was asked, or a decade late.
+ *
+ * The width reasoning lives in util.h with the implementation: `long` is 32
+ * bits under -m32 (a CI leg here, and a real consumer platform), where
+ * tv_sec * 1000 overflows after about 24 days of uptime and every close
+ * deadline misjudges.
+ *
+ * Delegated rather than open-coded, because it WAS open-coded twice -- here and
+ * in fakesrv.c -- and only this copy got the 64-bit fix. The other one still
+ * had `long` when the audit found it (R-9). Two copies of a clock is two
+ * chances to fix one of them.
  */
 static long long
 now_ms(void)
 {
-    struct timespec  ts;
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-
-    /*
-     * long long, and the multiply is done in it.
-     *
-     * `long` is 32 bits under -m32 (a CI leg here, and a real consumer
-     * platform), where tv_sec * 1000 overflows once the machine has been up
-     * about 24 days -- CLOCK_MONOTONIC counts from boot, so this is not a
-     * far-future problem but an ordinary uptime. The result would go negative
-     * mid-run and every close deadline would misjudge: a prompt close reported
-     * as impossibly late, or a late one as instant, on a box whose only sin was
-     * staying up a month. The cast is on tv_sec so the multiply itself is
-     * 64-bit; casting the product would preserve the overflow.
-     */
-    return (long long) ts.tv_sec * 1000 + ts.tv_nsec / 1000000L;
+    return prober_monotonic_ms();
 }
 
 
