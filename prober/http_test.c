@@ -2684,8 +2684,7 @@ main(void)
          * `t1 - t0` and reds the assertion with nothing wrong -- observed for
          * real (assertion #122, PRs #182 and #185, host load 5.71/6.83 at the
          * failures, clean at 0.13). Neither direction is fixable by widening
-         * the multiplier: that only trades which stall size still reds, per
-         * [[feedback-widening-shared-timeout-disables-oracle]].
+         * the multiplier: that only trades which stall size still reds.
          *
          * `er.client_reads == 1` and `er.paced_sleep_ms == 0` below prove the
          * identical claim -- the unpaced run took the uncapped, unslept path --
