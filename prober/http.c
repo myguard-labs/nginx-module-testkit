@@ -758,15 +758,31 @@ static int
 tls_table_put(int fd, SSL *ssl)
 {
     int  i;
+    int  free_slot = -1;
 
     tls_table_init();
 
+    /*
+     * Scan the WHOLE table before claiming anything. Stopping at the first
+     * free slot would let a stale entry for this same fd survive further down
+     * -- and tls_table_get() returns the first match in table order, so it
+     * could hand back the older, already-freed SSL*. Refusing turns that
+     * silent use-after-free into a named error at the point it is created.
+     */
     for (i = 0; i < TLS_TABLE_MAX; i++) {
-        if (tls_table[i].fd == -1) {
-            tls_table[i].fd = fd;
-            tls_table[i].ssl = ssl;
-            return 0;
+        if (tls_table[i].fd == fd) {
+            return -1;
         }
+
+        if (free_slot < 0 && tls_table[i].fd == -1) {
+            free_slot = i;
+        }
+    }
+
+    if (free_slot >= 0) {
+        tls_table[free_slot].fd = fd;
+        tls_table[free_slot].ssl = ssl;
+        return 0;
     }
 
     return -1;
@@ -995,7 +1011,15 @@ tls_or_plain_read(int fd, SSL *ssl, void *buf, size_t want)
          * which calls SSL_get_error() unconditionally.
          */
         case SSL_ERROR_SYSCALL:
-            if (errno == EINTR) {
+            /*
+             * EINTR asks to be stepped again; EAGAIN/EWOULDBLOCK on these
+             * blocking sockets means SO_RCVTIMEO expired, which the reader
+             * maps to HTTP_CLOSE_TIMEOUT. Both are passed through unchanged
+             * -- collapsing them into ECONNRESET would label a TLS read that
+             * merely timed out as a peer reset, the one distinction the
+             * close_reason field exists to draw.
+             */
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 return -1;
             }
             errno = ECONNRESET;
