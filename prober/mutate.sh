@@ -1293,24 +1293,30 @@ mutate "probe: zone.name escaping removed" ../src/ngx_test_probe.c \
 # Short-escape boundary guard. When exactly 1 byte remains in the buffer and
 # the next character needs a 2-byte escape (quote, backslash, or C0 shortcut),
 # the guard `if (p + 2 <= last)` ensures the escape is omitted entirely rather
-# than writing a dangling backslash, which would produce invalid JSON. The guard
-# replaces ngx_snprintf() with explicit byte writes -- replacing ANY of the seven
-# short-escape if-blocks with bare writes (no guard) will break the invariant.
-# The zone-name-escaping scenario covers all seven escape types and validates
-# JSON round-tripping, so removing ANY guard fails it when the buffer boundary
-# happens to truncate at that character.
+# than writing a dangling backslash, which would produce invalid JSON.
+#
+# This used to be checked against the zone-name-escaping scenario, but that
+# scenario's buffer never lands on the exact one-byte-remaining boundary --
+# CI run 30765129992 reported the row SURVIVED against a passing suite, i.e.
+# removing the guard changed nothing observable. probe_escape_json_string_test
+# (t/probe_escape_json_string_test.c) constructs the boundary directly instead
+# of hoping a scenario's buffer sizing happens to hit it: it calls
+# ngx_test_probe_escape_json_string() with `last` set exactly 1 byte past `p`
+# for each of the seven short-escape characters and asserts nothing is
+# written. The C-test binary is built by prober/build.sh's t/*_test.c loop, so
+# it needs no scenario tree and runs under MUT_KIND=c.
 # SC2016: literal source text to match, not shell to expand.
 # SC1003: the mutation strings contain C code with quote/backslash escapes that
 # look odd in shell -- they're meant to be matched and replaced literally in C.
 # shellcheck disable=SC2016,SC1003
-mutate "probe: escape-quote guard removed" ../src/ngx_test_probe.c \
+mutate "probe: escape-quote guard removed" ../src/ngx_test_probe_arm.c \
     '            if (p + 2 <= last) {
                 *p++ = '"'"'\\'"'"';
                 *p++ = '"'"'"'"'"';' \
     '            {
                 *p++ = '"'"'\\'"'"';
                 *p++ = '"'"'"'"'"';' \
-    scenarios/zone-name-escaping/mutate-suite.sh
+    ../t/probe_escape_json_string_test
 
 # The reverse sweep's anchor. Without it the needle is a bare suffix match, so
 # a stray member hides behind any declared key ending in the same text --

@@ -282,6 +282,18 @@ u_char *ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone);
  */
 ngx_int_t ngx_test_probe_arm(ngx_shm_zone_t *zone, ngx_str_t *args);
 
+/*
+ * Escape `str` into a JSON string body written to [p, last), applying the
+ * RFC 8259 short escapes (\", \\, \b, \f, \n, \r, \t) and \uXXXX for other C0
+ * controls. Never writes a dangling escape byte: a two-byte short escape or a
+ * six-byte \uXXXX escape is omitted whole when it would not fit before last.
+ * Returns the new buffer position. Declared here (not just in
+ * ngx_test_probe_arm.c) so probe_escape_json_string_test.c can call it
+ * without pulling in the renderer's real-nginx dependencies.
+ */
+u_char *ngx_test_probe_escape_json_string(u_char *p, u_char *last,
+    const ngx_str_t *str);
+
 #endif /* NGX_TEST_HARNESS */
 
 #endif /* NGX_TEST_PROBE_H_INCLUDED_ */
