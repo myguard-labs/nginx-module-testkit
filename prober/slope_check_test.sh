@@ -37,7 +37,11 @@ export PROBER_LIB
 # shellcheck source=lib.sh
 . ./lib.sh
 
-echo "1..17"
+PLANNED=17
+tests_run=0
+failures=0
+
+echo "1..$PLANNED"
 
 n=0
 FAILED=0
@@ -45,12 +49,14 @@ FAILED=0
 # ok NAME EXPECTED ACTUAL -- one comparison, one TAP line.
 check() {
     n=$((n + 1))
+    tests_run=$((tests_run + 1))
     if [ "$2" = "$3" ]; then
         echo "ok $n - $1"
     else
         echo "not ok $n - $1"
         echo "# expected [$2], got [$3]"
         FAILED=$((FAILED + 1))
+        failures=$((failures + 1))
     fi
 }
 
@@ -278,4 +284,16 @@ check "the sentinel failure names the unreadable field" "named" "$got"
 check "SAMPLES=0 is rejected rather than passing vacuously" \
     "1" "$(run 10 0 0 1000)"
 
-exit "$FAILED"
+# plan reconciliation
+
+if [ "$tests_run" -ne "$PLANNED" ]; then
+    echo "# ran $tests_run tests but the plan says $PLANNED"
+    failures=$((failures + 1))
+fi
+
+if [ "$failures" -gt 0 ]; then
+    echo "# $failures of $tests_run self-tests failed" >&2
+    exit 1
+fi
+
+exit 0
