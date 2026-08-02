@@ -567,13 +567,36 @@ spawn_tls_echo(int *port)
     pid_t               pid;
     X509               *cert;
     EVP_PKEY           *pkey;
+    SSL_CTX            *ctx;
 
     if (make_self_signed_cert(&cert, &pkey) != 0) {
         return -1;
     }
 
+    /*
+     * Built and validated BEFORE the fork on purpose. A context failure has
+     * to be reportable as -1 so the caller can SKIP; a child that only
+     * discovers it after the fork can do nothing but _exit(2), by which time
+     * the parent already holds a valid pid and would take the non-SKIP branch
+     * -- turning "this environment has no usable OpenSSL server context" into
+     * a hard assertion failure instead of the loud SKIP it is meant to be.
+     */
+    ctx = SSL_CTX_new(TLS_server_method());
+    if (ctx == NULL
+        || SSL_CTX_use_certificate(ctx, cert) != 1
+        || SSL_CTX_use_PrivateKey(ctx, pkey) != 1)
+    {
+        if (ctx != NULL) {
+            SSL_CTX_free(ctx);
+        }
+        X509_free(cert);
+        EVP_PKEY_free(pkey);
+        return -1;
+    }
+
     srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) {
+        SSL_CTX_free(ctx);
         X509_free(cert);
         EVP_PKEY_free(pkey);
         return -1;
@@ -591,6 +614,7 @@ spawn_tls_echo(int *port)
         || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
     {
         close(srv);
+        SSL_CTX_free(ctx);
         X509_free(cert);
         EVP_PKEY_free(pkey);
         return -1;
@@ -604,21 +628,14 @@ spawn_tls_echo(int *port)
     pid = fork();
     if (pid < 0) {
         close(srv);
+        SSL_CTX_free(ctx);
         X509_free(cert);
         EVP_PKEY_free(pkey);
         return -1;
     }
 
     if (pid == 0) {
-        SSL_CTX  *ctx = SSL_CTX_new(TLS_server_method());
-        int       n;
-
-        if (ctx == NULL
-            || SSL_CTX_use_certificate(ctx, cert) != 1
-            || SSL_CTX_use_PrivateKey(ctx, pkey) != 1)
-        {
-            _exit(2);
-        }
+        int  n;
 
         /* Serve up to the cap, one connection at a time, so a caller that
          * closes one TLS connection and opens a fresh one against the same
@@ -660,6 +677,7 @@ spawn_tls_echo(int *port)
     }
 
     close(srv);
+    SSL_CTX_free(ctx);
     X509_free(cert);
     EVP_PKEY_free(pkey);
     return pid;
