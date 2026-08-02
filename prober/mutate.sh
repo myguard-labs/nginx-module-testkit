@@ -1226,10 +1226,22 @@ mutate "schema: shm-unmapped zone's return demoted to a fall-through assignment"
 # call leaves the field unescaped, breaking JSON when the name contains quotes.
 # The zone-name-escaping scenario catches this by verifying the document is
 # valid JSON.
+# The escaped result is computed and thrown away rather than the call being
+# deleted outright: deleting it leaves ngx_test_probe_escape_json_string()
+# with no caller, which -Werror=unused-function turns into a build failure
+# for every consumer -- failure mode 1 from this script's own header ("the
+# mutation did not compile"), not a caught mutation. Keeping the call but
+# discarding its result reproduces the exact defect this row exists to catch
+# (the escape helper's output never reaches the document) while the function
+# stays referenced, same trick as the `ms * 0` rows above.
 mutate "probe: zone.name escaping removed" ../src/ngx_test_probe.c \
     '    p = ngx_test_probe_escape_json_string(p, last, &zone->shm.name);
-    p = ngx_slprintf(p, last,' \
-    '    p = ngx_slprintf(p, last,' \
+    p = ngx_slprintf(p, last,
+                     "\","' \
+    '    (void) ngx_test_probe_escape_json_string(p, last, &zone->shm.name);
+    p = ngx_slprintf(p, last, "%V",  &zone->shm.name);
+    p = ngx_slprintf(p, last,
+                     "\","' \
     scenarios/zone-name-escaping/mutate-suite.sh
 
 # The reverse sweep's anchor. Without it the needle is a bare suffix match, so
