@@ -380,11 +380,15 @@ table_pairs=$(printf '%s\n' "$EXCLUSIONS" | grep . \
     | awk -F: '{print (NF==2 && $1 > $2 ? $2":"$1 : $0)}' \
     | sort -u | sort)
 
-if [ "$parser_pairs" = "$table_pairs" ]; then
+# Each gate reports only its OWN direction. Firing this one on any inequality
+# would make a stale table row -- which the reverse gate below is what actually
+# names -- report "incomplete (missing from table):" with an empty list, sending
+# the reader to look for a pair that is not the problem.
+missing=$(comm -23 <(printf '%s\n' "$parser_pairs") <(printf '%s\n' "$table_pairs"))
+
+if [ -z "$missing" ]; then
     ok 0 "EXCLUSIONS table matches all parser exclusion pairs"
 else
-    # Show which pairs are missing from the table
-    missing=$(comm -23 <(printf '%s\n' "$parser_pairs") <(printf '%s\n' "$table_pairs"))
     ok 1 "EXCLUSIONS table is incomplete (missing from table):$missing"
 fi
 
