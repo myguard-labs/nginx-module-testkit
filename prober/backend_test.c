@@ -37,7 +37,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  138
+#define PLANNED  142
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -699,6 +699,24 @@ test_memcached_codec(void)
     ok(used == 7, "a pipelined pair consumes only the first command");
 
     /*
+     * R-16: a raw NUL inside the command line is not something this grammar
+     * can spell (backend.h), but strtok_r + strlen() treat the wire bytes as
+     * a C string and stop at the embedded NUL, so pre-fix this parsed as the
+     * one-byte key "a" and silently dropped "x\r\n". Post-fix it must be
+     * rejected, not answered against a truncated key.
+     */
+    memcpy(buf, "get a\0x\r\n", 9);
+    used = backend_parse_memcached(buf, 9, &cmd);
+    ok(used == -1, "a NUL embedded in the command line is a protocol error");
+
+    /* Same shape, no NUL: the check above must not have made ordinary
+     * commands collateral damage. */
+    memcpy(buf, "get a\r\n", 7);
+    used = backend_parse_memcached(buf, 7, &cmd);
+    ok(used == 7 && cmd.n_args == 1 && strcmp(cmd.args[0], "a") == 0,
+       "a command with no NUL still parses");
+
+    /*
      * Arguments must point into the CALLER's buffer, not into a parser local.
      *
      * The first draft copied the command line into a stack buffer and
@@ -895,6 +913,23 @@ test_resp_codec(void)
     used = backend_parse_resp(buf, 6, &cmd);
     ok(used == 6 && strcmp(cmd.name, "ping") == 0,
        "an inline command is parsed and its verb folded to lower case");
+
+    /*
+     * R-16: the same gap as the memcached inline path. Pre-fix, strtok_r +
+     * strlen() stop at the embedded NUL and this parses as a one-argument
+     * `DEL a`, deleting the key "a" instead of rejecting the malformed line.
+     */
+    memcpy(buf, "DEL a\0x\r\n", 9);
+    used = backend_parse_resp(buf, 9, &cmd);
+    ok(used == -1, "a NUL embedded in an inline command line is a protocol error");
+
+    /* Same shape, no NUL: the check must not disturb an ordinary inline
+     * command. */
+    memcpy(buf, "DEL a\r\n", 7);
+    used = backend_parse_resp(buf, 7, &cmd);
+    ok(used == 7 && strcmp(cmd.name, "del") == 0 && cmd.n_args == 1
+       && strcmp(cmd.args[0], "a") == 0,
+       "an inline command with no NUL still parses");
 
     {
         unsigned char *out = NULL;

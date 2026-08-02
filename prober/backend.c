@@ -990,6 +990,20 @@ backend_parse_memcached(unsigned char *buf, size_t len, backend_cmd *out)
     }
 
     /*
+     * A raw NUL inside the command line is not something this grammar can
+     * spell (backend.h), but strtok_r + strlen() below would happily accept
+     * the bytes anyway: strlen(tok) stops at the embedded NUL, so
+     * `get a\0x\r\n` parsed as the one-byte key "a" and silently dropped the
+     * rest of the line rather than reporting a protocol error (R-16). Check
+     * against line_len -- the byte count already established by the scan
+     * above -- never strlen, which is exactly the function that hides the
+     * bug.
+     */
+    if (memchr(buf, '\0', line_len) != NULL) {
+        return -1;
+    }
+
+    /*
      * Tokenise the caller's buffer IN PLACE, exactly as the RESP parser does.
      *
      * The obvious alternative -- copy the line into a local and tokenise that
@@ -1256,6 +1270,16 @@ backend_parse_resp(unsigned char *buf, size_t len, backend_cmd *out)
 
         line_len = (size_t) (nl - p);
         if (line_len >= sizeof(tmp)) {
+            return -1;
+        }
+
+        /*
+         * Same R-16 gap as the memcached inline path: strtok_r + strlen()
+         * below would stop at an embedded NUL and quietly answer the
+         * truncated command, e.g. `DEL a\0x\r\n` deleting "a". Reject the raw
+         * bytes against line_len before tokenising -- never strlen.
+         */
+        if (memchr(p, '\0', line_len) != NULL) {
             return -1;
         }
 
