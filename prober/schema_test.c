@@ -47,8 +47,10 @@
  */
 static const char doc_zone_present[] =
     "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
+    "\"ppid\":1,\"config_generation\":3,"
     "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
-    "\"fds\":9,\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
+    "\"fds\":9,\"timers\":6,"
+    "\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
     "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
@@ -58,8 +60,10 @@ static const char doc_zone_present[] =
 /* The zone-absent tail is a literal in the emitter, so it is a literal here. */
 static const char doc_zone_absent[] =
     "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
+    "\"ppid\":1,\"config_generation\":3,"
     "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
-    "\"fds\":9,\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
+    "\"fds\":9,\"timers\":6,"
+    "\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
     "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
@@ -86,8 +90,10 @@ static const char doc_zone_absent[] =
  */
 static const char doc_zone_shm_unmapped[] =
     "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
+    "\"ppid\":1,\"config_generation\":3,"
     "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
-    "\"fds\":9,\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
+    "\"fds\":9,\"timers\":6,"
+    "\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
     "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
@@ -111,11 +117,14 @@ static const schema_field SCHEMA[] = {
     { "flavor",              JSON_STRING, 0 },
     { "flavor_version",      JSON_STRING, 0 },
     { "pid",                 JSON_NUMBER, 0 },
+    { "ppid",                JSON_NUMBER, 0 },
+    { "config_generation",   JSON_NUMBER, 0 },
     { "page_size",           JSON_NUMBER, 0 },
     { "connections",         JSON_OBJECT, 0 },
     { "connections.total",   JSON_NUMBER, 0 },
     { "connections.free",    JSON_NUMBER, 0 },
     { "fds",                 JSON_NUMBER, 0 },
+    { "timers",              JSON_NUMBER, 0 },
     { "fds_by_kind",         JSON_OBJECT, 0 },
     { "fds_by_kind.socket",  JSON_NUMBER, 0 },
     { "fds_by_kind.file",    JSON_NUMBER, 0 },
@@ -150,13 +159,25 @@ static const char *CLOSED_LEVELS[] = {
 #define CLOSED_N  ((int) (sizeof(CLOSED_LEVELS) / sizeof(CLOSED_LEVELS[0])))
 
 /*
+ * Count of field entries actually found in probe-schema.json's "fields"
+ * block, filled in by count_schema_file_fields() before PLANNED is used.
+ * The reverse schema-file check below needs one "ok" per line found there,
+ * so the plan has to know that count up front -- see main().
+ */
+static int schema_file_field_n = 0;
+
+/*
  * SCHEMA_N schema fields against the zone-present document, SCHEMA_N against
  * the zone-absent one and SCHEMA_N again against the shm-unmapped one (the
  * three zone-present-only members are asserted ABSENT in the latter two,
  * which is the same count either way), CLOSED_N closed levels, SCHEMA_N
- * schema-file agreement checks, plus the three parses.
+ * schema-file agreement checks (FORWARD: every SCHEMA[] entry is named in
+ * the file), schema_file_field_n schema-file agreement checks (REVERSE:
+ * every field named in the file is in SCHEMA[]), plus the three parses.
  */
-#define PLANNED  (SCHEMA_N + SCHEMA_N + SCHEMA_N + CLOSED_N + SCHEMA_N + 3)
+#define PLANNED \
+    (SCHEMA_N + SCHEMA_N + SCHEMA_N + CLOSED_N + SCHEMA_N + \
+     schema_file_field_n + 3)
 
 static int tests_run = 0;
 static int failures  = 0;
@@ -226,6 +247,146 @@ slurp(const char *path)
     return buf;
 }
 
+/*
+ * Pull every dotted field path out of probe-schema.json's "fields" object,
+ * in file order, into out[] (capacity max). Returns the count found, or -1
+ * if the "fields" key itself is not present (a malformed/renamed file --
+ * the FORWARD loop already treats a missing file as a failure per SCHEMA
+ * entry, so this only has to handle the "file exists but reshaped" case by
+ * returning a count of 0, which fails loudly via schema_file_field_n
+ * mismatching what the FORWARD block expects to find).
+ *
+ * A field path is any quoted string at the start of a line (after leading
+ * whitespace) that is immediately followed by `:` and a `{` -- that shape is
+ * unique to a field entry in this file; "//", "fields", "closed", "notes"
+ * and "version" are keys but none of them has an object value starting with
+ * `"type"`, and free-text lines inside "//" or "notes" are quoted strings
+ * that are values, not line-leading keys followed by `{`.
+ */
+static int
+extract_schema_file_fields(const char *text, char out[][160], int max)
+{
+    const char *fields_kw;
+    const char *p;
+    int         n = 0;
+
+    fields_kw = strstr(text, "\"fields\"");
+
+    if (fields_kw == NULL) {
+        return -1;
+    }
+
+    p = strchr(fields_kw, '{');
+
+    if (p == NULL) {
+        return -1;
+    }
+
+    p++;
+
+    /*
+     * Depth counts braces from just inside the outer "fields": { -- 0 means
+     * "at the top of the fields object, looking for the next key". Each
+     * field entry's own "{ ... }" value nests one level deeper; the '}' that
+     * closes a per-field object must NOT be read as the end of "fields"
+     * itself (an unquoted value like `true` scanned char-by-char used to
+     * walk straight into that '}' and stop after the first field).
+     */
+    {
+    int depth = 0;
+
+    while (*p != '\0' && n < max) {
+        const char *q;
+        const char *close;
+        size_t      len;
+
+        if (depth == 0) {
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+                p++;
+            }
+        }
+
+        if (*p == '}') {
+            if (depth == 0) {
+                /* end of the "fields" object */
+                break;
+            }
+            depth--;
+            p++;
+            continue;
+        }
+
+        if (depth > 0) {
+            /* Inside a field's value object: track nesting only, don't
+             * look for keys here (a value like "type" is not a field
+             * name). */
+            if (*p == '{') {
+                depth++;
+            }
+            p++;
+            continue;
+        }
+
+        if (*p != '"') {
+            /* not a key at this position (stray comma, etc.) -- skip a
+             * char at a time rather than bailing, so a formatting quirk
+             * doesn't hide every field after it. */
+            p++;
+            continue;
+        }
+
+        q = strchr(p + 1, '"');
+
+        if (q == NULL) {
+            break;
+        }
+
+        len = (size_t) (q - (p + 1));
+
+        /* Confirm this quoted string is a key: next non-space char after
+         * the closing quote must be ':', and the value must open with '{'
+         * (a field entry), not '[' (e.g. the "//" array) or another quote. */
+        close = q + 1;
+
+        while (*close == ' ' || *close == '\t') {
+            close++;
+        }
+
+        if (*close != ':') {
+            p = q + 1;
+            continue;
+        }
+
+        close++;
+
+        while (*close == ' ' || *close == '\t') {
+            close++;
+        }
+
+        if (*close != '{' || len == 0 || len >= sizeof(out[0])) {
+            p = q + 1;
+            continue;
+        }
+
+        memcpy(out[n], p + 1, len);
+        out[n][len] = '\0';
+        n++;
+
+        /* Enter the field's value object: everything until its matching
+         * '}' belongs to the value, not to another key at this level. */
+        depth = 1;
+        p = close + 1;
+    }
+    }
+
+    return n;
+}
+
+/* Capacity for the reverse schema-file scan: comfortably above SCHEMA_N so
+ * a schema file that grows past the current field count still gets a real
+ * count instead of silently truncating. */
+#define SCHEMA_FILE_FIELD_MAX  128
+
 int
 main(void)
 {
@@ -234,8 +395,31 @@ main(void)
     json_value *shm_unmapped;
     const char *err = NULL;
     char       *schema_text;
+    char        schema_file_fields[SCHEMA_FILE_FIELD_MAX][160];
     int         i;
     int         j;
+
+    /*
+     * Read the schema file and extract its field list BEFORE printing the
+     * plan line: the reverse check's test count depends on how many fields
+     * the file actually names, and TAP requires the plan up front.
+     */
+    schema_text = slurp("../probe-schema.json");
+
+    if (schema_text != NULL) {
+        schema_file_field_n =
+            extract_schema_file_fields(schema_text, schema_file_fields,
+                                        SCHEMA_FILE_FIELD_MAX);
+
+        if (schema_file_field_n < 0) {
+            /* "fields" key not found -- treat as zero found, the mismatch
+             * against SCHEMA_N below on the FORWARD side is what fails
+             * loudly in that case already. */
+            schema_file_field_n = 0;
+        }
+    } else {
+        schema_file_field_n = 0;
+    }
 
     printf("1..%d\n", PLANNED);
 
@@ -355,19 +539,17 @@ main(void)
 
     /* ---- the checked-in schema names exactly these fields -------------- */
 
-    schema_text = slurp("../probe-schema.json");
-
     if (schema_text == NULL) {
         for (i = 0; i < SCHEMA_N; i++) {
             ok(0, "probe-schema.json is readable (\"%s\")", SCHEMA[i].path);
         }
     } else {
         /*
-         * Substring rather than a parse of the schema's own syntax: the check
-         * that matters is that the file and this table name the same fields,
-         * and a quoted dotted path is unambiguous enough to test by presence.
-         * A field deleted from the schema but still asserted here fails, and
-         * so does the reverse via the REVERSE loop above.
+         * FORWARD: every SCHEMA[] entry is named in the file. Substring
+         * rather than a parse of the schema's own syntax: the check that
+         * matters is that the file and this table name the same fields, and
+         * a quoted dotted path is unambiguous enough to test by presence. A
+         * field deleted from the schema but still asserted here fails.
          */
         for (i = 0; i < SCHEMA_N; i++) {
             char needle[160];
@@ -376,6 +558,26 @@ main(void)
 
             ok(strstr(schema_text, needle) != NULL,
                "probe-schema.json names \"%s\"", SCHEMA[i].path);
+        }
+
+        /*
+         * REVERSE: every field the file names is in SCHEMA[]. Without this
+         * direction a field added to probe-schema.json but never mirrored
+         * into SCHEMA[] passes forever -- the FORWARD loop only ever checks
+         * the fields SCHEMA[] already knows about.
+         */
+        for (i = 0; i < schema_file_field_n; i++) {
+            int found = 0;
+
+            for (j = 0; j < SCHEMA_N; j++) {
+                if (strcmp(SCHEMA[j].path, schema_file_fields[i]) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+
+            ok(found, "SCHEMA[] names \"%s\" from probe-schema.json",
+               schema_file_fields[i]);
         }
 
         free(schema_text);

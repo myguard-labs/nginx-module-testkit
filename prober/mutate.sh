@@ -1069,16 +1069,20 @@ mutate "schema: emitter adds an undeclared field" ../src/ngx_test_probe.c \
 mutate "schema: zone-absent variant leaks a zone member" schema_test.c \
     'static const char doc_zone_absent[] =
     "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
+    "\"ppid\":1,\"config_generation\":3,"
     "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
-    "\"fds\":9,\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
+    "\"fds\":9,\"timers\":6,"
+    "\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
     "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
     "\"zone\":{\"present\":false}}";' \
     'static const char doc_zone_absent[] =
     "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
+    "\"ppid\":1,\"config_generation\":3,"
     "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
-    "\"fds\":9,\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
+    "\"fds\":9,\"timers\":6,"
+    "\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
     "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
