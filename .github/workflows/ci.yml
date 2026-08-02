@@ -1376,10 +1376,16 @@ jobs:
           WARN="-Wall -Wextra -Werror -Wconversion -Wsign-conversion -Wshadow"
           WARN="$WARN -Wvla -Wformat=2 -Wwrite-strings -Wcast-qual"
           WARN="$WARN -Wpointer-arith -Wdeclaration-after-statement"
+          # This link line is a hand-maintained duplicate of the one build.sh
+          # derives, and it drifts whenever a LIB unit takes a new dependency:
+          # http.c already needed -lz, and the TLS transport leg made -lssl
+          # -lcrypto load-bearing too (OpenSSL is in any case an unconditional
+          # dependency of every prober binary -- see build.sh's LDFLAGS, which
+          # links it for the body_sha256 oracle). Keep in sync with build.sh.
           # shellcheck disable=SC2086
           gcc -O1 -g -std=c11 $WARN -D_FORTIFY_SOURCE=3 -fstack-protector-strong \
               -o /tmp/http_locale_check http_locale_check.c http.c json.c \
-              util.c -lz
+              util.c -lz -lssl -lcrypto
           /tmp/http_locale_check
 
   # License-header gate: all .c and .h files must carry BSD-2-Clause SPDX

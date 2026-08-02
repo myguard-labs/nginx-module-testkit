@@ -948,14 +948,17 @@ tls_handshake(int fd, const http_tls *tls_opt, char *errbuf, size_t errlen)
  *     ECONNRESET is labelled -- the harness has no more specific verdict to
  *     offer for either.
  *
- * EINTR needs no mapping: OpenSSL's own I/O retries it internally and never
- * surfaces it as an SSL_get_error() code, so returning -1/EINTR here would
- * currently be unreachable were it not for one thing -- signal delivery
- * during OpenSSL's internal syscall can still make SSL_read() itself return
- * having made no progress with an underlying errno of EINTR left set from
- * that internal call. Passed through unchanged so the caller's own EINTR
- * branch (which simply asks to be stepped again) handles it exactly like the
- * plaintext path already does.
+ * EINTR gets no mapping of its own: OpenSSL's own I/O retries it internally
+ * and never surfaces it as an SSL_get_error() code. It stays reachable only
+ * because signal delivery during OpenSSL's internal syscall can make
+ * SSL_read() return having made no progress with EINTR left set from that
+ * call -- which OpenSSL reports as SSL_ERROR_SYSCALL, the one and only code
+ * under which errno is meaningful. It is therefore honoured THERE and nowhere
+ * else, and passed through unchanged so the caller's own EINTR branch (which
+ * simply asks to be stepped again) handles it exactly like the plaintext path
+ * already does. Reading errno before consulting SSL_get_error() would let a
+ * stale EINTR from an unrelated earlier call disguise a fatal TLS error as a
+ * retry.
  */
 static ssize_t
 tls_or_plain_read(int fd, SSL *ssl, void *buf, size_t want)
@@ -972,16 +975,31 @@ tls_or_plain_read(int fd, SSL *ssl, void *buf, size_t want)
         return n;
     }
 
-    if (errno == EINTR) {
-        return -1;
-    }
-
     {
         int  err = SSL_get_error(ssl, (int) n);
 
         switch (err) {
         case SSL_ERROR_ZERO_RETURN:
             return 0;
+
+        /*
+         * SSL_ERROR_SYSCALL is the ONLY error where errno describes what
+         * happened -- OpenSSL sets it from the underlying syscall. Every other
+         * SSL_get_error() value leaves errno holding whatever an earlier,
+         * unrelated call left there, so testing errno before asking
+         * SSL_get_error() (as this function used to) could read a stale EINTR
+         * from e.g. the poll() in the driver loop and report a FATAL TLS error
+         * as "step me again", looping until the overall timeout fired and
+         * turning a real protocol failure into a bare timeout. Ask OpenSSL
+         * first, trust errno only here -- matching write_all()'s TLS branch,
+         * which calls SSL_get_error() unconditionally.
+         */
+        case SSL_ERROR_SYSCALL:
+            if (errno == EINTR) {
+                return -1;
+            }
+            errno = ECONNRESET;
+            return -1;
 
         case SSL_ERROR_WANT_READ:
         case SSL_ERROR_WANT_WRITE:
