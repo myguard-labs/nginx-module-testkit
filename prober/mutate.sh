@@ -170,6 +170,18 @@ refresh_ref_module_for_scenario () {
     version="${SRV_VERSION:-1.29.0}"
     build_dir=".build/${flavor}-${version}"
 
+    # `file` was just written (mutated, or restored to original) by a plain
+    # `cp`/write a moment ago. On a filesystem with 1s mtime resolution -- the
+    # common case -- that write and this rebuild can land in the same second,
+    # and GNU make treats an EQUAL prerequisite mtime as already up to date, not
+    # stale: `make modules` then no-ops, the .so it "rebuilds" is untouched, and
+    # the stage below copies out the same stale artifact prober_stale_so_check
+    # was about to catch anyway. touch -c (never CREATES a file -- this one must
+    # already exist, mutate() just wrote it) with no reference forces `file`'s
+    # mtime one tick past whatever the .so currently holds, so make's
+    # newer-than check is unambiguous regardless of clock granularity.
+    touch -c "$file"
+
     if ! ( cd "$srv_dir" && make -j"$(nproc)" modules ) \
             >"$work/ref-module-rebuild.log" 2>&1; then
         echo "          reference module rebuild failed after the mutation:"
@@ -178,8 +190,12 @@ refresh_ref_module_for_scenario () {
     fi
 
     mkdir -p "$build_dir/objs"
-    cp "$srv_dir/objs/ngx_http_test_ref_module.so" "$build_dir/objs/" \
-        2>>"$work/ref-module-rebuild.log"
+    if ! cp "$srv_dir/objs/ngx_http_test_ref_module.so" "$build_dir/objs/" \
+            2>>"$work/ref-module-rebuild.log"; then
+        echo "          could not stage the rebuilt reference module:"
+        sed -n '1,5p' "$work/ref-module-rebuild.log" | sed 's/^/          /'
+        return 1
+    fi
 }
 
 baseline_ok () {
@@ -327,7 +343,13 @@ PY
         echo "BROKEN  $name -- reference module would not rebuild against the mutant"
         cp "$work/orig" "$file"
         MUT_ACTIVE=""
-        refresh_ref_module_for_scenario "$file" "$kind" || true
+        if ! refresh_ref_module_for_scenario "$file" "$kind"; then
+            echo "FATAL: the reference module would not rebuild from the RESTORED" \
+                 "(unmutated) source either -- every scenario row after this one" \
+                 "would read a corrupted .so and report BROKEN for reasons that" \
+                 "have nothing to do with its own mutation" >&2
+            exit 1
+        fi
         broken=$((broken + 1))
         return
     fi
@@ -342,7 +364,13 @@ PY
         sed -n '1,3p' "$work/build.log" | sed 's/^/          /'
         cp "$work/orig" "$file"
         MUT_ACTIVE=""
-        refresh_ref_module_for_scenario "$file" "$kind" || true
+        if ! refresh_ref_module_for_scenario "$file" "$kind"; then
+            echo "FATAL: the reference module would not rebuild from the RESTORED" \
+                 "(unmutated) source either -- every scenario row after this one" \
+                 "would read a corrupted .so and report BROKEN for reasons that" \
+                 "have nothing to do with its own mutation" >&2
+            exit 1
+        fi
         broken=$((broken + 1))
         return
     fi
@@ -374,7 +402,13 @@ PY
 
     cp "$work/orig" "$file"
     MUT_ACTIVE=""
-    refresh_ref_module_for_scenario "$file" "$kind" || true
+    if ! refresh_ref_module_for_scenario "$file" "$kind"; then
+        echo "FATAL: the reference module would not rebuild from the RESTORED" \
+             "(unmutated) source after $name -- every scenario row after this" \
+             "one would read a corrupted .so and report BROKEN for reasons that" \
+             "have nothing to do with its own mutation" >&2
+        exit 1
+    fi
 }
 
 
