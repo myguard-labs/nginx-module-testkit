@@ -190,8 +190,14 @@ for ((i = 0; i < COUNT; i++)); do
                 else
                     # Scenario is NOT in the allowlist: this is an unexpected
                     # skip, a coverage regression. Fail the job.
+                    # No `# SKIP` directive on this line, deliberately. In TAP a
+                    # trailing `# SKIP` marks the point as skipped rather than
+                    # failed, so `not ok ... # SKIP` is self-contradictory and
+                    # some consumers resolve it toward "skipped" -- swallowing
+                    # the one verdict this gate exists to raise. The reason is
+                    # kept as plain description text instead.
                     DISALLOWED_SKIPS+=("$NAME")
-                    echo "not ok $N - $NAME # SKIP NOT ALLOWLISTED ($SKIP_REASON)"
+                    echo "not ok $N - $NAME (skipped but not allowlisted: $SKIP_REASON)"
                     STATUS=1
                 fi
                 ;;
