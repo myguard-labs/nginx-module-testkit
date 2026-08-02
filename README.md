@@ -2037,10 +2037,13 @@ not a scenario:
   `rules/stock/huge-content-length.rule` (predates this row) sends Content-Length
   values at and past every integer boundary nginx has, with no body at all;
   this backlog line was stale against the tree.
-  Trickling a chunked body one byte per chunk is still open: `send_slow`
+  ~~Trickling a chunked body one byte per chunk is still open: `send_slow`
   paces raw bytes irrespective of chunk framing, so pacing at chunk-unit
   granularity (one `<size>\r\n<data>\r\n` unit per pause, not one arbitrary
-  byte-count slice) needs a directive, tracked separately.
+  byte-count slice) needs a directive, tracked separately.~~ **GRADUATED:**
+  `rules/stock/chunked-trickle.rule` uses the `send_slow_chunks` directive to pace
+  the span at chunked-framing granularity (one complete `<size>\r\n<data>\r\n` unit
+  per pause), shipped in PR #155.
 - **Concurrency as an attack.** ~~Every scenario is sequential.~~ **GRADUATED:**
   the `concurrent N` directive (documented above) issues N requests in flight and
   asserts the same zero deltas, opening the shared-memory/per-worker race class to
