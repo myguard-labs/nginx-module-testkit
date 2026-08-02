@@ -37,7 +37,7 @@ key_eq(const backend_entry *e, const char *key, size_t key_len)
 
 
 const backend_entry *
-backend_get_n(const backend_script *s, const char *key, size_t key_len)
+backend_get(const backend_script *s, const char *key, size_t key_len)
 {
     size_t i;
 
@@ -52,20 +52,20 @@ backend_get_n(const backend_script *s, const char *key, size_t key_len)
 
 
 const backend_entry *
-backend_get(const backend_script *s, const char *key)
+backend_get_cstr(const backend_script *s, const char *key)
 {
-    return backend_get_n(s, key, strlen(key));
+    return backend_get(s, key, strlen(key));
 }
 
 
 void
-backend_set(backend_script *s, const char *key, const unsigned char *value,
+backend_set_cstr(backend_script *s, const char *key, const unsigned char *value,
             size_t len)
 {
     /* Fatal for a SCRIPT-supplied key: a .backend file naming an over-long key
      * is an authoring mistake, and dying names the file and line while a silent
      * skip would surface much later as a mystery cache miss. Input off the WIRE
-     * goes through backend_set_checked() instead, which reports rather than
+     * goes through backend_set_checked_cstr() instead, which reports rather than
      * exits -- see the note there.
      *
      * The three refusal reasons are distinguished rather than merged into one
@@ -81,7 +81,7 @@ backend_set(backend_script *s, const char *key, const unsigned char *value,
             key, len, BACKEND_MAX_VALUE);
     }
 
-    if (backend_set_checked(s, key, value, len) != 0) {
+    if (backend_set_checked_cstr(s, key, value, len) != 0) {
         die("backend: store is full (max %d entries)", BACKEND_MAX_ENTRIES);
     }
 }
@@ -92,7 +92,7 @@ backend_set(backend_script *s, const char *key, const unsigned char *value,
  * success and -1 if the key or value is over its limit.
  *
  * Exists because the memcached and RESP command handlers take the key straight
- * off the socket. backend_set()'s die() is right for a script author and wrong
+ * off the socket. backend_set_cstr()'s die() is right for a script author and wrong
  * for wire input: fakesrv is one process serving every connection in a scenario
  * (and, for the shared fixtures, several scenarios), so a peer sending a
  * 300-byte key -- a module under test with a key-derivation bug, or a fuzz case
@@ -104,15 +104,15 @@ backend_set(backend_script *s, const char *key, const unsigned char *value,
  * memcached or redis does with an over-long key.
  */
 int
-backend_set_checked(backend_script *s, const char *key,
+backend_set_checked_cstr(backend_script *s, const char *key,
                     const unsigned char *value, size_t len)
 {
-    return backend_set_checked_n(s, key, strlen(key), value, len);
+    return backend_set_checked(s, key, strlen(key), value, len);
 }
 
 
 int
-backend_set_checked_n(backend_script *s, const char *key, size_t key_len,
+backend_set_checked(backend_script *s, const char *key, size_t key_len,
                       const unsigned char *value, size_t len)
 {
     size_t i, slot = BACKEND_MAX_ENTRIES;
@@ -166,14 +166,14 @@ backend_set_checked_n(backend_script *s, const char *key, size_t key_len,
 
 
 int
-backend_delete(backend_script *s, const char *key)
+backend_delete_cstr(backend_script *s, const char *key)
 {
-    return backend_delete_n(s, key, strlen(key));
+    return backend_delete(s, key, strlen(key));
 }
 
 
 int
-backend_delete_n(backend_script *s, const char *key, size_t key_len)
+backend_delete(backend_script *s, const char *key, size_t key_len)
 {
     size_t i;
 
@@ -678,11 +678,11 @@ backend_load_fp(FILE *fp, const char *file, backend_script *s)
                  * keeps its quotes, since the format has no general quoting
                  * rule to be consistent with. */
                 if (strcmp(value, "\"\"") == 0) {
-                    backend_set(s, key, (const unsigned char *) "", 0);
+                    backend_set_cstr(s, key, (const unsigned char *) "", 0);
 
                 } else {
                     append_escaped(&decoded, &len, &cap, value, "seed value");
-                    backend_set(s, key, decoded == NULL
+                    backend_set_cstr(s, key, decoded == NULL
                                         ? (const unsigned char *) "" : decoded,
                                 len);
                     free(decoded);
@@ -1161,7 +1161,7 @@ backend_reply_memcached(backend_script *s, const backend_cmd *cmd,
          * then a single END -- misses are simply absent rather than signalled,
          * which is the detail a client's miss handling most often gets wrong. */
         for (i = 0; i < cmd->n_args; i++) {
-            const backend_entry *e = backend_get(s, cmd->args[i]);
+            const backend_entry *e = backend_get_cstr(s, cmd->args[i]);
 
             if (e == NULL) {
                 continue;
@@ -1180,7 +1180,7 @@ backend_reply_memcached(backend_script *s, const backend_cmd *cmd,
          * makes the NEXT get answer a miss, which reads as a cache bug in the
          * module under test rather than as a defect in the fake. */
         if (cmd->n_args >= 1 && cmd->data != NULL && cmd->data_len >= 0
-            && backend_set_checked(s, cmd->args[0], cmd->data,
+            && backend_set_checked_cstr(s, cmd->args[0], cmd->data,
                                    (size_t) cmd->data_len) != 0)
         {
             /* What a real memcached answers for a key or value over its limit.
@@ -1198,7 +1198,7 @@ backend_reply_memcached(backend_script *s, const backend_cmd *cmd,
         buf_append(&buf, &len, &cap, "STORED\r\n", 8);
 
     } else if (strcmp(cmd->name, "delete") == 0) {
-        if (cmd->n_args > 0 && backend_delete(s, cmd->args[0])) {
+        if (cmd->n_args > 0 && backend_delete_cstr(s, cmd->args[0])) {
             buf_append(&buf, &len, &cap, "DELETED\r\n", 9);
         } else {
             buf_append(&buf, &len, &cap, "NOT_FOUND\r\n", 11);
@@ -1512,7 +1512,7 @@ backend_reply_resp(backend_script *s, const backend_cmd *cmd,
          * string, so GET "a\0b" must miss a stored "a" rather than find it.
          * The same applies to set/del/exists below.
          */
-        e = backend_get_n(s, cmd->args[0], cmd->args_len[0]);
+        e = backend_get(s, cmd->args[0], cmd->args_len[0]);
 
         if (e == NULL) {
             /* The nil bulk string. Distinct from an empty one ($0\r\n\r\n),
@@ -1542,7 +1542,7 @@ backend_reply_resp(backend_script *s, const backend_cmd *cmd,
          * had the same defect one argument over (R-6): it was passed as a C
          * string, so SET "a\0x" and SET "a\0y" overwrote each other.
          */
-        if (backend_set_checked_n(s, cmd->args[0], cmd->args_len[0],
+        if (backend_set_checked(s, cmd->args[0], cmd->args_len[0],
                                   (const unsigned char *) cmd->args[1],
                                   cmd->args_len[1]) != 0)
         {
@@ -1559,7 +1559,7 @@ backend_reply_resp(backend_script *s, const backend_cmd *cmd,
         size_t i;
 
         for (i = 0; i < cmd->n_args; i++) {
-            n += backend_delete_n(s, cmd->args[i], cmd->args_len[i]);
+            n += backend_delete(s, cmd->args[i], cmd->args_len[i]);
         }
 
         buf_appendf(&buf, &len, &cap, ":%ld\r\n", n);
@@ -1569,7 +1569,7 @@ backend_reply_resp(backend_script *s, const backend_cmd *cmd,
         size_t i;
 
         for (i = 0; i < cmd->n_args; i++) {
-            n += (backend_get_n(s, cmd->args[i], cmd->args_len[i]) != NULL);
+            n += (backend_get(s, cmd->args[i], cmd->args_len[i]) != NULL);
         }
 
         buf_appendf(&buf, &len, &cap, ":%ld\r\n", n);

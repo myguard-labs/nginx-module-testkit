@@ -1585,17 +1585,17 @@ mutate "backend: store copies the key with a NUL-terminated write" backend.c \
     backend_test
 
 mutate "backend: RESP set passes the key as a C string" backend.c \
-    '        if (backend_set_checked_n(s, cmd->args[0], cmd->args_len[0],
+    '        if (backend_set_checked(s, cmd->args[0], cmd->args_len[0],
                                   (const unsigned char *) cmd->args[1],
                                   cmd->args_len[1]) != 0)' \
-    '        if (backend_set_checked(s, cmd->args[0],
+    '        if (backend_set_checked_cstr(s, cmd->args[0],
                                 (const unsigned char *) cmd->args[1],
                                 cmd->args_len[1]) != 0)' \
     backend_test
 
 mutate "backend: RESP get looks the key up as a C string" backend.c \
-    '        e = backend_get_n(s, cmd->args[0], cmd->args_len[0]);' \
-    '        e = backend_get(s, cmd->args[0]);' \
+    '        e = backend_get(s, cmd->args[0], cmd->args_len[0]);' \
+    '        e = backend_get_cstr(s, cmd->args[0]);' \
     backend_test
 
 mutate "backend: SCAN emits keys with strlen" backend.c \
@@ -1608,13 +1608,13 @@ mutate "backend: SCAN emits keys with strlen" backend.c \
     backend_test
 
 mutate "backend: RESP del passes the key as a C string" backend.c \
-    '            n += backend_delete_n(s, cmd->args[i], cmd->args_len[i]);' \
-    '            n += backend_delete(s, cmd->args[i]);' \
+    '            n += backend_delete(s, cmd->args[i], cmd->args_len[i]);' \
+    '            n += backend_delete_cstr(s, cmd->args[i]);' \
     backend_test
 
 mutate "backend: RESP exists looks the key up as a C string" backend.c \
-    '            n += (backend_get_n(s, cmd->args[i], cmd->args_len[i]) != NULL);' \
-    '            n += (backend_get(s, cmd->args[i]) != NULL);' \
+    '            n += (backend_get(s, cmd->args[i], cmd->args_len[i]) != NULL);' \
+    '            n += (backend_get_cstr(s, cmd->args[i]) != NULL);' \
     backend_test
 
 # The header-field parser. Three rows, one per rejection it is the only thing

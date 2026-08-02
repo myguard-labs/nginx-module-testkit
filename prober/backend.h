@@ -213,25 +213,26 @@ const backend_fault *backend_fault_for(const backend_script *s,
 /*
  * The in-memory store. `get` returns NULL when the key is absent.
  *
- * Each operation comes in two spellings. The `_n` form takes an explicit key
+ * Each operation comes in two spellings. The plain form takes an explicit key
  * length and is the binary-safe one: RESP keys arrive as bulk strings and may
  * contain a NUL, so the RESP command handlers must use it or two distinct keys
- * collapse into one. The plain form takes a C string, derives the length with
- * strlen(), and exists for the memcached and inline text paths, whose grammar
- * is whitespace-delimited and therefore cannot express an embedded NUL, and
- * for .backend script keys.
+ * collapse into one. The `_cstr` form takes a C string, derives the length
+ * with strlen(), and exists for the memcached and inline text paths, whose
+ * grammar is whitespace-delimited and therefore cannot express an embedded
+ * NUL, and for .backend script keys.
  *
  * A key is `key_len` bytes compared with memcmp, so "a" and "a\0b" are
  * different keys and neither prefixes the other.
  */
-const backend_entry *backend_get(const backend_script *s, const char *key);
-const backend_entry *backend_get_n(const backend_script *s, const char *key,
-                                   size_t key_len);
-void backend_set(backend_script *s, const char *key,
-                 const unsigned char *value, size_t len);
+const backend_entry *backend_get_cstr(const backend_script *s,
+                                      const char *key);
+const backend_entry *backend_get(const backend_script *s, const char *key,
+                                 size_t key_len);
+void backend_set_cstr(backend_script *s, const char *key,
+                      const unsigned char *value, size_t len);
 
 /*
- * backend_set() for input that came off the SOCKET rather than out of a
+ * backend_set_cstr() for input that came off the SOCKET rather than out of a
  * .backend file: returns 0 stored, -1 refused (key or value over its limit, or
  * the store is full) instead of exiting the process. Callers answer with their
  * protocol's error token.
@@ -241,12 +242,12 @@ void backend_set(backend_script *s, const char *key,
  * every other live connection down with it, turning a module bug into what
  * looked like harness flakiness.
  */
-int  backend_set_checked(backend_script *s, const char *key,
+int  backend_set_checked_cstr(backend_script *s, const char *key,
+                              const unsigned char *value, size_t len);
+int  backend_set_checked(backend_script *s, const char *key, size_t key_len,
                          const unsigned char *value, size_t len);
-int  backend_set_checked_n(backend_script *s, const char *key, size_t key_len,
-                           const unsigned char *value, size_t len);
-int  backend_delete(backend_script *s, const char *key);
-int  backend_delete_n(backend_script *s, const char *key, size_t key_len);
+int  backend_delete_cstr(backend_script *s, const char *key);
+int  backend_delete(backend_script *s, const char *key, size_t key_len);
 void backend_flush_all(backend_script *s);
 
 
