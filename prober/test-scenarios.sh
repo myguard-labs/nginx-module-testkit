@@ -178,8 +178,12 @@ for ((i = 0; i < COUNT; i++)); do
         case "$OUT" in
             "1..0 # SKIP"*)
                 # This scenario skipped. Check if it is in the allowlist.
+                # Membership is tested with a glob, not =~: under =~ the
+                # scenario NAME is a regex, so `.` and `-` in a name would
+                # match characters they should not and quietly allowlist a
+                # neighbour. The surrounding spaces make it whole-word.
                 SKIP_REASON="${OUT#1..0 # SKIP }"
-                if [[ " ${PROBER_EXPECTED_SKIPS[*]} " =~ \ $NAME\  ]]; then
+                if [[ " ${PROBER_EXPECTED_SKIPS[*]} " == *" $NAME "* ]]; then
                     # Scenario is allowlisted, propagate the skip normally.
                     ACTUALLY_SKIPPED+=("$NAME")
                     echo "ok $N - $NAME # SKIP $SKIP_REASON"
@@ -200,10 +204,28 @@ for ((i = 0; i < COUNT; i++)); do
     fi
 done
 
-# Summary: report which allowlisted scenarios actually ran vs. skipped.
-if [ $STATUS -eq 0 ] && [ "${#ACTUALLY_SKIPPED[@]}" -gt 0 ]; then
+# Summary: report which allowlisted scenarios actually skipped.
+if [ "${#ACTUALLY_SKIPPED[@]}" -gt 0 ]; then
     echo "# Note: ${#ACTUALLY_SKIPPED[@]} allowlisted scenarios skipped:" >&2
     printf '#   - %s\n' "${ACTUALLY_SKIPPED[@]}" >&2
+fi
+
+# The other direction, and the one that rots silently: an allowlisted scenario
+# that DID run. The entry is now stale, and a stale entry is a standing licence
+# for that scenario to start skipping again later without anyone noticing --
+# the exact hole this allowlist exists to close. Reported, not fatal: a
+# scenario becoming runnable is good news and must not red an otherwise green
+# job, but it has to be visible enough to prune.
+STALE_ALLOWLIST=()
+for EXPECTED in "${PROBER_EXPECTED_SKIPS[@]}"; do
+    if [[ " ${ACTUALLY_SKIPPED[*]} " != *" $EXPECTED "* ]]; then
+        STALE_ALLOWLIST+=("$EXPECTED")
+    fi
+done
+if [ "${#STALE_ALLOWLIST[@]}" -gt 0 ]; then
+    echo "# Note: ${#STALE_ALLOWLIST[@]} allowlisted scenario(s) did NOT skip -- drop them from" >&2
+    echo "# PROBER_EXPECTED_SKIPS in skip-allowlist.sh so a future skip is caught:" >&2
+    printf '#   - %s\n' "${STALE_ALLOWLIST[@]}" >&2
 fi
 
 # If there were disallowed skips, the job already failed (STATUS=1 set above).
