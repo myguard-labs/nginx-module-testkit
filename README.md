@@ -687,6 +687,13 @@ kernel absorbs a modest response whole, so `recv_slow` alone delays when the
   on the client side.
 - `recv_slow` delay range: 1..10,000 ms between chunks.
 
+Note the kernel doubles the requested `so_rcvbuf` size and enforces its own
+floor, so the effective window is not the number given; assert on behaviour,
+never on the size.
+
+`recv_slow` is mutually exclusive with `abort` and `hold` — neither reads the
+connection at all, so pacing their reads would pace nothing.
+
 See `rules/stock/slow-reader.rule` for a working example.
 
 `pid_may_change` relaxes the worker-survival oracle for one case, from "the same
