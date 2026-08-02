@@ -50,6 +50,18 @@ VERSION="${2:-1.31.3}"
 
 GLOB="${PROBER_SCENARIOS:-./scenarios/*/}"
 
+# Source the allowlist of permitted SKIP scenarios for this flavor/version.
+# shellcheck source=skip-allowlist.sh
+. ./skip-allowlist.sh "$FLAVOR" "$VERSION"
+
+# Array to track which allowlisted scenarios actually skipped (for reporting).
+ACTUALLY_SKIPPED=()
+
+# Array to track disallowed skips (scenarios that skipped but are NOT in the
+# allowlist). This is what makes the job fail: an unexpected skip is a coverage
+# regression.
+DISALLOWED_SKIPS=()
+
 # Zero discovered scenarios is a failure, not a pass -- a typo'd glob would
 # otherwise turn the whole stage into a silent no-op that reports green. Same
 # rule test.sh applies to *_test.c discovery, for the same reason.
@@ -152,6 +164,7 @@ fi
 
 # Emit the aggregate TAP in scenario-list order, reading each captured stream
 # and its exit status. Deterministic regardless of finish order.
+# Simultaneously validate that scenarios only skip if they are in the allowlist.
 STATUS=0
 for ((i = 0; i < COUNT; i++)); do
     N=$((i + 1))
@@ -164,9 +177,30 @@ for ((i = 0; i < COUNT; i++)); do
     if [ "$RC" -eq 0 ]; then
         case "$OUT" in
             "1..0 # SKIP"*)
-                # Propagate the skip and its reason to the aggregate line, so
-                # a `prove` summary shows WHICH scenarios did not run here.
-                echo "ok $N - $NAME # SKIP ${OUT#1..0 # SKIP }" ;;
+                # This scenario skipped. Check if it is in the allowlist.
+                # Membership is tested with a glob, not =~: under =~ the
+                # scenario NAME is a regex, so `.` and `-` in a name would
+                # match characters they should not and quietly allowlist a
+                # neighbour. The surrounding spaces make it whole-word.
+                SKIP_REASON="${OUT#1..0 # SKIP }"
+                if [[ " ${PROBER_EXPECTED_SKIPS[*]} " == *" $NAME "* ]]; then
+                    # Scenario is allowlisted, propagate the skip normally.
+                    ACTUALLY_SKIPPED+=("$NAME")
+                    echo "ok $N - $NAME # SKIP $SKIP_REASON"
+                else
+                    # Scenario is NOT in the allowlist: this is an unexpected
+                    # skip, a coverage regression. Fail the job.
+                    # No `# SKIP` directive on this line, deliberately. In TAP a
+                    # trailing `# SKIP` marks the point as skipped rather than
+                    # failed, so `not ok ... # SKIP` is self-contradictory and
+                    # some consumers resolve it toward "skipped" -- swallowing
+                    # the one verdict this gate exists to raise. The reason is
+                    # kept as plain description text instead.
+                    DISALLOWED_SKIPS+=("$NAME")
+                    echo "not ok $N - $NAME (skipped but not allowlisted: $SKIP_REASON)"
+                    STATUS=1
+                fi
+                ;;
             *)
                 echo "ok $N - $NAME" ;;
         esac
@@ -175,5 +209,37 @@ for ((i = 0; i < COUNT; i++)); do
         STATUS=1
     fi
 done
+
+# Summary: report which allowlisted scenarios actually skipped.
+if [ "${#ACTUALLY_SKIPPED[@]}" -gt 0 ]; then
+    echo "# Note: ${#ACTUALLY_SKIPPED[@]} allowlisted scenarios skipped:" >&2
+    printf '#   - %s\n' "${ACTUALLY_SKIPPED[@]}" >&2
+fi
+
+# The other direction, and the one that rots silently: an allowlisted scenario
+# that DID run. The entry is now stale, and a stale entry is a standing licence
+# for that scenario to start skipping again later without anyone noticing --
+# the exact hole this allowlist exists to close. Reported, not fatal: a
+# scenario becoming runnable is good news and must not red an otherwise green
+# job, but it has to be visible enough to prune.
+STALE_ALLOWLIST=()
+for EXPECTED in "${PROBER_EXPECTED_SKIPS[@]}"; do
+    if [[ " ${ACTUALLY_SKIPPED[*]} " != *" $EXPECTED "* ]]; then
+        STALE_ALLOWLIST+=("$EXPECTED")
+    fi
+done
+if [ "${#STALE_ALLOWLIST[@]}" -gt 0 ]; then
+    echo "# Note: ${#STALE_ALLOWLIST[@]} allowlisted scenario(s) did NOT skip -- drop them from" >&2
+    echo "# PROBER_EXPECTED_SKIPS in skip-allowlist.sh so a future skip is caught:" >&2
+    printf '#   - %s\n' "${STALE_ALLOWLIST[@]}" >&2
+fi
+
+# If there were disallowed skips, the job already failed (STATUS=1 set above).
+# Report them for troubleshooting.
+if [ "${#DISALLOWED_SKIPS[@]}" -gt 0 ]; then
+    echo "# ERROR: ${#DISALLOWED_SKIPS[@]} scenario(s) skipped but are NOT in the allowlist for $FLAVOR:$VERSION" >&2
+    printf '# (add to PROBER_EXPECTED_SKIPS in skip-allowlist.sh if intentional)\n' >&2
+    printf '#   - %s\n' "${DISALLOWED_SKIPS[@]}" >&2
+fi
 
 exit $STATUS
