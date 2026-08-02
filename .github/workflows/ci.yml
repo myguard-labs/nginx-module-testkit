@@ -536,6 +536,7 @@ jobs:
             version: 1.29.0
             url: https://nginx.org/download/nginx-1.29.0.tar.gz
             sha256: 109754dfe8e5169a7a0cf0db6718e7da2db495753308f933f161e525a579a664
+            mutation_rows: true
           - flavor: angie
             version: 1.12.0
             url: https://download.angie.software/files/angie-1.12.0.tar.gz
@@ -718,7 +719,7 @@ jobs:
       # differences, so running them once is enough. The scenario TREE still
       # runs on every flavor in the matrix.
       - name: the scenario mutation rows actually catch (mutation)
-        if: matrix.flavor == 'nginx' && matrix.version == '1.29.0'
+        if: matrix.mutation_rows
         env:
           PROBER_ROOT: ${{ github.workspace }}
           PROBER_MODULE: ngx_http_test_ref_module.so
@@ -729,6 +730,38 @@ jobs:
           # the C binaries and would report a caught mutation on wall clock.
           MUT_SUITE_TIMEOUT: "600"
         run: prober/mutate.sh
+
+  # Guard to ensure the mutation_rows flag is present on exactly one scenarios
+  # matrix leg. This prevents silent coverage regressions when the mainline
+  # version is bumped: without this check, a stale if: condition could hide the
+  # fact that mutation rows are no longer running.
+  mutation-rows-gate:
+    runs-on: [self-hosted, builder02, lxc]
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: exactly one scenarios matrix leg has mutation_rows
+        run: |
+          count=$(python3 -c "
+          import yaml
+          with open('.github/workflows/ci.yml') as f:
+              wf = yaml.safe_load(f)
+
+          scenarios_matrix = wf['jobs']['scenarios']['strategy']['matrix']['include']
+          mutation_rows_count = sum(1 for entry in scenarios_matrix if entry.get('mutation_rows'))
+          print(mutation_rows_count)
+          ")
+
+          if [ "$count" -ne 1 ]; then
+              echo "ERROR: expected exactly 1 scenarios matrix leg with mutation_rows=true," \
+                   "found $count" >&2
+              echo "" >&2
+              echo "Fix: add 'mutation_rows: true' to the nginx mainline entry in the" \
+                   "scenarios job matrix, then remove it from all other entries." >&2
+              exit 1
+          fi
 
   header-self-sufficiency:
     runs-on: [self-hosted, builder02, lxc]
