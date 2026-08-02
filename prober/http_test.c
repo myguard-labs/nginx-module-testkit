@@ -37,9 +37,18 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Only for the TLS fixtures below: a throwaway self-signed cert generated at
+ * test time via the OpenSSL API (never shelled out to `openssl`, which would
+ * be an undeclared test dependency the rest of this file has none of), and a
+ * minimal TLS server loop in the forked child to answer the handshake. */
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  197
+#define PLANNED  202
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -412,7 +421,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                       pauses, n_pauses, shut_how, abort_at, hold_ms,
-                      recv_opt, want_close, idle_ms, 0, &resp,
+                      recv_opt, want_close, idle_ms, 0, NULL, &resp,
                       errbuf, sizeof(errbuf));
 
     if (rc == 0) {
@@ -448,6 +457,212 @@ run_echo_full(const unsigned char *req, size_t req_len,
     out->send_paced_ms = send_paced_ms;
 
     return rc;
+}
+
+
+/*
+ * Build a throwaway self-signed certificate + RSA key, entirely via the
+ * OpenSSL API (never by shelling out to the `openssl` binary, which would be
+ * an undeclared test dependency and the one thing this fixture must not
+ * become). Returns 0 and fills *out_cert and *out_pkey on success, or -1 on any
+ * OpenSSL failure -- the caller SKIPs loudly rather than treating that as a
+ * pass, since an environment with no usable OpenSSL cannot prove the TLS leg
+ * either way.
+ *
+ * 2048-bit RSA and a 1-day validity window: this cert lives for the length of
+ * one test process and is never written to disk or reused across runs, so
+ * there is nothing here worth hardening beyond "OpenSSL accepts it".
+ */
+static int
+make_self_signed_cert(X509 **out_cert, EVP_PKEY **out_pkey)
+{
+    EVP_PKEY_CTX  *pctx = NULL;
+    EVP_PKEY      *pkey = NULL;
+    X509          *cert = NULL;
+    X509_NAME     *name;
+
+    pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    if (pctx == NULL
+        || EVP_PKEY_keygen_init(pctx) <= 0
+        || EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048) <= 0
+        || EVP_PKEY_keygen(pctx, &pkey) <= 0)
+    {
+        goto fail;
+    }
+
+    cert = X509_new();
+    if (cert == NULL) {
+        goto fail;
+    }
+
+    if (X509_set_version(cert, 2) != 1
+        || ASN1_INTEGER_set(X509_get_serialNumber(cert), 1) != 1
+        || X509_gmtime_adj(X509_getm_notBefore(cert), 0) == NULL
+        || X509_gmtime_adj(X509_getm_notAfter(cert), 60L * 60L * 24L) == NULL
+        || X509_set_pubkey(cert, pkey) != 1)
+    {
+        goto fail;
+    }
+
+    name = X509_get_subject_name(cert);
+    if (name == NULL
+        || X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                      (const unsigned char *)
+                                      "prober-http-test.invalid",
+                                      -1, -1, 0) != 1
+        || X509_set_issuer_name(cert, name) != 1)
+    {
+        goto fail;
+    }
+
+    if (X509_sign(cert, pkey, EVP_sha256()) == 0) {
+        goto fail;
+    }
+
+    EVP_PKEY_CTX_free(pctx);
+    *out_cert = cert;
+    *out_pkey = pkey;
+    return 0;
+
+fail:
+    if (cert != NULL) {
+        X509_free(cert);
+    }
+    if (pkey != NULL) {
+        EVP_PKEY_free(pkey);
+    }
+    if (pctx != NULL) {
+        EVP_PKEY_CTX_free(pctx);
+    }
+    return -1;
+}
+
+
+/*
+ * Serve up to SPAWN_TLS_ECHO_MAX_CONNS TLS connections, one after another, on
+ * an ephemeral port: accept, complete a TLS server-side handshake with a
+ * throwaway self-signed cert, read the request, and write SPAWN_REPLY back --
+ * then loop and accept the next one. Modeled on spawn_echo() -- same
+ * fork-after-listen shape so the parent can never race the child to accept()
+ * -- but looped, because callers that prove fd-reuse/teardown behaviour open
+ * a second, independent connection against the same fixture after closing
+ * the first. The child exits after serving the cap or on any handshake/I/O
+ * error; the caller is responsible for reaping it (SIGKILL + waitpid) once
+ * it is done driving connections, since a child that served fewer than the
+ * cap is still blocked in accept() waiting for a connection that will never
+ * come.
+ *
+ * Returns the child pid, or -1 if this environment cannot produce a usable
+ * TLS server fixture (cert generation or context setup failed) -- the SKIP
+ * decision belongs to the caller, which knows what TAP line it owes.
+ */
+#define SPAWN_TLS_ECHO_MAX_CONNS  4
+
+static pid_t
+spawn_tls_echo(int *port)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+    X509               *cert;
+    EVP_PKEY           *pkey;
+
+    if (make_self_signed_cert(&cert, &pkey) != 0) {
+        return -1;
+    }
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        X509_free(cert);
+        EVP_PKEY_free(pkey);
+        return -1;
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, SPAWN_TLS_ECHO_MAX_CONNS) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        close(srv);
+        X509_free(cert);
+        EVP_PKEY_free(pkey);
+        return -1;
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    /* Listener bound before the fork, exactly as spawn_echo() does it, so
+     * connecting in the parent cannot race the child reaching accept(). */
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        close(srv);
+        X509_free(cert);
+        EVP_PKEY_free(pkey);
+        return -1;
+    }
+
+    if (pid == 0) {
+        SSL_CTX  *ctx = SSL_CTX_new(TLS_server_method());
+        int       n;
+
+        if (ctx == NULL
+            || SSL_CTX_use_certificate(ctx, cert) != 1
+            || SSL_CTX_use_PrivateKey(ctx, pkey) != 1)
+        {
+            _exit(2);
+        }
+
+        /* Serve up to the cap, one connection at a time, so a caller that
+         * closes one TLS connection and opens a fresh one against the same
+         * fixture (proving http_close() tore down the old side-table slot
+         * rather than leaking it) still has a live peer to handshake with.
+         * A handshake/I/O error on any one connection is fatal to the whole
+         * fixture, same as the original single-shot behaviour. */
+        for (n = 0; n < SPAWN_TLS_ECHO_MAX_CONNS; n++) {
+            SSL   *ssl;
+            int    c;
+            char   scratch[512];
+
+            c = accept(srv, NULL, NULL);
+            if (c < 0) {
+                _exit(2);
+            }
+
+            ssl = SSL_new(ctx);
+            if (ssl == NULL || SSL_set_fd(ssl, c) != 1
+                || SSL_accept(ssl) != 1)
+            {
+                _exit(2);
+            }
+
+            /* Read whatever the client sent (best-effort; the reply below
+             * is unconditional so a short or slow request still gets an
+             * answer to round-trip) and write the fixture's canned
+             * response. */
+            (void) SSL_read(ssl, scratch, sizeof(scratch));
+            (void) SSL_write(ssl, SPAWN_REPLY, (int) SPAWN_REPLY_LEN);
+
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            close(c);
+        }
+
+        SSL_CTX_free(ctx);
+        _exit(0);
+    }
+
+    close(srv);
+    X509_free(cert);
+    EVP_PKEY_free(pkey);
+    return pid;
 }
 
 
@@ -1573,7 +1788,7 @@ run_echo_abort(const unsigned char *req, size_t req_len, size_t want_len,
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                       pauses, n_pauses, HTTP_SHUT_NONE, abort_at,
-                      HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0, &resp,
+                      HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0, NULL, &resp,
                       errbuf, sizeof(errbuf));
 
     if (rc == 0) {
@@ -2933,7 +3148,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE, 0,
-                              &resp, errbuf, sizeof(errbuf));
+                              NULL, &resp, errbuf, sizeof(errbuf));
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_FIN
                && resp.close_ms >= 100,
@@ -2984,7 +3199,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE, 0,
-                              &resp, errbuf, sizeof(errbuf));
+                              NULL, &resp, errbuf, sizeof(errbuf));
 
             /* A reset can arrive either as ECONNRESET on the read or, if the
              * response was fully buffered first, as an ordinary EOF -- the
@@ -3021,7 +3236,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE, 0,
-                              &resp, errbuf, sizeof(errbuf));
+                              NULL, &resp, errbuf, sizeof(errbuf));
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_RESET,
                "a bare reset is classified as a reset, not as an unknown close");
@@ -3060,7 +3275,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0,
-                              &resp, errbuf, sizeof(errbuf));
+                              NULL, &resp, errbuf, sizeof(errbuf));
 
             ok(rc != 0,
                "without want_close a non-closing server is a transport error");
@@ -3087,7 +3302,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE, 0,
-                              &resp, errbuf, sizeof(errbuf));
+                              NULL, &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_TIMEOUT,
@@ -3162,7 +3377,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 200, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0,
-                              &resp, errbuf, sizeof(errbuf));
+                              NULL, &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
             ok(rc != 0, "a trickling server is a failure, not an infinite read "
@@ -3230,7 +3445,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 0, 200, 0,
-                              &resp, errbuf, sizeof(errbuf));
+                              NULL, &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_IDLE,
@@ -3278,7 +3493,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 0, 2000, 0,
-                              &resp, errbuf, sizeof(errbuf));
+                              NULL, &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_DATA,
@@ -3521,7 +3736,7 @@ main(void)
         rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
                           NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                           HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
-                          &r, errbuf, sizeof(errbuf));
+                          NULL, &r, errbuf, sizeof(errbuf));
         ok(rc == 0 && r.close_reason == HTTP_CLOSE_FRAMED,
            "a framed read stops on framing against a peer that never closes");
         ok(rc == 0 && r.status == 200 && r.body_len == 5
@@ -3541,7 +3756,7 @@ main(void)
         rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
                           NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                           HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0,
-                          &r, errbuf, sizeof(errbuf));
+                          NULL, &r, errbuf, sizeof(errbuf));
         ok(rc != 0,
            "without framed mode the same server hangs to timeout and fails");
         if (rc == 0) {
@@ -3557,7 +3772,7 @@ main(void)
         rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
                           NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                           HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
-                          &r, errbuf, sizeof(errbuf));
+                          NULL, &r, errbuf, sizeof(errbuf));
         ok(rc == 0 && r.raw_len == sizeof(KA_RESP) - 1
            && r.body_len == 5 && memcmp(r.body, "hello", 5) == 0,
            "a pipelined second response is left on the wire, not read into the first");
@@ -3574,7 +3789,7 @@ main(void)
         rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
                           NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                           HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
-                          &r, errbuf, sizeof(errbuf));
+                          NULL, &r, errbuf, sizeof(errbuf));
         /* The verdict is pinned to the UNFRAMEABLE rejection, not merely to a
          * non-zero return: if the rejection is removed the loop falls through to
          * read-to-EOF and still fails -- but on the per-read TIMEOUT, a
@@ -3599,7 +3814,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
-                              &r, errbuf, sizeof(errbuf));
+                              NULL, &r, errbuf, sizeof(errbuf));
             if (rc == 0) {
                 http_dechunk(&r);
             }
@@ -3624,7 +3839,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
-                              &r, errbuf, sizeof(errbuf));
+                              NULL, &r, errbuf, sizeof(errbuf));
             ok(rc == 0 && r.close_reason == HTTP_CLOSE_FRAMED
                && r.status == 204 && r.body_len == 0,
                "a bodiless 204 framed read ends at the terminator, no body wait");
@@ -4108,6 +4323,209 @@ main(void)
 
             kill(pid5, SIGKILL);
             waitpid(pid5, &st5, 0);
+        }
+    }
+
+    /* ---- optional TLS transport (T-1 part 1) ------------------------------
+     *
+     * Three things worth proving, per the item's own instructions:
+     *
+     *   1. The plaintext path is unchanged -- every test above this block IS
+     *      that control, since none of them pass a non-NULL tls_opt and all of
+     *      them still exercise write_all()/the reader/the idle-wait peek with
+     *      tls_table_get() returning NULL on every call. A new plaintext-only
+     *      assertion here would duplicate that rather than add to it.
+     *   2. A TLS handshake against a locally-spawned TLS server actually
+     *      completes and a request/response round-trips.
+     *   3. Teardown clears the slot: an fd reused after http_close() does NOT
+     *      inherit the previous SSL handle.
+     *
+     * spawn_tls_echo() returning -1 means this environment could not produce a
+     * working OpenSSL server context (cert/key generation or SSL_CTX setup
+     * failed) -- SKIP loudly rather than silently pass, since neither the
+     * handshake test nor the fd-reuse test can say anything true without a
+     * live TLS peer to prove it against.
+     */
+    {
+        int  tls_port = 0;
+        pid_t  tls_pid = spawn_tls_echo(&tls_port);
+
+        if (tls_pid < 0) {
+            printf("ok %d - TLS handshake round-trips a request/response "
+                   "# SKIP no usable OpenSSL server context in this "
+                   "environment\n", ++tests_run);
+            printf("ok %d - http_close clears the TLS side-table slot so a "
+                   "reused fd does not inherit a stale SSL* "
+                   "# SKIP no usable OpenSSL server context in this "
+                   "environment\n", ++tests_run);
+            printf("ok %d - a second, independent TLS connection also "
+                   "round-trips after the first is closed "
+                   "# SKIP no usable OpenSSL server context in this "
+                   "environment\n", ++tests_run);
+            printf("ok %d - TLS handshake fails loudly against a plaintext "
+                   "peer rather than silently downgrading "
+                   "# SKIP no usable OpenSSL server context in this "
+                   "environment\n", ++tests_run);
+        } else {
+            static const unsigned char  req[] =
+                "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+            http_tls       tls_on;
+            http_response  resp;
+            char           errbuf[256];
+            int            rc, first_fd, second_fd;
+            int            st;
+
+            memset(&tls_on, 0, sizeof(tls_on));
+            tls_on.enable = 1;
+            tls_on.verify = 0;  /* self-signed fixture cert; see http.h */
+
+            /*
+             * http_connect()+http_exchange()+http_close() rather than
+             * http_request(), because proving fd reuse needs the raw fd
+             * number back -- http_request() would close it before this code
+             * ever saw it.
+             */
+            first_fd = http_connect("127.0.0.1", tls_port, 5000, NULL, NULL,
+                                    &tls_on, errbuf, sizeof(errbuf));
+
+            ok(first_fd >= 0, "TLS handshake completes against a locally "
+                              "spawned TLS server");
+
+            memset(&resp, 0, sizeof(resp));
+
+            if (first_fd >= 0) {
+                rc = http_exchange(first_fd, req, sizeof(req) - 1, 5000,
+                                   NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                                   HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0,
+                                   &resp, NULL, errbuf, sizeof(errbuf));
+
+                ok(rc == 0 && resp.status == 200
+                   && resp.body_len == SPAWN_REPLY_LEN - 45,
+                   "a request/response round-trips over the TLS leg with "
+                   "the expected status and body");
+
+                http_response_free(&resp);
+                http_close(first_fd);
+            } else {
+                /* Cannot round-trip a request over a connection that never
+                 * existed; report the dependent assertion as a failure
+                 * rather than silently omitting it -- a skipped-because-
+                 * unreachable assertion reads as a pass, which is the
+                 * anti-pattern this whole item is written to avoid. */
+                ok(0, "a request/response round-trips over the TLS leg with "
+                      "the expected status and body");
+            }
+
+            /*
+             * fd-reuse / teardown proof: open a second TLS connection. Under
+             * normal kernel fd-allocation behaviour the just-closed fd number
+             * is the lowest free one and gets handed back immediately, so
+             * second_fd is very likely == first_fd here -- but the assertion
+             * does not depend on that coincidence. What it depends on is that
+             * http_close() called tls_table_del() on first_fd: if it had not,
+             * tls_table_put() below would either collide with a live slot (if
+             * the kernel reused the number) or simply coexist with a leaked
+             * stale entry (if it did not) -- neither of which this test can
+             * tell apart from outside. So the direct proof is that a FRESH
+             * handshake and round-trip on a new connection succeeds cleanly
+             * with no interference from the torn-down one; a stale slot
+             * pointing tls_table_get(second_fd) at the OLD, freed SSL* would
+             * make SSL_write/SSL_read below operate on freed memory, which
+             * ASan (this repo's default build) turns into a hard crash rather
+             * than a quiet wrong answer.
+             */
+            second_fd = http_connect("127.0.0.1", tls_port, 5000, NULL, NULL,
+                                     &tls_on, errbuf, sizeof(errbuf));
+
+            ok(second_fd >= 0, "http_close clears the TLS side-table slot so "
+                               "a reused fd does not inherit a stale SSL*");
+
+            if (second_fd >= 0) {
+                memset(&resp, 0, sizeof(resp));
+
+                rc = http_exchange(second_fd, req, sizeof(req) - 1, 5000,
+                                   NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                                   HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0,
+                                   &resp, NULL, errbuf, sizeof(errbuf));
+
+                ok(rc == 0 && resp.status == 200,
+                   "a second, independent TLS connection also round-trips "
+                   "after the first is closed");
+
+                http_response_free(&resp);
+                http_close(second_fd);
+            } else {
+                ok(0, "a second, independent TLS connection also round-trips "
+                      "after the first is closed");
+            }
+
+            /* spawn_tls_echo()'s child loops accepting up to
+             * SPAWN_TLS_ECHO_MAX_CONNS connections; this block only ever
+             * drives two, so the child is still blocked in accept() waiting
+             * for a connection that will never come. SIGKILL it rather than
+             * a bare waitpid(), which would hang here. */
+            kill(tls_pid, SIGKILL);
+            waitpid(tls_pid, &st, 0);
+
+            /*
+             * Negative control for the handshake assertion above: ask for TLS
+             * against a PLAINTEXT server (spawn_echo(), which speaks raw HTTP,
+             * never TLS records). A client that silently fell back to
+             * plaintext on a failed/skipped handshake would make this
+             * indistinguishable from success -- exactly the anti-pattern
+             * http.h's http_tls comment and the item's own instructions both
+             * call out. The handshake must fail outright.
+             */
+            {
+                int    plain_port = 0;
+                int    fds[2];
+                pid_t  plain_pid;
+                int    plain_fd;
+                char   perrbuf[256];
+
+                if (pipe(fds) == 0) {
+                    plain_pid = spawn_echo(&plain_port, sizeof(req) - 1, 0,
+                                           fds[1]);
+                    close(fds[1]);
+
+                    plain_fd = http_connect("127.0.0.1", plain_port, 1000,
+                                            NULL, NULL, &tls_on, perrbuf,
+                                            sizeof(perrbuf));
+
+                    ok(plain_fd < 0, "TLS handshake fails loudly against a "
+                                     "plaintext peer rather than silently "
+                                     "downgrading");
+
+                    if (plain_fd >= 0) {
+                        http_close(plain_fd);
+                    }
+
+                    {
+                        echo_result  discard;
+                        int          pst;
+
+                        /* Drain the fixture's result pipe and reap it like
+                         * every other spawn_echo() user does, so this block
+                         * leaves no zombie or blocked writer behind even
+                         * though the exchange above never sent a request. The
+                         * result is discarded on purpose -- this control cares
+                         * only that the TLS handshake itself failed, and the
+                         * child's own read/timing report is unused; the
+                         * assignment silences -Wunused-result without
+                         * pretending a short read here is a fixture bug. */
+                        ssize_t  ndiscard = read(fds[0], &discard,
+                                                 sizeof(discard));
+
+                        (void) ndiscard;
+                        close(fds[0]);
+                        kill(plain_pid, SIGKILL);
+                        waitpid(plain_pid, &pst, 0);
+                    }
+                } else {
+                    ok(0, "TLS handshake fails loudly against a plaintext "
+                          "peer rather than silently downgrading");
+                }
+            }
         }
     }
 

@@ -213,7 +213,7 @@ arm_fault(const char *query, const char *source, char *errbuf, size_t errlen)
     if (http_request(opt_host, opt_port, (const unsigned char *) req,
                      (size_t) n, opt_timeout_ms, source, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE,
-                     NULL, 0, HTTP_IDLE_NONE, 0, &resp,
+                     NULL, 0, HTTP_IDLE_NONE, 0, NULL, &resp,
                      errbuf, errlen) != 0)
     {
         return -1;
@@ -253,7 +253,7 @@ fetch_probe(char *errbuf, size_t errlen)
     if (http_request(opt_host, opt_port, (const unsigned char *) req,
                      (size_t) n, opt_timeout_ms, NULL, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE,
-                     NULL, 0, HTTP_IDLE_NONE, 0, &resp,
+                     NULL, 0, HTTP_IDLE_NONE, 0, NULL, &resp,
                      errbuf, errlen) != 0)
     {
         return NULL;
@@ -609,7 +609,7 @@ run_case(const test_case *tc, const json_value *baseline)
                          opt_timeout_ms, tc->source,
                          tc->pauses, tc->n_pauses, tc->shut_how, tc->abort_at,
                          tc->hold_ms, &tc->recv_opt, tc->saw_close_within,
-                         tc->idle_ms, 0, &resp,
+                         tc->idle_ms, 0, NULL, &resp,
                          errbuf, sizeof(errbuf)) != 0)
         {
             printf("# request failed: %s\n", errbuf);
@@ -657,7 +657,8 @@ run_case(const test_case *tc, const json_value *baseline)
          * so_rcvbuf on any block but the first, so this is the only one that set
          * it. */
         fd = http_connect(opt_host, opt_port, opt_timeout_ms, tc->source,
-                          &tc->blocks[0].recv_opt, errbuf, sizeof(errbuf));
+                          &tc->blocks[0].recv_opt, NULL, errbuf,
+                          sizeof(errbuf));
 
         if (fd < 0) {
             printf("# connect failed: %s\n", errbuf);
@@ -744,7 +745,8 @@ run_case(const test_case *tc, const json_value *baseline)
 
         for (i = 0; i < (size_t) tc->open_conns; i++) {
             int cfd = http_connect(opt_host, opt_port, opt_timeout_ms,
-                                   tc->source, NULL, errbuf, sizeof(errbuf));
+                                   tc->source, NULL, NULL, errbuf,
+                                   sizeof(errbuf));
 
             if (cfd < 0) {
                 /* Not enough slots to open what the case asked for is itself a
