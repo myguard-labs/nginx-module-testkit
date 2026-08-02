@@ -635,17 +635,8 @@ prober_probe_body() {
 
         # `"pid": 1234` -- tolerate any spacing the emitter might use, though
         # ngx_test_probe.c:203 emits `"pid":%P` with none.
-        #
-        # NOT `| head -1`: if the field ever matched more than once, head would
-        # take its line and close the pipe while the upstream grep still had
-        # output queued, SIGPIPEing it and, under this file's `set -e -o
-        # pipefail` callers, aborting the function silently -- the same shape
-        # as the `find | head -1` fix above. The multi-match string is captured
-        # whole and trimmed to its first line in bash instead, which never
-        # closes a pipe early.
         pid="$(printf '%s' "$body" | grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' \
-               | grep -o '[0-9]\+$')"
-        pid="${pid%%$'\n'*}"
+               | grep -o '[0-9]\+$' | head -1)"
 
         # A pid was extracted -- that IS the success verdict, and the whole body
         # is what the caller gets (prober_probe_pid re-greps the pid from it).
@@ -693,14 +684,9 @@ prober_probe_field() {
     # Bounded to the field's own value: `"name" : 123`, tolerating any spacing,
     # and anchored on the quoted name so `cycle_used` cannot be matched by a
     # longer field that merely ends with it.
-    #
-    # NOT `| head -1` -- see prober_probe_body's identical fix above: a second
-    # match would let head close the pipe on grep mid-write, SIGPIPEing it and
-    # aborting under `set -e -o pipefail`. Capture whole, trim in bash.
     val="$(printf '%s' "$body" \
            | grep -o "\"$name\"[[:space:]]*:[[:space:]]*[0-9]\+" \
-           | grep -o '[0-9]\+$')"
-    val="${val%%$'\n'*}"
+           | grep -o '[0-9]\+$' | head -1)"
 
     [ -n "$val" ] || return 1
     printf '%s\n' "$val"
