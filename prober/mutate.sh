@@ -2277,3 +2277,31 @@ mutate "rule literals: assert.c stops sharing the document grammar" assert.c \
     '    { char *stop; if (*want == 0) return 0;
       *out = strtod(want, &stop); return stop != want && *stop == 0; }' \
     assert_test
+
+# R-16: both TEXT command parsers must reject a raw NUL inside the command
+# line before tokenising, rather than letting strtok_r + strlen() stop at it
+# and silently answer a truncated command (`get a\0x\r\n` parsing as key "a").
+# Two rows, one per parser -- they are independent NUL checks at independent
+# call sites, and reverting either one alone reopens that parser's half of the
+# bug.
+mutate "backend: memcached text parser accepts an embedded NUL" backend.c \
+    '    if (memchr(buf, '"'"'\0'"'"', line_len) != NULL) {
+        return -1;
+    }
+
+    /*
+     * Tokenise the caller'"'"'s buffer IN PLACE, exactly as the RESP parser does.' \
+    '    /*
+     * Tokenise the caller'"'"'s buffer IN PLACE, exactly as the RESP parser does.' \
+    backend_test
+
+mutate "backend: RESP inline parser accepts an embedded NUL" backend.c \
+    '        if (memchr(p, '"'"'\0'"'"', line_len) != NULL) {
+            return -1;
+        }
+
+        /*
+         * Tokenise the caller'"'"'s buffer IN PLACE, exactly as the framed and' \
+    '        /*
+         * Tokenise the caller'"'"'s buffer IN PLACE, exactly as the framed and' \
+    backend_test
