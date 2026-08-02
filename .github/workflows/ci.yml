@@ -91,8 +91,10 @@ jobs:
   # The gate is proven non-vacuous the same way every other gate here is: a
   # planted out-of-bounds read in json_parse_n makes replay abort under ASan and
   # exit nonzero (see prober/fuzz/README.md). A fuzz target that "reports but
-  # exits 0" is the canonical vacuous fuzz gate, and the standalone driver has no
-  # reporting path at all -- only the process living or dying.
+  # exits 0" is the canonical vacuous fuzz gate, and the standalone driver does
+  # not admit one: a crash kills the process, and the driver's only report is a
+  # count of files it actually fed to the target, with zero files exiting
+  # nonzero -- so an emptied corpus fails here instead of passing silently.
   fuzz-replay:
     runs-on: [self-hosted, builder02, lxc]
     steps:

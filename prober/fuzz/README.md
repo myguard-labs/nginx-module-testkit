@@ -36,9 +36,11 @@ unchanged (hook NULL → `exit(2)` byte-identical).
 target with `fuzz_standalone.c` (the LLVM StandaloneFuzzTargetMain pattern:
 `main` feeds each corpus file once to the target) under gcc + ASan/UBSan, over
 the checked-in `corpus/<t>/`. A crash or sanitizer abort exits nonzero and fails
-the run. There is no "report and continue" path — only the process living or
-dying — which is what makes this gate impossible to render vacuous. Wired into
-`ci.yml`'s `fuzz-replay` job.
+the run. There is no "report and continue" path for a crash — only the process
+living or dying. The driver's one report is a count of files it actually handed
+to the target, and a corpus resolving to zero files exits nonzero rather than
+reporting clean, so an emptied corpus cannot become a silent permanent pass.
+Wired into `ci.yml`'s `fuzz-replay` job.
 
 **Scheduled path — discovery (`fuzz.sh fuzz [seconds]`).** Needs clang
 (`-fsanitize=fuzzer,address,undefined`). Mutates unbounded on a time budget,
@@ -51,11 +53,20 @@ Plant an out-of-bounds read in `json_parse_n` (e.g. `s.end = text + len + 4;`)
 and run `./fuzz.sh replay`: the `bignum`/`obj` seed drives the over-read, ASan
 aborts, and the script exits 1. Restore the source and it exits 0. This is the
 same mutation ritual every gate in this repo is held to — a fuzzer that reports
-but exits 0 is the canonical vacuous fuzz gate, and neither path admits it: the
-standalone driver has no reporting path at all (a crash kills the process), and
-the scheduled discovery run turns any crasher into a nonzero exit via the
+but exits 0 is the canonical vacuous fuzz gate, and neither path admits it: a
+crash kills the standalone driver's process outright, and the scheduled
+discovery run turns any crasher into a nonzero exit via the
 `collect crashers` step in `fuzz.yml` (which greps `crashes/` and `exit 1`s),
 since libFuzzer itself already exits nonzero on a crash under ASan.
+
+The other way this gate could go vacuous is a corpus that stops feeding the
+target at all — a target whose seeds are deleted or made unreadable still passes
+if the driver only proves it was *invoked*. Empty one corpus directory and run
+`./fuzz.sh replay`: it exits 1 with `0 files processed`. Restore the seeds and
+it exits 0 reporting the true file count. The count is of files actually handed
+to `LLVMFuzzerTestOneInput`, not of argv entries, because `fuzz.sh` passes each
+corpus as a single directory argument — counting argv would report `1 path(s)
+processed clean` for an empty directory and a full one alike.
 
 ## Corpus
 
