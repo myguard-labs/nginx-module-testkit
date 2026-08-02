@@ -412,13 +412,34 @@ main(void)
                                         SCHEMA_FILE_FIELD_MAX);
 
         if (schema_file_field_n < 0) {
-            /* "fields" key not found -- treat as zero found, the mismatch
-             * against SCHEMA_N below on the FORWARD side is what fails
-             * loudly in that case already. */
             schema_file_field_n = 0;
         }
     } else {
         schema_file_field_n = 0;
+    }
+
+    /*
+     * Zero extracted fields is a FAILURE, not an empty check set. The reverse
+     * direction exists to catch drift between probe-schema.json and SCHEMA[],
+     * and every way the extraction can come back empty -- file moved or
+     * unreadable, "fields" renamed, the object reshaped -- is itself that
+     * drift. Degrading to "ran no reverse checks, exit 0" would let the one
+     * edit most likely to need this gate be the edit that silently removes it.
+     * Measured before this guard existed: renaming "fields" in the schema
+     * dropped all 26 reverse checks and still exited 0.
+     *
+     * Not folded into the loop below: with a count of 0 that loop body never
+     * runs, so the failure has to be stated outside it, and it has to be in
+     * the plan (hence the +1 in PLANNED) to avoid a ran-vs-planned mismatch.
+     */
+    if (schema_file_field_n <= 0) {
+        printf("1..1\n");
+        printf("not ok 1 - probe-schema.json yields at least one field "
+               "(read %s, \"fields\" object %s)\n",
+               schema_text != NULL ? "ok" : "FAILED",
+               schema_text != NULL ? "missing or unparseable" : "not reached");
+        free(schema_text);
+        return 1;
     }
 
     printf("1..%d\n", PLANNED);
