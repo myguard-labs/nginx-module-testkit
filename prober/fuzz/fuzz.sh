@@ -54,9 +54,12 @@ replay)
         "$CC" -O1 -g -std=c11 $SAN \
             -o "$bin" "fuzz_$t.c" fuzz_standalone.c $LIBPATHS $LDLIBS
         echo "== replay $t =="
-        # A target with an empty corpus dir still runs (the dir exists, readdir
-        # yields nothing, driver reports 0 paths and exits clean); a seed file
-        # that crashes exits nonzero and fails the whole run via set -e.
+        # A target with an empty corpus dir runs (the dir exists, readdir yields
+        # nothing) but the driver counts files actually processed, not argv
+        # entries, so 0 files handed to the target is treated as a failure and
+        # exits nonzero -- an emptied corpus does not get to report clean. A
+        # seed file that crashes also exits nonzero and fails the whole run via
+        # set -e.
         if ! ./"$bin" "corpus/$t"; then
             echo "!! replay $t FAILED" >&2
             rc=1
