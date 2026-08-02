@@ -1264,8 +1264,14 @@ mutate "schema: shm-unmapped zone's return demoted to a fall-through assignment"
 # zone.name JSON escaping. The escape helper converts " and \ to their JSON
 # forms, which is necessary for zone names with special characters. Dropping the
 # call leaves the field unescaped, breaking JSON when the name contains quotes.
-# The zone-name-escaping scenario catches this by verifying the document is
-# valid JSON.
+# The zone-name-escaping scenario catches this: its env configures a real
+# `test_ref_zone` whose name contains a literal quote, backslash and TAB (see
+# that scenario's env), so the mutant's raw %V write both breaks JSON validity
+# (an unescaped " closes the string early) and, even where it happens to
+# still parse, fails the driver's exact round-trip comparison against the
+# known raw name -- not merely "the document is valid JSON" against an absent
+# zone, which is what this scenario checked before the reference module could
+# register one.
 # The escaped result is computed and thrown away rather than the call being
 # deleted outright: deleting it leaves ngx_test_probe_escape_json_string()
 # with no caller, which -Werror=unused-function turns into a build failure

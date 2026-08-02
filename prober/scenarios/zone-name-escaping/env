@@ -1,0 +1,28 @@
+# This is the one scenario that needs a REAL shm zone whose name contains
+# characters ngx_test_probe_escape_json_string() has to escape -- see
+# t/module/ngx_http_test_ref_module.c's file header for why the reference
+# module takes no zone by default and why `test_ref_zone` is the opt-in.
+#
+# PROBER_PROBE overrides mutate-suite-lib.sh's default ("test_ref_probe;"):
+# the probe directive is unchanged, but this scenario ALSO needs
+# `test_ref_zone` in the http block, which only nginx.conf's @PROBE_ZONE@
+# placeholder reaches. PROBER_PROBE_ZONE supplies that.
+#
+# The zone name is an nginx-conf double-quoted string, unescaped by nginx's
+# own lexer (ngx_conf_read_token) before ngx_http_test_ref_zone_directive
+# ever sees it -- this file does not do any escaping of its own, it just
+# writes the nginx-conf source form. It carries, in order:
+#   - a literal double quote                    (\")
+#   - a literal backslash                        (\\)
+#   - a literal ASCII TAB, 0x09                   (\t)
+# which cover all three families ngx_test_probe_escape_json_string switches
+# on: the two characters JSON forbids unescaped (" and \), and a C0 control
+# character that gets the \u00XX form. A literal LF or CR cannot be used here:
+# ngx_conf_read_token treats an embedded (unescaped) newline as an ordinary
+# token character but the shell/heredoc plumbing that gets this string from
+# nginx.conf to the process is not newline-safe across all supported
+# platforms, so \t stands in as the representative control character -- the
+# escape helper does not special-case which control byte it is (see its
+# `c < 0x20` branch), so \t exercises the exact same code path \n or \r would.
+PROBER_PROBE="test_ref_probe;"
+PROBER_PROBE_ZONE='test_ref_zone "a\"b\\c\td" 1m;'
