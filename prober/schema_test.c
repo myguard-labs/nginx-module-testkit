@@ -248,136 +248,58 @@ slurp(const char *path)
 }
 
 /*
- * Pull every dotted field path out of probe-schema.json's "fields" object,
- * in file order, into out[] (capacity max). Returns the count found, or -1
- * if the "fields" key itself is not present (a malformed/renamed file --
- * the FORWARD loop already treats a missing file as a failure per SCHEMA
- * entry, so this only has to handle the "file exists but reshaped" case by
- * returning a count of 0, which fails loudly via schema_file_field_n
- * mismatching what the FORWARD block expects to find).
+ * Pull every field name out of probe-schema.json's "fields" object, in file
+ * order, into out[] (capacity max). Returns the count found, or -1 if the
+ * document does not parse or has no "fields" object.
  *
- * A field path is any quoted string at the start of a line (after leading
- * whitespace) that is immediately followed by `:` and a `{` -- that shape is
- * unique to a field entry in this file; "//", "fields", "closed", "notes"
- * and "version" are keys but none of them has an object value starting with
- * `"type"`, and free-text lines inside "//" or "notes" are quoted strings
- * that are values, not line-leading keys followed by `{`.
+ * This uses the same json.c the prober itself uses rather than scanning the
+ * text. A hand-rolled scanner lived here first and counted raw '{' and '}'
+ * bytes inside field values without treating quoted strings as opaque, so a
+ * '}' inside any string value -- a "note" or a description, the style this
+ * very file already uses -- desynced the depth counter and silently dropped
+ * every field after it. Measured: one injected "closes here }" cut the
+ * reverse sweep from 26 checks to 1 and the suite still exited 0. A gate that
+ * quietly stops checking is worse than no gate, and this repo already links a
+ * parser that gets strings, escapes and nesting right.
  */
 static int
 extract_schema_file_fields(const char *text, char out[][160], int max)
 {
-    const char *fields_kw;
-    const char *p;
-    int         n = 0;
+    const char       *err = NULL;
+    json_value       *root;
+    const json_value *fields;
+    size_t            i;
+    int               n = 0;
 
-    fields_kw = strstr(text, "\"fields\"");
+    root = json_parse(text, &err);
 
-    if (fields_kw == NULL) {
+    if (root == NULL) {
         return -1;
     }
 
-    p = strchr(fields_kw, '{');
+    fields = json_get(root, "fields");
 
-    if (p == NULL) {
+    if (fields == NULL || fields->type != JSON_OBJECT) {
+        json_free(root);
         return -1;
     }
 
-    p++;
+    for (i = 0; i < fields->count && n < max; i++) {
+        size_t len = strlen(fields->keys[i]);
 
-    /*
-     * Depth counts braces from just inside the outer "fields": { -- 0 means
-     * "at the top of the fields object, looking for the next key". Each
-     * field entry's own "{ ... }" value nests one level deeper; the '}' that
-     * closes a per-field object must NOT be read as the end of "fields"
-     * itself (an unquoted value like `true` scanned char-by-char used to
-     * walk straight into that '}' and stop after the first field).
-     */
-    {
-    int depth = 0;
-
-    while (*p != '\0' && n < max) {
-        const char *q;
-        const char *close;
-        size_t      len;
-
-        if (depth == 0) {
-            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
-                p++;
-            }
-        }
-
-        if (*p == '}') {
-            if (depth == 0) {
-                /* end of the "fields" object */
-                break;
-            }
-            depth--;
-            p++;
+        /* A key too long for the buffer is skipped rather than truncated:
+         * a truncated name could spuriously match a shorter SCHEMA[] entry
+         * and turn a real mismatch into a pass. */
+        if (len == 0 || len >= sizeof(out[0])) {
             continue;
         }
 
-        if (depth > 0) {
-            /* Inside a field's value object: track nesting only, don't
-             * look for keys here (a value like "type" is not a field
-             * name). */
-            if (*p == '{') {
-                depth++;
-            }
-            p++;
-            continue;
-        }
-
-        if (*p != '"') {
-            /* not a key at this position (stray comma, etc.) -- skip a
-             * char at a time rather than bailing, so a formatting quirk
-             * doesn't hide every field after it. */
-            p++;
-            continue;
-        }
-
-        q = strchr(p + 1, '"');
-
-        if (q == NULL) {
-            break;
-        }
-
-        len = (size_t) (q - (p + 1));
-
-        /* Confirm this quoted string is a key: next non-space char after
-         * the closing quote must be ':', and the value must open with '{'
-         * (a field entry), not '[' (e.g. the "//" array) or another quote. */
-        close = q + 1;
-
-        while (*close == ' ' || *close == '\t') {
-            close++;
-        }
-
-        if (*close != ':') {
-            p = q + 1;
-            continue;
-        }
-
-        close++;
-
-        while (*close == ' ' || *close == '\t') {
-            close++;
-        }
-
-        if (*close != '{' || len == 0 || len >= sizeof(out[0])) {
-            p = q + 1;
-            continue;
-        }
-
-        memcpy(out[n], p + 1, len);
+        memcpy(out[n], fields->keys[i], len);
         out[n][len] = '\0';
         n++;
+    }
 
-        /* Enter the field's value object: everything until its matching
-         * '}' belongs to the value, not to another key at this level. */
-        depth = 1;
-        p = close + 1;
-    }
-    }
+    json_free(root);
 
     return n;
 }
