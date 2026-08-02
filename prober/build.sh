@@ -46,8 +46,22 @@ CFLAGS="${CFLAGS:--O1 -g -std=c11 $WARN $HARDEN}"
 # gets the same treatment the module under test does.
 if [ "${SAN:-0}" = "1" ]; then
     CFLAGS="$CFLAGS -fsanitize=address,undefined -fno-omit-frame-pointer"
-    # UBSan defaults to printing and continuing, which would let a signed
-    # overflow or a bad shift scroll past in a run that still exits 0.
+    # -fno-sanitize-recover=undefined is what actually enforces halting: it is
+    # a compile-time property baked into the binary, so it survives any
+    # caller that runs the binary without carrying UBSAN_OPTIONS through --
+    # test.sh, mutate.sh and the CI workflow all invoke build.sh's output
+    # without setting it themselves. Without this flag UBSan defaults to
+    # printing and continuing, so every finding in a sanitizer run is
+    # advisory and the run still exits 0.
+    #
+    # The export below is NOT what enforces halting (that used to be the
+    # claim here, and it was wrong: UBSAN_OPTIONS lives in this script's own
+    # process and dies with it, never reaching the test binary in a fresh
+    # shell). It is kept because it still improves the trace when the flag
+    # above does trip: print_stacktrace=1 works whenever a caller's
+    # environment happens to inherit this export, e.g. fuzz.sh re-exports it
+    # itself before replaying a crash.
+    CFLAGS="$CFLAGS -fno-sanitize-recover=undefined"
     export UBSAN_OPTIONS="${UBSAN_OPTIONS:-halt_on_error=1:print_stacktrace=1}"
 fi
 
