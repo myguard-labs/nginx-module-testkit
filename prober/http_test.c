@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  198
+#define PLANNED  197
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -2597,7 +2597,7 @@ main(void)
         echo_result                 er;
         http_recv                   rv;
         int                         rc;
-        long long                   t0, t1, paced_ms;
+        long long                   t0, t1;
 
         memset(&rv, 0, sizeof(rv));
         rv.chunk = 100;
@@ -2608,7 +2608,6 @@ main(void)
                            HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0,
                            HTTP_IDLE_NONE, &er);
         t1 = now_ms();
-        paced_ms = t1 - t0;
 
         ok(rc == 0, "a recv_slow request completes");
 
@@ -2669,26 +2668,37 @@ main(void)
         /*
          * The negative control: the same exchange unpaced must NOT cost what
          * the paced one did, or the assertions above would be measuring the
-         * fixture rather than the pacing.
+         * fixture rather than the pacing. Proved below by two counters the
+         * machine cannot move, deliberately WITHOUT a wall-clock assertion.
          *
-         * Stated RELATIVE to the paced run measured in this same execution, not
-         * against a constant. A fixed wall-clock ceiling reds on a sanitizer
-         * build or a contended runner with nothing wrong -- observed for real
-         * on a scenario-only diff that touches no C. Halving the paced elapsed
-         * is the same claim ("the sleeps dominate") expressed in a unit that
-         * scales with whatever the machine is doing: the four 30 ms sleeps are
-         * the bulk of `paced_ms`, so an unpaced run that reaches half of it did
-         * not skip them. The sibling floor at the top of this block already
-         * uses a derived bound for exactly this reason.
+         * A wall-clock version of this control was tried and reverted twice.
+         * `(t1 - t0) * 2 < paced_ms` (paced elapsed time measured above,
+         * before that variable was removed) was relative rather than a fixed
+         * constant, which fixes the ceiling-side failure mode (a fixed bound
+         * reds on a sanitizer build or a contended runner with nothing
+         * wrong), but a relative comparison of two wall clocks measured at
+         * different times has a failure mode of its own: a stall landing on
+         * the PACED run inflates the paced elapsed time and makes the
+         * comparison easier (load-tolerant, the direction the comment here
+         * used to analyse), but a stall landing on THIS unpaced run inflates
+         * `t1 - t0` and reds the assertion with nothing wrong -- observed for
+         * real (assertion #122, PRs #182 and #185, host load 5.71/6.83 at the
+         * failures, clean at 0.13). Neither direction is fixable by widening
+         * the multiplier: that only trades which stall size still reds, per
+         * [[feedback-widening-shared-timeout-disables-oracle]].
+         *
+         * `er.client_reads == 1` and `er.paced_sleep_ms == 0` below prove the
+         * identical claim -- the unpaced run took the uncapped, unslept path --
+         * from counters `sleep_ms()`'s real return value feeds (see the field
+         * comments in http.h): a mutant cannot satisfy them without actually
+         * skipping the cap and the sleep, and neither counter can be moved by
+         * scheduler noise in either direction. They fully subsume the
+         * wall-clock claim, so there is deliberately no timing assertion here;
+         * re-adding one would be a regression back to a flaky gate.
          */
-        t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
                            HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, 0,
                            HTTP_IDLE_NONE, &er);
-        t1 = now_ms();
-
-        ok(rc == 0 && (t1 - t0) * 2 < paced_ms,
-           "without recv_slow the same response costs well under the paced run");
 
         /*
          * The read-count mirror of the control, and the half of it no load
@@ -2718,14 +2728,12 @@ main(void)
          * entered, so any nonzero total means the client slept for a reason
          * nothing asked it to.
          *
-         * This is what upgrades the elapsed-time control above from load-
-         * TOLERANT to load-IMMUNE. `(t1 - t0) * 2 < paced_ms` compares two wall
-         * clocks, so a stall landing on the PACED run inflates `paced_ms` and
-         * makes the comparison EASIER -- a pacing mechanism broken in exactly
-         * the way it exists to catch could ride that inflation through. Pairing
-         * it with a counter the machine cannot move closes that direction:
-         * together they say the paced run slept and the unpaced one did not,
-         * with neither claim resting on how busy the box was.
+         * Paired with `er.client_reads == 1` above, this is the whole negative
+         * control: together they say the paced run slept and capped its reads
+         * and the unpaced one did neither, with neither claim resting on how
+         * busy the box was. See the comment above the unpaced call for why
+         * that pairing replaced a wall-clock assertion here rather than
+         * supplementing one.
          */
         ok(rc == 0 && er.paced_sleep_ms == 0,
            "without recv_slow the client never sleeps between reads");
