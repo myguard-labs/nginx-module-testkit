@@ -731,10 +731,13 @@ jobs:
           MUT_SUITE_TIMEOUT: "600"
         run: prober/mutate.sh
 
-  # Guard to ensure the mutation_rows flag is present on exactly one scenarios
-  # matrix leg. This prevents silent coverage regressions when the mainline
-  # version is bumped: without this check, a stale if: condition could hide the
-  # fact that mutation rows are no longer running.
+  # The scenario mutation rows in `scenarios` select their leg with
+  # `if: matrix.mutation_rows`, so the flag -- not a version literal -- is the
+  # single source of truth for which leg runs them. That removes the silent-skip
+  # on a version bump, but it moves the failure mode: a leg with no flag at all,
+  # or a flag that drifted onto the angie leg, would again lose the rows with no
+  # red anywhere (MUT_CHECK still reports the anchors live, so the loss is
+  # invisible). This job is the loud failure. It is deliberately build-free.
   mutation-rows-gate:
     runs-on: [self-hosted, builder02, lxc]
     steps:
@@ -742,26 +745,39 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: exactly one scenarios matrix leg has mutation_rows
+      - name: exactly one nginx scenarios matrix leg has mutation_rows
         run: |
-          count=$(python3 -c "
-          import yaml
+          python3 - <<'PY'
+          import sys, yaml
+
           with open('.github/workflows/ci.yml') as f:
               wf = yaml.safe_load(f)
 
-          scenarios_matrix = wf['jobs']['scenarios']['strategy']['matrix']['include']
-          mutation_rows_count = sum(1 for entry in scenarios_matrix if entry.get('mutation_rows'))
-          print(mutation_rows_count)
-          ")
+          legs = wf['jobs']['scenarios']['strategy']['matrix']['include']
+          flagged = [e for e in legs if e.get('mutation_rows')]
 
-          if [ "$count" -ne 1 ]; then
-              echo "ERROR: expected exactly 1 scenarios matrix leg with mutation_rows=true," \
-                   "found $count" >&2
-              echo "" >&2
-              echo "Fix: add 'mutation_rows: true' to the nginx mainline entry in the" \
-                   "scenarios job matrix, then remove it from all other entries." >&2
-              exit 1
-          fi
+          def die(msg):
+              print("ERROR: %s" % msg, file=sys.stderr)
+              print("", file=sys.stderr)
+              print("The scenario mutation rows run on exactly one leg, selected by"
+                    " `mutation_rows: true` (ci.yml, `scenarios` job). They assert"
+                    " oracle behaviour, not flavor differences, so they run on the"
+                    " nginx mainline leg only. If you bumped or reordered the matrix,"
+                    " move the flag with it -- do not drop it and do not put it on the"
+                    " angie leg.", file=sys.stderr)
+              sys.exit(1)
+
+          if len(flagged) != 1:
+              die("expected exactly 1 scenarios matrix leg with mutation_rows: true,"
+                  " found %d" % len(flagged))
+
+          leg = flagged[0]
+          if leg.get('flavor') != 'nginx':
+              die("the mutation_rows flag is on the %r leg; it must be on an nginx leg"
+                  % leg.get('flavor'))
+
+          print("ok: mutation_rows on %s %s" % (leg.get('flavor'), leg.get('version')))
+          PY
 
   header-self-sufficiency:
     runs-on: [self-hosted, builder02, lxc]
