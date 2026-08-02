@@ -121,13 +121,20 @@ while IFS= read -r entry; do
     paths=${entry#*:}
 
     # The function's doc comment (the ~26 lines above its definition) must
-    # actually claim the sentinel discipline in prose -- otherwise the marker
-    # was added to a function that doesn't document why, and the drift this
-    # test exists to catch (code and doc disagreeing) is invisible.
+    # actually claim the sentinel discipline in EXPLANATORY PROSE -- otherwise
+    # the marker was added to a function that doesn't document why, and the
+    # drift this test exists to catch (code and doc disagreeing) is invisible.
+    # The @sentinel-schema marker line itself is excluded from this window:
+    # it contains the literal substring "sentinel" (the marker's own name), so
+    # leaving it in would make the case match below trivially true even for a
+    # function whose comment carries the marker and NOTHING else -- checking
+    # the marker against itself rather than against real prose.
     doc=$(awk -v fn="$func" '
         { buf[NR] = $0 }
         $0 ~ ("^" fn "\\(") {
-            for (i = (NR > 26 ? NR - 26 : 1); i < NR; i++) print buf[i]
+            for (i = (NR > 26 ? NR - 26 : 1); i < NR; i++) {
+                if (buf[i] !~ /@sentinel-schema:/) print buf[i]
+            }
             found = 1
         }
         END { if (!found) exit 1 }
