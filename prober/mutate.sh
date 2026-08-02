@@ -639,6 +639,25 @@ mutate "delta: timers dropped from the sentinel-rejection list" assert.c \
         "smaps.private_dirty",
     };' assert_test
 
+# R-14 follow-up (CodeRabbit, PR #192): sentinel_fields_test.sh's "doc comment
+# claims the discipline" check reads the @sentinel-schema marker's own window,
+# and the marker's name itself contains the substring "sentinel" -- so a
+# function whose comment carries the marker and NO explanatory prose still
+# passed before the marker line was excluded from that window. This mutant
+# strips ngx_test_probe_timer_count()'s explanatory paragraph, leaving only
+# the bare @sentinel-schema marker, and requires sentinel_fields_test.sh to
+# go red rather than read the marker's own name as the prose it is checking
+# for.
+mutate "sentinel doc-comment check: marker alone is not explanatory prose" \
+    ../src/ngx_test_probe.c \
+    ' * -1 on an uninitialised tree rather than 0, sharing the sentinel discipline of
+ * ngx_test_probe_fd_count(): before ngx_event_timer_init() runs, root and
+ * sentinel are both NULL, and reporting that as a genuine zero would let a
+ * delta over it cancel to a passing zero.
+ *
+ * @sentinel-schema: timers' \
+    ' * @sentinel-schema: timers' sentinel_fields_test.sh
+
 # The comparison itself, in both directions. `>=` passes a close that missed the
 # deadline by exactly nothing; inverting it fails every prompt close.
 mutate "close_within: deadline comparison inverted" assert.c \

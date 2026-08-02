@@ -108,6 +108,8 @@ NGX_TEST_PROBE_ABI_PIN(sizeof(ngx_pool_data_t) < sizeof(ngx_pool_t),
  * nothing. Linux-only by construction (/proc/self/fd); elsewhere the field is
  * reported as -1 so a rule asserting on it fails loudly rather than silently
  * comparing against a fabricated zero.
+ *
+ * @sentinel-schema: fds
  */
 static ngx_int_t
 ngx_test_probe_fd_count(void)
@@ -174,6 +176,8 @@ ngx_test_probe_fd_count(void)
  * reported as -1 so a delta over it cannot cancel to a passing zero. A partial
  * count would understate exactly the leak this exists to catch, so it is not
  * reported as a smaller-but-real number.
+ *
+ * @sentinel-schema: fds_by_kind.socket fds_by_kind.file fds_by_kind.anon fds_by_kind.other
  */
 static void
 ngx_test_probe_fd_kinds(ngx_int_t *sockets, ngx_int_t *files, ngx_int_t *anon,
@@ -289,6 +293,8 @@ ngx_test_probe_fd_kinds(ngx_int_t *sockets, ngx_int_t *files, ngx_int_t *anon,
  * and expensive to sum in userspace). It appeared in Linux 4.14; on a kernel or
  * sandbox without it, both fields are -1, the same fail-loud sentinel as fds so
  * a delta cannot cancel to a passing zero.
+ *
+ * @sentinel-schema: smaps.pss smaps.private_dirty
  */
 static void
 ngx_test_probe_smaps(ngx_int_t *pss, ngx_int_t *private_dirty)
@@ -424,6 +430,8 @@ ngx_test_probe_pool_stats(ngx_pool_t *pool, size_t *used, ngx_uint_t *blocks,
  * ngx_test_probe_fd_count(): before ngx_event_timer_init() runs, root and
  * sentinel are both NULL, and reporting that as a genuine zero would let a
  * delta over it cancel to a passing zero.
+ *
+ * @sentinel-schema: timers
  */
 static ngx_int_t
 ngx_test_probe_timer_count(void)
