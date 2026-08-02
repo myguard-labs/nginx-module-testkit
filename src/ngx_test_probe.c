@@ -466,6 +466,14 @@ ngx_test_probe_timer_count(void)
 }
 
 
+/* ngx_test_probe_escape_json_string() depends on nothing but the input bytes
+ * (no ngx_cycle, no slab pool, no /proc), so it lives in ngx_test_probe_arm.c
+ * next to ngx_test_probe_arm() for the same reason that one is split out:
+ * reachability from a direct-call unit harness built against the t/ shim
+ * instead of a configured server. See ngx_test_probe_arm.c and
+ * ngx_test_probe.h for the declaration. */
+
+
 u_char *
 ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
 {
@@ -591,10 +599,12 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
     p = ngx_slprintf(p, last,
                      ",\"zone\":{"
                      "\"present\":true,"
-                     "\"name\":\"%V\","
+                     "\"name\":\"");
+    p = ngx_test_probe_escape_json_string(p, last, &zone->shm.name);
+    p = ngx_slprintf(p, last,
+                     "\","
                      "\"size\":%uz,"
                      "\"slab_pages_free\":%ui",
-                     &zone->shm.name,
                      (size_t) zone->shm.size,
                      pages_free);
 

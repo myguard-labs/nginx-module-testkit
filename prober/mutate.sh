@@ -120,6 +120,90 @@ skipped=0
 # The cache stores the verdict, not just its absence, so a suite proven red is
 # not silently re-run once per row. Build environment is part of the key: a san
 # suite and a plain suite are different programs.
+# refresh_ref_module_for_scenario FILE KIND
+#
+# A mutation to a probe SOURCE file (src/ngx_test_probe*.c/.h) changes what the
+# reference module's .so contains, but ./build.sh only compiles this repo's own
+# C binaries (http_test, rules_test, the prober CLI) -- it never touches
+# t/module's .so. Every scenario suite boots a real server against
+# .build/<flavor>-<version>/objs/ngx_http_test_ref_module.so, staged once by
+# the `scenarios` CI job before this script ever runs, and prober_stale_so_check
+# (lib.sh) bails the moment that artifact's mtime falls behind a probe source
+# it did not just get rebuilt from -- which after a source-mutating row is
+# always, since the patch above is the row's whole mechanism.
+#
+# This is invisible on every row that predates this one: the two other rows
+# that mutate ../src/ngx_test_probe.c (the schema-emitter renames) point at
+# schema_emitter_test.sh, which reads that file as TEXT and never boots a
+# server, so the stale .so is never consulted. This row is the first to pair a
+# probe-source mutation with a suite that drives a live nginx, which is what
+# makes the gap reachable at all.
+#
+# The only place nginx's own Makefile can rebuild that .so is the full source
+# tree the `scenarios` job builds it in ($SRV_DIR, /tmp/srv by default) --
+# .build/<flavor>-<version>/objs is a partial COPY (objs/ only) with no
+# src/core/nginx.h beside it, so a make invoked there fails on the very first
+# relative dependency. /tmp/srv is not passed through any PROBER_* variable;
+# it is CI's own build location for the flavor under test, so it is named
+# directly here (SRV_DIR, overridable for a non-default layout) rather than
+# threaded through ci.yml, which this script does not own.
+#
+# Silently a no-op when the file mutated is not a probe source, when the
+# suite is not a scenario suite, or when SRV_DIR does not exist (a local
+# MUT_KIND=c run, or a consumer repo with no live nginx tree checked out) --
+# in all of those cases either nothing downstream needs the .so refreshed, or
+# there is nothing here capable of refreshing it, and prober_stale_so_check
+# reports the failure on its own terms rather than this silently masking it.
+refresh_ref_module_for_scenario () {
+    local file="$1" kind="$2"
+    local srv_dir="${SRV_DIR:-/tmp/srv}"
+
+    [ "$kind" = "scenario" ] || return 0
+    case "$file" in
+        ../src/ngx_test_probe*.[ch]) ;;
+        *) return 0 ;;
+    esac
+    [ -d "$srv_dir" ] || return 0
+
+    local flavor version build_dir
+    flavor="${SRV_FLAVOR:-nginx}"
+    version="${SRV_VERSION:-1.29.0}"
+    # mutate.sh runs with cwd = prober/ (see the `cd` at the top of this file),
+    # but PROBER_ROOT -- both CI's explicit github.workspace and lib.sh's own
+    # default of `cd ../.. && pwd` from prober/ -- is the REPO ROOT, and that is
+    # where prober_resolve builds PROBER_RESOLVED_BUILD from. Staging under
+    # prober/.build instead of ../.build would rebuild a copy nothing ever
+    # reads, leaving the real staged .so exactly as stale as before.
+    build_dir="../.build/${flavor}-${version}"
+
+    # `file` was just written (mutated, or restored to original) by a plain
+    # `cp`/write a moment ago. On a filesystem with 1s mtime resolution -- the
+    # common case -- that write and this rebuild can land in the same second,
+    # and GNU make treats an EQUAL prerequisite mtime as already up to date, not
+    # stale: `make modules` then no-ops, the .so it "rebuilds" is untouched, and
+    # the stage below copies out the same stale artifact prober_stale_so_check
+    # was about to catch anyway. touch -c (never CREATES a file -- this one must
+    # already exist, mutate() just wrote it) with no reference forces `file`'s
+    # mtime one tick past whatever the .so currently holds, so make's
+    # newer-than check is unambiguous regardless of clock granularity.
+    touch -c "$file"
+
+    if ! ( cd "$srv_dir" && make -j"$(nproc)" modules ) \
+            >"$work/ref-module-rebuild.log" 2>&1; then
+        echo "          reference module rebuild failed after the mutation:"
+        sed -n '1,5p' "$work/ref-module-rebuild.log" | sed 's/^/          /'
+        return 1
+    fi
+
+    mkdir -p "$build_dir/objs"
+    if ! cp "$srv_dir/objs/ngx_http_test_ref_module.so" "$build_dir/objs/" \
+            2>>"$work/ref-module-rebuild.log"; then
+        echo "          could not stage the rebuilt reference module:"
+        sed -n '1,5p' "$work/ref-module-rebuild.log" | sed 's/^/          /'
+        return 1
+    fi
+}
+
 baseline_ok () {
     local suite="$1" buildenv="$2"
     local key stamp rc=0
@@ -258,6 +342,24 @@ PY
         return
     fi
 
+    # The patch above lands in src/, which a scenario suite's live server
+    # reads from a COMPILED .so -- see refresh_ref_module_for_scenario's own
+    # comment for why ./build.sh below cannot be what produces it.
+    if ! refresh_ref_module_for_scenario "$file" "$kind"; then
+        echo "BROKEN  $name -- reference module would not rebuild against the mutant"
+        cp "$work/orig" "$file"
+        MUT_ACTIVE=""
+        if ! refresh_ref_module_for_scenario "$file" "$kind"; then
+            echo "FATAL: the reference module would not rebuild from the RESTORED" \
+                 "(unmutated) source either -- every scenario row after this one" \
+                 "would read a corrupted .so and report BROKEN for reasons that" \
+                 "have nothing to do with its own mutation" >&2
+            exit 1
+        fi
+        broken=$((broken + 1))
+        return
+    fi
+
     # Failure mode 1: without this check a failed build silently re-runs the
     # previous binary, and its red result reads as a caught mutation.
     # SC2086: $buildenv is a set of VAR=value words that env must receive as
@@ -268,6 +370,13 @@ PY
         sed -n '1,3p' "$work/build.log" | sed 's/^/          /'
         cp "$work/orig" "$file"
         MUT_ACTIVE=""
+        if ! refresh_ref_module_for_scenario "$file" "$kind"; then
+            echo "FATAL: the reference module would not rebuild from the RESTORED" \
+                 "(unmutated) source either -- every scenario row after this one" \
+                 "would read a corrupted .so and report BROKEN for reasons that" \
+                 "have nothing to do with its own mutation" >&2
+            exit 1
+        fi
         broken=$((broken + 1))
         return
     fi
@@ -299,6 +408,13 @@ PY
 
     cp "$work/orig" "$file"
     MUT_ACTIVE=""
+    if ! refresh_ref_module_for_scenario "$file" "$kind"; then
+        echo "FATAL: the reference module would not rebuild from the RESTORED" \
+             "(unmutated) source after $name -- every scenario row after this" \
+             "one would read a corrupted .so and report BROKEN for reasons that" \
+             "have nothing to do with its own mutation" >&2
+        exit 1
+    fi
 }
 
 
@@ -1144,6 +1260,63 @@ mutate "schema: shm-unmapped zone's return demoted to a fall-through assignment"
 
     ngx_shmtx_lock(&shpool->mutex);' \
     schema_emitter_test.sh
+
+# zone.name JSON escaping. The escape helper converts " and \ to their JSON
+# forms, which is necessary for zone names with special characters. Dropping the
+# call leaves the field unescaped, breaking JSON when the name contains quotes.
+# The zone-name-escaping scenario catches this: its env configures a real
+# `test_ref_zone` whose name contains a literal quote, backslash and TAB (see
+# that scenario's env), so the mutant's raw %V write both breaks JSON validity
+# (an unescaped " closes the string early) and, even where it happens to
+# still parse, fails the driver's exact round-trip comparison against the
+# known raw name -- not merely "the document is valid JSON" against an absent
+# zone, which is what this scenario checked before the reference module could
+# register one.
+# The escaped result is computed and thrown away rather than the call being
+# deleted outright: deleting it leaves ngx_test_probe_escape_json_string()
+# with no caller, which -Werror=unused-function turns into a build failure
+# for every consumer -- failure mode 1 from this script's own header ("the
+# mutation did not compile"), not a caught mutation. Keeping the call but
+# discarding its result reproduces the exact defect this row exists to catch
+# (the escape helper's output never reaches the document) while the function
+# stays referenced, same trick as the `ms * 0` rows above.
+mutate "probe: zone.name escaping removed" ../src/ngx_test_probe.c \
+    '    p = ngx_test_probe_escape_json_string(p, last, &zone->shm.name);
+    p = ngx_slprintf(p, last,
+                     "\","' \
+    '    (void) ngx_test_probe_escape_json_string(p, last, &zone->shm.name);
+    p = ngx_slprintf(p, last, "%V",  &zone->shm.name);
+    p = ngx_slprintf(p, last,
+                     "\","' \
+    scenarios/zone-name-escaping/mutate-suite.sh
+
+# Short-escape boundary guard. When exactly 1 byte remains in the buffer and
+# the next character needs a 2-byte escape (quote, backslash, or C0 shortcut),
+# the guard `if (p + 2 <= last)` ensures the escape is omitted entirely rather
+# than writing a dangling backslash, which would produce invalid JSON.
+#
+# This used to be checked against the zone-name-escaping scenario, but that
+# scenario's buffer never lands on the exact one-byte-remaining boundary --
+# CI run 30765129992 reported the row SURVIVED against a passing suite, i.e.
+# removing the guard changed nothing observable. probe_escape_json_string_test
+# (t/probe_escape_json_string_test.c) constructs the boundary directly instead
+# of hoping a scenario's buffer sizing happens to hit it: it calls
+# ngx_test_probe_escape_json_string() with `last` set exactly 1 byte past `p`
+# for each of the seven short-escape characters and asserts nothing is
+# written. The C-test binary is built by prober/build.sh's t/*_test.c loop, so
+# it needs no scenario tree and runs under MUT_KIND=c.
+# SC2016: literal source text to match, not shell to expand.
+# SC1003: the mutation strings contain C code with quote/backslash escapes that
+# look odd in shell -- they're meant to be matched and replaced literally in C.
+# shellcheck disable=SC2016,SC1003
+mutate "probe: escape-quote guard removed" ../src/ngx_test_probe_arm.c \
+    '            if (p + 2 <= last) {
+                *p++ = '"'"'\\'"'"';
+                *p++ = '"'"'"'"'"';' \
+    '            {
+                *p++ = '"'"'\\'"'"';
+                *p++ = '"'"'"'"'"';' \
+    ../t/probe_escape_json_string_test
 
 # The reverse sweep's anchor. Without it the needle is a bare suffix match, so
 # a stray member hides behind any declared key ending in the same text --

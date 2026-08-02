@@ -24,10 +24,21 @@
  * documented in the header and exercised by the direct-call unit harness in
  * t/; that is where they belong.
  *
- * For the same reason it takes no shm zone. `test_ref_probe;` is the whole
- * directive, PROBER_PROBE_ZONE stays empty, and the probe reports
+ * By default it takes no shm zone. `test_ref_probe;` is the whole directive,
+ * PROBER_PROBE_ZONE stays empty, and the probe reports
  * "zone": {"present": false} -- which is a legitimate rendering, not a
- * degraded one, and one no scenario currently discriminates on.
+ * degraded one, and is what every scenario except zone-name-escaping relies
+ * on.
+ *
+ * The one exception is `test_ref_zone <name> <size>;` (optional, http-level).
+ * It exists solely so the zone-name-escaping scenario can drive a REAL zone
+ * whose name contains characters ngx_test_probe_escape_json_string() has to
+ * escape, and assert the probe's JSON round-trips that name exactly -- a
+ * `zone.present:false` document never reaches the escape helper at all, so
+ * without this directive that scenario could not fail no matter how broken
+ * the escaping got. When the directive is absent, ngx_http_test_ref_zone
+ * stays NULL and the handler passes NULL to ngx_test_probe_json() exactly as
+ * before -- every other scenario's boot is unaffected.
  *
  * A consuming module (shield, and whatever follows) is the real integration
  * test of the hook API. This one only has to prove the harness can drive a
@@ -46,17 +57,31 @@
 
 static char *ngx_http_test_ref_probe(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_test_ref_zone_directive(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_test_ref_init_zone(ngx_shm_zone_t *shm_zone,
+    void *data);
 static ngx_int_t ngx_http_test_ref_handler(ngx_http_request_t *r);
+
+/*
+ * The zone this module's probe reports, when `test_ref_zone` configured one.
+ * A plain module-global, not a location/main-conf field: the probe handler
+ * runs per-worker and only needs to read the pointer nginx already fixed up
+ * at postconfiguration time, and every scenario conf that uses this directive
+ * declares exactly one zone (see the "is duplicate" guard below), so there is
+ * nothing per-location to disambiguate.
+ */
+static ngx_shm_zone_t  *ngx_http_test_ref_zone = NULL;
 
 
 static ngx_command_t  ngx_http_test_ref_commands[] = {
 
     /*
-     * NGX_CONF_NOARGS: this module takes no zone, so the directive that the
-     * scenario confs put in `location /__probe` is bare. A consumer whose
-     * probe needs a zone declares its own directive with its own argument
-     * spec -- @PROBE@ exists precisely so the scenario tree does not have to
-     * know which shape it is.
+     * NGX_CONF_NOARGS: the directive that the scenario confs put in
+     * `location /__probe` is bare. A consumer whose probe needs a zone
+     * declares its own directive with its own argument spec -- @PROBE@
+     * exists precisely so the scenario tree does not have to know which
+     * shape it is.
      */
     { ngx_string("test_ref_probe"),
       NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
@@ -65,12 +90,33 @@ static ngx_command_t  ngx_http_test_ref_commands[] = {
       0,
       NULL },
 
+    /*
+     * Optional, http-level: `test_ref_zone <name> <size>;`. Only the
+     * zone-name-escaping scenario's conf carries this (via @PROBE_ZONE@);
+     * every other scenario conf leaves it out and ngx_http_test_ref_zone
+     * stays NULL. NGX_CONF_TAKE2 so the name is its own token and can be a
+     * quoted nginx-conf string ("a\"b") -- nginx's own lexer unescapes
+     * \", \\ and control-char escapes before this handler ever sees value[1],
+     * which is what lets the scenario drive a zone name containing a literal
+     * quote, backslash and control character without this module doing any
+     * unescaping itself.
+     */
+    { ngx_string("test_ref_zone"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE2,
+      ngx_http_test_ref_zone_directive,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      0,
+      NULL },
+
       ngx_null_command
 };
 
 
+static ngx_int_t ngx_http_test_ref_preconfiguration(ngx_conf_t *cf);
+
+
 static ngx_http_module_t  ngx_http_test_ref_module_ctx = {
-    NULL,                          /* preconfiguration */
+    ngx_http_test_ref_preconfiguration, /* preconfiguration */
     NULL,                          /* postconfiguration */
     NULL,                          /* create main configuration */
     NULL,                          /* init main configuration */
@@ -95,6 +141,23 @@ ngx_module_t  ngx_http_test_ref_module = {
     NULL,                          /* exit master */
     NGX_MODULE_V1_PADDING
 };
+
+
+/*
+ * Runs once per configuration parse (nginx -t, initial boot, or a reload),
+ * before any command handler in this file. A reload re-parses configuration
+ * in the SAME master process, so the module-global ngx_http_test_ref_zone
+ * would otherwise still point at the previous cycle's zone if the new config
+ * dropped `test_ref_zone` -- resetting it here is what keeps "directive
+ * absent" meaning NULL on every parse, not just the first one.
+ */
+static ngx_int_t
+ngx_http_test_ref_preconfiguration(ngx_conf_t *cf)
+{
+    ngx_http_test_ref_zone = NULL;
+
+    return NGX_OK;
+}
 
 
 static char *
@@ -126,15 +189,88 @@ ngx_http_test_ref_probe(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/*
+ * `test_ref_zone <name> <size>;` -- http-level, optional. Registers a real
+ * shm zone under the given name so the probe can report `zone.present: true`
+ * with that name, for scenarios (currently only zone-name-escaping) that need
+ * to exercise the JSON-escaping path on a name they control. See the file
+ * header for why this exists and why every other scenario is unaffected by
+ * its absence.
+ */
+static char *
+ngx_http_test_ref_zone_directive(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_str_t        *value;
+    ssize_t            size;
+    ngx_shm_zone_t    *shm_zone;
+
+    if (ngx_http_test_ref_zone != NULL) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    size = ngx_parse_size(&value[2]);
+    if (size == NGX_ERROR || size < (ssize_t) (8 * ngx_pagesize)) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                            "invalid test_ref_zone size \"%V\"", &value[2]);
+        return NGX_CONF_ERROR;
+    }
+
+    shm_zone = ngx_shared_memory_add(cf, &value[1], (size_t) size,
+                                      &ngx_http_test_ref_module);
+    if (shm_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (shm_zone->data) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                            "test_ref_zone \"%V\" is already bound",
+                            &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    shm_zone->init = ngx_http_test_ref_init_zone;
+    /*
+     * Nonzero, meaningless data pointer: init_zone below only needs to
+     * allocate the slab pool (ngx_init_zone_pool does that unconditionally,
+     * before init() ever runs), and the probe reads name/size/pfree straight
+     * off shm.addr/shm.size. Duplicate-directive detection above already
+     * covers "already bound"; this is just a marker so a SECOND zone with a
+     * different tag colliding on the same name (ngx_shared_memory_add's own
+     * "already declared for a different use" case) is not this module's
+     * problem to re-check.
+     */
+    shm_zone->data = (void *) 1;
+
+    ngx_http_test_ref_zone = shm_zone;
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * Nothing to initialize beyond the slab pool nginx already sets up in
+ * shm.addr before calling init() -- this module has no per-zone data
+ * structure, only the generic zone.name/zone.size/zone.slab_pages_free the
+ * harness renders from shm.addr/shm.size directly. See ngx_test_probe_json().
+ */
+static ngx_int_t
+ngx_http_test_ref_init_zone(ngx_shm_zone_t *shm_zone, void *data)
+{
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_test_ref_handler(ngx_http_request_t *r)
 {
-    u_char       *last;
-    size_t        len;
+    u_char       *buf, *last;
+    size_t        len, size;
     ngx_int_t     rc;
     ngx_buf_t    *b;
     ngx_chain_t   out;
-    u_char        buf[NGX_TEST_PROBE_JSON_MAX];
 
     if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
         return NGX_HTTP_NOT_ALLOWED;
@@ -159,9 +295,29 @@ ngx_http_test_ref_handler(ngx_http_request_t *r)
      * is the normal answer here and not an error. The probe validates the
      * argument itself; a malformed one arms nothing.
      */
-    (void) ngx_test_probe_arm(NULL, &r->args);
+    (void) ngx_test_probe_arm(ngx_http_test_ref_zone, &r->args);
 
-    last = ngx_test_probe_json(buf, buf + sizeof(buf), NULL);
+    /*
+     * NGX_TEST_PROBE_JSON_MAX covers the generic document. When a zone is
+     * configured its name is rendered too (escaped, so up to 6x its raw
+     * length -- \u00XX is the longest expansion), plus a small margin; a pool
+     * buffer replaces the old fixed stack buffer because that bound is no
+     * longer a compile-time constant once test_ref_zone is in play.
+     * Undersizing truncates the JSON (ngx_slprintf stops at `last`), which
+     * would surface as a parse error, not a wrong escape -- oversize rather
+     * than trim this.
+     */
+    size = NGX_TEST_PROBE_JSON_MAX;
+    if (ngx_http_test_ref_zone != NULL) {
+        size += ngx_http_test_ref_zone->shm.name.len * 6 + 64;
+    }
+
+    buf = ngx_pnalloc(r->pool, size);
+    if (buf == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    last = ngx_test_probe_json(buf, buf + size, ngx_http_test_ref_zone);
     len = (size_t) (last - buf);
 
     r->headers_out.status = NGX_HTTP_OK;

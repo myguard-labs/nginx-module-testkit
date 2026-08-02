@@ -181,6 +181,108 @@ ngx_test_probe_arm(ngx_shm_zone_t *zone, ngx_str_t *args)
     return NGX_DECLINED;
 }
 
+
+/*
+ * Emit a JSON-escaped string into a buffer using ngx_slprintf-style semantics.
+ * The output is surrounded by quotes; the caller provides opening quote context
+ * if needed (e.g. "\"name\":\"" before, and "\"" after for the closing quote).
+ *
+ * RFC 8259 requires these characters to be escaped in JSON strings:
+ * - " (quotation mark)
+ * - \ (backslash)
+ * - C0 control characters (0x00-0x1F)
+ *
+ * This implements the short escape sequences for the most common controls
+ * (\", \\, \b, \f, \n, \r, \t) and \uXXXX for everything else < 0x20.
+ * Characters >= 0x20 are passed through unchanged (supports UTF-8 directly).
+ *
+ * Returns the new buffer position after the escaping.
+ *
+ * Lives here rather than in the renderer (ngx_test_probe.c) because it
+ * depends on nothing but the input bytes -- no ngx_cycle, no slab pool, no
+ * /proc -- the same reachability rationale as ngx_test_probe_arm() above.
+ * Not static for that reason: probe_escape_json_string_test.c calls it
+ * directly against the t/ shim.
+ */
+u_char *
+ngx_test_probe_escape_json_string(u_char *p, u_char *last, const ngx_str_t *str)
+{
+    u_char  c;
+    size_t  i;
+
+    static const u_char  hex[] = "0123456789abcdef";
+
+    for (i = 0; i < str->len && p < last; i++) {
+        c = str->data[i];
+
+        switch (c) {
+        case '"':
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = '"';
+            }
+            break;
+        case '\\':
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = '\\';
+            }
+            break;
+        case '\b':
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = 'b';
+            }
+            break;
+        case '\f':
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = 'f';
+            }
+            break;
+        case '\n':
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = 'n';
+            }
+            break;
+        case '\r':
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = 'r';
+            }
+            break;
+        case '\t':
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = 't';
+            }
+            break;
+        default:
+            if (c < 0x20) {
+                /* C0 control characters (other than those above) get
+                 * \uXXXX escape. */
+                if (p + 6 <= last) {
+                    *p++ = '\\';
+                    *p++ = 'u';
+                    *p++ = '0';
+                    *p++ = '0';
+                    *p++ = hex[(c >> 4) & 0xf];
+                    *p++ = hex[c & 0xf];
+                }
+            } else {
+                /* Printable characters (including UTF-8 continuations)
+                 * are passed through unchanged. */
+                if (p < last) {
+                    *p++ = c;
+                }
+            }
+        }
+    }
+
+    return p;
+}
+
 #else
 
 /* ISO C forbids an empty translation unit, and angie's configure adds -Werror,
