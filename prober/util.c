@@ -241,3 +241,39 @@ append_escaped(unsigned char **buf, size_t *len, size_t *cap, const char *src,
         (*buf)[(*len)++] = c;
     }
 }
+
+
+void
+prober_jstrn(FILE *fp, const char *s, size_t n)
+{
+    size_t i;
+
+    fputc('"', fp);
+
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char) s[i];
+
+        switch (c) {
+        case '"':  fputs("\\\"", fp); break;
+        case '\\': fputs("\\\\", fp); break;
+        case '\n': fputs("\\n", fp);  break;
+        case '\r': fputs("\\r", fp);  break;
+        case '\t': fputs("\\t", fp);  break;
+        default:
+            if (c < 0x20 || c == 0x7f) {
+                fprintf(fp, "\\u%04x", c);
+            } else if (c >= 0x80) {
+                /* Not valid on its own as a single-byte unit under UTF-8
+                 * (see util.h): JSON text must be valid Unicode, so a lone
+                 * high byte gets the same \u00XX escape as a C0 control
+                 * rather than being forwarded raw and breaking every
+                 * consumer's JSON parser. */
+                fprintf(fp, "\\u%04x", c);
+            } else {
+                fputc((int) c, fp);
+            }
+        }
+    }
+
+    fputc('"', fp);
+}

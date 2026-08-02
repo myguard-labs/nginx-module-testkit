@@ -106,7 +106,7 @@ repos:
       - id: semgrep
         name: semgrep (gate on >=WARNING)
         entry: semgrep scan --config p/c --config p/security-audit
-               --severity=WARNING --severity=ERROR --error
+               --severity=WARNING --severity=ERROR --error --jobs=1
         language: system
         files: '^([^/]+\.[ch]|prober/.*\.[ch]|src/.*\.[ch])$'
         pass_filenames: true
