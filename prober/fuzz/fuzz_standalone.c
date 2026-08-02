@@ -192,7 +192,19 @@ main(int argc, char **argv)
         return rc != 0 ? rc : 1;
     }
 
-    fprintf(stderr, "fuzz-replay: %ld file(s) processed clean, rc=%d\n",
-            nfiles, rc);
+    /* "clean" is a claim about the whole replay, so it may only be printed
+     * when rc is 0. A partial corpus -- some files replayed, others
+     * unreadable -- exits nonzero either way, but saying "processed clean"
+     * next to a nonzero rc sends whoever reads the log looking for a crash
+     * that did not happen, when the real fault is the corpus. */
+    if (rc == 0) {
+        fprintf(stderr, "fuzz-replay: %ld file(s) processed clean, rc=0\n",
+                nfiles);
+    } else {
+        fprintf(stderr,
+                "fuzz-replay: %ld file(s) processed, corpus I/O failed on at "
+                "least one path, rc=%d\n", nfiles, rc);
+    }
+
     return rc;
 }
