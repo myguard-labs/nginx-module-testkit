@@ -27,13 +27,13 @@ cd "$(dirname "$0")"
 RULES=rules.c
 README=../README.md
 
-# 30 parser directives + 1 reverse sweep + 10 exclusion pairs + 5 self-checks
+# 30 parser directives + 1 reverse sweep + 10 exclusion pairs + 7 self-checks
 # (ladder extraction, backlog cut, fenced backlog heading, locale letter range,
-# parser not empty).
+# parser not empty, parser gate on EXCLUSIONS, reverse gate on EXCLUSIONS).
 # The per-directive count is not hardcoded anywhere else on purpose (see
 # parser_directives), so a directive added without touching this number fails
 # the plan check at the bottom -- which is the intended nag, not a nuisance.
-PLANNED=47
+PLANNED=49
 tests_run=0
 failures=0
 
@@ -192,6 +192,54 @@ else
     ok 1 "the README teaches directives the parser rejects:$stale"
 fi
 
+# Extract the mutually-exclusive pairs that the parser enforces. The parser's
+# die() messages may span multiple C string literals (line-wrapped), so a naive
+# per-line grep undercounts: "X and Y are mutually exclusive" appears at the end
+# of one literal and continues on the next. This function concatenates adjacent
+# string literals first (removes the '" "' artifact) before extracting, so all
+# pairs are found exactly once.
+#
+# The extraction must be done by a tool that can hold the whole file in one
+# stream -- bash/grep alone cannot join strings across lines reliably. Python's
+# regex engine and its slurp mode handle this naturally.
+parser_exclusions() {
+    python3 << 'PYEOF'
+import re
+import sys
+import os
+
+# Read the entire rules.c file
+rules_file = os.environ.get('RULES_FILE')
+with open(rules_file, 'r') as f:
+    content = f.read()
+
+# Find all die() calls with "mutually exclusive" message.
+# Pattern matches: die("...", allowing for adjacent string literals.
+die_pattern = r'die\s*\(\s*"([^"]*(?:"\s*"[^"]*)*)"\s*,'
+
+pairs = set()
+for match in re.finditer(die_pattern, content, re.MULTILINE):
+    msg = match.group(1)
+    # Remove the artifact from string literal concatenation: '" "' becomes nothing
+    msg = re.sub(r'"\s*"', '', msg)
+
+    # Extract the pair: "X and Y are mutually exclusive"
+    pair_match = re.search(
+        r'(\w+)\s+and\s+(\w+)\s+are\s+mutually\s+exclusive',
+        msg
+    )
+    if pair_match:
+        a, b = pair_match.groups()
+        # Normalize to sorted order for canonical representation
+        pair = tuple(sorted([a, b]))
+        pairs.add(pair)
+
+# Output each pair on one line, sorted for stable order
+for a, b in sorted(pairs):
+    print(f"{a}:{b}")
+PYEOF
+}
+
 # The mutually-exclusive pairs the parser enforces at load time. These are the
 # rules a reader is most likely to hit and least likely to guess: the parser
 # dies, and the README is where the reason lives. Checking the prose exists at
@@ -310,6 +358,47 @@ for pair in $EXCLUSIONS; do
         ok 1 "the README never relates \`$a\` and \`$b\` (they are exclusive)"
     fi
 done
+
+# PARSER GATE: the EXCLUSIONS table is a hand-maintained copy of facts the
+# parser already states in its die() messages. This check ensures that if a new
+# exclusion pair is added to the parser (a new die() call with "are mutually
+# exclusive"), the EXCLUSIONS table will fail until updated. Without this gate,
+# the table drifts silently: an 11th pair could be added to rules.c and the
+# table stays at 10, exactly the drift PR #184 had to fix by hand.
+#
+# The check extracts parser_exclusions by reading the whole rules.c file and
+# joining adjacent string literals (to defeat line-wrapping) before matching.
+# It then compares against the EXCLUSIONS table in this test file. Any parser
+# pair missing from the table fails; any table row missing from the parser is
+# caught by the reverse check below.
+parser_pairs=$(RULES_FILE="$RULES" parser_exclusions "$RULES" | sort)
+
+# Convert EXCLUSIONS table to canonical (sorted) pair format for comparison.
+# Each line is a:b; sort both directives so abort:hold becomes abort:hold,
+# shutdown:abort becomes abort:shutdown (sorted order for canonical form).
+table_pairs=$(printf '%s\n' "$EXCLUSIONS" | grep . \
+    | awk -F: '{print (NF==2 && $1 > $2 ? $2":"$1 : $0)}' \
+    | sort -u | sort)
+
+if [ "$parser_pairs" = "$table_pairs" ]; then
+    ok 0 "EXCLUSIONS table matches all parser exclusion pairs"
+else
+    # Show which pairs are missing from the table
+    missing=$(comm -23 <(printf '%s\n' "$parser_pairs") <(printf '%s\n' "$table_pairs"))
+    ok 1 "EXCLUSIONS table is incomplete (missing from table):$missing"
+fi
+
+# REVERSE GATE: a stale row in the EXCLUSIONS table (a pair that was removed
+# from the parser but left in the table) would be silently ignored by the
+# documentation checks above. This check catches entries that have no
+# corresponding exclusion in rules.c.
+stale_pairs=$(comm -13 <(printf '%s\n' "$parser_pairs") <(printf '%s\n' "$table_pairs"))
+
+if [ -z "$stale_pairs" ]; then
+    ok 0 "EXCLUSIONS table has no stale pairs"
+else
+    ok 1 "EXCLUSIONS table has stale pairs (removed from parser):$stale_pairs"
+fi
 
 # A bracket range spelled with a letter range is a range over COLLATION order,
 # not over ASCII. Under LC_ALL=tr_TR.UTF-8 it stops covering the letters this
