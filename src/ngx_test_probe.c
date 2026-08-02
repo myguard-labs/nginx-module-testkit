@@ -466,6 +466,81 @@ ngx_test_probe_timer_count(void)
 }
 
 
+/*
+ * Emit a JSON-escaped string into a buffer using ngx_slprintf-style semantics.
+ * The output is surrounded by quotes; the caller provides opening quote context
+ * if needed (e.g. "\"name\":\"" before, and "\"" after for the closing quote).
+ *
+ * RFC 8259 requires these characters to be escaped in JSON strings:
+ * - " (quotation mark)
+ * - \ (backslash)
+ * - C0 control characters (0x00-0x1F)
+ *
+ * This implements the short escape sequences for the most common controls
+ * (\", \\, \b, \f, \n, \r, \t) and \uXXXX for everything else < 0x20.
+ * Characters >= 0x20 are passed through unchanged (supports UTF-8 directly).
+ *
+ * Returns the new buffer position after the escaping.
+ */
+static u_char *
+ngx_test_probe_escape_json_string(u_char *p, u_char *last, const ngx_str_t *str)
+{
+    u_char  c;
+    size_t  i;
+
+    static const char  hex[] = "0123456789abcdef";
+
+    for (i = 0; i < str->len && p < last; i++) {
+        c = str->data[i];
+
+        switch (c) {
+        case '"':
+            p = ngx_snprintf(p, last - p, "\\\"");
+            break;
+        case '\\':
+            p = ngx_snprintf(p, last - p, "\\\\");
+            break;
+        case '\b':
+            p = ngx_snprintf(p, last - p, "\\b");
+            break;
+        case '\f':
+            p = ngx_snprintf(p, last - p, "\\f");
+            break;
+        case '\n':
+            p = ngx_snprintf(p, last - p, "\\n");
+            break;
+        case '\r':
+            p = ngx_snprintf(p, last - p, "\\r");
+            break;
+        case '\t':
+            p = ngx_snprintf(p, last - p, "\\t");
+            break;
+        default:
+            if (c < 0x20) {
+                /* C0 control characters (other than those above) get
+                 * \uXXXX escape. */
+                if (p + 6 <= last) {
+                    *p++ = '\\';
+                    *p++ = 'u';
+                    *p++ = '0';
+                    *p++ = '0';
+                    *p++ = hex[(c >> 4) & 0xf];
+                    *p++ = hex[c & 0xf];
+                }
+            } else {
+                /* Printable characters (including UTF-8 continuations)
+                 * are passed through unchanged. */
+                if (p < last) {
+                    *p++ = c;
+                }
+            }
+        }
+    }
+
+    return p;
+}
+
+
 u_char *
 ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
 {
@@ -591,10 +666,12 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
     p = ngx_slprintf(p, last,
                      ",\"zone\":{"
                      "\"present\":true,"
-                     "\"name\":\"%V\","
+                     "\"name\":\"");
+    p = ngx_test_probe_escape_json_string(p, last, &zone->shm.name);
+    p = ngx_slprintf(p, last,
+                     "\","
                      "\"size\":%uz,"
                      "\"slab_pages_free\":%ui",
-                     &zone->shm.name,
                      (size_t) zone->shm.size,
                      pages_free);
 

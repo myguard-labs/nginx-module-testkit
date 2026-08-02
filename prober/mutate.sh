@@ -1145,6 +1145,17 @@ mutate "schema: shm-unmapped zone's return demoted to a fall-through assignment"
     ngx_shmtx_lock(&shpool->mutex);' \
     schema_emitter_test.sh
 
+# zone.name JSON escaping. The escape helper converts " and \ to their JSON
+# forms, which is necessary for zone names with special characters. Dropping the
+# call leaves the field unescaped, breaking JSON when the name contains quotes.
+# The zone-name-escaping scenario catches this by verifying the document is
+# valid JSON.
+mutate "probe: zone.name escaping removed" ../src/ngx_test_probe.c \
+    '    p = ngx_test_probe_escape_json_string(p, last, &zone->shm.name);
+    p = ngx_slprintf(p, last,' \
+    '    p = ngx_slprintf(p, last,' \
+    scenarios/zone-name-escaping/mutate-suite.sh
+
 # The reverse sweep's anchor. Without it the needle is a bare suffix match, so
 # a stray member hides behind any declared key ending in the same text --
 # "pages_free" behind "slab_pages_free" -- and is reported as covered.
