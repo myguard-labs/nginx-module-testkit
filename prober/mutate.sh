@@ -120,6 +120,68 @@ skipped=0
 # The cache stores the verdict, not just its absence, so a suite proven red is
 # not silently re-run once per row. Build environment is part of the key: a san
 # suite and a plain suite are different programs.
+# refresh_ref_module_for_scenario FILE KIND
+#
+# A mutation to a probe SOURCE file (src/ngx_test_probe*.c/.h) changes what the
+# reference module's .so contains, but ./build.sh only compiles this repo's own
+# C binaries (http_test, rules_test, the prober CLI) -- it never touches
+# t/module's .so. Every scenario suite boots a real server against
+# .build/<flavor>-<version>/objs/ngx_http_test_ref_module.so, staged once by
+# the `scenarios` CI job before this script ever runs, and prober_stale_so_check
+# (lib.sh) bails the moment that artifact's mtime falls behind a probe source
+# it did not just get rebuilt from -- which after a source-mutating row is
+# always, since the patch above is the row's whole mechanism.
+#
+# This is invisible on every row that predates this one: the two other rows
+# that mutate ../src/ngx_test_probe.c (the schema-emitter renames) point at
+# schema_emitter_test.sh, which reads that file as TEXT and never boots a
+# server, so the stale .so is never consulted. This row is the first to pair a
+# probe-source mutation with a suite that drives a live nginx, which is what
+# makes the gap reachable at all.
+#
+# The only place nginx's own Makefile can rebuild that .so is the full source
+# tree the `scenarios` job builds it in ($SRV_DIR, /tmp/srv by default) --
+# .build/<flavor>-<version>/objs is a partial COPY (objs/ only) with no
+# src/core/nginx.h beside it, so a make invoked there fails on the very first
+# relative dependency. /tmp/srv is not passed through any PROBER_* variable;
+# it is CI's own build location for the flavor under test, so it is named
+# directly here (SRV_DIR, overridable for a non-default layout) rather than
+# threaded through ci.yml, which this script does not own.
+#
+# Silently a no-op when the file mutated is not a probe source, when the
+# suite is not a scenario suite, or when SRV_DIR does not exist (a local
+# MUT_KIND=c run, or a consumer repo with no live nginx tree checked out) --
+# in all of those cases either nothing downstream needs the .so refreshed, or
+# there is nothing here capable of refreshing it, and prober_stale_so_check
+# reports the failure on its own terms rather than this silently masking it.
+refresh_ref_module_for_scenario () {
+    local file="$1" kind="$2"
+    local srv_dir="${SRV_DIR:-/tmp/srv}"
+
+    [ "$kind" = "scenario" ] || return 0
+    case "$file" in
+        ../src/ngx_test_probe*.[ch]) ;;
+        *) return 0 ;;
+    esac
+    [ -d "$srv_dir" ] || return 0
+
+    local flavor version build_dir
+    flavor="${SRV_FLAVOR:-nginx}"
+    version="${SRV_VERSION:-1.29.0}"
+    build_dir=".build/${flavor}-${version}"
+
+    if ! ( cd "$srv_dir" && make -j"$(nproc)" modules ) \
+            >"$work/ref-module-rebuild.log" 2>&1; then
+        echo "          reference module rebuild failed after the mutation:"
+        sed -n '1,5p' "$work/ref-module-rebuild.log" | sed 's/^/          /'
+        return 1
+    fi
+
+    mkdir -p "$build_dir/objs"
+    cp "$srv_dir/objs/ngx_http_test_ref_module.so" "$build_dir/objs/" \
+        2>>"$work/ref-module-rebuild.log"
+}
+
 baseline_ok () {
     local suite="$1" buildenv="$2"
     local key stamp rc=0
@@ -258,6 +320,18 @@ PY
         return
     fi
 
+    # The patch above lands in src/, which a scenario suite's live server
+    # reads from a COMPILED .so -- see refresh_ref_module_for_scenario's own
+    # comment for why ./build.sh below cannot be what produces it.
+    if ! refresh_ref_module_for_scenario "$file" "$kind"; then
+        echo "BROKEN  $name -- reference module would not rebuild against the mutant"
+        cp "$work/orig" "$file"
+        MUT_ACTIVE=""
+        refresh_ref_module_for_scenario "$file" "$kind" || true
+        broken=$((broken + 1))
+        return
+    fi
+
     # Failure mode 1: without this check a failed build silently re-runs the
     # previous binary, and its red result reads as a caught mutation.
     # SC2086: $buildenv is a set of VAR=value words that env must receive as
@@ -268,6 +342,7 @@ PY
         sed -n '1,3p' "$work/build.log" | sed 's/^/          /'
         cp "$work/orig" "$file"
         MUT_ACTIVE=""
+        refresh_ref_module_for_scenario "$file" "$kind" || true
         broken=$((broken + 1))
         return
     fi
@@ -299,6 +374,7 @@ PY
 
     cp "$work/orig" "$file"
     MUT_ACTIVE=""
+    refresh_ref_module_for_scenario "$file" "$kind" || true
 }
 
 
