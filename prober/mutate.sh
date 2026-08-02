@@ -168,7 +168,13 @@ refresh_ref_module_for_scenario () {
     local flavor version build_dir
     flavor="${SRV_FLAVOR:-nginx}"
     version="${SRV_VERSION:-1.29.0}"
-    build_dir=".build/${flavor}-${version}"
+    # mutate.sh runs with cwd = prober/ (see the `cd` at the top of this file),
+    # but PROBER_ROOT -- both CI's explicit github.workspace and lib.sh's own
+    # default of `cd ../.. && pwd` from prober/ -- is the REPO ROOT, and that is
+    # where prober_resolve builds PROBER_RESOLVED_BUILD from. Staging under
+    # prober/.build instead of ../.build would rebuild a copy nothing ever
+    # reads, leaving the real staged .so exactly as stale as before.
+    build_dir="../.build/${flavor}-${version}"
 
     # `file` was just written (mutated, or restored to original) by a plain
     # `cp`/write a moment ago. On a filesystem with 1s mtime resolution -- the
