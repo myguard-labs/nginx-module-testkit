@@ -495,25 +495,46 @@ ngx_test_probe_escape_json_string(u_char *p, u_char *last, const ngx_str_t *str)
 
         switch (c) {
         case '"':
-            p = ngx_snprintf(p, last - p, "\\\"");
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = '"';
+            }
             break;
         case '\\':
-            p = ngx_snprintf(p, last - p, "\\\\");
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = '\\';
+            }
             break;
         case '\b':
-            p = ngx_snprintf(p, last - p, "\\b");
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = 'b';
+            }
             break;
         case '\f':
-            p = ngx_snprintf(p, last - p, "\\f");
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = 'f';
+            }
             break;
         case '\n':
-            p = ngx_snprintf(p, last - p, "\\n");
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = 'n';
+            }
             break;
         case '\r':
-            p = ngx_snprintf(p, last - p, "\\r");
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = 'r';
+            }
             break;
         case '\t':
-            p = ngx_snprintf(p, last - p, "\\t");
+            if (p + 2 <= last) {
+                *p++ = '\\';
+                *p++ = 't';
+            }
             break;
         default:
             if (c < 0x20) {

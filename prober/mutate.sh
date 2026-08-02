@@ -1290,6 +1290,31 @@ mutate "probe: zone.name escaping removed" ../src/ngx_test_probe.c \
                      "\","' \
     scenarios/zone-name-escaping/mutate-suite.sh
 
+# Short-escape boundary guard. When exactly 1 byte remains in the buffer and
+# the next character needs a 2-byte escape (quote, backslash, or C0 shortcut),
+# the guard `if (p + 2 <= last)` ensures the escape is omitted entirely rather
+# than writing a dangling backslash, which would produce invalid JSON. Removing
+# the guard breaks JSON validity when zone.name contains a special character
+# and the buffer happens to truncate at that exact boundary -- the zone-name-
+# escaping scenario deliberately exercises this by configuring a zone with a
+# quote, backslash, and TAB character.
+# SC2016: literal source text to match, not shell to expand.
+# SC1003: the mutation strings contain C code with quote/backslash escapes that
+# look odd in shell -- they're meant to be matched and replaced literally in C.
+# shellcheck disable=SC2016,SC1003
+mutate "probe: short-escape boundary guard removed" ../src/ngx_test_probe.c \
+    '        case '"'"'"'"'"':
+            if (p + 2 <= last) {
+                *p++ = '"'"'\\'"'"';
+                *p++ = '"'"'"'"'"';
+            }' \
+    '        case '"'"'"'"'"':
+            {
+                *p++ = '"'"'\\'"'"';
+                *p++ = '"'"'"'"'"';
+            }' \
+    scenarios/zone-name-escaping/mutate-suite.sh
+
 # The reverse sweep's anchor. Without it the needle is a bare suffix match, so
 # a stray member hides behind any declared key ending in the same text --
 # "pages_free" behind "slab_pages_free" -- and is reported as covered.
