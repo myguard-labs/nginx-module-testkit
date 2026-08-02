@@ -4351,7 +4351,12 @@ main(void)
         pid_t  tls_pid = spawn_tls_echo(&tls_port);
 
         if (tls_pid < 0) {
-            printf("ok %d - TLS handshake round-trips a request/response "
+            printf("ok %d - TLS handshake completes against a locally "
+                   "spawned TLS server "
+                   "# SKIP no usable OpenSSL server context in this "
+                   "environment\n", ++tests_run);
+            printf("ok %d - a request/response round-trips over the TLS leg "
+                   "with the expected status and body "
                    "# SKIP no usable OpenSSL server context in this "
                    "environment\n", ++tests_run);
             printf("ok %d - http_close clears the TLS side-table slot so a "
