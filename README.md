@@ -2042,8 +2042,8 @@ not a scenario:
   granularity (one `<size>\r\n<data>\r\n` unit per pause, not one arbitrary
   byte-count slice) needs a directive, tracked separately.~~ **GRADUATED:**
   `rules/stock/chunked-trickle.rule` uses the `send_slow_chunks` directive to pace
-  the span at chunked-framing granularity (one complete `<size>\r\n<data>\r\n` unit
-  per pause), shipped in PR #155.
+  the span at chunked-framing granularity (one complete `<hex>[;ext]\r\n<data>\r\n`
+  unit per pause, the terminating `0`-chunk included), shipped in PR #155.
 - **Concurrency as an attack.** ~~Every scenario is sequential.~~ **GRADUATED:**
   the `concurrent N` directive (documented above) issues N requests in flight and
   asserts the same zero deltas, opening the shared-memory/per-worker race class to
