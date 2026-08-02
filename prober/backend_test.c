@@ -191,7 +191,7 @@ test_script_parser(void)
     ok(s.proto == BACKEND_PROTO_MEMCACHED, "proto memcached is parsed");
     ok(s.n_entries == 1, "seed creates one entry");
     {
-        const backend_entry *e = backend_get(&s, "hello");
+        const backend_entry *e = backend_get_cstr(&s, "hello");
         ok(e != NULL && e->value_len == 5 && memcmp(e->value, "world", 5) == 0,
            "seed stores the value verbatim");
     }
@@ -204,7 +204,7 @@ test_script_parser(void)
     /* Escapes in a seed value: a cache client's least-handled input. */
     load_ok(&s, "proto redis\nseed k a\\r\\nb\n");
     {
-        const backend_entry *e = backend_get(&s, "k");
+        const backend_entry *e = backend_get_cstr(&s, "k");
         ok(e != NULL && e->value_len == 4
            && memcmp(e->value, "a\r\nb", 4) == 0,
            "seed value decodes \\r\\n escapes");
@@ -213,7 +213,7 @@ test_script_parser(void)
 
     load_ok(&s, "proto redis\nseed k a\\x00b\n");
     {
-        const backend_entry *e = backend_get(&s, "k");
+        const backend_entry *e = backend_get_cstr(&s, "k");
         ok(e != NULL && e->value_len == 3
            && memcmp(e->value, "a\0b", 3) == 0,
            "seed value carries an embedded NUL");
@@ -227,7 +227,7 @@ test_script_parser(void)
      * script format could not express it at all until now. */
     load_ok(&s, "proto memcached\nseed k \"\"\n");
     {
-        const backend_entry *e = backend_get(&s, "k");
+        const backend_entry *e = backend_get_cstr(&s, "k");
         ok(e != NULL && e->value_len == 0,
            "seed \"\" stores a zero-length value");
     }
@@ -239,7 +239,7 @@ test_script_parser(void)
      * bytes. */
     load_ok(&s, "proto memcached\nseed k \"a\"\n");
     {
-        const backend_entry *e = backend_get(&s, "k");
+        const backend_entry *e = backend_get_cstr(&s, "k");
         ok(e != NULL && e->value_len == 3
            && memcmp(e->value, "\"a\"", 3) == 0,
            "a quoted value keeps its quotes -- only bare \"\" is the marker");
@@ -445,34 +445,34 @@ test_store(void)
 
     load_ok(&s, "proto memcached\n");
 
-    backend_set(&s, "k", (const unsigned char *) "v1", 2);
+    backend_set_cstr(&s, "k", (const unsigned char *) "v1", 2);
     ok(s.n_entries == 1, "set creates an entry");
 
     /* Overwrite in place: without the existing-key scan first, a second set
      * would take a free slot and leave two entries with one name. */
-    backend_set(&s, "k", (const unsigned char *) "v2", 2);
+    backend_set_cstr(&s, "k", (const unsigned char *) "v2", 2);
     ok(s.n_entries == 1, "setting an existing key does not add an entry");
     {
-        const backend_entry *e = backend_get(&s, "k");
+        const backend_entry *e = backend_get_cstr(&s, "k");
         ok(e != NULL && e->value_len == 2 && memcmp(e->value, "v2", 2) == 0,
            "setting an existing key overwrites its value");
     }
 
-    ok(backend_get(&s, "absent") == NULL, "get on a missing key returns NULL");
+    ok(backend_get_cstr(&s, "absent") == NULL, "get on a missing key returns NULL");
 
-    ok(backend_delete(&s, "k") == 1, "delete reports the key was present");
-    ok(backend_get(&s, "k") == NULL, "delete removes the key");
-    ok(backend_delete(&s, "k") == 0, "delete reports a missing key");
+    ok(backend_delete_cstr(&s, "k") == 1, "delete reports the key was present");
+    ok(backend_get_cstr(&s, "k") == NULL, "delete removes the key");
+    ok(backend_delete_cstr(&s, "k") == 0, "delete reports a missing key");
 
-    backend_set(&s, "a", (const unsigned char *) "1", 1);
-    backend_set(&s, "b", (const unsigned char *) "2", 1);
+    backend_set_cstr(&s, "a", (const unsigned char *) "1", 1);
+    backend_set_cstr(&s, "b", (const unsigned char *) "2", 1);
     backend_flush_all(&s);
-    ok(s.n_entries == 0 && backend_get(&s, "a") == NULL,
+    ok(s.n_entries == 0 && backend_get_cstr(&s, "a") == NULL,
        "flush_all empties the store");
 
     /*
      * An over-limit key or value off the WIRE must be refused, not fatal.
-     * backend_set() die()s -- correct for a .backend authoring mistake, fatal
+     * backend_set_cstr() die()s -- correct for a .backend authoring mistake, fatal
      * in the wrong sense for input a peer controls: fakesrv is one process
      * behind every connection in a scenario, so a module sending a 300-byte key
      * used to exit the daemon and take every other live connection with it.
@@ -490,21 +490,21 @@ test_store(void)
         bigkey[sizeof(bigkey) - 1] = '\0';
         memset(bigval, 'B', sizeof(bigval));
 
-        ok(backend_set_checked(&s, bigkey, (const unsigned char *) "v", 1) != 0,
+        ok(backend_set_checked_cstr(&s, bigkey, (const unsigned char *) "v", 1) != 0,
            "a key over BACKEND_MAX_KEY is refused rather than fatal");
-        ok(s.n_entries == before && backend_get(&s, bigkey) == NULL,
+        ok(s.n_entries == before && backend_get_cstr(&s, bigkey) == NULL,
            "a refused over-long key leaves the store untouched");
 
-        ok(backend_set_checked(&s, "okkey", bigval, sizeof(bigval)) != 0,
+        ok(backend_set_checked_cstr(&s, "okkey", bigval, sizeof(bigval)) != 0,
            "a value over BACKEND_MAX_VALUE is refused rather than fatal");
-        ok(s.n_entries == before && backend_get(&s, "okkey") == NULL,
+        ok(s.n_entries == before && backend_get_cstr(&s, "okkey") == NULL,
            "a refused over-long value leaves the store untouched");
 
-        ok(backend_set_checked(&s, "okkey", (const unsigned char *) "v", 1) == 0
-           && backend_get(&s, "okkey") != NULL,
+        ok(backend_set_checked_cstr(&s, "okkey", (const unsigned char *) "v", 1) == 0
+           && backend_get_cstr(&s, "okkey") != NULL,
            "the checked store still accepts a key and value within limits");
 
-        backend_delete(&s, "okkey");
+        backend_delete_cstr(&s, "okkey");
 
         /* Capacity exhaustion is the third refusal reason and is reachable from
          * the wire (a peer sending BACKEND_MAX_ENTRIES distinct keys), so it
@@ -519,7 +519,7 @@ test_store(void)
 
             for (i = 0; i < BACKEND_MAX_ENTRIES; i++) {
                 snprintf(k, sizeof(k), "fill%zu", i);
-                if (backend_set_checked(&s, k, (const unsigned char *) "v", 1)
+                if (backend_set_checked_cstr(&s, k, (const unsigned char *) "v", 1)
                     != 0)
                 {
                     filled_ok = 0;
@@ -530,15 +530,15 @@ test_store(void)
             ok(filled_ok == 1 && s.n_entries == BACKEND_MAX_ENTRIES,
                "the checked store accepts exactly BACKEND_MAX_ENTRIES keys");
 
-            ok(backend_set_checked(&s, "onemore",
+            ok(backend_set_checked_cstr(&s, "onemore",
                                    (const unsigned char *) "v", 1) != 0
-               && backend_get(&s, "onemore") == NULL,
+               && backend_get_cstr(&s, "onemore") == NULL,
                "a full store refuses the next key rather than exiting");
 
             /* An overwrite must still succeed at capacity: it takes the
              * existing slot, so refusing it would break every scenario that
              * re-sets a seeded key. */
-            ok(backend_set_checked(&s, "fill0",
+            ok(backend_set_checked_cstr(&s, "fill0",
                                    (const unsigned char *) "w", 1) == 0,
                "a full store still accepts an overwrite of an existing key");
 
@@ -548,9 +548,9 @@ test_store(void)
 
     /* A value with an embedded NUL survives, since the store is length-based
      * rather than NUL-terminated -- the shape a cache client mishandles. */
-    backend_set(&s, "n", (const unsigned char *) "a\0b", 3);
+    backend_set_cstr(&s, "n", (const unsigned char *) "a\0b", 3);
     {
-        const backend_entry *e = backend_get(&s, "n");
+        const backend_entry *e = backend_get_cstr(&s, "n");
         ok(e != NULL && e->value_len == 3 && memcmp(e->value, "a\0b", 3) == 0,
            "a value containing NUL is stored by length");
     }
@@ -572,24 +572,24 @@ test_store(void)
 
         backend_flush_all(&s);
 
-        ok(backend_set_checked_n(&s, "a\0x", 3,
+        ok(backend_set_checked(&s, "a\0x", 3,
                                  (const unsigned char *) "1", 1) == 0
-           && backend_set_checked_n(&s, "a\0y", 3,
+           && backend_set_checked(&s, "a\0y", 3,
                                     (const unsigned char *) "2", 1) == 0
            && s.n_entries == 2,
            "two keys differing only after a NUL are two entries");
 
-        e = backend_get_n(&s, "a\0x", 3);
+        e = backend_get(&s, "a\0x", 3);
         ok(e != NULL && e->key_len == 3 && memcmp(e->key, "a\0x", 3) == 0
            && e->value_len == 1 && e->value[0] == '1',
            "a binary key is stored whole and finds its own value");
 
-        ok(backend_get_n(&s, "a", 1) == NULL,
+        ok(backend_get(&s, "a", 1) == NULL,
            "a key is not found by a prefix of itself");
 
         before = s.n_entries;
-        ok(backend_delete_n(&s, "a\0x", 3) == 1 && s.n_entries == before - 1
-           && backend_get_n(&s, "a\0y", 3) != NULL,
+        ok(backend_delete(&s, "a\0x", 3) == 1 && s.n_entries == before - 1
+           && backend_get(&s, "a\0y", 3) != NULL,
            "deleting a binary key leaves its NUL-sharing neighbour alone");
 
         backend_flush_all(&s);
@@ -803,7 +803,7 @@ test_memcached_codec(void)
         ok(out != NULL && out_len == 41
            && memcmp(out, "SERVER_ERROR object too large for cache\r\n", 41) == 0,
            "memcached set with an over-long key answers SERVER_ERROR, not STORED");
-        ok(backend_get(&s, big) == NULL,
+        ok(backend_get_cstr(&s, big) == NULL,
            "the refused memcached set stored nothing");
         free(out);
     }
@@ -972,7 +972,7 @@ test_resp_codec(void)
         free(out);
 
         {
-            const backend_entry *e = backend_get(&s, "k");
+            const backend_entry *e = backend_get_cstr(&s, "k");
             ok(e != NULL && e->value_len == 1 && e->value[0] == 'v',
                "a RESP set actually stores the value");
         }
@@ -1000,7 +1000,7 @@ test_resp_codec(void)
         ok(out != NULL && out_len == 22
            && memcmp(out, "-ERR value too large\r\n", 22) == 0,
            "a RESP set with an over-long key answers -ERR, not +OK");
-        ok(backend_get(&s, big) == NULL, "the refused RESP set stored nothing");
+        ok(backend_get_cstr(&s, big) == NULL, "the refused RESP set stored nothing");
         free(out);
     }
 
@@ -1023,7 +1023,7 @@ test_resp_codec(void)
 
         backend_reply_resp(&s, &cmd, &out, &out_len);
         free(out);
-        e = backend_get(&s, "binkey");
+        e = backend_get_cstr(&s, "binkey");
         ok(e != NULL && e->value_len == 3
            && memcmp(e->value, "a\x00""b", 3) == 0,
            "a RESP set stores the full binary value, NUL included");
@@ -1110,7 +1110,7 @@ test_resp_codec(void)
 
         REPLAY(del_x);
         ok(out_len == 4 && memcmp(out, ":1\r\n", 4) == 0
-           && s.n_entries == 1 && backend_get_n(&s, "a\0y", 3) != NULL,
+           && s.n_entries == 1 && backend_get(&s, "a\0y", 3) != NULL,
            "a RESP del of a binary key removes only that key");
         free(out);  /* nosem: double-free */
 
