@@ -1437,7 +1437,7 @@ only so the harness can be proven end to end.
 ```sh
 # Fetch nginx, unpack it, build with the module, stage objs/ where prober_resolve expects it
 mkdir -p /tmp/srv && cd /tmp/srv
-curl -fsSL -o srv.tar.gz 'http://nginx.org/download/nginx-1.29.0.tar.gz'
+curl -fsSL -o srv.tar.gz 'https://nginx.org/download/nginx-1.29.0.tar.gz'
 tar -xzf srv.tar.gz --strip-components=1
 ./configure --with-compat --add-dynamic-module="$HARNESS_ROOT/t/module"
 make -j"$(nproc)"
@@ -2361,7 +2361,7 @@ bisecting a build race). Default: parallel, all compiles launched at once.
 **`PROBER_PROBE_TIMEOUT` (optional)**
 
 Wall-clock seconds to wait for each probe request to complete before killing it.
-The harness reads from the probe's UNIX socket to collect the JSON response;
+The harness reads the JSON response from the probe's TCP connection;
 a stalling probe is bounded by this timeout so the suite never hangs. Default: 2 seconds.
 
 **`PROBER_PROBE_ATTEMPTS` (optional)**
