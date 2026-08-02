@@ -241,3 +241,41 @@ append_escaped(unsigned char **buf, size_t *len, size_t *cap, const char *src,
         (*buf)[(*len)++] = c;
     }
 }
+
+
+void
+prober_jstrn(FILE *fp, const char *s, size_t n)
+{
+    size_t i;
+
+    fputc('"', fp);
+
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char) s[i];
+
+        switch (c) {
+        case '"':  fputs("\\\"", fp); break;
+        case '\\': fputs("\\\\", fp); break;
+        case '\n': fputs("\\n", fp);  break;
+        case '\r': fputs("\\r", fp);  break;
+        case '\t': fputs("\\t", fp);  break;
+        default:
+            /* c >= 0x80 is not valid on its own as a single-byte unit
+             * under UTF-8 (see util.h): JSON text must be valid Unicode,
+             * so a lone high byte gets the same \u00XX escape as a C0
+             * control rather than being forwarded raw and breaking every
+             * consumer's JSON parser. Folded into one condition with the
+             * C0/DEL case (rather than a separate `else if`) because both
+             * arms emit byte-identical output -- clang-tidy's
+             * bugprone-branch-clone flags the split as a repeated branch
+             * body, and this repo's analyzers job runs -warnings-as-errors. */
+            if (c < 0x20 || c == 0x7f || c >= 0x80) {
+                fprintf(fp, "\\u%04x", c);
+            } else {
+                fputc((int) c, fp);
+            }
+        }
+    }
+
+    fputc('"', fp);
+}

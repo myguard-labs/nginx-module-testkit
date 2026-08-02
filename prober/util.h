@@ -12,6 +12,7 @@
 #include <setjmp.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <time.h>
 
 /*
@@ -120,5 +121,32 @@ int64_t prober_timespec_ms(const struct timespec *ts);
  */
 void append_escaped(unsigned char **buf, size_t *len, size_t *cap,
                     const char *src, const char *where);
+
+/*
+ * Write `n` bytes of `s` to `fp` as a double-quoted JSON string, escaping
+ * whatever JSON forbids. Length-delimited rather than NUL-delimited: `s` is a
+ * RESP argument, which is binary-safe and may contain embedded NULs, so
+ * iterating to strlen() would silently truncate the record.
+ *
+ * `s` is a client's wire bytes, so this has to hold for anything a byte can
+ * be, not just the ASCII a hand test happens to try. Two classes need
+ * escaping: JSON's own syntax (quote, backslash, C0 controls) and the byte
+ * values 0x80-0xff. Those are never valid on their own as a single-byte
+ * unit under UTF-8 (continuation bytes 0x80-0xbf need a preceding lead byte;
+ * 0xf8-0xff are not assigned at all), and JSON text is required to be valid
+ * Unicode -- RFC 8259 SS8.1. A RESP command is not itself required to be
+ * UTF-8, so a lone high byte (e.g. 0xC0 from an attacker-chosen argument)
+ * must not be forwarded as if it already were. `\u00XX` on the raw byte
+ * value is the honest, lossless rendering: a decoder gets back the exact
+ * byte, and the line stays valid JSON either way, which is the point --
+ * the journal is documented as JSONL and every consumer is entitled to
+ * `jq` it without a byte in the input breaking that contract.
+ *
+ * Split out from fakesrv.c's jlog()/jstr() so it is reachable from a test
+ * binary: fakesrv.c has a main() and links into no test binary (same
+ * reasoning as prober_monotonic_ms() versus fakesrv.c's now_ms() wrapper,
+ * above).
+ */
+void prober_jstrn(FILE *fp, const char *s, size_t n);
 
 #endif /* NGX_TEST_HARNESS_UTIL_H */

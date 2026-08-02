@@ -1318,6 +1318,26 @@ mutate "probe: escape-quote guard removed" ../src/ngx_test_probe_arm.c \
                 *p++ = '"'"'"'"'"';' \
     ../t/probe_escape_json_string_test
 
+# High-byte journal escaping. prober_jstrn() (util.c, shared with fakesrv.c's
+# jstrn()/jstr()) must \u00XX-escape any byte >= 0x80: a lone high byte is
+# never valid on its own under UTF-8 (0x80-0xbf are continuation-only,
+# 0xf8-0xff unassigned), and RFC 8259 SS8.1 requires JSON text to be valid
+# Unicode. Dropping the `else if (c >= 0x80)` branch forwards such a byte
+# raw, so the journal line stops parsing as JSON for any RESP argument
+# containing one -- a contract the journal's own docs promise ("JSONL") and
+# that jstrn_test.c pins directly rather than through a scenario: no
+# scenario in this repo drives an arbitrary raw byte through a RESP argument
+# on its own (a scenario is free-form text describing traffic, not raw wire
+# bytes), so a scenario row here would be checking whether one HAPPENS to
+# contain a stray high byte rather than proving the escaper handles one --
+# the exact vacuous-row mistake flagged in the C-vs-scenario note above.
+# jstrn_test is built by prober/build.sh's *_test.c discovery loop, so this
+# runs under MUT_KIND=c.
+mutate "util: high-byte journal escaping removed" util.c \
+    '            if (c < 0x20 || c == 0x7f || c >= 0x80) {' \
+    '            if (c < 0x20 || c == 0x7f) {' \
+    jstrn_test
+
 # The reverse sweep's anchor. Without it the needle is a bare suffix match, so
 # a stray member hides behind any declared key ending in the same text --
 # "pages_free" behind "slab_pages_free" -- and is reported as covered.

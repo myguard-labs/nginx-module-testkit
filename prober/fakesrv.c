@@ -197,39 +197,19 @@ jlog(const char *fmt, ...)
 }
 
 
-/* JSON string escaping for journal fields. Values come from a client's wire
- * bytes, so a quote or a control character in a key must not be able to break
- * out of the record and forge a field. */
+/*
+ * JSON string escaping for journal fields. Values come from a client's wire
+ * bytes, so a quote, control character or non-UTF-8 byte in a key must not be
+ * able to break out of the record, forge a field, or hand a downstream `jq`
+ * an invalid JSONL line. The escaper itself lives in util.c as
+ * prober_jstrn() -- same reasoning as now_ms() above: this file has a
+ * main() and links into no test binary, so a self-test can only reach the
+ * escaping logic if it lives somewhere else.
+ */
 static void
 jstrn(FILE *fp, const char *s, size_t n)
 {
-    size_t i;
-
-    fputc('"', fp);
-
-    /* Length-delimited, not NUL-delimited: a RESP argument is binary-safe and
-     * may contain embedded NULs, so iterating to strlen would truncate the
-     * journal at the first one and hide exactly the adversarial byte a scenario
-     * is trying to prove the module handled. */
-    for (i = 0; i < n; i++) {
-        unsigned char c = (unsigned char) s[i];
-
-        switch (c) {
-        case '"':  fputs("\\\"", fp); break;
-        case '\\': fputs("\\\\", fp); break;
-        case '\n': fputs("\\n", fp);  break;
-        case '\r': fputs("\\r", fp);  break;
-        case '\t': fputs("\\t", fp);  break;
-        default:
-            if (c < 0x20 || c == 0x7f) {
-                fprintf(fp, "\\u%04x", c);
-            } else {
-                fputc((int) c, fp);
-            }
-        }
-    }
-
-    fputc('"', fp);
+    prober_jstrn(fp, s, n);
 }
 
 
