@@ -1,0 +1,7 @@
+# Scenario: deploy-canary
+#
+# On a shared runner, a concurrent job may hold a port in the 1813x/1814x range,
+# causing bind() to fail with [emerg] Address already in use. This is not a fault
+# the scenario exists to detect (worker death, real config faults), so exempt it.
+# A genuine [emerg] that is NOT a port collision still reds the log scan.
+export PROBER_ALLOW_LOG='Address already in use'
