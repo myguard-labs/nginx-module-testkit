@@ -1334,12 +1334,8 @@ mutate "probe: escape-quote guard removed" ../src/ngx_test_probe_arm.c \
 # jstrn_test is built by prober/build.sh's *_test.c discovery loop, so this
 # runs under MUT_KIND=c.
 mutate "util: high-byte journal escaping removed" util.c \
-    '            if (c < 0x20 || c == 0x7f) {
-                fprintf(fp, "\\u%04x", c);
-            } else if (c >= 0x80) {' \
-    '            if (c < 0x20 || c == 0x7f) {
-                fprintf(fp, "\\u%04x", c);
-            } else if (0) {' \
+    '            if (c < 0x20 || c == 0x7f || c >= 0x80) {' \
+    '            if (c < 0x20 || c == 0x7f) {' \
     jstrn_test
 
 # The reverse sweep's anchor. Without it the needle is a bare suffix match, so
