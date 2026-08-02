@@ -114,16 +114,15 @@ Concretely:
   Instrumenting nginx core here spends our CI budget re-testing someone else's
   code, and every finding it could produce is a finding for upstream, not for
   this repo.
-- **No ASan/UBSan legs in this repo's CI.** Not on nginx, and not on our own
-  binary either. The sanitizer legs cost multi-minute wall-clock on a shared
-  builder and were a steady source of flakes; the selftest suites, the
-  mutation gates, and the scenario oracles are what actually prove this tool
-  works. Decided 2026-07-28, removed from `ci.yml` 2026-07-30 — the decision
-  sat in this file for two days while the legs kept running, so a red
-  sanitizer job was still gating PRs against a rule that had already retired
-  it. The one remaining `SAN=1` build in CI is the `hygiene` job's
-  gitignore-drift check, which reports no sanitizer findings; see the comment
-  there.
+- **ASan/UBSan coverage:** No sanitizer instrumentation on nginx itself (the
+  `selftest`, `scenario`, and mutation gates do not compile nginx under ASan/UBSan).
+  The parser fuzz targets run deterministic replay under gcc + ASan/UBSan on every
+  PR (`fuzz-replay` job) to catch memory safety issues in the rule parser; this is
+  a Decided policy, not a gap. The sanitizer legs for the main prober binary and
+  the full test suite were removed 2026-07-30 — they cost multi-minute wall-clock
+  on the shared builder and were a steady source of flakes. The selftest suites,
+  the mutation gates, and the scenario oracles are what actually prove the tool
+  works; parser memory safety is proven separately by fuzz-replay.
 
 The known cost of that last rule, recorded so nobody has to rediscover it:
 `prober/rules.c` and `prober/json.c` are parsers, and dropping the sanitizer
@@ -676,13 +675,26 @@ burn a worker on a slow reader.
 The two directives only work as a pair. With the default receive buffer the
 kernel absorbs a modest response whole, so `recv_slow` alone delays when the
 *prober* sees the bytes while the server never blocks — nothing is under test.
-`so_rcvbuf` is what makes the stall reach the far end. Note the kernel doubles
-the requested size and enforces its own floor, so the effective window is not the
-number given; assert on behaviour, never on the size. See
-`rules/stock/slow-reader.rule`.
+`so_rcvbuf` is what makes the stall reach the far end.
+
+**Constraints:**
+- `so_rcvbuf` range: 128..1,048,576 bytes. The kernel enforces a minimum, so
+  values below 128 are rejected at rule load time (not silently absorbed).
+  `so_rcvbuf` may appear only once per case and only in the first block of a
+  pipelined case — it is a connection property set when the connection opens,
+  so a later block's value would never take effect.
+- `recv_slow` chunk range: 1..4,096 bytes per read. This paces the read loop
+  on the client side.
+- `recv_slow` delay range: 1..10,000 ms between chunks.
+
+Note the kernel doubles the requested `so_rcvbuf` size and enforces its own
+floor, so the effective window is not the number given; assert on behaviour,
+never on the size.
 
 `recv_slow` is mutually exclusive with `abort` and `hold` — neither reads the
 connection at all, so pacing their reads would pace nothing.
+
+See `rules/stock/slow-reader.rule` for a working example.
 
 `pid_may_change` relaxes the worker-survival oracle for one case, from "the same
 worker answered both probe reads" to "the worker answering now is still a child
@@ -1152,7 +1164,7 @@ The rules:
 **5. Check the rules parse, without a server:**
 
 ```sh
-prober/prober --check rules/*.rule
+prober/prober --check prober/rules/stock/*.rule
 # 12 cases parsed from 3 rule files
 ```
 
@@ -1329,7 +1341,7 @@ scenarios/conn-delta/
 
 Every conf template — a scenario's `nginx.conf` or the single-run
 `$PROBER_CONF` — is rendered through the same substitution pass before the
-server sees it. Six placeholders are recognized, and nothing else is: a
+server sees it. Seven placeholders are recognized, and nothing else is: a
 template containing an unknown `@NAME@` reaches nginx with the literal text
 intact, which `render_conf_test.sh` fails on rather than leaving to be
 discovered as a parse error.
@@ -1337,6 +1349,7 @@ discovered as a parse error.
 | Placeholder | Supplied by | Expands to |
 |---|---|---|
 | `@LOAD@` | harness | The `load_module` line for a dynamic build; empty when the module is linked statically (asan/coverage builds) |
+| `@BUILD_OBJS@` | harness | Path to the build tree's `objs/` directory — used in consumer confs to reference pre-built objects |
 | `@PORT@` | harness | `$PROBER_PORT` (default `18099`) |
 | `@PREFIX@` | harness | The per-run `mktemp -d` prefix — `pid` and `error_log` must be written under it |
 | `@PROBE@` | **consumer** (`PROBER_PROBE`) | The body of the `/__probe` location: the module's probe directive |
@@ -1422,10 +1435,17 @@ module uses, and it is documented in `src/ngx_test_probe.h`. This one exists
 only so the harness can be proven end to end.
 
 ```sh
-./configure --with-compat --add-dynamic-module=t/module
+# Fetch nginx, unpack it, build with the module, stage objs/ where prober_resolve expects it
+mkdir -p /tmp/srv && cd /tmp/srv
+curl -fsSL -o srv.tar.gz 'https://nginx.org/download/nginx-1.29.0.tar.gz'
+tar -xzf srv.tar.gz --strip-components=1
+./configure --with-compat --add-dynamic-module="$HARNESS_ROOT/t/module"
 make -j"$(nproc)"
-mkdir -p .build/nginx-1.29.0 && cp -r objs .build/nginx-1.29.0/
+mkdir -p "$HARNESS_ROOT/.build/nginx-1.29.0"
+cp -r objs "$HARNESS_ROOT/.build/nginx-1.29.0/"
 
+# Run scenarios against the built module
+cd "$HARNESS_ROOT"
 PROBER_ROOT="$PWD" \
 PROBER_MODULE=ngx_http_test_ref_module.so \
 PROBER_DIRECTIVE=test_ref_probe \
@@ -1865,15 +1885,15 @@ a lingering `.oldbin` is a stuck upgrade. Runs under `PROBER_DAEMON_MODE=on`: US
 is silently dropped under `daemon off` (see `check_conf` and the fake-upstream USR2
 notes), so the boot contract demands a daemonized master tracked by its pidfile.
 
-### Running scenarios under valgrind (weekly)
+### Running scenarios under valgrind (optional)
 
 Every scenario asserts fd/pool deltas through the probe's own accounting --
 real, but blind to a leaked `malloc` the probe never had a counter for, a
 one-time startup leak no delta catches, or a read of freed memory that
 happens not to corrupt anything the assertions look at. `valgrind --tool=
 memcheck` catches that class directly, at the cost of running the whole
-worker 20-50x slower -- too slow for the fast PR gate, cheap enough for a
-weekly job.
+worker 20-50x slower -- too slow for the fast PR gate, but feasible in an
+optional separate job (e.g. scheduled weekly in a consumer's CI).
 
 The gate is **belt and suspenders**, not exit-code-only, because memcheck's
 own default behaviour makes exit-code-only a vacuous check: it reports every
@@ -1907,14 +1927,15 @@ own nginx-version pin and the harness submodule pin) is a fourth thing to
 drift, for a template short enough to copy-paste and read in one sitting:
 
 ```yaml
-name: valgrind (weekly)
+# Consumer template: schedule a valgrind job in your own CI (optional).
+# Stagger off the hour and off other heavy jobs sharing a runner, since
+# a shared self-hosted box cannot absorb several heavy crons at once.
+
+name: valgrind (optional)
 
 on:
   schedule:
-    # Staggered off the hour and off other weekly jobs sharing this runner --
-    # see this repo's own scheduled-job comments for why a shared self-hosted
-    # box cannot absorb several heavy crons landing at once.
-    - cron: '17 3 * * 1'   # Monday 03:17 UTC
+    - cron: '17 3 * * 1'   # Monday 03:17 UTC; adjust for your schedule
   workflow_dispatch:
 
 jobs:
@@ -1947,29 +1968,29 @@ jobs:
 
 ### PR-lane counterpart: `prober/pr-memcheck`
 
-`valgrind-scenarios.sh` is the **weekly** whole-server memcheck. Its PR-lane
-counterpart is `prober/pr-memcheck` (P2-F): it consumes `verify-impact`'s
-diff-selected targets and runs only the **direct-callable** ones (the unit test
-binaries and fuzz targets a change actually touched) under
-`--leak-check=full --errors-for-leak-kinds=definite --track-origins=yes`, inside
-a 45 s outer budget, so a PR pays seconds for its own targets' leak +
-uninitialised-read surface instead of minutes for the whole tree.
+`valgrind-scenarios.sh` is the optional whole-server memcheck (run as a scheduled
+job in a consumer's CI, not in this repo). Its PR-lane counterpart is
+`prober/pr-memcheck` (P2-F): it consumes `verify-impact`'s diff-selected targets
+and runs only the **direct-callable** ones (the unit test binaries and fuzz targets
+a change actually touched) under `--leak-check=full --errors-for-leak-kinds=definite
+--track-origins=yes`, inside a 45 s outer budget, so a PR pays seconds for its own
+targets' leak + uninitialised-read surface instead of minutes for the whole tree.
 
 ```sh
-prober/pr-memcheck --base <merge-base-sha>   # self-test (pr_memcheck_test.sh) runs in the selftest job; the adapter itself is not yet wired into a PR-lane CI job
+prober/pr-memcheck --base <merge-base-sha>   # local-only tool; self-test (pr_memcheck_test.sh) runs in the selftest job, but the adapter is not wired into a PR-lane CI job
 ```
 
 It **refuses** any selected target that needs a full nginx boot (a `scenarios/*`
 row) rather than blow the budget on it, and the refusal names both where that
 coverage does live — the native scenario oracles on the PR path
-(`test-scenarios.sh`) and the weekly memcheck owner (`valgrind-scenarios.sh`) —
+(`test-scenarios.sh`) and the optional whole-server memcheck (`valgrind-scenarios.sh`) —
 so an expensive check is never silently skipped. The fd-leak class stays with
-the weekly whole-server run deliberately: `pr-memcheck` does **not** pass
-`--track-fds`, because the forking `expect_die` unit binaries inherit the
-parent's temp-file descriptor into each short-lived child, which `--track-fds`
-would report as a leak in every one. `prober/pr_memcheck_test.sh` proves the
-memcheck verdict, the refusal (with a blanked-oracle negative control), the
-budget refusal and the empty-selection path are all non-vacuous.
+the optional whole-server run: `pr-memcheck` does **not** pass `--track-fds`,
+because the forking `expect_die` unit binaries inherit the parent's temp-file
+descriptor into each short-lived child, which `--track-fds` would report as a leak
+in every one. `prober/pr_memcheck_test.sh` proves the memcheck verdict, the refusal
+(with a blanked-oracle negative control), the budget refusal and the empty-selection
+path are all non-vacuous.
 
 ## Ideas and opportunities — ways to break a module we do not yet try
 
@@ -2048,8 +2069,8 @@ into a generator of concrete adversarial scenarios instead of a number to chase.
 
 **Sharper oracles on what we already do.**
 
-- The `delta` oracles pin fds, pool bytes and slab. A module can still leak in
-  places nothing snapshots — timers, cleanup handlers, resolver state. Each is
+- The `delta` oracles pin fds, pool bytes, slab and timers. A module can still
+  leak in places nothing snapshots — cleanup handlers, resolver state. Each is
   a probe field somebody has to add before an oracle can assert on it.
 
 If you have a way to break a module that is not on this list, that is the most
@@ -2077,7 +2098,9 @@ prober/fakesrv -script mc.backend -listen 127.0.0.1:0 \
 
 `-listen …:0` binds an ephemeral port and writes the real one to `-portfile`
 (atomically, before the first `accept()`, so a polling shell can never read it
-half-written).
+half-written). `-journal` is the JSONL event log (documented below). `-errfile`
+is an optional file where fakesrv's fatal errors are written (used by the harness
+to report backend startup failures).
 
 ### Script format
 
@@ -2124,9 +2147,15 @@ fires on a connection that has gone quiet.
 | `rst` | — | TCP reset instead of a reply |
 | `accept_close` | — | accept, then close without reading |
 | `drip` | `bytes=<n> ms=<n>` | correct reply, N bytes at a time |
-| `close_after` | `ms=<n>` | close this long after the connection goes idle |
+| `close_after` | `ms=<n>` | close this long after the connection goes idle (only for `on=idle`, unrelated to `close_after` in other faults) |
 | `raw` | `data=<bytes>` | send these exact bytes instead |
 | `cursor_never_zero` | — | RESP `SCAN` that never terminates |
+
+**`on=idle` threshold:** A connection that goes quiet for longer than the idle
+threshold fires the `on=idle` fault. The threshold is controlled by fakesrv's
+`-idle-ms` flag (default: 50 ms). The harness does not currently pass `-idle-ms`
+to fakesrv, so all `on=idle` faults use the 50 ms default. To use a different
+threshold, modify the backend script or the harness invocation.
 
 `raw` carries most of the adversarial surface — embedded NULs, oversize declared
 lengths, a reply when none was due, `$-1` nil against a malformed near-miss. It
@@ -2310,6 +2339,63 @@ The `&r->args` parse the HTTP query string for fault directives (e.g.,
 `?fault_slab=5`). The return value is ignorable — both `NGX_OK` and
 `NGX_DECLINED` are success. The timing matters: call `arm()` *before*
 rendering the snapshot, so the response reflects the armed state.
+
+## Runtime environment variables
+
+Beyond the consumer contract above, several environment variables tune the harness's
+behavior:
+
+**`PROBER_BUILD` (optional)**
+
+Explicit path to the build tree containing the `.so` under test. By default,
+`prober_resolve` constructs it from `$PROBER_ROOT/.build/<flavor>-<version>`.
+Set this to override the path — e.g., when using multiple build trees or
+testing a pre-built `.so` from another location.
+
+**`PROBER_BUILD_JOBS` (optional)**
+
+Controls parallelism during the prober binary's own compilation. Set to `1` to
+force serial compilation (useful on tiny or heavily-loaded runners, or when
+bisecting a build race). Default: parallel, all compiles launched at once.
+
+**`PROBER_PROBE_TIMEOUT` (optional)**
+
+Wall-clock seconds to wait for each probe request to complete before killing it.
+The harness reads the JSON response from the probe's TCP connection;
+a stalling probe is bounded by this timeout so the suite never hangs. Default: 2 seconds.
+
+**`PROBER_PROBE_ATTEMPTS` (optional)**
+
+Number of consecutive probe requests to attempt before bailing on a server boot.
+Each attempt is spaced 100ms apart to give the server time to stabilize.
+Default: 3 attempts.
+
+**`PROBER_TIMEOUT_SCALE` (optional)**
+
+Multiplicative scale factor for all timing budgets throughout the harness: probe
+timeouts, boot waits, reachability checks. A value of 2 doubles all timeouts
+(e.g., 2-second probes become 4 seconds). Useful on slow runners or systems
+under load. Constraints: must be a positive integer in the range 1..1000.
+Default: 1 (no scaling).
+
+**`PROBER_SCENARIO_JOBS` (optional)**
+
+Number of scenarios to run in parallel. Default: CPU core count (from
+`getconf _NPROCESSORS_ONLN`). Set to 1 for serial scenario runs, or to limit
+parallelism on resource-constrained systems.
+
+**`PROBER_SCENARIO_PORT_BASE` (optional)**
+
+Base port number for parallel scenario runs. Scenario `N` (0-indexed) listens on
+`PORT_BASE + N`, so slots do not collide on concurrent runs.
+Default: 18120. Increase this if the default range conflicts with other services.
+
+**`PROBER_TIMEOUT_SCALE` contract mismatch**
+
+Note: `PROBER_TIMEOUT_SCALE` has two documented contracts that may differ:
+`lib.sh:55` enforces 1..1000 and bails outside this range, while `prober.c:327`
+silently falls back to 1 if the value is invalid or unset. This asymmetry should
+be resolved (both should validate the same way).
 
 ## Writing a C unit test (the runner convention)
 
