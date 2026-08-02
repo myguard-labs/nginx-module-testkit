@@ -25,13 +25,14 @@ mission above is what the tool does to a consumer's module; the rule below is
 what our CI proves about our own code. We develop a probe TOOL for nginx, not an
 nginx MODULE. The thing
 under test is our own code: the prober binary, its rule parser, the probe's JSON
-emitter, the shell plumbing. nginx is the fixture, never the subject. So: no
-ASan/UBSan legs in this repo's CI — not on nginx, and not on our own binary
-either (decided 2026-07-28; `SAN=1 prober/test.sh` remains available for a
-one-off local run when a parser bug is suspected). No valgrind on nginx, no
-whole-server fuzzing, no nginx benchmarking. Fuzzing our OWN parser stays in
-scope. Do not add a sanitizer job back without the user asking for it. Full
-rationale + the known cost → README "What this repo is — and what it is not".
+emitter, the shell plumbing. nginx is the fixture, never the subject. So: the
+parser runs under ASan/UBSan deterministically on every PR (`fuzz-replay` job);
+nginx and the main prober binary do not (decided 2026-07-28, implemented 2026-07-30).
+`SAN=1 prober/test.sh` remains available for one-off local runs when a parser bug
+is suspected. No valgrind on nginx, no whole-server fuzzing, no nginx benchmarking.
+Fuzzing our OWN parser stays in scope. Do not add a sanitizer job back without the
+user asking for it. Full rationale + the known cost → README "What this repo is — and
+what it is not".
 
 **DO NOT ADD A TEST HERE THAT THE PERL SUITE CAN ALREADY DO.** A consuming
 module has `Test::Nginx::Socket` and its own `.t` files, and that is the right
@@ -69,7 +70,8 @@ Working notes for this repo live OUTSIDE it, at
 
 ```
 cd prober && ./build.sh                 # the prober + its unit tests
-prober/test.sh                          # full local gate, 26 suites
+prober/test.sh                          # full local gate, 28 suites
+# Optional local tools (not wired into CI):
 prober/verify-impact --explain          # what a diff selects (omit --base for the working tree)
 prober/pr-impact --budget 90            # actually run the selected fast lane
 ```
@@ -94,8 +96,13 @@ SC2034 on variables the library consumes. Use the form above.
 - **`set -euo pipefail` everywhere.** An unguarded `$(cmd)` whose non-match is
   legitimate will kill a TAP suite mid-stream, which reads as a pass to anything
   counting `not ok`. Guard with `|| true`.
-- **Local runs need a free port:** `PROBER_PORT=<free>`; 18099 is a hardcoded
-  default that collides with concurrent CI on this shared box.
+- **Scenario port allocation:** `test-scenarios.sh` runs at core count by default
+  (`PROBER_SCENARIO_JOBS`), assigning each slot a unique port offset from the base
+  (`PROBER_SCENARIO_PORT_BASE`, default 18120): `PROBER_PORT=$((PORT_BASE + slot))`.
+  Single-scenario runs use a hardcoded default of 18099 (`PROBER_PORT`); to avoid
+  collisions in concurrent CI on a shared box, either set `PROBER_PORT=<free>` for
+  single runs or set `PROBER_SCENARIO_PORT_BASE=<free_base>` and
+  `PROBER_SCENARIO_JOBS=<count>` for multi-scenario runs.
 - **A stale reference `.so` fakes flavor-specific failures.** Check its mtime
   against `src/ngx_test_probe.c` before believing any local scenario red.
 - Own nginx modules are BSD-2-Clause.

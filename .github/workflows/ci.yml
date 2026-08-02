@@ -864,9 +864,8 @@ jobs:
       # step regenerates into a temp dir and diffs, so a hand-edit fails here
       # with the diff printed rather than rotting.
       #
-      # It lives in the `shell` job, not the opt-in `consumers` job below,
-      # because it needs no nginx build: it is a pure text check and belongs on
-      # every PR.
+      # It lives in the `shell` job because it needs no nginx build: it is a
+      # pure text check and belongs on every PR.
       - name: generated consumer scenarios are up to date
         run: tools/gen-consumer-scenarios.sh --check
 
