@@ -1733,6 +1733,34 @@ mutate "backend: RESP trailing garbage read as incomplete" backend.c \
     if (argc < 1 || argc > BACKEND_MAX_ARGS) {' \
     backend_test
 
+# ---- the monotonic clock ----------------------------------------------------
+
+# The clock feeds every fakesrv deadline, and it is int64_t because `long` is
+# 32 bits under -m32 (the arch-32bit leg builds and RUNS these suites), where
+# tv_sec * 1000 wraps NEGATIVE after ~24.9 days of host uptime and the
+# `close_at_ms >= 0` sentinel then reads the deadline as disarmed. That WIDTH
+# cannot be mutated usefully here: on an LP64 build long IS int64_t, so
+# reverting the type changes nothing a plain-arch suite can observe. The
+# endpoint rows in util_test.c are its pin, and arch-32bit.yml is its oracle.
+# What follows mutates the VALUE, which is arch-independent.
+mutate "clock: the sub-second part is dropped" util.c \
+    'return (int64_t) ts->tv_sec * 1000 + (int64_t) ts->tv_nsec / 1000000;' \
+    'return (int64_t) ts->tv_sec * 1000 + (int64_t) ts->tv_nsec / 1000000000;' \
+    util_test
+
+mutate "clock: seconds are not scaled to milliseconds" util.c \
+    '(int64_t) ts->tv_sec * 1000 +' \
+    '(int64_t) ts->tv_sec * 1 +' \
+    util_test
+
+# The syscall path must be wired to the conversion. Returning the failure
+# sentinel unconditionally makes every deadline in the daemon arm at zero.
+mutate "clock: the monotonic reading is always the failure sentinel" util.c \
+    '    return prober_timespec_ms(&ts);' \
+    '    return 0 * prober_timespec_ms(&ts);' \
+    util_test
+
+
 # ---- fake backend: the daemon ----------------------------------------------
 
 # The atomic portfile. Writing in place is visible to a polling shell as a

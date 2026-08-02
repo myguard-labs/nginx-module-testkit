@@ -2,7 +2,7 @@
  * Copyright (C) 2026 Thijs Eilander
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * util_test.c -- TAP self-test for xstrtol().
+ * util_test.c -- TAP self-test for xstrtol() and the monotonic clock.
  *
  * xstrtol() replaced atoi() on the -p and -t flags, and it exists for one
  * reason: atoi() reports a conversion error the same way it reports a genuine
@@ -33,10 +33,28 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  14
+#define PLANNED  24
 
 static int  tests_run = 0;
 static int  failures = 0;
+
+
+/*
+ * prober_timespec_ms() on a hand-built timespec. The fields are assigned rather
+ * than brace-initialised because struct timespec's member ORDER is not fixed by
+ * the standard, and a positional initialiser that silently swaps them would
+ * make every clock row below assert the wrong thing while still passing.
+ */
+static int64_t
+ms_of(time_t sec, long nsec)
+{
+    struct timespec ts;
+
+    ts.tv_sec = sec;
+    ts.tv_nsec = nsec;
+
+    return prober_timespec_ms(&ts);
+}
 
 
 static void
@@ -215,6 +233,52 @@ main(void)
             "a value past LONG_MAX is refused");
     rejects("-99999999999999999999999", "out of range",
             "a value past LONG_MIN is refused");
+
+    /*
+     * The clock. The conversion is exact and truncating, and the ENDPOINTS are
+     * what these rows exist for: every value past INT32_MAX milliseconds
+     * overflows a 32-bit long, which is what util.h's header describes and what
+     * the arch-32bit workflow is the only leg able to execute. A test host is
+     * never up for 24.9 days mid-run, so the wrap cannot be reached by reading
+     * the real clock -- the timespec is handed in instead.
+     *
+     * These are CONTRACT PINS, not regression rows: on an LP64 build they pass
+     * with the pre-fix `long` code too, because there long IS 64 bits. Reverting
+     * the type is caught under -m32 and by nothing here. The value rows below
+     * (truncation, the seconds-to-ms scale) are what a plain-arch mutation can
+     * kill.
+     */
+    ok(ms_of(0, 0) == 0, "clock: a zero timespec is zero ms");
+    ok(ms_of(1, 0) == 1000, "clock: seconds are scaled to ms");
+    ok(ms_of(0, 999999999) == 999, "clock: the sub-second part is carried");
+    ok(ms_of(0, 1999999) == 1, "clock: nanoseconds truncate, they do not round");
+
+    /* INT32_MAX ms is 2147483.647 s of uptime. The three rows walk across it. */
+    ok(ms_of(2147483, 0) == INT64_C(2147483000),
+       "clock: just under INT32_MAX ms is exact");
+    ok(ms_of(2147483, 648000000) == INT64_C(2147483648),
+       "clock: the first ms past INT32_MAX is exact, not negative");
+    ok(ms_of(2147484, 0) == INT64_C(2147484000),
+       "clock: a 24.9-day uptime does not wrap");
+
+    /* Past UINT32_MAX ms as well, so an unsigned 32-bit type is excluded too. */
+    ok(ms_of(4294968, 0) == INT64_C(4294968000),
+       "clock: a 49.7-day uptime does not wrap");
+
+    {
+        int64_t a = prober_monotonic_ms();
+        int64_t b = prober_monotonic_ms();
+
+        /*
+         * Weak on purpose: the value is an unspecified epoch, so the only
+         * things assertable without a second clock are that it advances in one
+         * direction and that the syscall path is wired to the conversion at
+         * all. A zero would mean clock_gettime failed -- or that the body was
+         * replaced by its error return.
+         */
+        ok(a > 0, "clock: the monotonic reading is not the failure sentinel");
+        ok(b >= a, "clock: successive readings do not go backwards");
+    }
 
     if (tests_run != PLANNED) {
         printf("# planned %d tests but ran %d\n", PLANNED, tests_run);

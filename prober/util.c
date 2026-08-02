@@ -58,8 +58,16 @@ die(const char *fmt, ...)
      * which is how a suppression becomes a permanently red gate nobody can
      * explain.
      */
+    /*
+     * flawfinder rates any vfprintf level 4 on the assumption the format may
+     * be attacker-influenced. It cannot be here: die() is
+     * __attribute__((format(printf, 1, 2))) and build.sh compiles with
+     * -Wformat=2, whose -Wformat-nonliteral arm makes a non-literal format at
+     * any call site a BUILD failure under -Werror. The gate is the compiler,
+     * not a convention, so the finding is suppressed rather than carried.
+     */
     /* NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized) */
-    vfprintf(stderr, fmt, ap);
+    vfprintf(stderr, fmt, ap);  /* flawfinder: ignore */
 #pragma GCC diagnostic pop
 
     fprintf(stderr, "\n");
@@ -139,6 +147,36 @@ xstrtol(const char *s, const char *what)
     }
 
     return v;
+}
+
+
+int64_t
+prober_timespec_ms(const struct timespec *ts)
+{
+    /*
+     * The cast is on tv_sec, not on the product: tv_sec is time_t, which is
+     * 32 bits on an ILP32 target, so multiplying first and widening after
+     * would overflow exactly where this function exists to not overflow.
+     */
+    return (int64_t) ts->tv_sec * 1000 + (int64_t) ts->tv_nsec / 1000000;
+}
+
+
+int64_t
+prober_monotonic_ms(void)
+{
+    struct timespec ts;
+
+    /*
+     * CLOCK_MONOTONIC, not the wall clock: one of the scenarios this clock
+     * serves drives libfaketime, and a fault deadline measured on a clock the
+     * test is deliberately moving would fire at a time nobody asked for.
+     */
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+
+    return prober_timespec_ms(&ts);
 }
 
 
