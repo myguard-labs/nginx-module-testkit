@@ -48,7 +48,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  202
+#define PLANNED  203
 
 /* Ceiling on spawn_barrier()'s connection array. Sized for the fixtures here,
  * not for MAX_CONCURRENT: the barrier holds every connection open at once in a
@@ -4377,8 +4377,12 @@ main(void)
                    "with the expected status and body "
                    "# SKIP no usable OpenSSL server context in this "
                    "environment\n", ++tests_run);
-            printf("ok %d - http_close clears the TLS side-table slot so a "
-                   "reused fd does not inherit a stale SSL* "
+            printf("ok %d - a second TLS connection is established after "
+                   "the first is closed "
+                   "# SKIP no usable OpenSSL server context in this "
+                   "environment\n", ++tests_run);
+            printf("ok %d - the closed fd is handed back by the kernel for "
+                   "the second connection "
                    "# SKIP no usable OpenSSL server context in this "
                    "environment\n", ++tests_run);
             printf("ok %d - a second, independent TLS connection also "
@@ -4422,8 +4426,19 @@ main(void)
                                    HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0,
                                    &resp, NULL, errbuf, sizeof(errbuf));
 
+                /* Content assertion, not a byte-count one: SPAWN_REPLY's
+                 * body is the repeating "0123...63" digit run, so the body
+                 * the client received must END in that same run regardless
+                 * of how many header bytes precede it -- a header edit that
+                 * changes SPAWN_REPLY_LEN must not turn this red. */
+#define SPAWN_REPLY_BODY_TAIL  "67890123456789012345678901234567890123456789012"
                 ok(rc == 0 && resp.status == 200
-                   && resp.body_len == SPAWN_REPLY_LEN - 45,
+                   && resp.body_len > sizeof(SPAWN_REPLY_BODY_TAIL) - 1
+                   && resp.body != NULL
+                   && memcmp(resp.body + resp.body_len
+                                       - (sizeof(SPAWN_REPLY_BODY_TAIL) - 1),
+                             SPAWN_REPLY_BODY_TAIL,
+                             sizeof(SPAWN_REPLY_BODY_TAIL) - 1) == 0,
                    "a request/response round-trips over the TLS leg with "
                    "the expected status and body");
 
@@ -4460,8 +4475,17 @@ main(void)
             second_fd = http_connect("127.0.0.1", tls_port, 5000, NULL, NULL,
                                      &tls_on, errbuf, sizeof(errbuf));
 
-            ok(second_fd >= 0, "http_close clears the TLS side-table slot so "
-                               "a reused fd does not inherit a stale SSL*");
+            ok(second_fd >= 0, "a second TLS connection is established after "
+                               "the first is closed");
+
+            /* Separate, clearly-labelled observation carrying the reuse
+             * claim: the kernel hands the lowest free fd back first, so if
+             * http_close() actually removed first_fd from the fd table this
+             * is normally == first_fd. This does NOT by itself prove the
+             * TLS side-table slot was cleared -- see the comment above for
+             * why that real proof is the ASan-backed round-trip below. */
+            ok(second_fd == first_fd, "the closed fd is handed back by the "
+                                      "kernel for the second connection");
 
             if (second_fd >= 0) {
                 memset(&resp, 0, sizeof(resp));
