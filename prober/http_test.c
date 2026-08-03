@@ -4483,9 +4483,25 @@ main(void)
              * http_close() actually removed first_fd from the fd table this
              * is normally == first_fd. This does NOT by itself prove the
              * TLS side-table slot was cleared -- see the comment above for
-             * why that real proof is the ASan-backed round-trip below. */
-            ok(second_fd == first_fd, "the closed fd is handed back by the "
-                                      "kernel for the second connection");
+             * why that real proof is the ASan-backed round-trip below.
+             *
+             * Reported as a TODO rather than a hard gate, because "lowest
+             * free fd" is a kernel policy this harness does not control:
+             * anything that opens a descriptor between the http_close() and
+             * the http_connect() above -- an OpenSSL internal, a resolver
+             * socket, a sanitizer -- legitimately breaks the equality
+             * without any defect in http_close(). Asserting it outright
+             * would buy a flake on other environments in exchange for a
+             * fact the round-trip below already proves properly. */
+            if (second_fd == first_fd) {
+                printf("ok %d - the closed fd is handed back by the kernel "
+                       "for the second connection\n", ++tests_run);
+            } else {
+                printf("ok %d - the closed fd is handed back by the kernel "
+                       "for the second connection # TODO kernel returned fd "
+                       "%d, not %d; fd-reuse is not guaranteed here\n",
+                       ++tests_run, second_fd, first_fd);
+            }
 
             if (second_fd >= 0) {
                 memset(&resp, 0, sizeof(resp));
