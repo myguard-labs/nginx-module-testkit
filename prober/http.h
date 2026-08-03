@@ -371,6 +371,32 @@ const char *http_json_sort_reason(int status);
 
 
 /*
+ * Optional TLS on a connection. This is not a general TLS client -- it is
+ * enough transport to point the same raw-socket exchange machinery at a TLS
+ * listener, because T-1 needs the mockeagain/D1-shaped requires-gate SKIP leg
+ * to have something to gate on. Every existing caller passes NULL here and
+ * gets exactly the plaintext behaviour it always had; nothing about this
+ * struct changes a single byte on the plaintext path.
+ *
+ * `enable` is the on/off switch rather than a NULL http_tls* meaning "off" and
+ * a non-NULL one meaning "on", because a zeroed struct (the natural thing a
+ * caller builds with a plain initializer) must not accidentally turn TLS on.
+ *
+ * `verify` selects certificate verification and defaults to OFF (0) -- see the
+ * long comment beside its use in http_connect() in http.c for why: this client
+ * is not a security boundary, it is a test harness deliberately pointed at a
+ * local fixture serving a self-signed certificate, and the whole point of the
+ * TLS leg is to reach that fixture's handshake, not to validate a PKI. Set it
+ * to 1 to ask OpenSSL to verify the peer against the default trust store,
+ * which a rule exercising a REAL certificate (not this harness's normal case)
+ * can opt into.
+ */
+typedef struct {
+    int  enable;
+    int  verify;
+} http_tls;
+
+/*
  * Connect to host:port, write req_len bytes verbatim, read until the peer
  * closes or timeout_ms elapses, and parse the status line.
  *
@@ -633,6 +659,7 @@ int http_framed_state(const char *buf, size_t len, size_t *resp_len);
  */
 int http_connect(const char *host, int port, int timeout_ms,
                  const char *source, const http_recv *recv_opt,
+                 const http_tls *tls_opt,
                  char *errbuf, size_t errlen);
 
 /*
@@ -729,6 +756,7 @@ int http_request(const char *host, int port,
                  int shut_how, size_t abort_at, long hold_ms,
                  const http_recv *recv_opt, int want_close,
                  long idle_ms, int framed,
+                 const http_tls *tls_opt,
                  http_response *resp,
                  char *errbuf, size_t errlen);
 

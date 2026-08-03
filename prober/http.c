@@ -30,6 +30,9 @@
 #include <unistd.h>
 #include <zlib.h>
 
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+
 
 void
 http_response_free(http_response *resp)
@@ -658,20 +661,439 @@ http_json_sort(http_response *resp)
 
 
 /*
+ * TLS side table: fd -> SSL*, for the optional transport in http.h's
+ * `http_tls`.
+ *
+ * The public API is deliberately still a bare `int fd` -- see http.h's comment
+ * on `http_tls` for why rewriting it to a struct is out of scope -- so a TLS
+ * connection needs somewhere else to keep its SSL object. A fixed-size linear
+ * table is fine because the prober opens at most a small double-digit number
+ * of sockets at once (MAX_CONCURRENT is 64, and that is already a generous
+ * ceiling for one case's fan); a hash table would be solving a problem this
+ * program does not have.
+ *
+ * Capacity is deliberately NOT silently exceeded. A slot that ran out and fell
+ * back to plaintext would make a TLS rule's handshake simply never happen --
+ * the request would go out in cleartext, the plaintext server behind the
+ * fixture would answer something, and the case would report a PASS or FAIL
+ * that has nothing to do with TLS at all. That is precisely the silent-
+ * degradation failure mode this harness exists to catch elsewhere (see the
+ * framed-mode UNFRAMEABLE handling, or the recv pacing gate's forced failure);
+ * repeating it here for the sake of not adding a die() call would be
+ * indefensible. So tls_table_put() fails loudly and http_connect() reports it
+ * through the normal errbuf path rather than degrading.
+ */
+#define TLS_TABLE_MAX  128
+
+typedef struct {
+    int   fd;      /* -1 means the slot is free */
+    SSL  *ssl;
+} tls_slot;
+
+static tls_slot  tls_table[TLS_TABLE_MAX];
+static int       tls_table_init_done = 0;
+static SSL_CTX  *tls_ctx = NULL;
+
+static void
+tls_table_init(void)
+{
+    int  i;
+
+    if (tls_table_init_done) {
+        return;
+    }
+
+    for (i = 0; i < TLS_TABLE_MAX; i++) {
+        tls_table[i].fd = -1;
+        tls_table[i].ssl = NULL;
+    }
+
+    tls_table_init_done = 1;
+}
+
+
+/*
+ * Look up the SSL object for `fd`, or NULL if this fd carries no TLS.
+ *
+ * NULL is the ordinary answer for every plaintext connection, which is the
+ * overwhelming majority of every call this harness makes -- a linear scan over
+ * a small table is not a cost worth avoiding for that.
+ */
+static SSL *
+tls_table_get(int fd)
+{
+    int  i;
+
+    if (fd < 0) {
+        return NULL;
+    }
+
+    tls_table_init();
+
+    for (i = 0; i < TLS_TABLE_MAX; i++) {
+        if (tls_table[i].fd == fd) {
+            return tls_table[i].ssl;
+        }
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Record `ssl` against `fd`. Returns 0, or -1 if the table is full.
+ *
+ * fd numbers ARE reused -- close() on one connection followed by a fresh
+ * socket() call routinely hands back the same integer, and this program opens
+ * and closes plenty of connections in one run (every case, every fan leg).
+ * A stale slot left behind by a plaintext http_close() that forgot to clear it
+ * would make a LATER, unrelated fd with the same number silently inherit a
+ * dead SSL* the moment it needed the side table -- exactly the kind of bug
+ * that only shows up as a crash or a wrong-server error two connections after
+ * the one that caused it. So this asserts the slot it is about to use is
+ * genuinely free (fd -1, i.e. cleared by tls_table_del()) rather than
+ * overwriting whatever happens to be there.
+ */
+static int
+tls_table_put(int fd, SSL *ssl)
+{
+    int  i;
+    int  free_slot = -1;
+
+    tls_table_init();
+
+    /*
+     * Scan the WHOLE table before claiming anything. Stopping at the first
+     * free slot would let a stale entry for this same fd survive further down
+     * -- and tls_table_get() returns the first match in table order, so it
+     * could hand back the older, already-freed SSL*. Refusing turns that
+     * silent use-after-free into a named error at the point it is created.
+     */
+    for (i = 0; i < TLS_TABLE_MAX; i++) {
+        if (tls_table[i].fd == fd) {
+            return -1;
+        }
+
+        if (free_slot < 0 && tls_table[i].fd == -1) {
+            free_slot = i;
+        }
+    }
+
+    if (free_slot >= 0) {
+        tls_table[free_slot].fd = fd;
+        tls_table[free_slot].ssl = ssl;
+        return 0;
+    }
+
+    return -1;
+}
+
+
+/*
+ * Remove and return the SSL object for `fd`, clearing the slot so a future fd
+ * with the same number starts clean. Returns NULL if `fd` carried no TLS,
+ * which is the ordinary outcome for http_close() on a plaintext connection.
+ */
+static SSL *
+tls_table_del(int fd)
+{
+    int  i;
+
+    if (fd < 0) {
+        return NULL;
+    }
+
+    tls_table_init();
+
+    for (i = 0; i < TLS_TABLE_MAX; i++) {
+        if (tls_table[i].fd == fd) {
+            SSL  *ssl = tls_table[i].ssl;
+
+            tls_table[i].fd = -1;
+            tls_table[i].ssl = NULL;
+            return ssl;
+        }
+    }
+
+    return NULL;
+}
+
+
+/*
+ * The shared client SSL_CTX, created once and reused for every TLS
+ * connection. Sharing costs nothing here (the prober is single-threaded and
+ * short-lived) and avoids re-parsing OpenSSL's default settings on every
+ * `http_connect()` call in a fan or a long rule file.
+ *
+ * TLS_client_method() rather than a version-pinned method: this harness is
+ * pointed at a fixture the test author controls, not at an arbitrary Internet
+ * peer, so there is no downgrade surface worth defending by pinning the
+ * version here -- the fixture decides what it offers and OpenSSL negotiates
+ * the best both sides support.
+ */
+static SSL_CTX *
+tls_ctx_get(void)
+{
+    if (tls_ctx != NULL) {
+        return tls_ctx;
+    }
+
+    /* Once per process; OpenSSL 1.1.0+ no longer needs SSL_library_init() or
+     * error-string loading before this, both of which are folded into
+     * OPENSSL_init_ssl()'s implicit defaults on first use. */
+    tls_ctx = SSL_CTX_new(TLS_client_method());
+
+    return tls_ctx;
+}
+
+
+/*
+ * Perform the TLS handshake on `fd`, wiring OpenSSL to an already-connected
+ * plaintext socket and driving SSL_connect() to completion (or failure).
+ * `timeout_ms` bounds the handshake the same way SO_RCVTIMEO/SO_SNDTIMEO
+ * already bound the plaintext connect() path -- the socket is blocking and
+ * those options are set before this runs, so a peer that never completes the
+ * handshake fails the same way a peer that never accepts fails: with a timed-
+ * out syscall, not a hang.
+ *
+ * Returns the SSL* on success (already recorded in the side table under
+ * `fd`), or NULL with *errbuf set on failure. The caller owns closing `fd` on
+ * failure; this never does, matching http_connect()'s existing contract for
+ * every other failure inside it.
+ */
+static SSL *
+tls_handshake(int fd, const http_tls *tls_opt, char *errbuf, size_t errlen)
+{
+    SSL_CTX  *ctx = tls_ctx_get();
+    SSL      *ssl;
+    int        rc;
+
+    if (ctx == NULL) {
+        snprintf(errbuf, errlen, "TLS: SSL_CTX_new failed");
+        return NULL;
+    }
+
+    ssl = SSL_new(ctx);
+    if (ssl == NULL) {
+        snprintf(errbuf, errlen, "TLS: SSL_new failed");
+        return NULL;
+    }
+
+    /*
+     * Certificate verification is OFF unless the caller explicitly asks for
+     * it. This client is NOT a security boundary -- it is a harness that
+     * deliberately connects to a fixture TLS listener serving a throwaway
+     * self-signed certificate generated at test time (see http_test.c), and
+     * the whole point of standing that fixture up is to exercise the TLS
+     * transport, not to validate a certificate chain nobody issued through a
+     * real CA. Defaulting to verification ON would make every ordinary rule
+     * fail its handshake against the fixture and force every rule author to
+     * either disable verification per rule (easy to forget, and the forgotten
+     * case fails in exactly the confusing way an unrelated harness bug would)
+     * or maintain a trust store for a cert that exists only for the duration
+     * of one test run. `verify` exists precisely so a rule that DOES want a
+     * real chain validated (e.g. against a real intermediate fixture) can ask
+     * for it; every rule without that need gets the harness's actual job done
+     * instead of a PKI error.
+     */
+    if (tls_opt->verify) {
+        SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
+    } else {
+        SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
+    }
+
+    if (SSL_set_fd(ssl, fd) != 1) {
+        snprintf(errbuf, errlen, "TLS: SSL_set_fd failed");
+        SSL_free(ssl);
+        return NULL;
+    }
+
+    rc = SSL_connect(ssl);
+    if (rc != 1) {
+        int  err = SSL_get_error(ssl, rc);
+        unsigned long  e = ERR_get_error();
+        char           ebuf[256];
+
+        ERR_error_string_n(e, ebuf, sizeof(ebuf));
+        snprintf(errbuf, errlen, "TLS handshake failed (SSL_get_error=%d): %s",
+                 err, e != 0 ? ebuf : "no further detail");
+        SSL_free(ssl);
+        return NULL;
+    }
+
+    if (tls_table_put(fd, ssl) != 0) {
+        /* TLS_TABLE_MAX exceeded. Fail loudly rather than let this connection
+         * run in TLS while the side table cannot find it again on the next
+         * call -- see the table's own comment for why a silent fallback to
+         * plaintext here would be worse than refusing outright. */
+        snprintf(errbuf, errlen,
+                 "TLS: side table full (%d connections); raise "
+                 "TLS_TABLE_MAX or close some connections first",
+                 TLS_TABLE_MAX);
+        SSL_free(ssl);
+        return NULL;
+    }
+
+    return ssl;
+}
+
+
+/*
+ * The reader's TLS/plaintext seam.
+ *
+ * The reader below is written against read()'s contract: >0 bytes read, 0 for
+ * a clean peer close, -1 with errno in {EINTR, EAGAIN/EWOULDBLOCK, other} for
+ * everything else. Rather than duplicating that whole branch structure once
+ * per transport, this maps SSL_read()'s result back onto exactly that
+ * contract so the caller's existing if-ladder handles both transports
+ * unchanged -- the two failure modes it distinguishes (a peer that needs more
+ * time vs. one that is gone) exist on both sides of the seam, just spelled
+ * differently:
+ *
+ *   - SSL_ERROR_WANT_READ/WANT_WRITE is TLS's "try again" -- WANT_WRITE can
+ *     happen on a read because a renegotiation or session-ticket exchange can
+ *     need to write first -- and maps to errno=EAGAIN, the plaintext
+ *     "nothing ready yet, and the deadline governs what happens next" case.
+ *   - SSL_ERROR_ZERO_RETURN is TLS's clean close (a `close_notify` alert),
+ *     the direct analogue of read()==0, and is reported as 0 rather than -1:
+ *     a caller checking `n == 0` for HTTP_CLOSE_FIN must see the same 0 a
+ *     plaintext FIN produces, not an error it would have to special-case.
+ *   - Anything else (a torn connection, a bad record, an unexpected EOF
+ *     without close_notify) maps to -1/errno=ECONNRESET, so the existing
+ *     "was this a reset" branch labels it the same way a plaintext
+ *     ECONNRESET is labelled -- the harness has no more specific verdict to
+ *     offer for either.
+ *
+ * EINTR gets no mapping of its own: OpenSSL's own I/O retries it internally
+ * and never surfaces it as an SSL_get_error() code. It stays reachable only
+ * because signal delivery during OpenSSL's internal syscall can make
+ * SSL_read() return having made no progress with EINTR left set from that
+ * call -- which OpenSSL reports as SSL_ERROR_SYSCALL, the one and only code
+ * under which errno is meaningful. It is therefore honoured THERE and nowhere
+ * else, and passed through unchanged so the caller's own EINTR branch (which
+ * simply asks to be stepped again) handles it exactly like the plaintext path
+ * already does. Reading errno before consulting SSL_get_error() would let a
+ * stale EINTR from an unrelated earlier call disguise a fatal TLS error as a
+ * retry.
+ */
+static ssize_t
+tls_or_plain_read(int fd, SSL *ssl, void *buf, size_t want)
+{
+    ssize_t  n;
+
+    if (ssl == NULL) {
+        return read(fd, buf, want);
+    }
+
+    n = SSL_read(ssl, buf, (int) want);
+
+    if (n > 0) {
+        return n;
+    }
+
+    {
+        int  err = SSL_get_error(ssl, (int) n);
+
+        switch (err) {
+        case SSL_ERROR_ZERO_RETURN:
+            return 0;
+
+        /*
+         * SSL_ERROR_SYSCALL is the ONLY error where errno describes what
+         * happened -- OpenSSL sets it from the underlying syscall. Every other
+         * SSL_get_error() value leaves errno holding whatever an earlier,
+         * unrelated call left there, so testing errno before asking
+         * SSL_get_error() (as this function used to) could read a stale EINTR
+         * from e.g. the poll() in the driver loop and report a FATAL TLS error
+         * as "step me again", looping until the overall timeout fired and
+         * turning a real protocol failure into a bare timeout. Ask OpenSSL
+         * first, trust errno only here -- matching write_all()'s TLS branch,
+         * which calls SSL_get_error() unconditionally.
+         */
+        case SSL_ERROR_SYSCALL:
+            /*
+             * EINTR asks to be stepped again; EAGAIN/EWOULDBLOCK on these
+             * blocking sockets means SO_RCVTIMEO expired, which the reader
+             * maps to HTTP_CLOSE_TIMEOUT. Both are passed through unchanged
+             * -- collapsing them into ECONNRESET would label a TLS read that
+             * merely timed out as a peer reset, the one distinction the
+             * close_reason field exists to draw.
+             */
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                return -1;
+            }
+            errno = ECONNRESET;
+            return -1;
+
+        case SSL_ERROR_WANT_READ:
+        case SSL_ERROR_WANT_WRITE:
+            errno = EAGAIN;
+            return -1;
+
+        default:
+            errno = ECONNRESET;
+            return -1;
+        }
+    }
+}
+
+
+/*
  * send(MSG_NOSIGNAL) rather than write(): several rule files deliberately
  * provoke the server into closing mid-request (malformed framing, oversized
  * headers), and a plain write() to a closed peer raises SIGPIPE, whose default
  * action would kill the whole prober. A harness that dies on the case it was
  * written to exercise reports a crash as a missing test, so the failure has to
  * arrive as EPIPE on this one request instead.
+ *
+ * TLS routes through SSL_write() instead of send(): OpenSSL owns the record
+ * framing and its own retry contract (SSL_ERROR_WANT_READ/WANT_WRITE can occur
+ * on a WRITE, because a TLS renegotiation or session-ticket exchange can need
+ * to read first), so the byte-mover for an SSL* cannot be the same syscall as
+ * the plaintext one. MSG_NOSIGNAL has no TLS equivalent to preserve: OpenSSL
+ * itself never raises SIGPIPE from a library call, so nothing here needs to
+ * suppress a signal the library does not send.
  */
 static int
 write_all(int fd, const unsigned char *buf, size_t len)
 {
-    size_t off = 0;
+    size_t  off = 0;
+    SSL    *ssl = tls_table_get(fd);
 
     while (off < len) {
-        ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+        ssize_t  n;
+
+        if (ssl != NULL) {
+            n = SSL_write(ssl, buf + off, (int) (len - off));
+
+            if (n <= 0) {
+                int  err = SSL_get_error(ssl, (int) n);
+
+                /*
+                 * WANT_READ/WANT_WRITE means "try again", the TLS-layer
+                 * analogue of EINTR/EAGAIN on the plaintext path: the socket
+                 * is still blocking and SO_SNDTIMEO/SO_RCVTIMEO are already
+                 * set on it, so a peer that never becomes ready fails this
+                 * exactly the way the plaintext send() times out below --
+                 * with a syscall error the retry surfaces, not a hang.
+                 */
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                    continue;
+                }
+
+                /* SSL_ERROR_ZERO_RETURN (clean TLS close) and every other
+                 * OpenSSL error collapse to the same "this write failed"
+                 * outcome plaintext write_all() reports for n==0 / any send()
+                 * error -- the caller here has no TLS-specific action to take
+                 * beyond what the plaintext contract already promises. */
+                return -1;
+            }
+
+            off += (size_t) n;
+            continue;
+        }
+
+        n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
 
         if (n < 0) {
             if (errno == EINTR) {
@@ -1481,6 +1903,7 @@ elapsed_since(long long start)
 int
 http_connect(const char *host, int port, int timeout_ms,
              const char *source, const http_recv *recv_opt,
+             const http_tls *tls_opt,
              char *errbuf, size_t errlen)
 {
     int                 fd, one = 1;
@@ -1562,6 +1985,23 @@ http_connect(const char *host, int port, int timeout_ms,
         return -1;
     }
 
+    /*
+     * The TLS handshake runs AFTER the plaintext connect() and every socket
+     * option above, deliberately: SO_RCVTIMEO/SO_SNDTIMEO must already be in
+     * place so a peer that stalls mid-handshake times out instead of hanging,
+     * and TCP_NODELAY/SO_RCVBUF are transport-layer concerns the TLS record
+     * layer sits on top of, not underneath. Nothing about this changes
+     * behaviour for the tls_opt == NULL / !tls_opt->enable case that every
+     * existing caller takes -- the function returns exactly the plaintext fd
+     * it always did.
+     */
+    if (tls_opt != NULL && tls_opt->enable) {
+        if (tls_handshake(fd, tls_opt, errbuf, errlen) == NULL) {
+            close(fd);
+            return -1;
+        }
+    }
+
     return fd;
 }
 
@@ -1570,6 +2010,24 @@ void
 http_close(int fd)
 {
     if (fd >= 0) {
+        SSL  *ssl = tls_table_del(fd);
+
+        /*
+         * SSL_shutdown() first, while the fd is still open, so OpenSSL can
+         * send its close_notify alert on the wire -- a well-behaved TLS peer
+         * expects one, and skipping it is indistinguishable on this side from
+         * the connection being reset out from under it. The return value is
+         * ignored for the same reason http_exchange() ignores shutdown(2)'s:
+         * a peer that has already torn the connection down (the malformed-
+         * input cases this harness spends most of its time on) makes
+         * SSL_shutdown() fail, and that failure describes the peer's
+         * behaviour, not a defect in this call.
+         */
+        if (ssl != NULL) {
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+        }
+
         close(fd);
     }
 }
@@ -1800,7 +2258,56 @@ http_exchange(int fd,
 
             if (pfd.revents & POLLIN) {
                 char     peek;
-                ssize_t  got = recv(fd, &peek, 1, MSG_PEEK);
+                SSL     *ssl = tls_table_get(fd);
+                ssize_t  got;
+
+                /*
+                 * TLS: SSL_peek() is the direct analogue of recv(MSG_PEEK) --
+                 * it reads without consuming from OpenSSL's own buffered
+                 * plaintext. socket-level readiness (POLLIN) does not imply a
+                 * decrypted byte is available yet -- POLLIN can fire on a TLS
+                 * handshake message, a session ticket, or a partial record --
+                 * so SSL_peek() is what actually distinguishes "the peer sent
+                 * application data" from "the peer sent TLS-layer bytes that
+                 * are not applicaton data at all". A WANT_READ/WANT_WRITE here
+                 * means exactly that: readable at the socket, nothing decrypted
+                 * yet, so the wait keeps going rather than misreporting DATA.
+                 */
+                if (ssl != NULL) {
+                    got = SSL_peek(ssl, &peek, 1);
+
+                    if (got <= 0) {
+                        int  err = SSL_get_error(ssl, (int) got);
+
+                        if (err == SSL_ERROR_ZERO_RETURN) {
+                            resp->close_reason = HTTP_CLOSE_FIN;
+                            break;
+                        }
+
+                        if (err == SSL_ERROR_WANT_READ
+                            || err == SSL_ERROR_WANT_WRITE)
+                        {
+                            /* Nothing decrypted yet; recompute the remaining
+                             * wait and keep polling below rather than treating
+                             * this as data or a close. */
+                            left = idle_ms - (long) (now_ms() - wait_start);
+
+                            if (left <= 0) {
+                                break;
+                            }
+
+                            continue;
+                        }
+
+                        resp->close_reason = HTTP_CLOSE_RESET;
+                        break;
+                    }
+
+                    resp->close_reason = HTTP_CLOSE_DATA;
+                    break;
+                }
+
+                got = recv(fd, &peek, 1, MSG_PEEK);
 
                 if (got == 0) {
                     resp->close_reason = HTTP_CLOSE_FIN;
@@ -2259,7 +2766,7 @@ http_read_state_step(http_read_state *st, int readable,
             return 1;
         }
 
-        n = read(st->fd, buf + len, want);
+        n = tls_or_plain_read(st->fd, tls_table_get(st->fd), buf + len, want);
 
         if (n < 0) {
             if (errno == EINTR) {
@@ -2539,12 +3046,14 @@ http_request(const char *host, int port,
              int shut_how, size_t abort_at, long hold_ms,
              const http_recv *recv_opt, int want_close,
              long idle_ms, int framed,
+             const http_tls *tls_opt,
              http_response *resp,
              char *errbuf, size_t errlen)
 {
     int  fd, rc;
 
-    fd = http_connect(host, port, timeout_ms, source, recv_opt, errbuf, errlen);
+    fd = http_connect(host, port, timeout_ms, source, recv_opt, tls_opt,
+                      errbuf, errlen);
     if (fd < 0) {
         memset(resp, 0, sizeof(*resp));
         resp->status = -1;
@@ -2677,7 +3186,10 @@ http_exchange_concurrent(const char *host, int port, int n,
      * the last leg had even opened, shrinking the real overlap below N.
      */
     for (i = 0; i < n; i++) {
-        fds[i] = http_connect(host, port, timeout_ms, source, recv_opt,
+        /* NULL tls_opt: the concurrent fan stays plaintext-only in this PR --
+         * see http.h's http_tls comment. Not a limitation of the side table,
+         * simply out of scope until a `concurrent` rule needs it. */
+        fds[i] = http_connect(host, port, timeout_ms, source, recv_opt, NULL,
                               errbuf, errlen);
 
         if (fds[i] < 0) {
