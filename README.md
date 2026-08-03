@@ -2007,10 +2007,15 @@ oracle. Ordered roughly by attack value per unit of effort.
 A module that touches request bodies, headers or connection state behaves
 differently under other protocols, and none of those paths are attacked:
 
-- **TLS.** No scenario configures `ssl_`. A module doing anything at the
-  connection layer has an entirely untested path, and the SSL handshake is a
-  rich source of allocation-failure and lifecycle bugs. Needs a self-signed
-  fixture cert and a TLS-capable client leg in the prober.
+- **TLS.** The prober now has a TLS client leg — `http_connect()` and
+  `http_request()` take an optional `http_tls`, and `prober/http_test.c`
+  exercises the handshake, a round-trip, side-table teardown and a
+  plaintext-peer control against a self-signed in-process fixture. The
+  scenario half is still open: no scenario configures `ssl_`, so a module
+  doing anything at the connection layer remains untested end to end, and the
+  SSL handshake is a rich source of allocation-failure and lifecycle bugs.
+  What is left is a fixture cert on disk plus an `ssl_`-configured scenario;
+  the scenario nginx is already built with `ngx_http_ssl_module`.
 - **HTTP/2 and HTTP/3.** Different framing, different body delivery, different
   connection lifecycle. A module correct on HTTP/1.1 can leak per-stream state
   on h2. Larger effort (the prober's reader is HTTP/1.1-framed), but this is
