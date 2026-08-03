@@ -618,7 +618,9 @@ jobs:
           echo "${{ matrix.sha256 }}  /tmp/srv.tar.gz" | sha256sum -c -
           tar -xzf /tmp/srv.tar.gz -C /tmp/srv --strip-components=1
           cd /tmp/srv
-          ./configure --with-compat \
+          # Build with ssl to allow TLS scenarios to lift their requires-gate
+          # instead of skipping. libssl-dev is already installed on this leg.
+          ./configure --with-compat --with-http_ssl_module \
               --add-dynamic-module="$GITHUB_WORKSPACE/t/module" >/dev/null
           eatmydata make -j"$(nproc)" >/dev/null
 
