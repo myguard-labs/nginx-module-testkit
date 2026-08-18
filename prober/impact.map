@@ -69,6 +69,7 @@ PRIMARY	prober/stale_so_test.sh	stale_so_test.sh	fast
 PRIMARY	prober/check_conf_test.sh	check_conf_test.sh	fast
 PRIMARY	prober/docs_directives_test.sh	docs_directives_test.sh	fast
 PRIMARY	prober/schema_emitter_test.sh	schema_emitter_test.sh	fast
+PRIMARY	prober/tls_test.sh	tls_test.sh	fast
 
 # The strace summary parser (prober_strace_counts, prober_strace_family_sum)
 # lives in lib.sh but is only exercised end-to-end by the syscall-allowlist
@@ -101,6 +102,21 @@ PRIMARY	prober/rules_test.c	rules_test	fast
 # through this binary -- so a change here selects the scenarios rather than
 # silently mapping to a unit test that never runs the code.
 PRIMARY	prober/prober.c	scenarios	slow
+
+# ...and a FAST owner for the CLI wiring specifically. tls_test.sh drives
+# prober.c's argv walker and the --tls flag it sets against a plaintext
+# responder, with no server boot, so a change to the flag handling answers on
+# the PR lane instead of waiting for the weekly scenario run. The slow row
+# above stays: it is what covers everything in prober.c that only a live server
+# can exercise.
+PRIMARY	prober/prober.c	tls_test.sh	fast
+
+# run-scenario.sh is the scenario ENGINE -- it boots the server, renders the
+# conf, sources the env file and invokes the prober. Nothing unit-tests it, and
+# it had no row at all until the TLS scenario changed it, at which point
+# verify-impact correctly failed closed. The scenario tree IS its test: every
+# scenario runs through this script, so a change here selects all of them.
+PRIMARY	prober/run-scenario.sh	scenarios	slow
 
 # mutate.sh is the mutation gate's own driver. A change to it must re-run the
 # gate, or an edit that drops or misanchors a mutant reads as "still 100 caught".
@@ -145,6 +161,14 @@ SEMANTIC	prober/rules.c	mutate:send_slow	fast
 # real nginx/angie -- no #include links prober/scenarios/** back to src/, the
 # link is "this scenario's driver.sh boots a probe built from this source".
 SEMANTIC	prober/scenarios	scenarios/*	fast
+
+# The TLS scenario's own files. The rule file and conf are covered by the
+# scenarios glob above; these two are called out because they are EXECUTABLE
+# inputs to the boot path (a gate that exits nonzero, an env file sourced into
+# run-scenario.sh's shell), so a change to either alters what the scenario
+# actually does rather than only what it asserts.
+SEMANTIC	prober/scenarios/tls-listener/requires	scenarios/tls-listener	fast
+SEMANTIC	prober/scenarios/tls-listener/env	scenarios/tls-listener	fast
 SEMANTIC	src/ngx_test_probe_arm.c	scenarios/*	fast
 SEMANTIC	src/ngx_test_probe_arm.c	t/*	fast
 

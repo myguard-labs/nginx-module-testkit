@@ -2007,15 +2007,26 @@ oracle. Ordered roughly by attack value per unit of effort.
 A module that touches request bodies, headers or connection state behaves
 differently under other protocols, and none of those paths are attacked:
 
-- **TLS.** The prober now has a TLS client leg — `http_connect()` and
-  `http_request()` take an optional `http_tls`, and `prober/http_test.c`
-  exercises the handshake, a round-trip, side-table teardown and a
-  plaintext-peer control against a self-signed in-process fixture. The
-  scenario half is still open: no scenario configures `ssl_`, so a module
-  doing anything at the connection layer remains untested end to end, and the
-  SSL handshake is a rich source of allocation-failure and lifecycle bugs.
-  What is left is a fixture cert on disk plus an `ssl_`-configured scenario;
-  the scenario nginx is already built with `ngx_http_ssl_module`.
+- **TLS.** Shipped, both halves. The prober has a TLS client leg —
+  `http_connect()` and `http_request()` take an optional `http_tls`, and
+  `prober/http_test.c` exercises the handshake, a round-trip, side-table
+  teardown and a plaintext-peer control against a self-signed in-process
+  fixture. `prober/scenarios/tls-listener` is the scenario half: a real
+  `listen … ssl` server, a self-signed certificate minted into the run prefix
+  at boot (never committed, so it can neither leak a key nor expire into a red
+  suite), and four rule cases over the TLS transport. A scenario opts in by
+  setting `PROBER_TLS=1` in its `env` file, which run-scenario.sh expands into
+  `prober --tls`; the `.rule` grammar stays transport-agnostic, so the same
+  rule file runs against a plaintext and a TLS listener unchanged.
+
+  Two limits worth knowing. `concurrent` cases are refused under `--tls`
+  (`http_exchange_concurrent()` drives its own connect loop and never
+  populates the fd→`SSL*` side table), and the client does not verify the
+  peer certificate — it is a transport for a harness pointed at a local
+  fixture, not a security boundary. What is still open is a module doing
+  something at the connection layer: the SSL handshake is a rich source of
+  allocation-failure and lifecycle bugs, and nothing yet drives a fault into
+  one.
 - **HTTP/2 and HTTP/3.** Different framing, different body delivery, different
   connection lifecycle. A module correct on HTTP/1.1 can leak per-stream state
   on h2. Larger effort (the prober's reader is HTTP/1.1-framed), but this is
@@ -2249,6 +2260,31 @@ multi-worker server does by design. Setting this without `pid_may_change` on
 every case reproduces the wall of false pid failures the bail exists to
 prevent, so it is a per-scenario opt-in, never a run default. The `multi-worker`
 scenario is the reference user.
+
+**`PROBER_TLS` (environment variable, optional)**
+
+Set in a scenario's `env` file to make the rules run speak TLS:
+`run-scenario.sh` expands `${PROBER_TLS:+--tls}` into the prober invocation, so
+any non-empty value arms it. The transport is process-wide rather than
+per-case, because it is a property of the LISTENER — a scenario points the
+prober at one port, and that port either speaks TLS or it does not. That keeps
+the `.rule` grammar transport-agnostic: the same rule file runs unchanged
+against a plaintext listener and a TLS one, which is what makes a differing
+result evidence about the transport rather than about the rule.
+
+The scenario is responsible for the server side (`listen … ssl` plus a
+certificate) and for the fixture. `tls-listener` is the reference user: it
+mints a self-signed certificate into `$PROBER_PREFIX` from its `env` file —
+which is why the EXIT trap is armed above the env source, so a boot failure
+cannot leak it — and gates on `ngx_http_ssl_module` being linked, because
+`--with-compat` alone omits it.
+
+The client does NOT verify the peer certificate (see `http_tls.verify` in
+`http.h`): it is a transport for a harness pointed at a local fixture, not a
+security boundary. `concurrent` cases are refused under `--tls` and fail
+loudly, because `http_exchange_concurrent()` drives its own connect loop and
+never populates the fd→`SSL*` side table — a silent plaintext fallback there
+would make the case pass or fail for a reason unrelated to what it asserts.
 
 **`PROBER_ALLOW_STALE_SO` (environment variable, optional)**
 

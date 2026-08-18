@@ -14,7 +14,9 @@
 #   nginx.conf   conf template with @LOAD@/@PORT@ (default: $PROBER_CONF)
 #   *.rule       rule files for the prober         (default: $PROBER_RULES)
 #   env          sourced before boot: LD_PRELOAD, ulimit, PROBER_ALLOW_LOG,
-#                PROBER_ALLOW_MULTIWORKER, PROBER_DAEMON_MODE, PROBER_PORT
+#                PROBER_ALLOW_MULTIWORKER, PROBER_DAEMON_MODE, PROBER_PORT,
+#                PROBER_TLS (set to anything => the rules run gets --tls, for a
+#                scenario whose listen directive carries `ssl`)
 #                overrides -- anything the scenario needs armed before the
 #                master process forks. PROBER_DAEMON_MODE=on is the opt-in a
 #                USR2 binary-upgrade scenario sets: it inverts the daemon gate
@@ -83,6 +85,21 @@ prober_detect_load
 prober_heap_env
 prober_gates
 
+# ONE trap, installed before the first resource exists. The ladder this
+# replaces (rm-only, then stop+rm) left a window: a failure between the render
+# and the install after it leaked a tmpdir, because the trap that owned it was
+# not armed yet. prober_cleanup is idempotent and guards every handle, so
+# arming it against nothing is free.
+#
+# It is armed ABOVE the env source, not below it, because the env file is
+# sourced into THIS shell and may therefore create the first resource itself:
+# a scenario needing a fixture on disk before the conf is rendered calls
+# prober_make_prefix (idempotent -- prober_render_conf reuses what it finds)
+# and writes into $PROBER_PREFIX. With the trap below that point, a failure
+# between the two leaked the prefix, which is the exact window the comment
+# above says this trap exists to close.
+trap prober_cleanup EXIT
+
 # The env file is sourced, not executed, so ulimit and export take effect in
 # THIS shell -- the one about to fork the server. That is the mechanism by
 # which a scenario arms LD_PRELOAD (mockeagain), lowers `ulimit -n`
@@ -102,13 +119,6 @@ fi
 
 CONF="$SCENARIO/nginx.conf"
 [ -f "$CONF" ] || CONF="${PROBER_CONF:-./conf/prober.conf}"
-
-# ONE trap, installed before the first resource exists. The ladder this
-# replaces (rm-only, then stop+rm) left a window: a failure between the render
-# and the install after it leaked a tmpdir, because the trap that owned it was
-# not armed yet. prober_cleanup is idempotent and guards every handle, so
-# arming it against nothing is free.
-trap prober_cleanup EXIT
 
 # The backend boots BEFORE the conf is rendered, not after: it binds an
 # ephemeral port and the conf needs that port substituted for @BACKEND_PORT@,
@@ -169,9 +179,18 @@ else
     # loosening the close_within/idle read timeout is the safe direction --
     # scaling it UP only widens what a healthy-but-slow (memcheck-instrumented)
     # server is allowed to take, it cannot hide a genuine hang.
+    # A scenario whose listener speaks TLS sets PROBER_TLS=1 in its `env`
+    # file; anything else leaves the client on the plaintext path it has
+    # always taken. The expansion is ${PROBER_TLS:+--tls}, not a test on the
+    # value, so PROBER_TLS=0 also arms it -- deliberate: the only two states a
+    # scenario ever wants are "set" and "absent", and treating an explicit 0 as
+    # off would make `PROBER_TLS=0` in an env file read as a working switch it
+    # is not.
+    #
     # shellcheck disable=SC2086
     ./prober -H 127.0.0.1 -p "$PROBER_RESOLVED_PORT" \
-        -t "$((5000 * PROBER_TIMEOUT_SCALE))" $RULES || STATUS=$?
+        -t "$((5000 * PROBER_TIMEOUT_SCALE))" ${PROBER_TLS:+--tls} $RULES \
+        || STATUS=$?
 fi
 
 # The backend is scraped while it is still RUNNING. Its liveness check asks

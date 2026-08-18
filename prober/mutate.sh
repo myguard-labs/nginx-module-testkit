@@ -1165,6 +1165,14 @@ mutate "concurrent: fan serialized (leg read before the next is written)" http.c
 mutate "--check: flag does not take effect" prober.c \
     '            opt_check = 1;' '            opt_check = 0;' check_test.sh
 
+# Same shape as --check above, and the same failure: the flag parses, the run
+# proceeds, and every assertion that does not actually LOOK at the wire stays
+# green. tls_test.sh catches it by pointing the client at a plaintext responder
+# with --tls set -- an exchange that must fail, and must fail naming the
+# handshake. A mutant with enable=0 completes that exchange happily.
+mutate "--tls: flag does not take effect" prober.c \
+    '            opt_tls.enable = 1;' '            opt_tls.enable = 0;' tls_test.sh
+
 # ---- probe schema -----------------------------------------------------------
 
 # The schema exists to catch emitter drift on fields no rule happens to name,
