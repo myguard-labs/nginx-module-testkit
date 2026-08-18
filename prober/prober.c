@@ -565,23 +565,19 @@ run_case(const test_case *tc, const json_value *baseline)
         http_response *resps;
         int            leg;
 
-        resps = calloc((size_t) tc->concurrent, sizeof(*resps));
-
-        if (resps == NULL) {
-            printf("# concurrent: out of memory for %d responses\n",
-                   tc->concurrent);
-            json_free(before);
-            return 0;
-        }
-
         /*
+         * Checked BEFORE the allocation below, not after: this path returns
+         * without running the exchange, and a guard placed after the calloc
+         * leaks every byte of it (gcc -fanalyzer and cppcheck both caught
+         * exactly that).
+         *
          * http_exchange_concurrent() has no tls_opt parameter -- it drives its
          * own connect loop rather than going through http_connect(), so the
          * fd->SSL* side table is never populated for the fds it opens. Under
          * --tls it would therefore send plaintext at a TLS listener and report
          * the handshake garbage as a protocol failure of the server.
          *
-         * Dying is the only honest answer. A silent plaintext fallback would
+         * Failing is the only honest answer. A silent plaintext fallback would
          * make a `concurrent` case pass or fail for a reason that has nothing
          * to do with what it asserts, and a SKIP here would be invisible
          * inside a rules run that is otherwise reporting real verdicts.
@@ -589,6 +585,15 @@ run_case(const test_case *tc, const json_value *baseline)
         if (opt_tls.enable) {
             printf("# concurrent: not supported under --tls "
                    "(http_exchange_concurrent has no TLS transport)\n");
+            json_free(before);
+            return 0;
+        }
+
+        resps = calloc((size_t) tc->concurrent, sizeof(*resps));
+
+        if (resps == NULL) {
+            printf("# concurrent: out of memory for %d responses\n",
+                   tc->concurrent);
             json_free(before);
             return 0;
         }
