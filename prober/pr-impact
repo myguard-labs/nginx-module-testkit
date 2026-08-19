@@ -88,7 +88,7 @@ remaining() {
 VI_OUT="$(mktemp)"
 VI_ERR="$(mktemp)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pr-impact.XXXXXX")"
-# shellcheck disable=SC2317 # invoked indirectly via `trap ... EXIT`, not a dead call
+# shellcheck disable=SC2317,SC2329 # invoked indirectly via `trap ... EXIT`, not a dead call
 cleanup() { rm -f "$VI_OUT" "$VI_ERR"; rm -rf "$WORK"; }
 trap cleanup EXIT
 

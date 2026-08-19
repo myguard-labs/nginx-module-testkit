@@ -1313,8 +1313,22 @@ jobs:
         run: |
           # tr_TR for the dotless-i case-folding hazard; de_DE for the
           # comma-decimal LC_NUMERIC hazard (JSON numbers must still read '.').
-          printf 'tr_TR.UTF-8 UTF-8\nde_DE.UTF-8 UTF-8\n' | sudo tee -a /etc/locale.gen
-          sudo locale-gen
+          #
+          # Built with localedef straight from the charmap sources rather than
+          # by appending to /etc/locale.gen + locale-gen. On this self-hosted
+          # LXC runner that append is silently ignored: locale-gen regenerated
+          # only the pre-existing en_* set and reported "Generation complete",
+          # so the gate below failed with tr_TR absent. localedef does not
+          # consult /etc/locale.gen at all, so it cannot be no-opped that way.
+          # The locale SOURCES (/usr/share/i18n/locales) come from the `locales`
+          # package -- absent on a minimal image, which is the underlying gap.
+          if [ ! -f /usr/share/i18n/locales/tr_TR ]; then
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends locales
+          fi
+          for l in tr_TR de_DE; do
+              sudo localedef -i "$l" -f UTF-8 "/usr/lib/locale/${l}.utf8"
+          done
           # Fail here, not three steps later as a confusing test failure, if
           # generation did not actually register the locales.
           for l in tr_TR de_DE; do
