@@ -58,6 +58,23 @@ static const char  *opt_probe_uri = "/__probe";
 static int          opt_timeout_ms = 5000;
 static int          opt_verbose = 0;
 
+/*
+ * TLS transport for every connection this process opens, armed by --tls.
+ *
+ * Process-wide rather than per-case because the transport is a property of the
+ * LISTENER, not of a request: a scenario points the prober at one port, and
+ * that port either speaks TLS or it does not. A per-case directive would have
+ * to carry a second port with it to mean anything, and every rule file in the
+ * repo would then have to say which of the two it wanted. Keeping it here
+ * leaves the whole .rule grammar transport-agnostic -- the same rule file runs
+ * unchanged against a plaintext listener and a TLS one, which is exactly what
+ * makes it evidence that the transport, and not the rule, is what changed.
+ *
+ * Zeroed by default, so the tls_opt every call site now passes is an explicit
+ * "off" that reaches the same plaintext code path as the NULL it replaced.
+ */
+static http_tls     opt_tls = { 0, 0 };
+
 /* PROBER_TIMEOUT_SCALE, resolved once at the top of main() via
  * delta_settle_scale_from_env() (see its comment by DELTA_SETTLE_TRIES) and
  * read from here by the delta-settle loop. No CLI flag: see that function's
@@ -213,7 +230,7 @@ arm_fault(const char *query, const char *source, char *errbuf, size_t errlen)
     if (http_request(opt_host, opt_port, (const unsigned char *) req,
                      (size_t) n, opt_timeout_ms, source, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE,
-                     NULL, 0, HTTP_IDLE_NONE, 0, NULL, &resp,
+                     NULL, 0, HTTP_IDLE_NONE, 0, &opt_tls, &resp,
                      errbuf, errlen) != 0)
     {
         return -1;
@@ -253,7 +270,7 @@ fetch_probe(char *errbuf, size_t errlen)
     if (http_request(opt_host, opt_port, (const unsigned char *) req,
                      (size_t) n, opt_timeout_ms, NULL, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE,
-                     NULL, 0, HTTP_IDLE_NONE, 0, NULL, &resp,
+                     NULL, 0, HTTP_IDLE_NONE, 0, &opt_tls, &resp,
                      errbuf, errlen) != 0)
     {
         return NULL;
@@ -548,6 +565,30 @@ run_case(const test_case *tc, const json_value *baseline)
         http_response *resps;
         int            leg;
 
+        /*
+         * Checked BEFORE the allocation below, not after: this path returns
+         * without running the exchange, and a guard placed after the calloc
+         * leaks every byte of it (gcc -fanalyzer and cppcheck both caught
+         * exactly that).
+         *
+         * http_exchange_concurrent() has no tls_opt parameter -- it drives its
+         * own connect loop rather than going through http_connect(), so the
+         * fd->SSL* side table is never populated for the fds it opens. Under
+         * --tls it would therefore send plaintext at a TLS listener and report
+         * the handshake garbage as a protocol failure of the server.
+         *
+         * Failing is the only honest answer. A silent plaintext fallback would
+         * make a `concurrent` case pass or fail for a reason that has nothing
+         * to do with what it asserts, and a SKIP here would be invisible
+         * inside a rules run that is otherwise reporting real verdicts.
+         */
+        if (opt_tls.enable) {
+            printf("# concurrent: not supported under --tls "
+                   "(http_exchange_concurrent has no TLS transport)\n");
+            json_free(before);
+            return 0;
+        }
+
         resps = calloc((size_t) tc->concurrent, sizeof(*resps));
 
         if (resps == NULL) {
@@ -609,7 +650,7 @@ run_case(const test_case *tc, const json_value *baseline)
                          opt_timeout_ms, tc->source,
                          tc->pauses, tc->n_pauses, tc->shut_how, tc->abort_at,
                          tc->hold_ms, &tc->recv_opt, tc->saw_close_within,
-                         tc->idle_ms, 0, NULL, &resp,
+                         tc->idle_ms, 0, &opt_tls, &resp,
                          errbuf, sizeof(errbuf)) != 0)
         {
             printf("# request failed: %s\n", errbuf);
@@ -657,7 +698,7 @@ run_case(const test_case *tc, const json_value *baseline)
          * so_rcvbuf on any block but the first, so this is the only one that set
          * it. */
         fd = http_connect(opt_host, opt_port, opt_timeout_ms, tc->source,
-                          &tc->blocks[0].recv_opt, NULL, errbuf,
+                          &tc->blocks[0].recv_opt, &opt_tls, errbuf,
                           sizeof(errbuf));
 
         if (fd < 0) {
@@ -745,7 +786,7 @@ run_case(const test_case *tc, const json_value *baseline)
 
         for (i = 0; i < (size_t) tc->open_conns; i++) {
             int cfd = http_connect(opt_host, opt_port, opt_timeout_ms,
-                                   tc->source, NULL, NULL, errbuf,
+                                   tc->source, NULL, &opt_tls, errbuf,
                                    sizeof(errbuf));
 
             if (cfd < 0) {
@@ -968,12 +1009,14 @@ usage(void)
 {
     fprintf(stderr,
             "usage: prober [-H host] [-p port] [-u probe-uri] [-t ms]\n"
-            "              [-e error-log] [-v] [--check]"
+            "              [-e error-log] [-v] [--check] [--tls]"
             " <rulefile> [rulefile ...]\n"
             "  -e (or PROBER_ERROR_LOG) names the server error log, needed\n"
             "     by the no_error_log / grep_error_log directives\n"
             "  --check parses the rule files and exits without connecting;\n"
-            "     nonzero status means a rule file is malformed\n");
+            "     nonzero status means a rule file is malformed\n"
+            "  --tls speaks TLS to the port instead of plaintext, without\n"
+            "     verifying the certificate -- for a local fixture listener\n");
     exit(2);
 }
 
@@ -1000,6 +1043,22 @@ main(int argc, char **argv)
          * guard below rejects it as the last word on the command line. */
         if (strcmp(argv[argi], "--check") == 0) {
             opt_check = 1;
+            continue;
+        }
+
+        /*
+         * Argument-less like --check, so it has to be handled above the
+         * "flag needs a value" guard as well.
+         *
+         * verify stays 0: the listener this is pointed at serves a
+         * self-signed fixture certificate generated at scenario boot, and
+         * there is no trust store that could ever contain it. See http.h's
+         * comment on http_tls.verify -- this client is a transport for a test
+         * harness, not a security boundary, and the claim a TLS scenario makes
+         * is about the handshake and the bytes after it, not about PKI.
+         */
+        if (strcmp(argv[argi], "--tls") == 0) {
+            opt_tls.enable = 1;
             continue;
         }
 

@@ -574,7 +574,17 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: /tmp/srv
-          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-${{ hashFiles('t/module/**') }}-v1
+          # The trailing salt covers the CONFIGURE RECIPE, which no other term
+          # in this key does: the tarball hash pins the source and hashFiles
+          # pins the module, but the ./configure line below is workflow text
+          # neither of them sees. It went to v2 when --with-http_ssl_module was
+          # added, because a v1 entry written before that restores a tree built
+          # WITHOUT ssl and skips the rebuild -- the TLS scenario's requires
+          # gate then correctly SKIPs, test-scenarios.sh turns an
+          # un-allowlisted skip into `not ok`, and CI reds pointing at TLS
+          # rather than at a stale cache. Bump this whenever the configure line
+          # changes.
+          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-${{ hashFiles('t/module/**') }}-v2
 
       - name: install build deps
         run: |

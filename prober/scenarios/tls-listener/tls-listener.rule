@@ -1,0 +1,83 @@
+# Scenario: the same raw-socket exchange machinery, driven over TLS.
+#
+# The T-1 client leg (#198) shipped with unit coverage and no scenario: nothing
+# in the tree pointed it at a real nginx TLS listener, so every claim about it
+# rested on http_test.c's throwaway servers. This scenario is the other half.
+# It asserts nothing about PKI -- the certificate is a self-signed fixture and
+# the client does not verify it (see http.h on http_tls.verify). What it
+# asserts is that a request written into a TLS transport reaches an nginx
+# server, that the response comes back intact, and that the connection and
+# descriptor accounting behave exactly as they do on the plaintext path.
+#
+# A NOTE ON WHAT MAKES THIS NON-VACUOUS. Every case below would also pass over
+# plaintext against an ordinary listener, so the assertions alone do not prove
+# TLS happened. What proves it is the LISTENER: nginx.conf carries `listen ...
+# ssl`, so a client that did not perform a handshake gets its plaintext bytes
+# rejected and every case here fails. The negative control is structural, and
+# it is checked by the last case in this file.
+
+# Baseline. If the handshake itself is broken this is where it shows, before
+# any case that could be blamed on framing or on the reader.
+name    a request over TLS reaches the server
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~OK
+delta   fds == 0
+
+# The body has to survive reassembly across TLS records. The case above fits in
+# one record and one read, so it cannot distinguish a client that reads exactly
+# one record from one that reads to the end of the response. This one can: the
+# assertion is on the TAIL of the body, which a client that stopped at the
+# first record never sees.
+name    a response longer than one TLS record arrives whole
+from    127.0.0.1
+send    GET /longer HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~vwxyz
+delta   fds == 0
+
+# The teardown path. http_close() drops the fd from the SSL* side table, and a
+# leak there is invisible to a single request -- it shows as a descriptor that
+# is never returned. Asserting fds == 0 after a second, independent TLS
+# connection is what makes the side-table teardown observable from outside the
+# client.
+name    a second TLS connection leaves no descriptor behind
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+# THE NEGATIVE CONTROL, and the reason the rest of this file is evidence about
+# TLS rather than evidence about HTTP.
+#
+# `probe_baseline` subtracts from the run's ORIGIN snapshot, so it sees the
+# whole batch above at once: an SSL* or a descriptor leaked anywhere in it
+# fails here and nowhere else, because each per-case `delta` compares snapshots
+# that already carry the leak.
+#
+# The failure mode this scenario is most exposed to is PROBER_TLS ceasing to
+# reach the prober -- an env file rename, the ${PROBER_TLS:+--tls} expansion
+# dropped from run-scenario.sh. The client then sends plaintext at an `ssl`
+# listener, which cannot answer it, so the scenario CANNOT silently degrade
+# into a plaintext test. Measured 2026-08-19 by commenting out the export: the
+# run exits 2 and the suite goes red.
+#
+# BUT NOT VIA A `not ok` LINE, and that is worth knowing before trusting a TAP
+# parser here. `probe_baseline` needs an ORIGIN snapshot, taken before the
+# plan is printed; the plaintext probe fetch fails, and prober.c die()s at that
+# point -- which is above the `printf("1..%zu")`. The stream is therefore
+# EMPTY: no plan, no ok, no not ok, just the diagnostic on stderr and exit 2.
+# A consumer gating on the exit status sees the failure; one parsing TAP alone
+# sees a scenario that emitted nothing. That ordering is pre-existing and
+# affects every scenario using probe_baseline, not just this one.
+name    no descriptor drift across the whole TLS batch
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+probe_baseline  fds == 0
