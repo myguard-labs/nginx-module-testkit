@@ -2514,7 +2514,7 @@ main(void)
             const size_t  creq_len = sizeof(creq) - 1;
             const size_t  head_len = 48;   /* through the header terminator */
             size_t        cum, s;
-            int           saw_first, saw_second;
+            int           saw_first, saw_second, attempt;
 
             /* Pace only the body: a rule file that dribbles the header block
              * too is a different (slowloris) test, and the framing walk has
@@ -2524,7 +2524,35 @@ main(void)
             p[0].chunk = 0;
             p[0].unit = 1;
 
-            rc = run_echo(creq, creq_len, p, 1, &er);
+            /*
+             * Retry while the receiver coalesced the paced writes into fewer
+             * reads than there are units. The sender does one write_all() per
+             * unit with an inter-unit sleep and TCP_NODELAY set, so the
+             * boundaries are always ON THE WIRE; whether they survive as
+             * separate read() returns depends on when the receiving thread is
+             * scheduled, which is load-dependent and not a property of the
+             * code under test. Retrying (rather than asserting on the first
+             * sample) is what makes the framing assertions below deterministic
+             * on a loaded CI runner -- with a single sample, full coalescing
+             * reds case 99 and makes case 100 pass VACUOUSLY, since its
+             * !saw_second holds trivially when every boundary is gone.
+             *
+             * The guard is the FULL expected read count (4 here: the header
+             * block plus one per unit), not merely "more than one" -- a
+             * partially coalesced sample can still be missing exactly the
+             * boundary under test.
+             *
+             * Bounded, and the bound is not silent: falling through still
+             * leaves the assertions to run and report honestly rather than
+             * skipping, which would read as a pass.
+             */
+            for (attempt = 0; attempt < 20; attempt++) {
+                rc = run_echo(creq, creq_len, p, 1, &er);
+
+                if (rc != 0 || er.n_segs >= 4) {
+                    break;
+                }
+            }
 
             ok(rc == 0 && er.got_len == creq_len
                && memcmp(er.got, creq, creq_len) == 0,
@@ -2571,7 +2599,18 @@ main(void)
             p[0].chunk = 6;
             p[0].unit = 0;
 
-            rc = run_echo(creq, creq_len, p, 1, &er);
+            /* Same coalescing retry as above, for the same reason: this
+             * assertion is `!saw_second`, so a fully coalesced sample would
+             * satisfy it while proving nothing about where the byte-count
+             * pacer cuts. Five reads here, not four: the 6-byte chunk size
+             * cuts the 19-byte body into 6/6/6/1. */
+            for (attempt = 0; attempt < 20; attempt++) {
+                rc = run_echo(creq, creq_len, p, 1, &er);
+
+                if (rc != 0 || er.n_segs >= 5) {
+                    break;
+                }
+            }
 
             cum = 0;
             saw_second = 0;
