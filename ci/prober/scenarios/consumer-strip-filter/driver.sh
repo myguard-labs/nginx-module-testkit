@@ -162,6 +162,18 @@ SIG_SEEN=0
 # out of nginx.conf makes THIS oracle fail (and it was verified that way before
 # this scenario was committed), which is what makes oracles 3-6 worth reading:
 # they are measuring a request the module demonstrably participated in.
+#
+# A PRIMING trigger_request runs first, discarded. Every current signature is
+# stateless per-request (a marker header or attack pattern re-matches on every
+# call), so for most rows this is a harmless no-op repeat. error-abuse is the
+# exception the priming call exists for: its zone is threshold=1, so the FIRST
+# tagged request only counts toward the threshold -- the block a real observer
+# would see does not activate until the request AFTER that one. Priming supplies
+# that first tagged request so the measured trigger_request below is the second,
+# and gets the module's actual blocked response.
+if [ "$WARMUP_OK" -eq 1 ]; then
+    trigger_request "$PROBER_PREFIX/prime.out" "" || true
+fi
 if [ "$WARMUP_OK" -eq 1 ] && trigger_request "$HITCHECK" ""; then
     if grep -qiE '<html><body><p>x</p></body></html>' "$HITCHECK"; then
         SIG_SEEN=1

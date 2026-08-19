@@ -98,11 +98,41 @@ one_request() {
     grep -q '^HTTP/1.1 200' "$out"
 }
 
-
+# trigger_request OUTFILE [EXTRA_HEADER]: same bounded fetch as one_request,
+# but it must NOT require a 200 -- the whole point is that the module answers
+# with its own non-200 status. Only a COMPLETE response line is required;
+# oracle 2 then matches the module's signature against the captured bytes.
+trigger_request() {
+    local out="$1" extra="${2:-}" pid dl timed_out=0
+    (
+        exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
+        printf 'GET / HTTP/1.1\r\nHost: prober\r\n' >&3
+        [ -n "$extra" ] && printf '%s\r\n' "$extra" >&3
+        printf 'Connection: close\r\n\r\n' >&3
+        cat <&3 2>/dev/null || true
+    ) >"$out" 2>/dev/null &
+    pid=$!
+    dl=$(( SECONDS + 10 ))
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$SECONDS" -ge "$dl" ]; then
+            pkill -P "$pid" 2>/dev/null || true
+            kill "$pid" 2>/dev/null || true
+            timed_out=1
+            break
+        fi
+        sleep 0.05
+    done
+    wait "$pid" 2>/dev/null || true
+    # Same truncation gap as one_request: a deadline kill still leaves the
+    # status line in the capture, so oracle 2 would be matching the module's
+    # signature against a response that never finished arriving.
+    [ "$timed_out" -eq 0 ] || return 1
+    grep -q '^HTTP/1.1 ' "$out"
+}
 
 # TAP plan:
 #  1 warm-up request serves 200 (readiness / non-vacuity)
-#  2 the module is loaded and serving (WEAK: no observable signature -- see below)
+#  2 a signature proving ngx_http_error_abuse_module.so's code path actually ran
 #  3 cycle_used equal across the two post-drain quiescent snapshots
 #  4 cycle_blocks + cycle_large equal across the same two snapshots
 #  5 worker fds equal across the same two snapshots
@@ -127,28 +157,32 @@ fi
 # --- 2: anti-vacuity ---------------------------------------------------------
 HITCHECK="$PROBER_PREFIX/hitcheck.out"
 SIG_SEEN=0
-# WEAK ANTI-VACUITY, STATED HONESTLY -- THIS ORACLE DOES NOT PROVE THE MODULE
-# RAN. This module only acts once a rate/error threshold is crossed, and emits
-# no header, no body change and no INFO log line on an ordinary request, so
-# there is nothing a response-based check can match. Oracle 2 therefore asserts
-# only that the configured path still serves a clean 200 with the module loaded
-# and its directive accepted by `nginx -t`.
+# REAL ANTI-VACUITY. The signature matched below cannot be produced by nginx
+# core on this config -- only by the module. Commenting the module's directive
+# out of nginx.conf makes THIS oracle fail (and it was verified that way before
+# this scenario was committed), which is what makes oracles 3-6 worth reading:
+# they are measuring a request the module demonstrably participated in.
 #
-# WHAT THAT MEANS FOR ORACLES 3-6: if the module's per-request hook silently
-# stopped being invoked, this oracle would still pass and 3-6 would go flat and
-# green -- measuring a request the module never touched. Read a green run here
-# as "the module is loaded, configured and not leaking on a path it MAY be
-# handling", not as "the per-request path is proven allocation-neutral".
-# Promote this to a real signature check the moment the module grows one; that
-# is a strict improvement and is the reason this comment names the gap instead
-# of hiding it.
-if [ "$WARMUP_OK" -eq 1 ] && one_request "$HITCHECK"; then
-    SIG_SEEN=1
+# A PRIMING trigger_request runs first, discarded. Every current signature is
+# stateless per-request (a marker header or attack pattern re-matches on every
+# call), so for most rows this is a harmless no-op repeat. error-abuse is the
+# exception the priming call exists for: its zone is threshold=1, so the FIRST
+# tagged request only counts toward the threshold -- the block a real observer
+# would see does not activate until the request AFTER that one. Priming supplies
+# that first tagged request so the measured trigger_request below is the second,
+# and gets the module's actual blocked response.
+if [ "$WARMUP_OK" -eq 1 ]; then
+    trigger_request "$PROBER_PREFIX/prime.out" "X-Consumer-Probe: trip" || true
+fi
+if [ "$WARMUP_OK" -eq 1 ] && trigger_request "$HITCHECK" "X-Consumer-Probe: trip"; then
+    if grep -qiE '^HTTP/1\.1 429' "$HITCHECK"; then
+        SIG_SEEN=1
+    fi
 fi
 if [ "$SIG_SEEN" -eq 1 ]; then
-    echo "ok 2 - the configured path serves with error_abuse attached (WEAK -- no observable signature, see driver)"
+    echo "ok 2 - error_abuse BLOCKED a second X-Consumer-Probe-tagged request with 429 after threshold=1 statuses=200 counted the first tagged request's own 200 (an untagged request never populates the empty-key bypass and always gets 200, keeping oracles 3-7's unmarked measurement requests on the module's ordinary path -- verified both ways)"
 else
-    echo "not ok 2 - the configured path did not serve a clean 200 with the module loaded"
+    echo "not ok 2 - no signature that ngx_http_error_abuse_module.so ran was observed"
     head -20 "$HITCHECK" 2>/dev/null | sed 's/^/# /' || true
     FAILED=$((FAILED + 1))
 fi
