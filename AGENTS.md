@@ -1,4 +1,4 @@
-# AGENTS.md — nginx-test-harness (Codex / agent instructions)
+# AGENTS.md — nginx-module-testkit (Codex / agent instructions)
 
 Resource/fault/lifecycle verifier for nginx and angie modules. NOT a second
 request/response suite: ordinary status/header/body behaviour belongs in

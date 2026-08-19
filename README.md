@@ -1,4 +1,4 @@
-# nginx-test-harness
+# nginx-module-testkit
 
 Functional + leak testing for nginx and Angie modules, in C, with no Perl and
 no version banner sniffing.
@@ -296,7 +296,7 @@ copy-paste.
 **1. Add the harness to your module repo as a submodule:**
 
 ```sh
-git submodule add https://github.com/myguard-labs/nginx-test-harness t/harness
+git submodule add https://github.com/myguard-labs/nginx-module-testkit t/harness
 ```
 
 **2. Give the probe an HTTP surface.** An nginx module cannot inherit another

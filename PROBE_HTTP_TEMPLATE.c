@@ -2,7 +2,7 @@
  * Copyright (C) 2026 Thijs Eilander
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * nginx-test-harness HTTP probe template
+ * nginx-module-testkit HTTP probe template
  *
  * Copy this file to your module's src directory, rename to fit your module
  * (e.g., ngx_mymod_probe_http.c), and fill in the blanks:
