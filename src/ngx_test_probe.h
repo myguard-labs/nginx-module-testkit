@@ -16,7 +16,7 @@
  * generically is the SEMANTICS of a module's shared memory -- how many nodes,
  * how many are banned, which fault sites exist -- so a consuming module
  * registers two small hooks for that (see ngx_test_probe_hooks_t). Everything
- * else, including the whole prober under prober/, is module-agnostic.
+ * else, including the whole prober under ci/prober/, is module-agnostic.
  *
  * The feature compiles out entirely unless NGX_TEST_HARNESS is defined. It must
  * never be defined for a packaged build: the probe walks queues under the slab

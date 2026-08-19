@@ -78,7 +78,7 @@ Four properties carry the weight, each guarding an inference:
   failure this harness exists to rule out.
 
 Up to 16 blocks per case. `scenarios/keepalive-bleed` is the reference — and the
-negative control for the framing-aware reader itself: `prober/http.c` points at
+negative control for the framing-aware reader itself: `ci/prober/http.c` points at
 it for the conn-reuse split.
 
 ### Generated shapes (`scenarios/property-fuzz`)
@@ -145,7 +145,7 @@ every failure diagnostic), and each request batch is separately saved as
   lost. Both fuzz scenarios assert their own determinism as TAP tests.
 - **An `abort` case carrying `expect_not`.** A reset connection has no response,
   so the assertion passes against an empty buffer whatever the server did. The
-  loader rejects the combination — run `prober/prober --check rules/*.rule`
+  loader rejects the combination — run `ci/prober/prober --check rules/*.rule`
   before a run, which costs nothing and catches it without a server boot.
 
 ## Not yet reachable

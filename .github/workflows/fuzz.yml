@@ -59,7 +59,7 @@ jobs:
       # bail on the first), so a single crasher does not mask the rest, and the
       # crashes/ dirs are collected below.
       - name: fuzz parser targets
-        working-directory: prober/fuzz
+        working-directory: ci/prober/fuzz
         env:
           SECONDS_INPUT: ${{ github.event.inputs.seconds || '300' }}
         run: ./fuzz.sh fuzz "$SECONDS_INPUT"
@@ -72,7 +72,7 @@ jobs:
         if: always()
         run: |
           shopt -s nullglob
-          crashers=(prober/fuzz/crashes/*/*)
+          crashers=(ci/prober/fuzz/crashes/*/*)
           if [ ${#crashers[@]} -gt 0 ]; then
             echo "::error::libFuzzer found ${#crashers[@]} crasher(s)"
             printf '%s\n' "${crashers[@]}"
@@ -85,5 +85,5 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: fuzz-crashers
-          path: prober/fuzz/crashes/
+          path: ci/prober/fuzz/crashes/
           if-no-files-found: ignore

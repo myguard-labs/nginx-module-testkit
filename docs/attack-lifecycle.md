@@ -17,7 +17,7 @@ Almost nobody tests this, because from outside a reload looks like a reload.
 
 Lifecycle work happens in a scenario `driver.sh`, which runs with the server
 already booted and holds the master pid, so it can interleave prober runs with
-signals. `prober/lib.sh` gives it:
+signals. `ci/prober/lib.sh` gives it:
 
 | Helper | What it settles |
 |---|---|

@@ -107,7 +107,7 @@ opened, and the assertion becomes timing-dependent.
 ## `scenarios/concurrent-fan` — the directive against a real worker
 
 `concurrent N` is proven at the unit level against `spawn_barrier` in
-`prober/http_test.c`, a fixture that withholds every reply until all N requests
+`ci/prober/http_test.c`, a fixture that withholds every reply until all N requests
 have arrived and so pins the client-side write ordering exactly. What no
 self-test does is run the directive against a **real** worker: the fixture
 exercises none of nginx's accept path, connection slots, cycle pool or descriptor

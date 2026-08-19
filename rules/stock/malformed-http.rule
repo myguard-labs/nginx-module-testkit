@@ -163,7 +163,7 @@ delta   pool.cycle_large == 0
 #
 # No explicit pid assertion: the harness snapshots the probe before and after
 # EVERY case and fails the case outright when the worker pid moved
-# (eval_pid_stable, prober/assert.c), so a `probe pid ==` line here would only
+# (eval_pid_stable, ci/prober/assert.c), so a `probe pid ==` line here would only
 # restate a check that already ran unconditionally on all of them.
 name    worker survives the malformed batch and the zone is still coherent
 send    GET /__probe HTTP/1.1\r\n

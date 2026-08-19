@@ -31,7 +31,7 @@ jobs:
   # policy (README "What this repo is -- and what it is not"): no sanitizer
   # legs in this repo's CI, on nginx or on our own binary. They had been
   # written into README.md and AGENTS.md on 2026-07-28 but never removed from
-  # this file. `SAN=1 prober/test.sh` remains for a one-off local run when a
+  # this file. `SAN=1 ci/prober/test.sh` remains for a one-off local run when a
   # parser bug is suspected -- that, not a permanent CI leg, is the move.
   selftest:
     runs-on: [self-hosted, builder02, lxc]
@@ -49,7 +49,7 @@ jobs:
         env:
           CC: ${{ matrix.cc }}
           SAN: "0"
-        run: prober/test.sh
+        run: ci/prober/test.sh
 
   # The selftest job above proves the tests RUN. This one proves they ASSERT.
   #
@@ -79,7 +79,7 @@ jobs:
       - name: mutation smoke test (C suites)
         env:
           MUT_KIND: c
-        run: prober/mutate.sh
+        run: ci/prober/mutate.sh
 
   # Corpus replay of the parser fuzz targets, under gcc + ASan/UBSan, on the PR
   # path. This is the deterministic, engine-free half of the fuzzing story: each
@@ -90,7 +90,7 @@ jobs:
   #
   # The gate is proven non-vacuous the same way every other gate here is: a
   # planted out-of-bounds read in json_parse_n makes replay abort under ASan and
-  # exit nonzero (see prober/fuzz/README.md). A fuzz target that "reports but
+  # exit nonzero (see ci/prober/fuzz/README.md). A fuzz target that "reports but
   # exits 0" is the canonical vacuous fuzz gate, and the standalone driver does
   # not admit one: a crash kills the process, and the driver's only report is a
   # count of files it actually fed to the target, with zero files exiting
@@ -113,7 +113,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libssl-dev zlib1g-dev
 
       - name: replay parser fuzz corpus
-        run: prober/fuzz/fuzz.sh replay
+        run: ci/prober/fuzz/fuzz.sh replay
 
   # Deterministic algorithmic-cost gate: parsing an 8x larger JSON document must
   # cost ~8x the instructions, never ~64x. Cachegrind counts instructions
@@ -138,7 +138,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends valgrind libssl-dev zlib1g-dev
 
       - name: json parser instruction-count scaling gate
-        run: prober/perf/cachegrind-scale.sh
+        run: ci/prober/perf/cachegrind-scale.sh
 
   # Compiling the probe against real nginx headers is what proves the generic
   # split is actually generic. It is not enough that it builds standalone: the
@@ -478,7 +478,7 @@ jobs:
   # faking a uniform pass by excluding whatever does not fit would defeat the
   # gate:
   #
-  #   - prober/*.h are real, freestanding C headers with no nginx dependency
+  #   - ci/prober/*.h are real, freestanding C headers with no nginx dependency
   #     at all (the prober is a plain userspace program). Every one of them
   #     must compile with -fsyntax-only given nothing but -I prober, full
   #     stop.
@@ -642,7 +642,7 @@ jobs:
           cp -r /tmp/srv/objs ".build/${{ matrix.flavor }}-${{ matrix.version }}/"
 
       - name: build the prober
-        run: prober/build.sh
+        run: ci/prober/build.sh
 
       # The syscall-allowlist scenario attaches strace to the worker, which
       # needs PTRACE_SEIZE. GitHub's ubuntu-latest ships yama
@@ -657,15 +657,15 @@ jobs:
       # PROBER_MODULE / PROBER_DIRECTIVE / PROBER_PROBE are the consumer
       # contract -- normally supplied by the module under test. Here the
       # reference module in t/module plays that role. PROBER_ROOT is set
-      # explicitly because it otherwise defaults to two levels above prober/,
-      # which is the checkout's PARENT, not the checkout.
+      # explicitly to pin it to the checkout; lib.sh otherwise derives it from
+      # its own location (ci/prober/lib.sh -> repo root).
       - name: run the scenario tree against a live ${{ matrix.flavor }}
         env:
           PROBER_ROOT: ${{ github.workspace }}
           PROBER_MODULE: ngx_http_test_ref_module.so
           PROBER_DIRECTIVE: test_ref_probe
           PROBER_PROBE: "test_ref_probe;"
-        run: prober/test-scenarios.sh ${{ matrix.flavor }} ${{ matrix.version }}
+        run: ci/prober/test-scenarios.sh ${{ matrix.flavor }} ${{ matrix.version }}
 
       # A scenario tree that cannot fail is worth nothing, and this job is the
       # only place the tree ever executes -- so the mutation check belongs here
@@ -682,7 +682,7 @@ jobs:
           PROBER_DIRECTIVE: test_ref_probe
           PROBER_PROBE: "test_ref_probe;"
         run: |
-          RULE=prober/scenarios/conn-delta/conn-delta.rule
+          RULE=ci/prober/scenarios/conn-delta/conn-delta.rule
           cp "$RULE" /tmp/rule.orig
 
           # Assert something the server does NOT do. A scenario that still
@@ -697,7 +697,7 @@ jobs:
               exit 1
           fi
 
-          if prober/test-scenarios.sh ${{ matrix.flavor }} ${{ matrix.version }} \
+          if ci/prober/test-scenarios.sh ${{ matrix.flavor }} ${{ matrix.version }} \
                  >/tmp/mutant.tap 2>&1; then
               echo "MUTANT SURVIVED: conn-delta passed while asserting status=418" >&2
               sed -n '1,40p' /tmp/mutant.tap >&2
@@ -741,7 +741,7 @@ jobs:
           # These suites boot servers and sweep; the 120 s default is sized for
           # the C binaries and would report a caught mutation on wall clock.
           MUT_SUITE_TIMEOUT: "600"
-        run: prober/mutate.sh
+        run: ci/prober/mutate.sh
 
   # The scenario mutation rows in `scenarios` select their leg with
   # `if: matrix.mutation_rows`, so the flag -- not a version literal -- is the
@@ -798,17 +798,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: prober/*.h compile standalone
+      - name: ci/prober/*.h compile standalone
         run: |
           fail=0
-          for h in prober/*.h; do
+          for h in ci/prober/*.h; do
               echo "-- $h"
               if ! gcc -fsyntax-only -std=c11 -Wall -Wextra -I prober "$h"; then
                   fail=1
               fi
           done
           if [ "$fail" -ne 0 ]; then
-              echo "one or more prober/*.h headers do not compile standalone" \
+              echo "one or more ci/prober/*.h headers do not compile standalone" \
                    "-- a header must not depend on some other header having" \
                    "been included first" >&2
               exit 1
@@ -842,7 +842,7 @@ jobs:
           # Globbed, not listed: the previous explicit list silently stopped
           # covering the scripts added beside it, so a new script could ship
           # unlinted while the job still reported green. -x follows sourced
-          # files (prober/lib.sh is sourced by three entry points and is
+          # files (ci/prober/lib.sh is sourced by three entry points and is
           # where the engine actually lives).
           # --source-path is required alongside -x: the scripts `cd` to their
           # own directory and source `./lib.sh`, which shellcheck resolves
@@ -852,22 +852,22 @@ jobs:
           # scenarios/*/driver.sh is globbed too: a scenario driver is a shell
           # entry point like the others (it sources lib.sh via PROBER_LIB and
           # runs the prober), so leaving it out would be the same silent-hole
-          # the explicit-list comment above warns about. --source-path=prober
+          # the explicit-list comment above warns about. --source-path=ci/prober
           # still resolves its `# shellcheck source=lib.sh` directive.
           # verify-impact and pr-impact carry no .sh extension (P2-A/P2-C spec
-          # names them as bare entry points, matching prober/build.sh's own
+          # names them as bare entry points, matching ci/prober/build.sh's own
           # style of naming things by role) so the *.sh glob above does not
           # pick them up -- list them explicitly rather than rename them and
-          # lose the intended invocation form (`prober/pr-impact`, not
-          # `prober/pr-impact.sh`).
-          # tools/*.sh is globbed for the same reason as prober/*.sh: it is a
+          # lose the intended invocation form (`ci/prober/pr-impact`, not
+          # `ci/prober/pr-impact.sh`).
+          # tools/*.sh is globbed for the same reason as ci/prober/*.sh: it is a
           # script directory, and a directory that is linted only by an explicit
           # list is a directory that stops being linted the moment someone adds
           # to it. Nullglob so an empty tools/ is not a shellcheck argument
           # error -- the job should go red for a bad script, not for an absent
           # one.
           shopt -s nullglob
-          shellcheck -x --source-path=prober prober/*.sh prober/verify-impact prober/pr-impact prober/pr-memcheck prober/scenarios/*/driver.sh tools/*.sh
+          shellcheck -x --source-path=ci/prober ci/prober/*.sh ci/prober/verify-impact ci/prober/pr-impact ci/prober/pr-memcheck ci/prober/scenarios/*/driver.sh tools/*.sh
 
       # The consumer-* scenarios listed in tools/gen-consumer-scenarios.sh are
       # GENERATED from a table in that script. Hand-editing one works locally
@@ -891,7 +891,7 @@ jobs:
       # instead of 25-30 min into the CI long pole, and it covers the rows that
       # the long pole's own MUT_KIND selector skips.
       - name: mutate.sh anchors are all live
-        run: MUT_CHECK=1 prober/mutate.sh
+        run: MUT_CHECK=1 ci/prober/mutate.sh
 
       # Downloaded and hash-checked, same as the server tarballs above: a
       # linter that gates the build is as much a supply-chain dependency as
@@ -969,12 +969,12 @@ jobs:
       # no-sanitizer-legs policy: nothing here is instrumented for a finding to
       # be reported against, no server is built, and a sanitizer diagnostic
       # cannot fail this step -- only a file appearing that .gitignore misses.
-      # `SAN=1 prober/test.sh` stays supported for local runs, so its artifact
+      # `SAN=1 ci/prober/test.sh` stays supported for local runs, so its artifact
       # set still needs the drift check.
       - name: build + test leaves the tree clean
         run: |
           for san in 0 1; do
-              SAN="$san" prober/test.sh >/dev/null
+              SAN="$san" ci/prober/test.sh >/dev/null
 
               dirty=$(git status --porcelain)
               if [ -n "$dirty" ]; then
@@ -1050,7 +1050,7 @@ jobs:
                           -Wformat=2 -Wwrite-strings -Wcast-qual \
                           -Wpointer-arith -Wdeclaration-after-statement \
                           -ffile-prefix-map=$d=." \
-                      prober/build.sh >/dev/null
+                      ci/prober/build.sh >/dev/null
               )
           done
 
@@ -1120,7 +1120,7 @@ jobs:
       # so it runs with the plain flag set and -Werror: anything it says is
       # both new and, by this codebase's track record with it, worth reading.
       - name: gcc -fanalyzer
-        working-directory: prober
+        working-directory: ci/prober
         run: |
           for f in json.c http.c util.c rules.c assert.c prober.c; do
               gcc -fanalyzer -Werror -c -O1 -std=c11 -I. "$f" -o /dev/null
@@ -1140,7 +1140,7 @@ jobs:
       # normalCheckLevelMaxBranches is an informational note about analysis
       # depth, not a finding, and --check-level=exhaustive is what answers it.
       - name: cppcheck
-        working-directory: prober
+        working-directory: ci/prober
         run: |
           cppcheck \
               --enable=warning,performance,portability \
@@ -1184,7 +1184,7 @@ jobs:
       #       exceed 999000 and int arithmetic is exact -- the widening the
       #       check warns about has nothing to truncate.
       - name: clang-tidy
-        working-directory: prober
+        working-directory: ci/prober
         run: |
           checks='-*,bugprone-*,cert-*,clang-analyzer-*'
           checks="$checks,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling"
@@ -1212,7 +1212,7 @@ jobs:
   # asked for stack canaries and fortified libc calls, and both requests
   # actually landed in the emitted code.
   #
-  # Both flags are baked into prober/build.sh's WARN/CFLAGS rather than added
+  # Both flags are baked into ci/prober/build.sh's WARN/CFLAGS rather than added
   # only here, so every local build, the reproducible-build job, and the
   # analyzers job all compile under them too -- a flag that only CI passes is
   # a flag nobody develops against.
@@ -1224,7 +1224,7 @@ jobs:
           persist-credentials: false
 
       - name: build with canary + fortify flags
-        working-directory: prober
+        working-directory: ci/prober
         run: |
           gcc --version | head -1
           ./build.sh
@@ -1242,7 +1242,7 @@ jobs:
       # correctly fail rather than rely on the compiler having left dead code
       # in.
       - name: every prober unit was compiled with a stack canary
-        working-directory: prober
+        working-directory: ci/prober
         run: |
           fail=0
           for f in json.c http.c util.c rules.c assert.c prober.c; do
@@ -1279,7 +1279,7 @@ jobs:
       # the source lexeme verbatim, so that site is gone and json.c is back in
       # the not-checked camp.)
       - name: fortifiable call sites were rewritten to their _chk form
-        working-directory: prober
+        working-directory: ci/prober
         run: |
           fail=0
           for f in http.c util.c assert.c prober.c; do
@@ -1350,7 +1350,7 @@ jobs:
           done
 
       - name: build
-        working-directory: prober
+        working-directory: ci/prober
         run: ./build.sh
 
       # test.sh no longer includes http_locale_check.c in its *_test.c
@@ -1360,7 +1360,7 @@ jobs:
       # locale-sensitive comparisons, which is everything except
       # http_has_header.
       - name: self-tests under LC_ALL=tr_TR.UTF-8
-        working-directory: prober
+        working-directory: ci/prober
         env:
           LC_ALL: tr_TR.UTF-8
         run: |
@@ -1376,7 +1376,7 @@ jobs:
       # signature invisible-to-ordinary-CI shape of a locale bug (verified by
       # hand before this PR).
       - name: self-tests under LC_ALL=de_DE.UTF-8 (comma-decimal)
-        working-directory: prober
+        working-directory: ci/prober
         env:
           LC_ALL: de_DE.UTF-8
         run: |
@@ -1392,7 +1392,7 @@ jobs:
       # which is exactly the failure mode a locale bug has: invisible to any
       # CI leg that does not deliberately set a hostile locale.
       - name: dedicated Turkish-i regression case
-        working-directory: prober
+        working-directory: ci/prober
         env:
           LC_ALL: tr_TR.UTF-8
           CC: gcc

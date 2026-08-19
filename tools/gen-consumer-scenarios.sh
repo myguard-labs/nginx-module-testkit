@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # gen-consumer-scenarios.sh -- generate the zero-hook consumer scenarios under
-# prober/scenarios/consumer-<name>/ from one table.
+# ci/prober/scenarios/consumer-<name>/ from one table.
 #
 # WHY A GENERATOR
 #   Every zero-hook consumer scenario asserts the SAME property with the SAME
@@ -29,7 +29,7 @@
 #   --list       print the scenario names this script owns, one per line
 #   -h, --help   this header
 #
-# OUTPUT   prober/scenarios/consumer-<name>/{nginx.conf,requires,driver.sh}
+# OUTPUT   ci/prober/scenarios/consumer-<name>/{nginx.conf,requires,driver.sh}
 #
 # SIDE EFFECTS
 #   Overwrites the three files of every scenario it owns. It does NOT touch
@@ -124,7 +124,7 @@ if [ "$LIST" -eq 1 ]; then names; exit 0; fi
 
 in_csv() { case ",$2," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
-OUTROOT="prober/scenarios"
+OUTROOT="ci/prober/scenarios"
 if [ "$CHECK" -eq 1 ]; then
     OUTROOT="$(mktemp -d "${TMPDIR:-/tmp}/gen-consumer.XXXXXX")"
     trap 'rm -rf "$OUTROOT"' EXIT
@@ -196,7 +196,7 @@ EOF
 # scenarios are therefore a LOCAL instrument only:
 #
 #     tools/build-consumers.sh
-#     prober/test-scenarios.sh nginx 1.29.0-consumers
+#     ci/prober/test-scenarios.sh nginx 1.29.0-consumers
 #
 # Nothing in CI will tell you a consumer regressed. If you want that answer you
 # run it here, by hand, and read the output. Treating a green PR as evidence
@@ -214,8 +214,8 @@ EOF
 # exactly as run-scenario.sh passes them (with the same defaults).
 FLAVOR="\${2:-nginx}"
 VERSION="\${3:-1.31.3}"
-# The root fallback MUST match prober/lib.sh:77 exactly -- \$(cd ../.. && pwd),
-# evaluated from prober/, which is where run-scenario.sh has already cd'd by the
+# The root fallback MUST match ci/prober/lib.sh:77 exactly -- \$(cd ../.. && pwd),
+# evaluated from ci/prober/, which is where run-scenario.sh has already cd'd by the
 # time this gate runs. That fallback is written for the VENDORED layout
 # (t/harness/prober/ -> the consumer's repo root); in a standalone checkout of
 # this repo it lands one level above the repo, so PROBER_ROOT has to be set
@@ -595,7 +595,7 @@ if [ "$CHECK" -eq 1 ]; then
     rc=0
     while IFS= read -r name; do
         [ -n "$ONLY" ] && { in_csv "$name" "$ONLY" || continue; }
-        if ! diff -ru "prober/scenarios/consumer-$name" "$OUTROOT/consumer-$name"; then
+        if ! diff -ru "ci/prober/scenarios/consumer-$name" "$OUTROOT/consumer-$name"; then
             rc=1
         fi
     done < <(names)
@@ -611,12 +611,12 @@ if [ "$CHECK" -eq 1 ]; then
     # only exemption; a second one wants a comment saying why.
     if [ -z "$ONLY" ]; then
         owned=" $(names | tr '\n' ' ') cache-turbo "
-        for d in prober/scenarios/consumer-*/; do
+        for d in ci/prober/scenarios/consumer-*/; do
             [ -d "$d" ] || continue
             n="$(basename "$d")"; n="${n#consumer-}"
             case "$owned" in
                 *" $n "*) ;;
-                *)  echo "ORPHAN: prober/scenarios/consumer-$n is committed but no table row owns it" >&2
+                *)  echo "ORPHAN: ci/prober/scenarios/consumer-$n is committed but no table row owns it" >&2
                     echo "        -- delete the directory, or add its row back to TABLE" >&2
                     rc=1 ;;
             esac

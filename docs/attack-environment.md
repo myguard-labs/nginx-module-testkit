@@ -32,13 +32,13 @@ locale-aware folding here; this is *not* the ASCII-only guarantee an earlier
 draft assumed — verified empirically).
 
 The practical effect: `strncasecmp("ICE-Auth", "ice-auth", 8)` is `0` under the C
-locale and non-zero under `tr_TR.UTF-8`. `http_has_header()` in `prober/http.c` is
+locale and non-zero under `tr_TR.UTF-8`. `http_has_header()` in `ci/prober/http.c` is
 a direct `strncasecmp()` consumer over raw response header bytes, so a header
 whose name or value differs from the needle only in `I`/`i` casing silently stops
 matching under this locale — every `expect header~...` assertion quietly turns
 into a no-op.
 
-`prober/http_locale_check.c` is the dedicated regression case. It is named that
+`ci/prober/http_locale_check.c` is the dedicated regression case. It is named that
 way **specifically to opt out** of `test.sh`'s `*_test.c` discovery, because it
 only means anything when run standalone under `LC_ALL=tr_TR.UTF-8`.
 
@@ -217,8 +217,8 @@ proxy. A module keeping its own `CLOCK_REALTIME` deadline is caught only if the
 consumer exposes it via `zone_render` and adds a case. That is the honest limit of
 a generic clock oracle.
 
-`prober/http.c` and `prober/fakesrv.c` both time their deadlines with
-`prober_monotonic_ms()` (`prober/util.c`) for the same reason: `CLOCK_MONOTONIC`,
+`ci/prober/http.c` and `ci/prober/fakesrv.c` both time their deadlines with
+`prober_monotonic_ms()` (`ci/prober/util.c`) for the same reason: `CLOCK_MONOTONIC`,
 and a 64-bit millisecond count so a host up 24.9 days does not wrap a deadline
 negative under `-m32`. One implementation rather than two, because the two
 hand-written copies it replaced had already drifted -- only one carried the
