@@ -1,11 +1,11 @@
-prober/prober
-prober/fakesrv
-prober/*_test
-prober/http_locale_check
-prober/fuzz/replay_*
-prober/fuzz/fuzz_*.bin
-prober/fuzz/crashes/
-prober/perf/cg_scale.bin
+ci/prober/prober
+ci/prober/fakesrv
+ci/prober/*_test
+ci/prober/http_locale_check
+ci/prober/fuzz/replay_*
+ci/prober/fuzz/fuzz_*.bin
+ci/prober/fuzz/crashes/
+ci/prober/perf/cg_scale.bin
 *.o
 *.gcda
 *.gcno
@@ -16,7 +16,7 @@ prober/perf/cg_scale.bin
 *.d
 t/*_test
 /.build/
-prober/coverage-map.json
+ci/prober/coverage-map.json
 
 # Landing dir for the consumer-wiring exercise: copies of our own modules are
 # built and probed here, never committed. See

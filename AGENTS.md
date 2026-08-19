@@ -17,7 +17,7 @@ built. **Coverage goal is 100% of the code under test**, understood as a
 direction of travel, not a promise: chase the uncovered lines, never the
 percentage, and there is deliberately NO coverage-% merge gate (moving that
 number with non-asserting tests is the vacuous-gate failure this repo hunts).
-`prober/coverage-director.sh` is the reachability generator — use it to find
+`ci/prober/coverage-director.sh` is the reachability generator — use it to find
 what is NOT reached.
 
 **SCOPE (a narrower question — what THIS repo's own CI spends budget on).** The
@@ -28,7 +28,7 @@ under test is our own code: the prober binary, its rule parser, the probe's JSON
 emitter, the shell plumbing. nginx is the fixture, never the subject. So: the
 parser runs under ASan/UBSan deterministically on every PR (`fuzz-replay` job);
 nginx and the main prober binary do not (decided 2026-07-28, implemented 2026-07-30).
-`SAN=1 prober/test.sh` remains available for one-off local runs when a parser bug
+`SAN=1 ci/prober/test.sh` remains available for one-off local runs when a parser bug
 is suspected. No valgrind on nginx, no whole-server fuzzing, no nginx benchmarking.
 Fuzzing our OWN parser stays in scope. Do not add a sanitizer job back without the
 user asking for it. Full rationale + the known cost → README "What this repo is — and
@@ -53,34 +53,34 @@ Working notes for this repo live OUTSIDE it, at
 
 ## Layout
 
-- `prober/` — the C prober + its shell library. `lib.sh` is the shared harness
+- `ci/prober/` — the C prober + its shell library. `lib.sh` is the shared harness
   (boot, render, probe, slope, teardown); `rules.c` parses the `.rule` DSL;
   `http.c` owns wire timing and framing. All three are single-writer files —
   never two branches open against one of them.
-- `prober/scenarios/<name>/` — one scenario per directory: `nginx.conf` template,
+- `ci/prober/scenarios/<name>/` — one scenario per directory: `nginx.conf` template,
   `*.rule`, optional `env`, `driver.sh`, `requires` (a gate that SKIPs rather
   than fails when a prerequisite is absent), optional `backend` script.
 - `src/` — the reference probe module (`ngx_test_probe*.{c,h}`) compiled into a
   `.so` the scenarios load.
 - `t/module` — the minimal consumer module. Deliberately tiny.
-- `prober/impact.map` — the reverse-impact DB: which targets a changed file must
+- `ci/prober/impact.map` — the reverse-impact DB: which targets a changed file must
   run. A changed executable source that maps to NO target fails closed.
 
 ## Build and test
 
 ```
 cd prober && ./build.sh                 # the prober + its unit tests
-prober/test.sh                          # full local gate, 28 suites
+ci/prober/test.sh                          # full local gate, 28 suites
 # Optional local tools (not wired into CI):
-prober/verify-impact --explain          # what a diff selects (omit --base for the working tree)
-prober/pr-impact --budget 90            # actually run the selected fast lane
+ci/prober/verify-impact --explain          # what a diff selects (omit --base for the working tree)
+ci/prober/pr-impact --budget 90            # actually run the selected fast lane
 ```
 
 Repo-root shellcheck, exactly as CI runs it — must exit 0:
 
 ```
-shellcheck -x --source-path=prober prober/*.sh prober/verify-impact \
-  prober/pr-impact prober/pr-memcheck prober/scenarios/*/driver.sh
+shellcheck -x --source-path=prober ci/prober/*.sh ci/prober/verify-impact \
+  ci/prober/pr-impact ci/prober/pr-memcheck ci/prober/scenarios/*/driver.sh
 ```
 
 A bare `shellcheck` without `-x` cannot follow `. ./lib.sh` and reports spurious

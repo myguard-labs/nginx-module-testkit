@@ -119,8 +119,8 @@ consumers actually want, and it is the one the Perl suite cannot make at all.
 For the class below counters, there is valgrind: a leaked `malloc` the probe never
 had a counter for, a one-time startup leak no delta catches, a read of freed
 memory that happens not to corrupt anything the assertions look at.
-`prober/valgrind-scenarios.sh` runs the tree under memcheck at 20–50× slowdown —
-too slow for the PR gate, cheap enough weekly, with `prober/pr-memcheck` as the
+`ci/prober/valgrind-scenarios.sh` runs the tree under memcheck at 20–50× slowdown —
+too slow for the PR gate, cheap enough weekly, with `ci/prober/pr-memcheck` as the
 PR-lane counterpart.
 
 ## How this class produces a green run that proves nothing

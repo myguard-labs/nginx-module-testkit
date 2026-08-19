@@ -40,7 +40,7 @@ jobs:
   # sockets to a live nginx) under qemu-user emulation on a big-endian,
   # unsigned-char target. No consumer nginx/angie build here: those are
   # amd64/arm64-only upstream tarballs, and this leg's job is the PARSER
-  # code in prober/, not the src/ probe (which is covered by probe-compiles
+  # code in ci/prober/, not the src/ probe (which is covered by probe-compiles
   # against real headers, and never runs standalone).
   selftest-s390x:
     runs-on: [self-hosted, builder02, docker]
@@ -71,7 +71,7 @@ jobs:
                   # without this the emulated leg fails that one suite with
                   # "python3: command not found" -- not a big-endian defect.
                   apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev zlib1g-dev python3 >/dev/null
-                  cd prober
+                  cd ci/prober
                   CC=gcc ./build.sh
                   # qemu-user emulation runs ~10-20x slower than native, so the
                   # python3 probe-stub accept+reply cycle can exceed the probe
@@ -104,7 +104,7 @@ jobs:
               bash -euo pipefail -c '
                   apt-get update -qq
                   apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev zlib1g-dev >/dev/null
-                  cd prober
+                  cd ci/prober
                   CC=gcc ./build.sh
               ' >/tmp/endian-nc-build.log 2>&1
           rc=$?

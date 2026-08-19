@@ -52,7 +52,7 @@ the one this repository exists to enforce:
 
 Concretely, for anything you add: the test does not count until its **control**
 fails — until you have broken the code the test claims to guard and watched that
-specific assertion go red. `prober/mutate.sh` automates that for the prober's own
+specific assertion go red. `ci/prober/mutate.sh` automates that for the prober's own
 code; for scenario oracles that mutate nginx's own machinery, the sanctioned
 fallback is a documented by-hand control recorded in the driver's header comment.
 [COVERAGE.md](COVERAGE.md) states the rule; each attack document names the

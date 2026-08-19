@@ -65,11 +65,11 @@ jobs:
           queries: security-extended
 
       # The manual build declared above. autobuild guesses at a build system and
-      # this tree has no configure/make for it to find -- prober/build.sh is the
+      # this tree has no configure/make for it to find -- ci/prober/build.sh is the
       # entry point test.sh itself calls, so naming it directly is both what CI
       # already exercises and immune to a future autobuild heuristic change.
       - name: build
-        run: prober/build.sh
+        run: ci/prober/build.sh
 
       - name: analyze
         uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a  # v4.37.1

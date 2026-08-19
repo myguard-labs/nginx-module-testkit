@@ -67,7 +67,7 @@ get there, and that is fine — the number is a direction of travel, not a
 promise. What matters is that every uncovered line is *known* and either gets a
 real adversarial test or an honest note saying why it is unreachable.
 
-`prober/coverage-director.sh` generates the per-test reachability map (opt-in;
+`ci/prober/coverage-director.sh` generates the per-test reachability map (opt-in;
 it feeds the impact selector). Use it to find what is **not** reached — that is
 its value here, as a generator of work.
 
@@ -125,10 +125,10 @@ Concretely:
   works; parser memory safety is proven separately by fuzz-replay.
 
 The known cost of that last rule, recorded so nobody has to rediscover it:
-`prober/rules.c` and `prober/json.c` are parsers, and dropping the sanitizer
+`ci/prober/rules.c` and `ci/prober/json.c` are parsers, and dropping the sanitizer
 selftest legs removes the only automated check for an out-of-bounds read or a
 use-after-free inside them. If a parser bug is ever suspected, the move is a
-one-off local sanitizer build (`SAN=1 prober/test.sh` still works and is not
+one-off local sanitizer build (`SAN=1 ci/prober/test.sh` still works and is not
 going away), not a new permanent CI leg.
 
 **Also not in scope:** valgrind on nginx, whole-server fuzzing, and performance
@@ -163,7 +163,7 @@ question is what the *oracle asserts*:
 
 Two that read as nginx-behaviour from their names are deliberately kept, because
 our own C names them as the thing that proves it. `keepalive-bleed` is the
-negative control for the prober's framing-aware reader — `prober/http.c` points
+negative control for the prober's framing-aware reader — `ci/prober/http.c` points
 at it for the conn-reuse split, and it is the shape `stateful-property-fuzz`
 builds its pipeline kind on. `clock-jump` LD_PRELOADs libfaketime on purpose, to
 prove a timer parked before a backward wall-clock step still fires on schedule
@@ -220,10 +220,10 @@ prober (standalone binary)          nginx/Angie worker (test build only)
 - **`src/ngx_test_probe.{c,h}`** — the in-worker probe, compiled into the
   module under test. Renders worker and shm-zone state as JSON so a test can
   assert on things the HTTP response never reveals.
-- **`prober/`** — the standalone C prober. Rule files, raw sockets, an
+- **`ci/prober/`** — the standalone C prober. Rule files, raw sockets, an
   RFC 8259-strict JSON reader (24 self-tests), TAP output. Knows nothing
   about any particular module.
-- **`prober/fakesrv`** — a scriptable fake redis/memcached upstream, for
+- **`ci/prober/fakesrv`** — a scriptable fake redis/memcached upstream, for
   modules that talk to a cache. Serves correct replies by default and takes
   adversarial fault overlays (truncation, lying lengths, resets, idle closes)
   that a real daemon cannot be made to produce, plus a JSONL journal that makes
@@ -249,8 +249,8 @@ Perl suite cannot make at all.
 Ten of our own modules were wired this way in one pass, and eight of them
 produced a working allocation-neutrality scenario with zero lines of
 module-specific C. The worked reference is
-[`prober/scenarios/consumer-cache-turbo/`](prober/scenarios/consumer-cache-turbo/);
-the others in `prober/scenarios/consumer-*/` are generated from a table by
+[`ci/prober/scenarios/consumer-cache-turbo/`](ci/prober/scenarios/consumer-cache-turbo/);
+the others in `ci/prober/scenarios/consumer-*/` are generated from a table by
 [`tools/gen-consumer-scenarios.sh`](tools/gen-consumer-scenarios.sh).
 
 **Hooked (the Mini howto below).** You need this only when the generic document
@@ -271,7 +271,7 @@ source tree:
 |---|---|---|
 | build your module + the reference probe into one tree | `tools/build-consumers.sh --only <mod>` | **8 s** |
 | generate the scenario from the table | `tools/gen-consumer-scenarios.sh` | 0.05 s |
-| run it | `prober/run-scenario.sh scenarios/consumer-<mod> nginx <ver>` | **0.4 s** |
+| run it | `ci/prober/run-scenario.sh scenarios/consumer-<mod> nginx <ver>` | **0.4 s** |
 
 The first run in a fresh checkout also downloads and unpacks the nginx tarball,
 which dominates everything above and depends on your link. Budget minutes for
@@ -1159,12 +1159,12 @@ The rules:
   silently-skipped assertion reading as a pass is the exact failure this harness
   exists to rule out.
 - Up to `MAX_BLOCKS` (16) blocks per case; the block's name is diagnostic only,
-  the way a case `name` is. See `prober/scenarios/keepalive-bleed/`.
+  the way a case `name` is. See `ci/prober/scenarios/keepalive-bleed/`.
 
 **5. Check the rules parse, without a server:**
 
 ```sh
-prober/prober --check prober/rules/stock/*.rule
+ci/prober/prober --check ci/prober/rules/stock/*.rule
 # 12 cases parsed from 3 rule files
 ```
 
@@ -1207,14 +1207,14 @@ each failure mode once produced a green run that proved nothing:
 
 ### Proving the tests assert
 
-`prober/test.sh` proves the self-tests **run**. `prober/mutate.sh` proves they
+`ci/prober/test.sh` proves the self-tests **run**. `ci/prober/mutate.sh` proves they
 **assert**: it breaks the code on purpose, once per known behaviour, and requires
 the named suite to go red each time.
 
 ```sh
-prober/mutate.sh              # every mutation
-prober/mutate.sh SO_LINGER    # only those matching a substring
-MUT_KIND=c prober/mutate.sh   # only rows whose suite is a compiled test binary
+ci/prober/mutate.sh              # every mutation
+ci/prober/mutate.sh SO_LINGER    # only those matching a substring
+MUT_KIND=c ci/prober/mutate.sh   # only rows whose suite is a compiled test binary
 ```
 
 `MUT_KIND` is `all` (default), `c`, or `scenario`. The split is by the KIND of
@@ -1370,11 +1370,11 @@ PROBER_PROBE='mymod_probe probezone;' \
 PROBER_PROBE_ZONE='mymod_ban_zone probezone:1m;' \
 PROBER_MODULE=ngx_http_mymod_module.so \
 PROBER_DIRECTIVE=mymod_probe \
-prober/run-scenario.sh ./scenarios/conn-delta nginx 1.31.3
+ci/prober/run-scenario.sh ./scenarios/conn-delta nginx 1.31.3
 ```
 
-- `prober/run-scenario.sh <dir> [flavor] [version]` runs one scenario.
-- `prober/test-scenarios.sh [flavor] [version]` runs every directory matching
+- `ci/prober/run-scenario.sh <dir> [flavor] [version]` runs one scenario.
+- `ci/prober/test-scenarios.sh [flavor] [version]` runs every directory matching
   `PROBER_SCENARIOS` (default `scenarios/*/`) and aggregates to a single TAP
   stream, each scenario an indented subtest block — `prove`-consumable. Zero
   matching scenarios is a bail-out, not a green: a typo'd glob must not turn
@@ -1417,7 +1417,7 @@ inference the harness depends on: `worker_processes 1` (the pid oracle) and
 orphans itself past teardown and holds the port into the next scenario). The
 error-log scrape runs per scenario, `PROBER_ALLOW_LOG` and all.
 
-All three entry points share the same engine (`prober/lib.sh`), so boot,
+All three entry points share the same engine (`ci/prober/lib.sh`), so boot,
 teardown and the log scrape cannot drift apart between them.
 
 ### The reference module (`t/module`)
@@ -1450,7 +1450,7 @@ PROBER_ROOT="$PWD" \
 PROBER_MODULE=ngx_http_test_ref_module.so \
 PROBER_DIRECTIVE=test_ref_probe \
 PROBER_PROBE='test_ref_probe;' \
-    prober/test-scenarios.sh nginx 1.29.0
+    ci/prober/test-scenarios.sh nginx 1.29.0
 ```
 
 `--without-http_rewrite_module` must NOT be passed: the scenario confs use
@@ -1504,7 +1504,7 @@ prober.
   diagnostic on failure, and the driver re-runs that exact saved file a
   second time (test 4) to prove replaying it reproduces the same verdict.
 
-See `prober/scenarios/property-fuzz/driver.sh`'s header comment for the full
+See `ci/prober/scenarios/property-fuzz/driver.sh`'s header comment for the full
 non-vacuity accounting (three claims, three proofs) and cross-links to the
 `mutate.sh` entries and the documented leak negative-control run.
 
@@ -1547,7 +1547,7 @@ alphabet (it needs the `PROBER_DAEMON_MODE=on` contract, incompatible with the
 mandatory `daemon off;`); the USR2 lifecycle is owned by `usr2-mid-transfer` /
 `backend-usr2-keepalive` / `usr2-state-machine`.
 
-See `prober/scenarios/stateful-property-fuzz/driver.sh`'s header for the full
+See `ci/prober/scenarios/stateful-property-fuzz/driver.sh`'s header for the full
 non-vacuity accounting — two `mutate.sh`-wired claims (PRNG determinism, plan
 persistence) plus four documented manually-run driver mutations, one per
 checkpoint oracle C1–C4.
@@ -1899,15 +1899,15 @@ The gate is **belt and suspenders**, not exit-code-only, because memcheck's
 own default behaviour makes exit-code-only a vacuous check: it reports every
 finding and still exits 0 unless told otherwise. `--error-exitcode=99` is the
 belt (fails the process valgrind directly launched); `prober_scrape_valgrind`
-in `prober/lib.sh` is the suspenders (greps every `$PROBER_PREFIX/logs/
+in `ci/prober/lib.sh` is the suspenders (greps every `$PROBER_PREFIX/logs/
 valgrind.*` log for `ERROR SUMMARY: [1-9]` or `definitely lost: [1-9]`,
-regardless of what any exit code said). `prober/valgrind_scrape_test.sh`
+regardless of what any exit code said). `ci/prober/valgrind_scrape_test.sh`
 proves the pairing is load-bearing: it plants the same leak, shows
 `--error-exitcode` catching it and, immediately after, shows the identical
 finding exiting 0 *without* that flag -- the vacuity the belt-and-suspenders
 shape exists to close.
 
-`prober/valgrind-scenarios.sh` is the entry point: it exports
+`ci/prober/valgrind-scenarios.sh` is the entry point: it exports
 `PROBER_VALGRIND` (the valgrind command line, no `--log-file` -- `lib.sh`
 appends that once the per-run `$PROBER_PREFIX` is known) and
 `PROBER_TIMEOUT_SCALE=40`, then runs `test-scenarios.sh` so every scenario in
@@ -1918,7 +1918,7 @@ scales the prober's own `-t` read timeout, the boot readiness loops, and
 `prober.c`'s `DELTA_SETTLE_TRIES` retry budget for the fd/pool delta to
 settle after a request's async close -- all three, or a valgrind run reads as
 a false leak or a false hang purely from being instrumented. See
-`prober/valgrind.supp` for the (deliberately narrow, nginx-core-only)
+`ci/prober/valgrind.supp` for the (deliberately narrow, nginx-core-only)
 suppression file consumers inherit for free.
 
 Consumers copy the job below, not `valgrind-scenarios.sh` itself -- it is not
@@ -1966,18 +1966,18 @@ jobs:
           ./valgrind-scenarios.sh nginx 1.31.3
 ```
 
-### PR-lane counterpart: `prober/pr-memcheck`
+### PR-lane counterpart: `ci/prober/pr-memcheck`
 
 `valgrind-scenarios.sh` is the optional whole-server memcheck (run as a scheduled
 job in a consumer's CI, not in this repo). Its PR-lane counterpart is
-`prober/pr-memcheck` (P2-F): it consumes `verify-impact`'s diff-selected targets
+`ci/prober/pr-memcheck` (P2-F): it consumes `verify-impact`'s diff-selected targets
 and runs only the **direct-callable** ones (the unit test binaries and fuzz targets
 a change actually touched) under `--leak-check=full --errors-for-leak-kinds=definite
 --track-origins=yes`, inside a 45 s outer budget, so a PR pays seconds for its own
 targets' leak + uninitialised-read surface instead of minutes for the whole tree.
 
 ```sh
-prober/pr-memcheck --base <merge-base-sha>   # local-only tool; self-test (pr_memcheck_test.sh) runs in the selftest job, but the adapter is not wired into a PR-lane CI job
+ci/prober/pr-memcheck --base <merge-base-sha>   # local-only tool; self-test (pr_memcheck_test.sh) runs in the selftest job, but the adapter is not wired into a PR-lane CI job
 ```
 
 It **refuses** any selected target that needs a full nginx boot (a `scenarios/*`
@@ -1988,7 +1988,7 @@ so an expensive check is never silently skipped. The fd-leak class stays with
 the optional whole-server run: `pr-memcheck` does **not** pass `--track-fds`,
 because the forking `expect_die` unit binaries inherit the parent's temp-file
 descriptor into each short-lived child, which `--track-fds` would report as a leak
-in every one. `prober/pr_memcheck_test.sh` proves the memcheck verdict, the refusal
+in every one. `ci/prober/pr_memcheck_test.sh` proves the memcheck verdict, the refusal
 (with a blanked-oracle negative control), the budget refusal and the empty-selection
 path are all non-vacuous.
 
@@ -2009,9 +2009,9 @@ differently under other protocols, and none of those paths are attacked:
 
 - **TLS.** Shipped, both halves. The prober has a TLS client leg —
   `http_connect()` and `http_request()` take an optional `http_tls`, and
-  `prober/http_test.c` exercises the handshake, a round-trip, side-table
+  `ci/prober/http_test.c` exercises the handshake, a round-trip, side-table
   teardown and a plaintext-peer control against a self-signed in-process
-  fixture. `prober/scenarios/tls-listener` is the scenario half: a real
+  fixture. `ci/prober/scenarios/tls-listener` is the scenario half: a real
   `listen … ssl` server, a self-signed certificate minted into the run prefix
   at boot (never committed, so it can neither leak a key nor expire into a red
   suite), and four rule cases over the TLS transport. A scenario opts in by
@@ -2080,7 +2080,7 @@ not a scenario:
   registers none. That half needs a real module fault site plus a consumer
   `.so`, the same boundary `fault-matrix` documents.
 
-**Coverage-driven work.** Run `prober/coverage-director.sh` and read the map for
+**Coverage-driven work.** Run `ci/prober/coverage-director.sh` and read the map for
 *unreached* lines in a consumer's module rather than in our own code. An
 unreached line in error handling is a line no test has ever forced to run, and
 the `fault_*` knobs exist precisely to force them. This turns the coverage goal
@@ -2095,7 +2095,7 @@ into a generator of concrete adversarial scenarios instead of a number to chase.
 If you have a way to break a module that is not on this list, that is the most
 useful thing you can contribute.
 
-## Fake upstream (`prober/fakesrv`)
+## Fake upstream (`ci/prober/fakesrv`)
 
 A scriptable fake redis/memcached backend, for testing modules that talk to an
 upstream cache. It exists because a **real** daemon is the wrong instrument for
@@ -2110,7 +2110,7 @@ connection was reused; the JSONL journal can, which turns "the keepalive pool
 works" from an assumption into a one-line assertion.
 
 ```sh
-prober/fakesrv -script mc.backend -listen 127.0.0.1:0 \
+ci/prober/fakesrv -script mc.backend -listen 127.0.0.1:0 \
                -portfile "$PROBER_PREFIX/backend.port" \
                -journal  "$PROBER_PREFIX/backend.jsonl"
 ```
@@ -2228,7 +2228,7 @@ PROBER_PROBE='mymod_probe probezone;' \
 PROBER_PROBE_ZONE='mymod_ban_zone probezone:1m;' \
 PROBER_MODULE=ngx_http_mymod_module.so \
 PROBER_DIRECTIVE=mymod_probe \
-prober/run.sh nginx 1.31.3
+ci/prober/run.sh nginx 1.31.3
 ```
 
 A conf using `@PROBE@` with `PROBER_PROBE` unset bails at render. Both values
@@ -2311,7 +2311,7 @@ to compare against and is passed silently.
 Set it in the environment of the command you run:
 
 ```
-PROBER_ALLOW_STALE_SO=1 prober/run-scenario.sh scenarios/<name> nginx 1.29.0
+PROBER_ALLOW_STALE_SO=1 ci/prober/run-scenario.sh scenarios/<name> nginx 1.29.0
 ```
 
 Unlike `PROBER_ALLOW_LOG` and `PROBER_ALLOW_MULTIWORKER`, **a scenario's `env`
@@ -2360,7 +2360,7 @@ error log scrape, so a pattern like `"no memory for"` exempts that specific
 condition while leaving segfaults and other unexpected errors fatal.
 
 ```sh
-PROBER_ALLOW_LOG='no memory for|slab' prober/run.sh nginx 1.31.3
+PROBER_ALLOW_LOG='no memory for|slab' ci/prober/run.sh nginx 1.31.3
 ```
 
 **`ngx_test_probe_arm()` in zero-hook mode (optional)**
@@ -2452,9 +2452,9 @@ slightly different ones before this was written down, which is three too many.
 
 There is nothing to register. The convention is three rules:
 
-1. **Name the file `*_test.c`.** `prober/build.sh` globs `*_test.c` (and
+1. **Name the file `*_test.c`.** `ci/prober/build.sh` globs `*_test.c` (and
    `../t/*_test.c` for probe-side units), compiles each into its own binary, and
-   `prober/test.sh` runs every one. Dropping a file in is the whole wiring step —
+   `ci/prober/test.sh` runs every one. Dropping a file in is the whole wiring step —
    *"a test that has to be registered in two places is a test that eventually is
    not run at all"* (build.sh). A rename that stops matching the glob is caught,
    not silently dropped: **zero discovered suites is a hard failure**, never a
@@ -2502,9 +2502,9 @@ the compile-against-real-nginx/angie jobs and the live prober run.
   `/proc` is unreadable (or, for `timers`, the timer tree is uninitialised).
   Direct assertions on it fail loudly; `delta fds == 0` would subtract `-1`
   from `-1` and pass. The prober rejects it explicitly — the rejection list
-  is `path_is_proc_sentinel_field()` in `prober/assert.c`, kept in step with
+  is `path_is_proc_sentinel_field()` in `ci/prober/assert.c`, kept in step with
   the emitter's own sentinel-documented functions by
-  `prober/sentinel_fields_test.sh`.
+  `ci/prober/sentinel_fields_test.sh`.
 - **A delta rule fails loudly when the probe lacks the field** — running new
   rules against an older server gives "delta path not present", not a silent
   pass.
@@ -2553,7 +2553,7 @@ merely inert — it is not compiled at all.
 per-worker fields (pid, fds, cycle-pool, slab), which is enough to catch a
 per-request fd or memory leak. Hooks are what you add when you want the
 module's *own* zone rendered into the JSON or fault injection armed against it
-— see **Consumer contract** above. Every `prober/scenarios/consumer-*` scenario
+— see **Consumer contract** above. Every `ci/prober/scenarios/consumer-*` scenario
 in this repo starts zero-hook for exactly that reason.
 
 **Probe endpoint.** The consumer names a directive and puts it in one throwaway
@@ -2571,7 +2571,7 @@ leg rather than by a user.
 
 **Where it is used.** `nginx-http-shield-module` and
 `nginx-cache-turbo-module` consume it for automated CI verification.
-`prober/scenarios/consumer-*/` here additionally exercises a wider set of
+`ci/prober/scenarios/consumer-*/` here additionally exercises a wider set of
 MyGuard Labs modules — api-abuse, coraza-nginx, error-abuse, skeleton,
 strip-filter — as a local instrument; those scenarios SKIP in CI, because the
 sources they need are gitignored. `nginx-skeleton-module` is the template for
@@ -2586,7 +2586,7 @@ harness, so a new module opts in explicitly.
   — first consumer; its `t/prober/` rules and probe-hooks file are a worked
   example.
 - [nginx-cache-turbo-module](https://github.com/myguard-labs/nginx-cache-turbo-module)
-  — second consumer; `prober/scenarios/consumer-cache-turbo/` here is the
+  — second consumer; `ci/prober/scenarios/consumer-cache-turbo/` here is the
   hand-written reference the generated consumer scenarios are modelled on.
 - [Introduction article on deb.myguard.nl](https://deb.myguard.nl/articles/nginx-test-harness/)
   — the tour: what it catches, why sanitizers miss it, and the traps.

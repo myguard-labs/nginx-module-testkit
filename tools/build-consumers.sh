@@ -6,7 +6,7 @@
 # looks for it.
 #
 # WHY THIS EXISTS
-#   The consumer scenarios (prober/scenarios/consumer-*) each load a real
+#   The consumer scenarios (ci/prober/scenarios/consumer-*) each load a real
 #   third-party .so out of the SAME objs/ dir as the ref probe -- see
 #   consumer-cache-turbo/nginx.conf. nginx binds its dynamic-module list at
 #   CONFIGURE time, so "the ref probe plus these N consumers" is one configure
@@ -107,7 +107,7 @@ done
 # ref-probe-only tree the ordinary scenarios boot, and this script wipes objs/
 # before building. Defaulting there would silently destroy that tree on a bare
 # run. Drive the result with:
-#     prober/test-scenarios.sh nginx 1.29.0-consumers
+#     ci/prober/test-scenarios.sh nginx 1.29.0-consumers
 [ -n "$STAGE" ] || STAGE="${FLAVOR}-${VERSION}-consumers"
 
 case "$FLAVOR" in

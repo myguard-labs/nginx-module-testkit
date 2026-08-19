@@ -49,7 +49,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends gcc-multilib libc6-dev-i386 libssl-dev:i386 zlib1g-dev:i386
 
       - name: build the prober + self-tests as 32-bit
-        working-directory: prober
+        working-directory: ci/prober
         env:
           CC: "gcc -m32"
         run: |
@@ -62,7 +62,7 @@ jobs:
       # found; running is what proves a wrong VALUE, not just a wrong TYPE
       # that still happens to compile.
       - name: run the 32-bit self-tests
-        working-directory: prober
+        working-directory: ci/prober
         env:
           CC: "gcc -m32"
         run: ./test.sh
@@ -71,7 +71,7 @@ jobs:
       # been silently ignored (e.g. a toolchain that lacks the 32-bit runtime
       # and falls back). `file` reports the ELF class directly.
       - name: the built binary is ELF32
-        working-directory: prober
+        working-directory: ci/prober
         run: |
           file prober | grep -q 'ELF 32-bit' || {
               echo "prober is not ELF 32-bit -- the -m32 build did not" \

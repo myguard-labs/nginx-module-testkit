@@ -71,7 +71,7 @@ call. Reaching that half in this repository's own CI needs a real module fault
 site plus a consumer `.so`, and it is recorded as open work in
 [Ideas and opportunities](../README.md#ideas-and-opportunities--ways-to-break-a-module-we-do-not-yet-try).
 
-## Half two: a hostile upstream (`prober/fakesrv`)
+## Half two: a hostile upstream (`ci/prober/fakesrv`)
 
 A scriptable fake redis/memcached backend. A scenario gets one by shipping a
 `backend` file; it is started before the conf is rendered, binds an ephemeral
@@ -79,7 +79,7 @@ port, and `@BACKEND_PORT@` substitutes what it bound — the value does not exis
 any earlier.
 
 ```sh
-prober/fakesrv -script mc.backend -listen 127.0.0.1:0 \
+ci/prober/fakesrv -script mc.backend -listen 127.0.0.1:0 \
                -portfile "$PROBER_PREFIX/backend.port" \
                -journal  "$PROBER_PREFIX/backend.jsonl"
 ```

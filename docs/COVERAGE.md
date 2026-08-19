@@ -120,7 +120,7 @@ notice when it changes". Only the second is a proof, so:
 - Coverage is the **generator of work** — it produces the uncovered-line list.
 - Mutation is the **gate** — it decides whether a test that closed a gap is real.
 
-`prober/mutate.sh` is this repo's mutation runner and `prober/coverage-director.sh`
+`ci/prober/mutate.sh` is this repo's mutation runner and `ci/prober/coverage-director.sh`
 its per-test reachability map. Neither one gates on a number. The director exists
 to answer "what is *not* reached", which is the only question a coverage tool is
 good at.
@@ -131,7 +131,7 @@ Tests written under this policy are meant to land in the module's **own**
 repository, not to accumulate here. That constrains their shape:
 
 - The core unit tests must depend on **nothing but the module's own sources** —
-  no harness submodule, no `prober/`, no shared header from this repo. A plain
+  no harness submodule, no `ci/prober/`, no shared header from this repo. A plain
   `cc core.c tests.c -o t && ./t` has to work in a clean checkout.
 - TAP output, because every consuming repo's CI already understands it.
 - One test file per core source file, named after it, so the mapping from a

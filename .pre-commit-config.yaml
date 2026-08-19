@@ -24,7 +24,7 @@
 #
 # Detected in this repo:
 #   C source dirs : ., prober, src
-#   fuzz corpora  : prober/fuzz/corpus, prober/scenarios/property-fuzz/corpus, prober/scenarios/stateful-property-fuzz/corpus
+#   fuzz corpora  : ci/prober/fuzz/corpus, ci/prober/scenarios/property-fuzz/corpus, ci/prober/scenarios/stateful-property-fuzz/corpus
 #
 # What is NOT here, and why:
 #   clang-tidy   -- needs ngx_auto_config.h, which only exists after nginx is
@@ -53,7 +53,7 @@
 
 # Fuzz corpus files are byte-exact test inputs: a stripped space or an added
 # newline changes what is actually fuzzed. Never let a fixer touch them.
-exclude: '^prober/fuzz/corpus/|^prober/scenarios/property-fuzz/corpus/|^prober/scenarios/stateful-property-fuzz/corpus/|\.traefik-ref/|\.claude/worktrees/|\.build/|(^|/)objs/|(^|/)vendor/|(^|/)node_modules/|(^|/)\.venv/|\.(bin|gz|zip|png|ico|der|pem|so|o|a)$'
+exclude: '^ci/prober/fuzz/corpus/|^ci/prober/scenarios/property-fuzz/corpus/|^ci/prober/scenarios/stateful-property-fuzz/corpus/|\.traefik-ref/|\.claude/worktrees/|\.build/|(^|/)objs/|(^|/)vendor/|(^|/)node_modules/|(^|/)\.venv/|\.(bin|gz|zip|png|ico|der|pem|so|o|a)$'
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -82,7 +82,7 @@ repos:
         name: flawfinder (gate on >=4)
         entry: flawfinder --minlevel=4 --error-level=4 --quiet
         language: system
-        files: '^([^/]+\.[ch]|prober/.*\.[ch]|src/.*\.[ch])$'
+        files: '^([^/]+\.[ch]|ci/prober/.*\.[ch]|src/.*\.[ch])$'
         pass_filenames: true
 
       # Mirrors the CI "semgrep (gate on >=WARNING)" step, same configs and
@@ -108,7 +108,7 @@ repos:
         entry: semgrep scan --config p/c --config p/security-audit
                --severity=WARNING --severity=ERROR --error --jobs=1
         language: system
-        files: '^([^/]+\.[ch]|prober/.*\.[ch]|src/.*\.[ch])$'
+        files: '^([^/]+\.[ch]|ci/prober/.*\.[ch]|src/.*\.[ch])$'
         pass_filenames: true
         require_serial: true
 
@@ -146,7 +146,7 @@ repos:
       # They are real and worth fixing; they are deliberately NOT suppressed
       # here, so touching one of those scripts makes you fix it.
       # THIS REPO OVERRIDES THE -S warning DEFAULT ABOVE: its CI `shell` job runs
-      # `shellcheck -x --source-path=prober ...` with NO -S flag, i.e. it gates
+      # `shellcheck -x --source-path=ci/prober ...` with NO -S flag, i.e. it gates
       # at the INFO tier too. Gating locally at warning made local-green stop
       # predicting remote-green, and did exactly that on 2026-07-31: an SC2016
       # (info) on a mutate.sh anchor passed a -S warning hook and failed the
@@ -154,12 +154,12 @@ repos:
       # at CI's exact invocation (rc=0, zero findings), so the info tier costs
       # nothing here and is not the arrival-red the generic comment warns about.
       #
-      # -x --source-path=prober matches CI for the same reason: the scripts cd
+      # -x --source-path=ci/prober matches CI for the same reason: the scripts cd
       # to their own dir and source ./lib.sh, which shellcheck otherwise
       # resolves against ITS cwd and reports as SC1091.
       - id: shellcheck
         name: shellcheck (CI parity - all severities, follows sources)
-        entry: shellcheck -x --source-path=prober
+        entry: shellcheck -x --source-path=ci/prober
         language: system
         files: \.(sh|bash)$
         pass_filenames: true

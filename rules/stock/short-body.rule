@@ -18,7 +18,7 @@
 # close, rather than holding the half-closed socket (and whatever pool/fd it
 # took for the request) forever. `expect_close_within` is built exactly for
 # this: it turns "the read timed out" from a harness failure into a successful
-# return the assertion layer can judge (see prober/http.h and README ch. on
+# return the assertion layer can judge (see ci/prober/http.h and README ch. on
 # expect_close_within).
 #
 # WHY `shutdown 1`, NOT `hold` OR `abort`. `hold` sleeps without ever entering
