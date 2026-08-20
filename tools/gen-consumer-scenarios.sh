@@ -78,16 +78,37 @@ done
 #
 # ON THE ANTI-VACUITY COLUMN -- READ BEFORE ADDING A ROW.
 #
-# Three of these modules expose a signature that is genuinely IMPOSSIBLE without
+# Four of these modules expose a signature that is genuinely IMPOSSIBLE without
 # the module in the request path, and each was verified by running the module
-# both ways (see the per-row note). Two do not, and say so rather than pretending:
-# api-abuse and error-abuse only act once a threshold is crossed, and neither
-# emits a header, a body change, or even an INFO-level log line on a normal
-# request. A `grep '^HTTP/1.1 200'` against a `return 200` response would "pass"
-# with the module's directive commented out entirely -- that is a VACUOUS gate,
-# the exact shape this repo deletes scenarios for, so it is not used as one.
-# Those two rows carry an empty signature and the driver states the weakness in
-# its own output instead of overclaiming.
+# both ways (see the per-row note). error-abuse's threshold is a config-time
+# knob (`error_abuse_zone ... threshold=1 statuses=200`), so it can be driven
+# to 1 in the scenario itself. The zone is ALSO keyed on
+# `$http_x_consumer_probe` (empty for an ordinary request -- the module treats
+# an empty key as "bypass, do not track", see ngx_http_error_abuse_module.c's
+# two `key.len == 0` checks) instead of the default $binary_remote_addr, so
+# tracking/blocking is scoped to requests carrying the X-Consumer-Probe header
+# and can never leak into oracles 3-7's unmarked measurement requests, even
+# though every request in the scenario shares client 127.0.0.1. With
+# threshold=1, a single tagged request only COUNTS toward the threshold --
+# the module's own preaccess check runs before that request's header filter
+# records it, so the block a caller would observe does not exist yet on that
+# same request. The generated driver therefore fires one PRIMING tagged
+# request (discarded) before the measured trigger_request, so the measured
+# request is the second tagged one and gets the module's actual 429 (see the
+# "PRIMING trigger_request" block below -- it is a no-op repeat for the other
+# three real-signature rows, whose oracles are stateless per request). api-abuse does not, and says so rather than
+# pretending: reading the module's source (ngx_http_api_abuse_module.c) shows
+# BOTH of its wired phase handlers (preaccess, log) unconditionally
+# `return NGX_DECLINED` regardless of `api_abuse` mode -- the scoring/response
+# logic in ngx_http_api_abuse_{resp,score,detectors}.c is never called from any
+# phase handler, so `enforce` mode cannot affect a response at all. There is no
+# threshold to cross because there is no enforcement path wired up; this is not
+# a scenario-design gap, it is dead wiring in the module itself. A
+# `grep '^HTTP/1.1 200'` against a `return 200` response would "pass" with the
+# module's directive commented out entirely -- that is a VACUOUS gate, the
+# exact shape this repo deletes scenarios for, so it is not used as one. The
+# api-abuse row carries an empty signature and the driver states the weakness
+# in its own output instead of overclaiming.
 #
 # THE `shield` ROW IS THE ONE UNVERIFIED SIGNATURE, AND IT IS MARKED HERE
 # BECAUSE THAT MATTERS. nginx-http-shield-module does not currently BUILD (its
@@ -112,7 +133,7 @@ TABLE=$(cat <<'ROWS'
 skeleton|ngx_http_skel_module.so||location / {@@    skel block;@@    skel_status 403;@@}|^HTTP/1\.1 403|the skeleton module BLOCKED a marker request with 403 (the same request without the marker gets 200 -- verified both ways)|User-Agent: skel-marker
 strip-filter|ngx_http_strip_filter_module.so||location / {@@    strip on;@@    strip_min_size 0;@@}|<html><body><p>x</p></body></html>|the strip filter COLLAPSED the whitespace in the response body (the unstripped file on disk contains runs of spaces -- verified both ways)|
 api-abuse|ngx_http_api_abuse_module.so||location / {@@    api_abuse enforce;@@}||the configured path serves with api_abuse enforcing (WEAK -- no observable signature, see driver)|
-error-abuse|ngx_http_error_abuse_module.so|error_abuse_zone zone=consumer_errors:1m;|location / {@@    error_abuse zone=consumer_errors;@@}||the configured path serves with error_abuse attached (WEAK -- no observable signature, see driver)|
+error-abuse|ngx_http_error_abuse_module.so|error_abuse_zone zone=consumer_errors:1m key=$http_x_consumer_probe threshold=1 statuses=200;|location / {@@    error_abuse zone=consumer_errors;@@}|^HTTP/1\.1 429|error_abuse BLOCKED a second X-Consumer-Probe-tagged request with 429 after threshold=1 statuses=200 counted the first tagged request's own 200 (an untagged request never populates the empty-key bypass and always gets 200, keeping oracles 3-7's unmarked measurement requests on the module's ordinary path -- verified both ways)|X-Consumer-Probe: trip
 shield|ngx_http_shield_module.so|shield_ban_zone szone:1m;|location / {@@    shield block;@@}|^HTTP/1\.1 403|the shield module BLOCKED a request carrying an attack pattern with 403 (a benign request gets 200)|User-Agent: /bin/sh
 coraza|ngx_http_coraza_module.so||location / {@@    coraza on;@@    coraza_rules 'SecRuleEngine On';@@    coraza_rules 'SecRule REQUEST_HEADERS:X-Consumer-Probe "@streq trip" "id:9001,phase:1,deny,status:418"';@@}|^HTTP/1\.1 418|coraza's own rule DENIED with 418 (a status nginx never returns by itself; without the engine the request is a plain 200 -- verified both ways)|X-Consumer-Probe: trip
 ROWS
@@ -287,6 +308,18 @@ TRIGEOF
 # out of nginx.conf makes THIS oracle fail (and it was verified that way before
 # this scenario was committed), which is what makes oracles 3-6 worth reading:
 # they are measuring a request the module demonstrably participated in.
+#
+# A PRIMING trigger_request runs first, discarded. Every current signature is
+# stateless per-request (a marker header or attack pattern re-matches on every
+# call), so for most rows this is a harmless no-op repeat. error-abuse is the
+# exception the priming call exists for: its zone is threshold=1, so the FIRST
+# tagged request only counts toward the threshold -- the block a real observer
+# would see does not activate until the request AFTER that one. Priming supplies
+# that first tagged request so the measured trigger_request below is the second,
+# and gets the module's actual blocked response.
+if [ "\$WARMUP_OK" -eq 1 ]; then
+    trigger_request "\$PROBER_PREFIX/prime.out" "$trig" || true
+fi
 if [ "\$WARMUP_OK" -eq 1 ] && trigger_request "\$HITCHECK" "$trig"; then
     if grep -qiE '$av' "\$HITCHECK"; then
         SIG_SEEN=1
