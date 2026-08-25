@@ -1221,7 +1221,7 @@ mutate "probe: module_render dispatched after the zone branch" ../../src/ngx_tes
 mutate "probe: arm() refuses a NULL zone before reaching a hook" ../../src/ngx_test_probe_arm.c \
     'if (args == NULL || args->len == 0) {' \
     'if (zone == NULL || args == NULL || args->len == 0) {' \
-    probe_arm_test
+    ../../t/probe_arm_test
 
 # F1 compatibility: a member appended to the FROZEN ngx_test_probe_hooks_t.
 # Ten consumer repos initialise it positionally, so -Wextra's
