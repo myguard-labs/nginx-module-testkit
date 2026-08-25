@@ -217,9 +217,15 @@ ngx_mymod_probe_handler(ngx_http_request_t *r)
 
     mlcf = ngx_http_get_module_loc_conf(r, ngx_mymod_module);
 
-    /* Process any fault-injection directives in the query string before
+    /*
+     * Process any fault-injection directives in the query string before
      * rendering the snapshot. This arm-then-render order means the response
-     * reflects the state AFTER arming, which is what the test expects. */
+     * reflects the state AFTER arming, which is what the test expects.
+     *
+     * probe_zone may be NULL. With a zone and a fault_set hook the call routes
+     * there; otherwise it routes to fault_set_global, which is what a module
+     * with no shared memory must register.
+     */
     (void) ngx_test_probe_arm(mlcf->probe_zone, &r->args);
 
     /*
@@ -228,7 +234,9 @@ ngx_mymod_probe_handler(ngx_http_request_t *r)
      *
      *   1. The zone name length (shm.name.len)
      *   2. Space for your zone_render hook to append (if any)
-     *   3. A small margin for safety
+     *   3. Space for your module_render hook to append (if any), plus the
+     *      ~11 bytes of the `,"module":{}` wrapper the probe writes around it
+     *   4. A small margin for safety
      *
      * Example:
      *   NGX_TEST_PROBE_JSON_MAX + zone_name + ~128 bytes for hook overhead
@@ -247,8 +255,14 @@ ngx_mymod_probe_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    /* Render the snapshot. The harness handles the generic part; your
-     * zone_render hook (if registered) appends module-specific fields. */
+    /*
+     * Render the snapshot. The harness handles the generic part; your
+     * zone_render hook (if registered) appends fields inside "zone", and your
+     * module_render hook (if registered) fills a top-level "module" object.
+     *
+     * probe_zone may be NULL -- a module with no shm zone passes NULL here and
+     * still gets the whole generic document plus its module_render members.
+     */
     last = ngx_test_probe_json(buf, buf + size, mlcf->probe_zone);
 
     /* Send the JSON as the response body. */
