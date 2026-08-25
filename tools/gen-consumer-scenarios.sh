@@ -129,12 +129,29 @@ done
 # a request that should have been 403 until the location was changed to serve a
 # real static file from root. If a module's signature will not fire, check this
 # before concluding the module is broken.
+#
+# THE `zstd` ROW's SIGNATURE IS VERIFIED BOTH WAYS (2026-08-25). `Content-Encoding:
+# zstd` on the response is impossible without the filter module in the path:
+# observed present with `zstd on;` and ABSENT with `zstd off;` on the same conf,
+# same file, same request. nginx never emits that header by itself. The measured
+# request must carry `Accept-Encoding: zstd` or the filter correctly declines and
+# the signature legitimately disappears -- that is the trigger_hdr column's job.
+# `zstd_min_length 0` is required: the default minimum would skip the small
+# scenario document and the module would no-op for a reason unrelated to the
+# property under test. Do NOT add `zstd_types text/html` -- it is already in the
+# module's default type list and nginx warns "duplicate MIME type".
+#
+# http-zstd is also the only consumer that ships TWO modules from one checkout;
+# this scenario loads the FILTER module only, since the static module serves
+# precompressed .zst files from disk and has no per-request compression path to
+# assert allocation-neutrality on.
 TABLE=$(cat <<'ROWS'
 skeleton|ngx_http_skel_module.so||location / {@@    skel block;@@    skel_status 403;@@}|^HTTP/1\.1 403|the skeleton module BLOCKED a marker request with 403 (the same request without the marker gets 200 -- verified both ways)|User-Agent: skel-marker
 strip-filter|ngx_http_strip_filter_module.so||location / {@@    strip on;@@    strip_min_size 0;@@}|<html><body><p>x</p></body></html>|the strip filter COLLAPSED the whitespace in the response body (the unstripped file on disk contains runs of spaces -- verified both ways)|
 api-abuse|ngx_http_api_abuse_module.so||location / {@@    api_abuse enforce;@@}||the configured path serves with api_abuse enforcing (WEAK -- no observable signature, see driver)|
 error-abuse|ngx_http_error_abuse_module.so|error_abuse_zone zone=consumer_errors:1m key=$http_x_consumer_probe threshold=1 statuses=200;|location / {@@    error_abuse zone=consumer_errors;@@}|^HTTP/1\.1 429|error_abuse BLOCKED a second X-Consumer-Probe-tagged request with 429 after threshold=1 statuses=200 counted the first tagged request's own 200 (an untagged request never populates the empty-key bypass and always gets 200, keeping oracles 3-7's unmarked measurement requests on the module's ordinary path -- verified both ways)|X-Consumer-Probe: trip
 shield|ngx_http_shield_module.so|shield_ban_zone szone:1m;|location / {@@    shield block;@@}|^HTTP/1\.1 403|the shield module BLOCKED a request carrying an attack pattern with 403 (a benign request gets 200)|User-Agent: /bin/sh
+zstd|ngx_http_zstd_filter_module.so||location / {@@    zstd on;@@    zstd_min_length 0;@@}|Content-Encoding: zstd|the zstd filter COMPRESSED the response and set Content-Encoding: zstd (the same request against a zstd off location has no such header, and nginx never emits it by itself -- verified both ways 2026-08-25)|Accept-Encoding: zstd
 coraza|ngx_http_coraza_module.so||location / {@@    coraza on;@@    coraza_rules 'SecRuleEngine On';@@    coraza_rules 'SecRule REQUEST_HEADERS:X-Consumer-Probe "@streq trip" "id:9001,phase:1,deny,status:418"';@@}|^HTTP/1\.1 418|coraza's own rule DENIED with 418 (a status nginx never returns by itself; without the engine the request is a plain 200 -- verified both ways)|X-Consumer-Probe: trip
 ROWS
 )
