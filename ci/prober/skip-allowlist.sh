@@ -34,6 +34,7 @@ _PROBER_SKIPS_COMMON=(
     consumer-shield
     consumer-skeleton
     consumer-strip-filter
+    consumer-zstd
     reload-compressing
     syscall-allowlist
 )
