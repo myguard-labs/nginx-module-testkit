@@ -53,5 +53,8 @@ typedef struct ngx_shm_zone_s  ngx_shm_zone_t;
 #define ngx_strncmp(s1, s2, n)  strncmp((const char *) (s1), \
                                         (const char *) (s2), n)
 #define ngx_memzero(buf, n)     memset(buf, 0, n)
+/* ngx_test_probe_render_module() copies its two fixed literals with this.
+ * Real nginx spells it the same way (ngx_string.h). */
+#define ngx_memcpy(dst, src, n)  memcpy(dst, src, n)
 
 #endif /* NGX_TEST_HARNESS_SHIM_H */
