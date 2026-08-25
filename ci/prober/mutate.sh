@@ -1203,6 +1203,60 @@ mutate "schema: emitter adds an undeclared field" ../../src/ngx_test_probe.c \
     '"\"page_size\":%uz,\"undeclared\":1,"' \
     schema_emitter_test.sh
 
+# F1: the zone-independent render dispatch moved BELOW the zone branch -- the
+# pre-fix shape, in which a module with no shm zone (every compression body
+# filter) could register a module_render hook that was never once called.
+# schema_emitter_test.sh compares the two line numbers and goes red.
+mutate "probe: module_render dispatched after the zone branch" ../../src/ngx_test_probe.c \
+    '    p = ngx_test_probe_render_module(p, last);
+
+    if (zone == NULL) {' \
+    '    if (zone == NULL) {' \
+    schema_emitter_test.sh
+
+# F1: the zoneless arm path removed -- ngx_test_probe_arm() refusing on a NULL
+# zone before reaching any hook, which is exactly what made a zoneless module's
+# fault_set_global unreachable. probe_arm_test.c asserts the hook RAN, not just
+# the return code, so a refusal reddens it.
+mutate "probe: arm() refuses a NULL zone before reaching a hook" ../../src/ngx_test_probe_arm.c \
+    'if (args == NULL || args->len == 0) {' \
+    'if (zone == NULL || args == NULL || args->len == 0) {' \
+    probe_arm_test
+
+# F1 compatibility: a member appended to the FROZEN ngx_test_probe_hooks_t.
+# Ten consumer repos initialise it positionally, so -Wextra's
+# -Wmissing-field-initializers plus -Werror turns this into a build failure in
+# THEIR trees, from a change made here. hooks_abi_test.sh reproduces that shape
+# locally so it goes red in this repo first.
+mutate "probe: a member appended to the frozen hooks struct" ../../src/ngx_test_probe.h \
+    '        ngx_int_t nth);
+} ngx_test_probe_hooks_t;' \
+    '        ngx_int_t nth);
+    void (*appended)(void);
+} ngx_test_probe_hooks_t;' \
+    hooks_abi_test.sh
+
+# F1: the leaner variants leak a "module" object. A document from a module that
+# registered no module_render hook must carry no "module" member at all, not an
+# empty stub -- a rule asserting on a member inside it would then fail with
+# "not present in document" rather than the clearer absent-object. schema_test's
+# rich_only handling asserts the absence.
+mutate "schema: zone-absent variant leaks a module object" schema_test.c \
+    '    "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
+    "\"cycle_large\":0,\"cycle_cleanup\":2},"
+    "\"zone\":{\"present\":false}}";
+
+/*
+ * R-10'"'"'s regression fixture' \
+    '    "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
+    "\"cycle_large\":0,\"cycle_cleanup\":2},"
+    "\"module\":{\"frames\":7},"
+    "\"zone\":{\"present\":false}}";
+
+/*
+ * R-10'"'"'s regression fixture' \
+    schema_test
+
 # The fixture side: schema_test.c is what proves the DOCUMENT still carries
 # what the schema promises, independently of the emitter's text.
 # doc_zone_shm_unmapped (R-10's regression fixture) is deliberately
