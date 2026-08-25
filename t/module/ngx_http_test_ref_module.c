@@ -291,8 +291,11 @@ ngx_http_test_ref_handler(ngx_http_request_t *r)
      * Fault arming happens before rendering, so a request that both arms a
      * fault and reads the document sees the state it just asked for. Return
      * value is deliberately ignored: NGX_DECLINED means "no fault directive in
-     * this query, or no fault_set hook" -- this module registers none, so that
-     * is the normal answer here and not an error. The probe validates the
+     * this query, or no fault hook at all" -- this module registers neither
+     * fault_set nor fault_set_global, so that is the normal answer here and
+     * not an error. The zone may also legitimately be NULL (test_ref_zone is
+     * not configured in every scenario); arm() accepts that and would route to
+     * fault_set_global if one were registered. The probe validates the
      * argument itself; a malformed one arms nothing.
      */
     (void) ngx_test_probe_arm(ngx_http_test_ref_zone, &r->args);

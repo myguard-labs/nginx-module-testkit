@@ -32,7 +32,8 @@ green run proving nothing:
   pipelined and split-framing cases (`keepalive-bleed` is the negative control
   for the reader that makes those honest).
 - **[Allocation-failure injection](docs/attack-fault-injection.md)** — `fault_slab=`, `fault_palloc=`,
-  `fault_tempfile=`, `fault_accept=` (`src/ngx_test_probe_arm.c`) make the
+  `fault_tempfile=`, `fault_accept=`, `fault_codec=`, `fault_codec_end=`
+  (`src/ngx_test_probe_arm.c`) make the
   allocator fail on demand, on the Nth call. Most module bugs live on the error
   path that nobody exercises, because in a healthy test the allocator never
   fails. `fault-matrix` drives these.
@@ -254,9 +255,19 @@ the others in `ci/prober/scenarios/consumer-*/` are generated from a table by
 [`tools/gen-consumer-scenarios.sh`](tools/gen-consumer-scenarios.sh).
 
 **Hooked (the Mini howto below).** You need this only when the generic document
-cannot answer your question — custom zone introspection (`zone_render`) or
-on-demand allocation-fault injection (`fault_set`). Both hooks are optional and
-independent. Reach for this when zero-hook has shown you nothing, not before.
+cannot answer your question — custom introspection (`zone_render` /
+`module_render`) or on-demand fault injection (`fault_set` /
+`fault_set_global`). All four hooks are optional and independent. Reach for
+this when zero-hook has shown you nothing, not before.
+
+The pairs differ only in where your state lives. `zone_render`/`fault_set` are
+handed the shm zone the probe was pointed at and are skipped entirely when
+there is no zone. `module_render`/`fault_set_global` take no zone at all, and
+are the path for a module that has none — a body filter such as a compression
+module keeps every byte of its state in the request pool and per-worker
+globals. **Register the pair that matches your module**: a zoneless module that
+registers only the zone-addressed pair compiles, links and is never called
+once, which looks instrumented while asserting nothing.
 
 The rule of thumb: **start zero-hook, promote to a hook when an oracle you want
 is unexpressible.** Everything in the howto below still applies once you get
@@ -323,15 +334,41 @@ my_zone_render(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
     return ngx_slprintf(buf, last, ",\"nodes\":%ui", my_count(zone));
 }
 
+/* The zoneless counterpart, for a module with no shm zone. Renders into a
+ * top-level "module" object whose braces the probe writes -- so unlike
+ * zone_render there is NO leading comma and no closing brace. */
+static u_char *
+my_module_render(u_char *buf, u_char *last)
+{
+    return ngx_slprintf(buf, last, "\"frames\":%ui", my_frame_count);
+}
+
+/* Zone-addressed hooks. Skip this struct entirely if you have no shm zone. */
 static const ngx_test_probe_hooks_t  my_hooks = {
-    .zone_render = my_zone_render,   /* extra module fields in the JSON */
-    .fault_set   = my_fault_set,     /* arm allocation faults on demand */
+    .zone_render = my_zone_render,   /* extra fields inside "zone" */
+    .fault_set   = my_fault_set,     /* arm faults, zone-addressed */
 };
 
-ngx_test_probe_register(&my_hooks);
+/* Zone-independent hooks, in their own struct with its own registrar. */
+static const ngx_test_probe_module_hooks_t  my_module_hooks = {
+    .module_render    = my_module_render,     /* fields inside "module" */
+    .fault_set_global = my_fault_set_global,  /* arm faults, no zone    */
+};
+
+ngx_test_probe_register(&my_hooks);              /* if you have a zone */
+ngx_test_probe_register_module(&my_module_hooks);
 ```
 
-Both hooks are **optional**. Registering nothing still gets you the whole
+**Two structs, not one, and that is deliberate.** `ngx_test_probe_hooks_t` is
+frozen: existing consumers initialise it positionally, and `-Wextra` turns on
+`-Wmissing-field-initializers`, so appending a member there is a *build
+failure* in every one of those repos rather than a silent zero-init. New hooks
+therefore arrive in `ngx_test_probe_module_hooks_t` with its own registrar. A
+module that never calls `ngx_test_probe_register_module()` is unaffected. The
+two registries are independent in both directions — registering one never
+disturbs the other.
+
+All four hooks are **optional**. Registering nothing still gets you the whole
 generic document — flavor, pid, connections, `fds` (total and split by kind in
 `fds_by_kind`: socket / file / anon / other), resident-set lineage in `smaps`
 (`pss` and `private_dirty`, in kB, from `/proc/self/smaps_rollup`), cycle-pool
@@ -2074,11 +2111,13 @@ not a scenario:
   a reload landing on a request already failing upstream — using a fakesrv
   ordinal-keyed fault, which needs no hook and runs on the stock ref-probe legs.
   The *allocation* half is still open and is blocked on the fixture rather than
-  on effort: `fault_slab=`/`fault_palloc=`/`fault_tempfile=`/`fault_accept=` arm
+  on effort: `fault_slab=`/`fault_palloc=`/`fault_tempfile=`/`fault_accept=`/
+  `fault_codec=`/`fault_codec_end=` arm
   through `ngx_test_probe_arm()`, which returns `NGX_DECLINED` unless the module
-  under test registers a `fault_set` hook, and `t/module/` deliberately
-  registers none. That half needs a real module fault site plus a consumer
-  `.so`, the same boundary `fault-matrix` documents.
+  under test registers a fault hook (`fault_set`, or `fault_set_global` for a
+  module with no zone), and `t/module/` deliberately registers none. That half
+  needs a real module fault site plus a consumer `.so`, the same boundary
+  `fault-matrix` documents.
 
 **Coverage-driven work.** Run `ci/prober/coverage-director.sh` and read the map for
 *unreached* lines in a consumer's module rather than in our own code. An
@@ -2365,9 +2404,11 @@ PROBER_ALLOW_LOG='no memory for|slab' ci/prober/run.sh nginx 1.31.3
 
 **`ngx_test_probe_arm()` in zero-hook mode (optional)**
 
-If your module registers no `fault_set` hook (zero-hook mode — the generic
+If your module registers no fault hook at all (zero-hook mode — the generic
 probe alone suffices), you **should still call `ngx_test_probe_arm()`** from
-your HTTP handler before rendering the snapshot. The harness allows a later
+your HTTP handler before rendering the snapshot. Pass your zone if you have
+one and `NULL` if you do not; `NULL` is a supported argument, not an error, and
+is what routes a later `fault_set_global` registration. The harness allows a later
 hook registration to arm or disarm faults, so a test that calls `arm()` now
 can always be extended with a custom hook later without changing the test
 code. If no hook is registered, the call is a no-op and returns `NGX_DECLINED`;
@@ -2552,9 +2593,11 @@ merely inert — it is not compiled at all.
 `ngx_test_probe_hooks_t` registered, the probe still reports the generic
 per-worker fields (pid, fds, cycle-pool, slab), which is enough to catch a
 per-request fd or memory leak. Hooks are what you add when you want the
-module's *own* zone rendered into the JSON or fault injection armed against it
-— see **Consumer contract** above. Every `ci/prober/scenarios/consumer-*` scenario
-in this repo starts zero-hook for exactly that reason.
+module's *own* state rendered into the JSON — inside `zone` via `zone_render`,
+or in a top-level `module` object via `module_render` if you have no zone — or
+fault injection armed against it. See **Consumer contract** above. Every
+`ci/prober/scenarios/consumer-*` scenario in this repo starts zero-hook for
+exactly that reason.
 
 **Probe endpoint.** The consumer names a directive and puts it in one throwaway
 location; the harness then drives that endpoint and gets JSON back, which it

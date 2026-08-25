@@ -17,8 +17,8 @@ Two independent injectors cover the two halves.
 
 ## Half one: allocation faults inside the worker
 
-`src/ngx_test_probe_arm.c` implements the arming side. Four named knobs make the
-allocator fail on demand, on the Nth call:
+`src/ngx_test_probe_arm.c` implements the arming side. Six named knobs make a
+call fail on demand, on the Nth invocation:
 
 | Knob | Fails |
 |---|---|
@@ -26,6 +26,17 @@ allocator fail on demand, on the Nth call:
 | `fault_palloc=<n>` | the nth pool allocation |
 | `fault_tempfile=<n>` | the nth temp-file creation |
 | `fault_accept=<n>` | the nth `accept()` |
+| `fault_codec=<n>` | the nth streaming compress/decompress call |
+| `fault_codec_end=<n>` | the nth flush / end-of-frame call |
+
+The two codec knobs are spelled for the LAYER, not for a library: gzip, brotli
+and zstd all drive the same two-call shape (a streaming body call, then a
+flush/end-of-frame call), so every compression module inherits one vocabulary
+instead of each adding a library-specific synonym for the same two sites. They
+are separate sites because the end-of-frame call runs on a different request
+path — the last buffer, often after the body call already succeeded — and a
+codec that fails only there leaves a half-written body, which the body-call
+site cannot reach.
 
 They are armed over HTTP, by the rule directive `fault <query>`:
 
@@ -50,9 +61,20 @@ consequence of the design boundary below.
 ### The hook boundary, stated plainly
 
 `ngx_test_probe_arm()` returns `NGX_DECLINED` unless the module under test
-registers a `fault_set` hook. Zero-hook consumers therefore get the whole generic
+registers a fault hook. Zero-hook consumers therefore get the whole generic
 document and every leak oracle, but **not** allocation faults — there is no
 generic place for the harness to make someone else's allocator fail.
+
+There are two hooks and which one you register depends on where your fault
+counters live. `fault_set` (in `ngx_test_probe_hooks_t`, via
+`ngx_test_probe_register()`) is handed the shm zone the probe was pointed at.
+`fault_set_global` (in `ngx_test_probe_module_hooks_t`, via
+`ngx_test_probe_register_module()`) takes no zone, and is the one a module with
+no shared memory must register — every compression body filter is in that position. Registering
+only `fault_set` from a zoneless module means `arm()` can never reach it: the
+hook is registered and never called, which is a false green rather than a
+failure. A module that registers both gets `fault_set` whenever a zone is
+actually available and `fault_set_global` otherwise.
 
 Call it anyway, from the HTTP handler, before rendering the snapshot:
 
@@ -206,7 +228,9 @@ Each row asserts two things, in order:
   deleted `fault` line all yield a correct reply that satisfies every downstream
   assertion.
 - **An unknown action silently skipped.** Fatal by design, for the same reason.
-- **An allocation fault armed against a module with no `fault_set` hook.**
+- **An allocation fault armed against a module with no fault hook** — or
+  against a zoneless module that registered only the zone-addressed
+  `fault_set`, which cannot be reached without a zone.
   `NGX_DECLINED`, no fault, a clean request, a green case. The arming request's
   own reply is discarded, so nothing downstream notices — this is a real trap for
   a consumer who copies a `fault` rule from a hooked module.
