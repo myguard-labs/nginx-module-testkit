@@ -187,7 +187,21 @@ fi
 # ---- host rule: one build at a time ----------------------------------------
 # A concurrent nginx/pbuilder build on this box thrashes and has produced stale
 # artifacts before. Refuse rather than race.
-if pgrep -f 'pbuilder|dpkg-buildpackage' >/dev/null 2>&1; then
+#
+# BUILD_CONSUMERS_ALLOW_CONCURRENT=1 lifts EXACTLY this refusal and nothing
+# else. It exists for ci/prober/build_consumers_attrib_test.sh, which drives
+# this script against a STUB source tree whose ./configure and make do no
+# compilation at all -- so there is no CPU to contend for and no artifact to
+# race, and the property under test (the report block) lives after the guard.
+# Without the opt-out that self-test's verdict would depend on whether an
+# unrelated pdebuild happened to be running on the developer's box, which is a
+# test that reports on the host rather than on the code.
+#
+# Scoped to the literal value 1, following PROBER_ALLOW_STALE_SO: read as "any
+# non-empty value disables me", a stray ...=0 in an environment would silently
+# turn the host rule off. Never set this for a real build.
+if [ "${BUILD_CONSUMERS_ALLOW_CONCURRENT:-0}" != 1 ] \
+   && pgrep -f 'pbuilder|dpkg-buildpackage' >/dev/null 2>&1; then
     die "another package build is running on this host -- refusing to start (one build at a time)"
 fi
 
@@ -246,6 +260,30 @@ else
 fi
 
 # ---- configure + make -------------------------------------------------------
+# BUILD-START MARKER. A real file, not `date +%s`, so the freshness comparison
+# below is a plain `-nt`/`-ot` mtime test against the SAME filesystem clock the
+# .so files are stamped by. A wall-clock integer would have to be compared
+# against `stat -c %Y`, which drifts against a build dir on a different mount or
+# a host whose clock is not the fs clock; `find -newer` has no such gap.
+#
+# This exists because the staleness sweep below used to infer "not built now"
+# from a NAME-ATTRIBUTION miss -- the one thing that is not a freshness
+# measurement. That inference is false in both directions: it screamed at a .so
+# that had just been built (its name simply was not in the config text), and it
+# was silent about a genuinely stale .so whose name DID attribute, which is
+# precisely [[feedback-stale-so-fakes-negative-control]] -- the bug class this
+# script's own header cites as its reason to exist. Freshness is now measured.
+BUILD_START="$BUILDDIR/.build-start-marker"
+: >"$BUILD_START"
+# A filesystem with coarse (1s) mtime granularity can stamp a .so linked in the
+# same second as the marker with an mtime EQUAL to it, and `-nt` is strictly
+# greater-than -- that would report a fresh .so as stale. Back the marker off by
+# one second so an equal-second artifact still reads as newer. The window this
+# opens (a .so written in the second before the build started) is not reachable:
+# objs/ is wiped above, and a stale artifact is minutes-to-days old, not one
+# second.
+touch -d '1 second ago' "$BUILD_START"
+
 echo "==> configure with ${#CONSUMERS[@]} consumer(s) + the reference probe"
 CONFLOG="$BUILDDIR/configure.consumers.log"
 if ! ( cd "$BUILDDIR" && ./configure "${ARGS[@]}" ) >"$CONFLOG" 2>&1; then
@@ -272,37 +310,122 @@ MAKE_RC=0
 DEST="$ROOT/.build/$STAGE"
 mkdir -p "$DEST"
 rm -rf "$DEST/objs"
-cp -r "$BUILDDIR/objs" "$DEST/objs"
+# `cp -a`, NOT `cp -r`: -r stamps every copied file with the COPY time, which
+# erases the one piece of evidence the freshness sweep below reads. With -r a
+# stale .so carried out of a reused tree arrives in the stage dir looking newer
+# than the build marker, so the oracle would pass on every artifact
+# unconditionally -- structurally vacuous, and vacuous in the direction that
+# banks a green. -a preserves mtime, so an artifact this run did not rebuild
+# still carries the timestamp that proves it.
+cp -a "$BUILDDIR/objs" "$DEST/objs"
 echo "==> staged $DEST/objs"
 
-# ---- report -----------------------------------------------------------------
-# A module maps to its .so via its config's ngx_module_name / ngx_addon_name.
-# Both are read because the two spellings are both in use across our modules.
+# ---- attribute each .so to the consumer that produced it --------------------
+# RESOLVED FROM THE BUILD'S OWN MANIFEST (objs/Makefile), not from config text.
 #
-# The value may be QUOTED (coraza-nginx writes ngx_addon_name="ngx_http_coraza_module")
-# or bare, and a config may set ngx_module_name from a variable
-# (ngx_module_name="$ngx_addon_name"), so strip quotes and drop any value that is
-# still a $-reference after that. Getting this wrong reports a module that built
-# fine as NO -- which is worse than a build failure, because it sends the next
-# session hunting a compile bug that does not exist.
+# The old resolution grepped ngx_module_name= / ngx_addon_name= out of the
+# TOP-LEVEL consumers/<n>/config only, with no descent. That is not a manifest,
+# it is a guess about one file, and it is wrong for any module whose config is
+# multi-file, sourced, generated, or reassigns ngx_addon_dir:
+#
+#   http-zstd's top-level config declares only `ngx_addon_name=ngx_zstd` and
+#   then sources filter/config + static/config, where the REAL names
+#   (ngx_http_zstd_filter_module / ngx_http_zstd_static_module) are set. The
+#   grep therefore expected `ngx_zstd.so`, reported the consumer as NO, and
+#   sent both genuinely-fresh .so into the "belong to no module" sweep with a
+#   remediation ("delete the stage dir and rebuild") that reproduces the same
+#   output forever.
+#
+# objs/Makefile cannot be fooled that way: it is written by ./configure from the
+# module set nginx ACTUALLY bound, one `objs/<name>.so:` target per dynamic
+# module, and each of that target's .o prerequisites has its own compile rule
+# naming the ABSOLUTE source path. Since this script adds every consumer as
+# --add-dynamic-module=$ROOT/consumers/<n>, a .so belongs to consumer <n> iff
+# one of its sources lives under $ROOT/consumers/<n>/. That holds however deeply
+# the config nests, because the path in the Makefile is the path the compiler is
+# given.
+#
+# objs/ngx_modules.c is deliberately NOT used: it lists the STATIC module table
+# only, and contains no dynamic module at all (verified on a real tree -- 0 hits
+# for a dynamic module's name).
+#
+# Line continuations are joined first: nginx writes both the prerequisite list
+# and the link line across `\`-continued lines, so an unjoined scan sees only
+# the first prerequisite of each target.
+declare -A SO_OWNER=()
+MKF="$DEST/objs/Makefile"
+if [ -f "$MKF" ]; then
+    JOINED="$(mktemp "${TMPDIR:-/tmp}/build-consumers-mk.XXXXXX")"
+    sed -e :a -e '/\\$/N; s/\\\n//; ta' "$MKF" >"$JOINED"
+
+    # obj -> absolute source path (only compile rules; a .o whose source is a
+    # relative objs/ path is nginx's own generated *_modules.c and attributes
+    # nothing).
+    declare -A OBJ_SRC=()
+    while read -r o src; do
+        [ -n "$o" ] || continue
+        OBJ_SRC["$o"]="$src"
+    done < <(awk '/^objs\/[^:[:space:]]*\.o:/ {
+                      o=$1; sub(/:$/,"",o)
+                      for (i=2;i<=NF;i++) if ($i ~ /\.c$/) { print o, $i; break }
+                  }' "$JOINED")
+
+    # .so -> the consumers that own its objects. A .so is normally owned by
+    # exactly one, but the loop does not assume it: a config that pulled sources
+    # from two consumer dirs would show both rather than silently picking one.
+    while read -r so obj; do
+        [ -n "$so" ] || continue
+        src="${OBJ_SRC[$obj]:-}"
+        [ -n "$src" ] || continue
+        for n in "${CONSUMERS[@]}"; do
+            case "$src" in
+                "$ROOT/consumers/$n/"*)
+                    case " ${SO_OWNER[$so]:-} " in
+                        *" $n "*) ;;
+                        *) SO_OWNER["$so"]="${SO_OWNER[$so]:-}${SO_OWNER[$so]:+ }$n" ;;
+                    esac
+                    ;;
+            esac
+        done
+    done < <(awk '/^objs\/[^:[:space:]]*\.so:/ {
+                      so=$1; sub(/^objs\//,"",so); sub(/:$/,"",so)
+                      for (i=2;i<=NF;i++) if ($i ~ /\.o$/) print so, $i
+                  }' "$JOINED")
+
+    rm -f "$JOINED"
+else
+    echo "!!! $MKF is missing -- cannot attribute .so files to consumers from the build manifest" >&2
+fi
+
+# Invert: consumer -> its .so names, from the manifest above.
+declare -A CONSUMER_SOS=()
+for so in "${!SO_OWNER[@]}"; do
+    for n in ${SO_OWNER[$so]}; do
+        CONSUMER_SOS["$n"]="${CONSUMER_SOS[$n]:-}${CONSUMER_SOS[$n]:+ }$so"
+    done
+done
+
+# ---- report -----------------------------------------------------------------
 missing=0
 ACCOUNTED=()
 echo
 printf '%-32s %-12s %s\n' MODULE BUILT SO
 printf '%-32s %-12s %s\n' ------ ----- --
 for n in "${CONSUMERS[@]}"; do
-    mapfile -t names < <(
-        grep -hoE '^[[:space:]]*(ngx_module_name|ngx_addon_name)=["'"'"']?[A-Za-z0-9_$]+' \
-            "consumers/$n/config" 2>/dev/null \
-            | sed -e 's/.*=//' -e 's/^["'"'"']//' \
-            | grep -v '\$' | sort -u
-    )
+    # The manifest names every .so ./configure bound for this consumer, whether
+    # or not the link succeeded -- so a consumer that configured but failed to
+    # compile still has its names ACCOUNTED, and its artifacts are not mistaken
+    # for foreign ones by the sweep below.
+    read -r -a names <<<"${CONSUMER_SOS[$n]:-}"
     got=""
+    # $names holds full .so FILENAMES (the manifest's target names), not bare
+    # module names -- no ".so" is appended here.
     for nm in "${names[@]}"; do
-        [ -f "$DEST/objs/${nm}.so" ] && got="$got ${nm}.so"
+        [ -n "$nm" ] || continue
+        [ -f "$DEST/objs/$nm" ] && got="$got $nm"
         # Record it as accounted-for whether or not it exists, so the
         # unattributable sweep below only reports genuinely foreign artifacts.
-        ACCOUNTED+=("${nm}.so")
+        ACCOUNTED+=("$nm")
     done
     if [ -n "$got" ]; then
         printf '%-32s %-12s%s\n' "$n" yes "$got"
@@ -345,22 +468,55 @@ fi
 # as if it were fresh.
 ACCOUNTED+=(ngx_http_test_ref_module.so)
 unattributed=()
+stale=()
 for so in "$DEST"/objs/*.so; do
     [ -e "$so" ] || continue
     base="$(basename "$so")"
+
+    # FRESHNESS IS MEASURED, NOT INFERRED. This is the half the old sweep did
+    # not have at all: it asserted "these were NOT built now" purely from a
+    # name-attribution miss, so a genuinely stale .so whose name DID attribute
+    # passed in total silence -- a false GREEN for every consumer in the run,
+    # and exactly the [[feedback-stale-so-fakes-negative-control]] shape.
+    #
+    # $BUILD_START is stamped immediately before ./configure, so any artifact
+    # this run produced is newer than it. Note the attribution status is NOT
+    # consulted here: an attributed .so is checked with the same rigour as a
+    # foreign one, because a stale artifact with a familiar name is the more
+    # dangerous of the two -- the requires gate finds it, the scenario loads it,
+    # and the probe reports on code that was never rebuilt.
+    if [ ! "$so" -nt "$BUILD_START" ]; then
+        stale+=("$base")
+    fi
+
     known=0
     for a in "${ACCOUNTED[@]}"; do
         [ "$base" = "$a" ] && { known=1; break; }
     done
     [ "$known" -eq 0 ] && unattributed+=("$base")
 done
+
+if [ "${#stale[@]}" -gt 0 ]; then
+    echo
+    echo "!!! ${#stale[@]} .so in $DEST/objs are OLDER than this build started:" >&2
+    printf '        %s\n' "${stale[@]}" >&2
+    echo "    These were NOT built now -- their mtime predates the configure of" >&2
+    echo "    this run. A scenario loading one probes a stale artifact and" >&2
+    echo "    reports on code that was never rebuilt. Delete $DEST and rebuild," >&2
+    echo "    or re-run without --only/--skip." >&2
+    missing=$((missing + 1))
+fi
+
 if [ "${#unattributed[@]}" -gt 0 ]; then
     echo
     echo "!!! ${#unattributed[@]} .so in $DEST/objs belong to no module in this run:" >&2
     printf '        %s\n' "${unattributed[@]}" >&2
-    echo "    These were NOT built now. A scenario loading one probes a stale" >&2
-    echo "    artifact and reports on code that was never rebuilt -- delete the" >&2
-    echo "    stage dir and rebuild, or re-run without --only/--skip." >&2
+    echo "    The build manifest ($DEST/objs/Makefile) has no dynamic-module" >&2
+    echo "    target owning these, so nothing in consumers/ or t/module claims" >&2
+    echo "    them. Check the freshness verdict above before concluding they are" >&2
+    echo "    stale: an unowned but FRESH .so is a module this run built without" >&2
+    echo "    a consumer dir behind it, which is a different problem from a" >&2
+    echo "    leftover artifact." >&2
     missing=$((missing + 1))
 fi
 
