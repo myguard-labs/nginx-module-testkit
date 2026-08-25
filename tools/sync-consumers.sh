@@ -67,6 +67,16 @@ TARGETS=(
     # memory mirror -- this repo does not fix consumers, it reports on them.
     # Re-add the row once that module builds; syncing it before then only
     # copies 30M of sources that can never produce a .so.
+
+    # http-zstd is the only target that builds TWO modules from one checkout
+    # (ngx_http_zstd_filter_module + ngx_http_zstd_static_module, wired by the
+    # top-level config sourcing filter/config and static/config). It is also
+    # the most heavily tested module in the tree -- 39 tests, 11 workflows,
+    # ASAN/valgrind/fuzz lanes of its own -- which is exactly why it is here:
+    # the value is what it finds missing in THIS tool, not what this tool
+    # finds in it. Added 2026-08-25 by user decision, extending the original
+    # 10-target scope.
+    labs/http-zstd
     labs/nginx-http-shield-module
     labs/nginx-label-autoconf-module
     labs/nginx-skeleton-module
