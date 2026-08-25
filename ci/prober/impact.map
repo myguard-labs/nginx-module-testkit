@@ -224,7 +224,7 @@ SLOW	src/ngx_test_probe.c	scenarios/fault-matrix	slow
 # plan at each, diffs status/headers/body, and slope-checks the candidate's
 # own cycle_used/private_dirty across a post-warmup sweep. Two boots plus a
 # slope is a soak like rss-slope -- weekly lane, not the PR path (design pass:
-# memory/labs/nginx-test-harness/design-p2h-canary.md D-8). Its owners are the
+# memory/labs/nginx-module-testkit/design-p2h-canary.md D-8). Its owners are the
 # boot/probe/slope helper set (lib.sh) and the probe document the differential
 # and O7 growth oracles both read.
 SLOW	ci/prober/lib.sh	scenarios/deploy-canary	slow

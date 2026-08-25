@@ -4,7 +4,7 @@
 # copies of our own nginx modules, so the harness can be pointed at them.
 #
 # WHY THIS EXISTS
-#   The consumer-wiring exercise (memory/labs/nginx-test-harness/
+#   The consumer-wiring exercise (memory/labs/nginx-module-testkit/
 #   plan-wire-own-modules.md) measures what this tool finds when aimed at ten
 #   real modules instead of the deliberately-minimal t/module. The instruction
 #   behind it is explicit: do NOT fix the modules and do NOT commit the copies.

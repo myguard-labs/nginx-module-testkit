@@ -1619,7 +1619,7 @@ the diff.
 
 An external sidecar that drives a fixed, synthetic GET/HEAD request plan at a
 CONTROL server, then at a CANDIDATE server, and diffs what each answered.
-Design pass: `memory/labs/nginx-test-harness/design-p2h-canary.md`.
+Design pass: `memory/labs/nginx-module-testkit/design-p2h-canary.md`.
 
 - **Sequential boot, one conf.** There is no "previous release" tree to diff
   against in this harness, so control and candidate are the *same*
