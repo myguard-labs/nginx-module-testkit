@@ -44,6 +44,14 @@
  * `nodes` is here because a module hook may render extra members inside the
  * zone object. It must NOT trip the reverse check -- that is the difference
  * between a closed level and an open one.
+ *
+ * `module` is the same idea one level up, and it is why "rich" is the right
+ * name for this variant rather than "zone-present". A module registering a
+ * module_render hook gets a top-level "module" object whose CONTENTS are its
+ * own (frames, here), rendered independently of any zone -- that is the whole
+ * point of the hook: a module with no shm zone at all reaches the document
+ * only through it. So "module" is an open level like "zone", and it is
+ * OPTIONAL at the top level, present only when such a hook is registered.
  */
 static const char doc_zone_present[] =
     "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
@@ -54,6 +62,7 @@ static const char doc_zone_present[] =
     "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
+    "\"module\":{\"frames\":7},"
     "\"zone\":{\"present\":true,\"name\":\"demo\",\"size\":1048576,"
     "\"slab_pages_free\":248,\"nodes\":2}}";
 
@@ -107,10 +116,24 @@ static const char doc_zone_shm_unmapped[] =
  * file is instead checked for agreement field-by-field below, so a schema edit
  * that is not mirrored here fails rather than passing unnoticed.
  */
+/*
+ * `rich_only` marks a field the emitter renders only in the "rich" variant --
+ * the fixture with both a mapped zone and a module_render hook. Two unrelated
+ * reasons put a field there and the flag deliberately does not distinguish
+ * them, because the assertion is the same either way: the field must be
+ * ABSENT from the leaner variants, not rendered as a fabricated zero.
+ *
+ *   zone.name / zone.size / zone.slab_pages_free  -- present:false promises
+ *   no siblings (R-10).
+ *
+ *   module  -- rendered only when a module_render hook is registered; the
+ *   reference module in t/module registers none, so its documents carry no
+ *   "module" member at all and a required:true here would be a lie.
+ */
 typedef struct {
     const char *path;
     json_type   type;
-    int         zone_present_only;
+    int         rich_only;
 } schema_field;
 
 static const schema_field SCHEMA[] = {
@@ -138,6 +161,7 @@ static const schema_field SCHEMA[] = {
     { "pool.cycle_blocks",   JSON_NUMBER, 0 },
     { "pool.cycle_large",    JSON_NUMBER, 0 },
     { "pool.cycle_cleanup",  JSON_NUMBER, 0 },
+    { "module",              JSON_OBJECT, 1 },
     { "zone",                JSON_OBJECT, 0 },
     { "zone.present",        JSON_BOOL,   0 },
     { "zone.name",           JSON_STRING, 1 },
@@ -149,8 +173,13 @@ static const schema_field SCHEMA[] = {
 
 /*
  * Levels where the emitter renders a fixed set of members, so an unexpected
- * one means drift. "zone" is absent from this list by design: zone_render lets
- * a consuming module add its own members there.
+ * one means drift. "zone" and "module" are absent from this list by design:
+ * zone_render lets a consuming module add its own members to the first, and
+ * module_render owns the entire contents of the second.
+ *
+ * The top level "" stays closed, which is what makes "module" have to be
+ * written down here at all -- an unnamed top-level object would fail the
+ * reverse check rather than slipping in undocumented.
  */
 static const char *CLOSED_LEVELS[] = {
     "", "connections", "fds_by_kind", "smaps", "pool"
@@ -385,13 +414,13 @@ main(void)
         return 1;
     }
 
-    /* ---- FORWARD: zone-present variant -------------------------------- */
+    /* ---- FORWARD: rich variant (mapped zone + module_render hook) ------ */
 
     for (i = 0; i < SCHEMA_N; i++) {
         const json_value *v = json_get(present, SCHEMA[i].path);
 
         ok(v != NULL && v->type == SCHEMA[i].type,
-           "zone-present: \"%s\" is %s", SCHEMA[i].path,
+           "rich: \"%s\" is %s", SCHEMA[i].path,
            json_type_name(SCHEMA[i].type));
     }
 
@@ -400,12 +429,16 @@ main(void)
     for (i = 0; i < SCHEMA_N; i++) {
         const json_value *v = json_get(absent, SCHEMA[i].path);
 
-        if (SCHEMA[i].zone_present_only) {
+        if (SCHEMA[i].rich_only) {
             /*
              * present:false promises nothing about its siblings. Asserting
              * they are ABSENT rather than skipping them is what stops the
              * emitter from quietly rendering a stale name or a zero size on
-             * the variant that has no zone to describe.
+             * the variant that has no zone to describe. The same assertion
+             * covers "module": a document from a module registering no
+             * module_render hook must carry no empty "module":{} stub, or a
+             * rule asserting on a member inside it would fail with "not
+             * present in document" instead of the clearer absent-object.
              */
             ok(v == NULL, "zone-absent: \"%s\" is not rendered",
                SCHEMA[i].path);
@@ -421,7 +454,7 @@ main(void)
     for (i = 0; i < SCHEMA_N; i++) {
         const json_value *v = json_get(shm_unmapped, SCHEMA[i].path);
 
-        if (SCHEMA[i].zone_present_only) {
+        if (SCHEMA[i].rich_only) {
             /* Same reasoning as the zone-absent block above: shm.addr ==
              * NULL is a legitimate present:false case, and none of its
              * siblings may be rendered -- that is R-10 itself. */

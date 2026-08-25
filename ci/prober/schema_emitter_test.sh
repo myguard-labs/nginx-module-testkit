@@ -20,7 +20,7 @@ cd "$(dirname "$0")"
 EMITTER=../../src/ngx_test_probe.c
 SCHEMA=../../probe-schema.json
 
-PLANNED=34
+PLANNED=36
 tests_run=0
 failures=0
 
@@ -120,6 +120,41 @@ if [ "$present_false_returns" -eq 2 ]; then
     ok 0 "the emitter has two present:false early returns (zone==NULL and shm.addr==NULL)"
 else
     ok 1 "the emitter has two present:false early returns (zone==NULL and shm.addr==NULL), saw $present_false_returns"
+fi
+
+# F1: the zone-INDEPENDENT render dispatch must run BEFORE the zone branch.
+#
+# ngx_test_probe_render_module() emits the top-level "module" object, which is
+# the only path into the document for a module that has no shm zone at all --
+# every compression body filter. Both present:false early returns above sit
+# between that call and the zone_render dispatch, so calling it after the zone
+# branch would put it behind two returns a zoneless module ALWAYS takes: the
+# hook is registered, never called, and the module looks instrumented while
+# asserting nothing. That is a false green, not a failure, which is why the
+# ordering is pinned as text here in addition to being unit-tested directly in
+# t/probe_arm_test.c.
+#
+# Line numbers rather than control-flow parsing, for the same reason the rest
+# of this file greps: the emitter needs real nginx headers to execute. The
+# comparison is against the FIRST present:false return, so a dispatch moved
+# below either one fails.
+# `|| true` for the same set -e reason as the counts above.
+render_line=$(grep -n 'p = ngx_test_probe_render_module(p, last);' "$EMITTER" \
+    | head -1 | cut -d: -f1 || true)
+zone_ret_line=$(grep -n 'return ngx_slprintf(p, last, ",\\"zone\\":{\\"present\\":false}}");' \
+    "$EMITTER" | head -1 | cut -d: -f1 || true)
+
+if [ -n "$render_line" ]; then
+    ok 0 "the emitter dispatches ngx_test_probe_render_module()"
+else
+    ok 1 "the emitter dispatches ngx_test_probe_render_module()"
+fi
+
+if [ -n "$render_line" ] && [ -n "$zone_ret_line" ] \
+    && [ "$render_line" -lt "$zone_ret_line" ]; then
+    ok 0 "the module_render dispatch precedes the first present:false return"
+else
+    ok 1 "the module_render dispatch precedes the first present:false return (render=${render_line:-none} return=${zone_ret_line:-none})"
 fi
 
 # The reverse sweep: any member the emitter renders that the schema never

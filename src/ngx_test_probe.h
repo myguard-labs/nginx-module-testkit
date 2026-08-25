@@ -115,14 +115,36 @@
  * (the NAME:nth split, its own boundary and malformed cases) inside the first,
  * multiplying the attacker-text surface the file was split out to keep small.
  *
- * The values are stable across builds only in that fault_slab stays first; a
- * consumer switches on the enum, never on its integer value.
+ * The values are stable across builds only in that fault_slab stays first and
+ * that new sites are APPENDED, never inserted; a consumer switches on the
+ * enum, never on its integer value.
  */
 typedef enum {
     NGX_TEST_PROBE_FAULT_SLAB = 0,   /* ngx_slab_alloc failure          */
     NGX_TEST_PROBE_FAULT_PALLOC,     /* ngx_palloc/ngx_pnalloc failure  */
     NGX_TEST_PROBE_FAULT_TEMPFILE,   /* temp-file creation failure      */
-    NGX_TEST_PROBE_FAULT_ACCEPT      /* accept() EMFILE                 */
+    NGX_TEST_PROBE_FAULT_ACCEPT,     /* accept() EMFILE                 */
+
+    /*
+     * Codec sites, for compression/decompression filter modules.
+     *
+     * Deliberately spelled for the LAYER, not for a library: every codec
+     * module in the fleet -- gzip, brotli, zstd, and whatever comes next --
+     * drives the same two-call shape, so a zstd-specific spelling would
+     * force the next codec to add a third and fourth synonym for the same
+     * two failure sites and leave the prober's rule vocabulary keyed to
+     * whichever library happened to arrive first.
+     *
+     * CODEC covers the streaming body call (ZSTD_compressStream2 with a
+     * continue op, deflate() with Z_NO_FLUSH, BrotliEncoderCompressStream);
+     * CODEC_END covers the flush/end-of-frame call, which is a distinct
+     * site because it runs on a different request path (the last buffer,
+     * often after the body call already succeeded) and because a codec that
+     * only fails on end-of-frame leaves a half-written body -- the bug
+     * class the body-call site cannot reach.
+     */
+    NGX_TEST_PROBE_FAULT_CODEC,      /* streaming compress/decompress call */
+    NGX_TEST_PROBE_FAULT_CODEC_END   /* flush / end-of-frame call          */
 } ngx_test_probe_fault_e;
 
 
@@ -137,10 +159,24 @@ typedef enum {
 
 
 /*
- * Module-specific hooks. Both are optional; a module that registers neither
- * still gets the whole generic document (flavor, pid, connections, fds,
- * cycle-pool stats, and the zone's name/size/slab-page accounting), which is
- * enough for fd and memory leak assertions without a line of module C.
+ * Zone-addressed module hooks. Both are optional; a module that registers
+ * neither still gets the whole generic document (flavor, pid, connections,
+ * fds, cycle-pool stats, and the zone's name/size/slab-page accounting),
+ * which is enough for fd and memory leak assertions without a line of
+ * module C.
+ *
+ * Both are handed the shm zone the probe was pointed at, and the probe skips
+ * them when there is no zone (or its shm is not mapped yet), because they
+ * exist to describe and to fault-inject SHARED state. A module with no shm
+ * zone wants ngx_test_probe_module_hooks_t instead -- see below.
+ *
+ * THIS STRUCT IS FROZEN. New hooks go in the struct below, never here. Ten
+ * consumer modules initialise this one POSITIONALLY (shield's
+ * src/ngx_shield_probe_hooks.c:160 is `{ zone_render, fault_set }`), and
+ * -Wmissing-field-initializers -- which -Wextra turns on, and which this
+ * repo's own CI pairs with -Werror -- makes appending a member a BUILD
+ * FAILURE in every one of those repos, not a silent zero-init. Verified by
+ * compiling shield's initializer both ways, 2026-08-25.
  */
 typedef struct {
     /*
@@ -189,6 +225,91 @@ void ngx_test_probe_register(const ngx_test_probe_hooks_t *hooks);
 
 
 /*
+ * Zone-INDEPENDENT module hooks: the path into the probe for a module that
+ * has no shm zone at all.
+ *
+ * A body filter -- every compression module is one -- keeps every byte of its
+ * state in the request pool and in per-worker globals. Under the zone-
+ * addressed hooks alone such a module could register, compile, link and then
+ * never be called once: ngx_test_probe_json()'s present:false early returns
+ * fire before the zone_render dispatch, and ngx_test_probe_arm() used to
+ * refuse outright on a NULL zone. Both are silent false greens -- the module
+ * looks instrumented and asserts nothing -- which is why this exists.
+ *
+ * A SEPARATE STRUCT, not two more members on ngx_test_probe_hooks_t, and the
+ * reason is a hard compatibility constraint rather than taste: existing
+ * consumers initialise that struct positionally, and under
+ * -Wextra -Werror (this repo's own CI settings) a new member there is a build
+ * failure in ten downstream repos. A new struct with its own registration
+ * function is additive by construction -- a module that never calls
+ * ngx_test_probe_register_module() is byte-for-byte unaffected.
+ *
+ * Both members are optional, and a module with BOTH a zone and per-worker
+ * state may register both structs.
+ */
+typedef struct {
+    /*
+     * Append this module's zone-independent members, e.g.
+     *
+     *     "frames":3,"flushes":1
+     *
+     * Rendered into a top-level "module" object of its own -- NOT into "zone"
+     * -- so a document keeps saying what it means when a module has both a
+     * zone and per-worker counters. The probe writes the object's braces and
+     * calls this hook between them, so unlike zone_render there is NO leading
+     * comma and the hook must not close the brace. A hook that writes nothing
+     * yields "module":{}, which is a valid empty object rather than malformed
+     * JSON.
+     *
+     * Called unconditionally when registered, before the zone object and
+     * independently of whether a zone exists, which is the whole point: this
+     * is the path a module with no shm zone has to the document. Rendering
+     * must be bounded against `last`.
+     *
+     * The hook is responsible for its own locking; the probe holds no lock
+     * when it calls this.
+     */
+    u_char    *(*module_render)(u_char *buf, u_char *last);
+
+    /*
+     * Arm or clear fault injection for `fault` at nth (a negative value
+     * disarms), for a module whose fault counters do not live in a zone.
+     *
+     * Same contract as fault_set otherwise: the probe has already parsed and
+     * validated the value and identified the site, the module stores it, and
+     * a module returns NGX_DECLINED for any site it has no fault point for.
+     *
+     * DISPATCH ORDER, and why it is this way round. ngx_test_probe_arm() calls
+     * fault_set when a zone is present and fault_set is registered; otherwise
+     * it falls back to fault_set_global. So a zone-carrying module that
+     * registers only fault_set behaves exactly as it did before this hook
+     * existed, while a zoneless module -- which could not be armed AT ALL,
+     * because arm() refused on zone == NULL before it ever reached a hook --
+     * now has a path. A module that registers both gets the zone-addressed
+     * hook whenever a zone is actually available, and the global one on the
+     * zoneless probe endpoint.
+     *
+     * The counter this feeds is a per-worker global by construction (there is
+     * no shared memory to put it in), so it is armed and tripped in the SAME
+     * worker only. A test that arms through one connection and asserts through
+     * another must pin itself to one worker (worker_processes 1, or a
+     * keepalive connection) -- the same hazard fault_set's comment describes,
+     * except here it is unavoidable rather than a module's choice.
+     */
+    ngx_int_t  (*fault_set_global)(ngx_test_probe_fault_e fault, ngx_int_t nth);
+} ngx_test_probe_module_hooks_t;
+
+
+/*
+ * Register the zone-independent hooks. Call once, from module init or
+ * postconfiguration; NULL clears them. Independent of
+ * ngx_test_probe_register() in both directions -- registering one never
+ * disturbs the other.
+ */
+void ngx_test_probe_register_module(const ngx_test_probe_module_hooks_t *hooks);
+
+
+/*
  * Count one config load, and report how many have happened.
  *
  * Rendered as the top-level "config_generation" field. Its ONLY guaranteed
@@ -231,6 +352,11 @@ ngx_uint_t ngx_test_probe_config_generation(void);
  * yet; both are reported as "present": false rather than treated as errors, so
  * the prober can tell "no zone configured" from "zone empty".
  *
+ * A registered module_render hook is dispatched into a top-level "module"
+ * object BEFORE the zone object and regardless of which of those three zone
+ * states holds -- a zoneless module's members are not conditional on a zone it
+ * does not have. zone_render still runs only on the present:true path.
+ *
  * Costs that only a test build may pay: a /proc/self/fd scan ("fds"), a walk of
  * the cycle pool's block chain ("pool.cycle_*"), and whatever the module hook
  * does under the slab mutex.
@@ -262,12 +388,19 @@ u_char *ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone);
  *     GET /__probe?fault_palloc=1    fail the next ngx_palloc/ngx_pnalloc
  *     GET /__probe?fault_tempfile=1  fail the next temp-file creation
  *     GET /__probe?fault_accept=1    return EMFILE from the next accept()
+ *     GET /__probe?fault_codec=1     fail the next streaming compress call
+ *     GET /__probe?fault_codec_end=1 fail the next flush/end-of-frame call
  *
  * Each site has its own sibling key (see ngx_test_probe_fault_e); the first
  * one present in the query wins. Returns NGX_OK if a fault directive was found
  * and applied, NGX_DECLINED otherwise -- including a malformed value, which is
- * ignored rather than guessed at, and including "no fault_set hook registered"
- * or "the module does not implement the named site".
+ * ignored rather than guessed at, and including "no fault hook registered at
+ * all" or "the module does not implement the named site".
+ *
+ * `zone` may be NULL. It is passed through to fault_set when both it and that
+ * hook are present; otherwise the parsed site and nth go to fault_set_global,
+ * which is how a module with no shm zone arms a fault. A query is refused
+ * before parsing when neither hook is registered.
  *
  * Each key is matched as a whole query argument and the value must end at the
  * argument boundary, so neither "not_fault_slab=1" nor "fault_slab=1junk" arms
@@ -293,6 +426,29 @@ ngx_int_t ngx_test_probe_arm(ngx_shm_zone_t *zone, ngx_str_t *args);
  */
 u_char *ngx_test_probe_escape_json_string(u_char *p, u_char *last,
     const ngx_str_t *str);
+
+/*
+ * Render the top-level "module" object into [p, last): the literal
+ * `,"module":{`, whatever the registered module_render hook appends, then `}`.
+ * Writes nothing at all when no module_render hook is registered, so the
+ * document simply has no "module" member. Returns the new buffer position.
+ *
+ * Called by ngx_test_probe_json() before the zone object. It lives beside
+ * ngx_test_probe_arm() in ngx_test_probe_arm.c rather than in the renderer for
+ * the reason that whole file is split out: it depends on nothing but the hook
+ * registry and the output bytes -- no ngx_cycle, no slab pool, no /proc -- so
+ * it is reachable from the direct-call unit harness in t/. That reachability
+ * is the point. The dispatch it performs is exactly the thing a zoneless
+ * module's instrumentation hangs on, and a dispatch that is only exercised
+ * through a configured server fails silently: the hook is registered, never
+ * called, and the module looks instrumented while asserting nothing.
+ *
+ * Truncation is bounded, not safe-by-luck: each literal is written only when
+ * it fits whole, so a short buffer yields a prefix, never a partial escape or
+ * an out-of-bounds write. As everywhere else in the document, truncation
+ * surfaces as a prober parse error.
+ */
+u_char *ngx_test_probe_render_module(u_char *p, u_char *last);
 
 #endif /* NGX_TEST_HARNESS */
 
