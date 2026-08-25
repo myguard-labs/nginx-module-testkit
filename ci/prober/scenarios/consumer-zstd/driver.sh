@@ -180,7 +180,7 @@ if [ "$WARMUP_OK" -eq 1 ] && trigger_request "$HITCHECK" "Accept-Encoding: zstd"
     fi
 fi
 if [ "$SIG_SEEN" -eq 1 ]; then
-    echo "ok 2 - the zstd filter COMPRESSED the response and set Content-Encoding: zstd (the same request against a zstd off location has no such header, and nginx never emits it by itself -- verified both ways 2026-08-25)"
+    echo "ok 2 - the zstd filter COMPRESSED the response and set Content-Encoding: zstd (the same request against a \`zstd off;\` location has no such header, and nginx never emits it by itself -- verified both ways 2026-08-25)"
 else
     echo "not ok 2 - no signature that ngx_http_zstd_filter_module.so ran was observed"
     head -20 "$HITCHECK" 2>/dev/null | sed 's/^/# /' || true

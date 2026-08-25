@@ -151,7 +151,7 @@ strip-filter|ngx_http_strip_filter_module.so||location / {@@    strip on;@@    s
 api-abuse|ngx_http_api_abuse_module.so||location / {@@    api_abuse enforce;@@}||the configured path serves with api_abuse enforcing (WEAK -- no observable signature, see driver)|
 error-abuse|ngx_http_error_abuse_module.so|error_abuse_zone zone=consumer_errors:1m key=$http_x_consumer_probe threshold=1 statuses=200;|location / {@@    error_abuse zone=consumer_errors;@@}|^HTTP/1\.1 429|error_abuse BLOCKED a second X-Consumer-Probe-tagged request with 429 after threshold=1 statuses=200 counted the first tagged request's own 200 (an untagged request never populates the empty-key bypass and always gets 200, keeping oracles 3-7's unmarked measurement requests on the module's ordinary path -- verified both ways)|X-Consumer-Probe: trip
 shield|ngx_http_shield_module.so|shield_ban_zone szone:1m;|location / {@@    shield block;@@}|^HTTP/1\.1 403|the shield module BLOCKED a request carrying an attack pattern with 403 (a benign request gets 200)|User-Agent: /bin/sh
-zstd|ngx_http_zstd_filter_module.so||location / {@@    zstd on;@@    zstd_min_length 0;@@}|Content-Encoding: zstd|the zstd filter COMPRESSED the response and set Content-Encoding: zstd (the same request against a zstd off location has no such header, and nginx never emits it by itself -- verified both ways 2026-08-25)|Accept-Encoding: zstd
+zstd|ngx_http_zstd_filter_module.so||location / {@@    zstd on;@@    zstd_min_length 0;@@}|Content-Encoding: zstd|the zstd filter COMPRESSED the response and set Content-Encoding: zstd (the same request against a `zstd off;` location has no such header, and nginx never emits it by itself -- verified both ways 2026-08-25)|Accept-Encoding: zstd
 coraza|ngx_http_coraza_module.so||location / {@@    coraza on;@@    coraza_rules 'SecRuleEngine On';@@    coraza_rules 'SecRule REQUEST_HEADERS:X-Consumer-Probe "@streq trip" "id:9001,phase:1,deny,status:418"';@@}|^HTTP/1\.1 418|coraza's own rule DENIED with 418 (a status nginx never returns by itself; without the engine the request is a plain 200 -- verified both ways)|X-Consumer-Probe: trip
 ROWS
 )
@@ -168,10 +168,128 @@ if [ "$CHECK" -eq 1 ]; then
     trap 'rm -rf "$OUTROOT"' EXIT
 fi
 
+# ---- escaping the table columns on the way out ------------------------------
+# EVERY heredoc below uses an UNQUOTED delimiter (`<<EOF`), which is required --
+# the templates interpolate $so, $server_extra, $av_block and friends. The
+# consequence is that whatever a table column CONTAINS is shell source in the
+# emitted file, not text. Command substitution, `$var` and `\` were all live.
+#
+# Observed, and the reason this exists: the zstd row's description contained
+# `zstd off;` in backticks -- the markdown reflex for naming a directive, and
+# the table is the one place this script INVITES prose (the header asks for a
+# WHY sentence per row). The generated driver ran `zstd off` as a COMMAND at
+# scenario time:
+#
+#     zstd: can't stat off : No such file or directory -- ignored
+#     ok 2 - ... (the same request against  has no such header ...)
+#
+# Note the empty gap where the backticked text was -- and note the scenario
+# still banked `ok 2`. The failure mode is worse than a mangled message: oracle
+# 2 matches the row's ERE against the response, and a substitution whose OUTPUT
+# happened to match that ERE would bank a FALSE GREEN attributed to the module.
+#
+# `--check` DOES NOT CATCH THIS and must not be offered as the guard: the
+# generated file matched the generator perfectly while being wrong. Both are
+# derived from the same unescaped column. ci/prober/gen_scenarios_escape_test.sh
+# is the round-trip guard instead.
+#
+# MECHANISM: backslash-escape the four characters that are special inside a
+# DOUBLE-QUOTED shell word -- \ ` $ " -- in that order (the backslash first, or
+# the escapes inserted after it would themselves be re-escaped).
+#
+# Why this rather than printf %q or single-quoting: the columns are not emitted
+# as standalone words. They land INSIDE already-quoted constructs in the
+# template -- `echo "ok 2 - $avdesc"`, `trigger_request "$out" "$trig"`,
+# `grep -qiE '$av'` -- and inside nginx.conf, which is not shell at all. printf
+# %q produces a self-quoting WORD ($'...' or 'x'"'"'y'), which is wrong in every
+# one of those positions: dropped into an existing double-quoted string it emits
+# its own quote characters as literal text. Escaping for the surrounding context
+# keeps the template's quoting intact and changes only what the column can DO.
+#
+# ONE PASS, AT THE RIGHT LAYER. The generator's own heredocs do not evaluate a
+# column -- a substituted value is not re-scanned -- so escaping "for the
+# generator" is escaping nothing and only emits stray backslashes. The single
+# live evaluation is in the GENERATED DRIVER at scenario time. See the measured
+# note in emit_one.
+dq_escape() {   # dq_escape STRING -> STRING safe as literal text in "..."
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\`/\\\`}"
+    s="${s//\$/\\\$}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
+# sq_escape: the SINGLE-quoted counterpart, for the one column that lands inside
+# single quotes in the emitted file -- the anti-vacuity ERE, which the driver
+# uses as `grep -qiE '<ERE>'`.
+#
+# dq_escape is WRONG for that position and would silently corrupt the oracle: a
+# single-quoted shell string takes a backslash literally, so dq_escape's
+# inserted `\` would become part of the regex and stop it matching. The ERE also
+# legitimately CONTAINS backslashes (`^HTTP/1\.1 403`), which must reach the
+# file unchanged.
+#
+# So the emitted text must be the ERE verbatim, with only the quoting hazard
+# handled: a `'` in the ERE would close the driver's quote early. Standard
+# close-quote/escaped-quote/reopen ('"'"') handles it. The generator's own two
+# reader passes are handled separately by the caller, which escapes `$`, backtick
+# and `\` for those passes ONLY and lets them arrive as the original characters.
+sq_escape() {   # sq_escape STRING -> STRING safe as literal text inside '...'
+    local s="$1"
+    s="${s//\'/\'\"\'\"\'}"
+    printf '%s' "$s"
+}
+
+
 emit_one() {
     local name="$1" so="$2" http_extra="$3" server_extra="$4" av="$5" avdesc="$6" trig="$7"
     local dir="$OUTROOT/consumer-$name"
     mkdir -p "$dir"
+
+    # NEUTRALISE THE COLUMNS THAT LAND IN SHELL, AND ONLY THOSE.
+    #
+    # WHERE THE EVALUATION ACTUALLY HAPPENS -- measured, not reasoned. The
+    # generator's heredocs do NOT evaluate a column: expanding `$avdesc` inside
+    # a heredoc substitutes the value, and the shell does not re-scan a
+    # substituted value for backticks or `$`. Confirmed directly: a value
+    # containing `id -u` passes through one heredoc, and through a second
+    # heredoc interpolating the first heredoc's result, entirely untouched.
+    #
+    # The single evaluation is at SCENARIO RUN TIME, in the generated driver,
+    # because the column lands inside a double-quoted shell string there:
+    #
+    #     echo "ok 2 - <avdesc>"          # backtick and $ are live
+    #     trigger_request "$out" "<trig>" # same
+    #
+    # So the fix is ONE escape pass, for the double-quoted position, applied to
+    # the columns that reach one. Escaping for the generator's passes would be
+    # escaping a hazard that does not exist and would emit stray backslashes.
+    #
+    # $http_extra and $server_extra are DELIBERATELY NOT escaped: they are
+    # emitted into nginx.conf, which is not shell. nginx has its own `$var`
+    # syntax that these rows legitimately use (error-abuse's
+    # `key=$http_x_consumer_probe`) and its own quoting (coraza's
+    # `coraza_rules '...'`). A shell escape there is pure corruption -- verified
+    # by doing it: the backslashes landed in the emitted conf. They are still
+    # interpolated only into nginx.conf and into shell COMMENT lines, never into
+    # an executable shell string.
+    #
+    # $so likewise reaches nginx.conf, a comment, and the requires gate's
+    # message; it is a .so filename from the table's second column, constrained
+    # by the file it must name.
+    #
+    # $av is handled separately below -- it lands inside SINGLE quotes.
+    avdesc="$(dq_escape "$avdesc")"
+    trig="$(dq_escape "$trig")"
+
+    # $av is the ODD ONE OUT: the driver uses it as `grep -qiE '<ERE>'`, inside
+    # SINGLE quotes. There, a backslash is LITERAL and the ERE's own backslashes
+    # (`^HTTP/1\.1 403`) must arrive verbatim -- dq_escape would double them and
+    # silently stop the oracle matching, which is a false-green in the direction
+    # this fix exists to close. The only hazard in that position is a `'`
+    # closing the quote early, so that is the only thing handled.
+    av="$(sq_escape "$av")"
 
     # `@@` -> newline + 8 spaces, so the table can hold a multi-line block.
     server_extra="${server_extra//@@/$'\n'        }"
