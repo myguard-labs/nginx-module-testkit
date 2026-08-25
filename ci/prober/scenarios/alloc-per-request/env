@@ -1,0 +1,31 @@
+# This scenario asserts on the three zone.slab_* counters, which only exist
+# when the probe has a zone to report: with no `test_ref_zone` the document
+# renders "zone":{"present":false} and every slab path is ABSENT, not zero.
+#
+# That absence is not a silent pass -- `probe`/`delta` over a missing path
+# fails with "not present in document" -- but it fails for the wrong reason,
+# reporting a harness misconfiguration in the language of a module defect. The
+# zone is declared here so the counters are present and the assertions measure
+# what they claim to.
+#
+# WHY THIS FILE DID NOT EXIST BEFORE. Every other assertion in this scenario
+# watches the CYCLE POOL, which needs no zone, so the scenario ran zoneless
+# from its creation until the slab counters were added. CI supplies
+# PROBER_MODULE/DIRECTIVE/PROBE but never PROBER_PROBE_ZONE (it is per-scenario
+# by design -- the reference module takes no zone by default, see
+# t/module/ngx_http_test_ref_module.c's file header), so without this file the
+# slab assertions would red on every remote leg while passing locally for
+# anyone who happened to export the variable by hand.
+#
+# PROBER_PROBE is restated because mutate-suite-lib.sh defaults it and a
+# scenario that overrides PROBER_PROBE_ZONE alone would lose the pairing --
+# same reasoning as scenarios/zone-name-escaping/env, which is the other
+# zone-carrying scenario and the model for this file.
+#
+# A plain name and a 1m size: this scenario tests allocation ACCOUNTING, not
+# name escaping (that is zone-name-escaping's job) and not exhaustion (the
+# fault_slab= knob's). 1m is far larger than the zero-allocation reference
+# module will ever use, so slab_pages_free stays flat and a page-level change
+# would be a real signal rather than sizing noise.
+PROBER_PROBE="test_ref_probe;"
+PROBER_PROBE_ZONE="test_ref_zone alloc_per_request 1m;"

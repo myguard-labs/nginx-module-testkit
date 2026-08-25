@@ -66,6 +66,66 @@
 #     watches all three counters. (The case still reds either way; the settle
 #     loop prints the first failing delta, which for this leak is cycle_used's
 #     node-overhead drift.)
+#
+# THE SLAB COUNTERS, AND WHY THEY ARE HERE AT ALL. The four pool.* assertions
+# above watch the CYCLE POOL; the three zone.slab_* ones watch the SHARED
+# MEMORY ZONE, a different arena with a different failure mode. Two of the
+# three are a genuinely new class of oracle rather than a restatement:
+#
+#   - `delta zone.slab_used == 0` is the leak oracle, and is the slab analogue
+#     of the cycle-pool deltas: used goes up on alloc and down on free, so a
+#     per-request block that is allocated and never freed shows here.
+#   - `delta zone.slab_reqs <= K` is the CHURN oracle, and has no analogue
+#     above. reqs is cumulative and never decreases, so it counts allocation
+#     TRAFFIC. That is the one thing every other memory oracle in this repo is
+#     structurally blind to: N matched alloc/free pairs inside one request net
+#     to zero in used, in pfree and in every cycle-pool counter, and read as a
+#     perfectly clean result while the module thrashes the slab under the zone
+#     mutex. A ceiling catches it; an equality cannot.
+#
+# WHY K IS 0 ON THIS MODULE AND WHY THAT IS NOT THE INTERESTING NUMBER. The
+# reference module deliberately allocates nothing from its zone per request
+# (ngx_http_test_ref_module.c:21 -- registering hooks here would defeat the
+# generic-path testing this module exists for), so its honest ceiling is 0 and
+# the assertion below is written `<= 0`, NOT `== 0`. The operator is the point:
+# `<= K` is the form a consuming module copies, and a consumer's K is a
+# property of ITS allocation behaviour, not of this harness -- which is why the
+# harness ships no default K and this scenario cannot supply a representative
+# one. What this scenario proves is that the MECHANISM works and is not
+# vacuous; a real ceiling is proven in the consumer that owns it.
+#
+# NON-VACUITY OF THE SLAB ASSERTIONS (proven locally against nginx 1.29.0):
+#   - CHURN, invisible to every other oracle: add a matched
+#     ngx_slab_alloc/ngx_slab_free pair (under shpool->mutex) on the request
+#     path. Every pool.* delta, slab_pages_free and `delta slab_used` all stay
+#     flat -- and `delta zone.slab_reqs <= 0` reds by exactly the number of
+#     pairs added. That divergence IS the case for these fields; if this
+#     mutation ever reds one of the older oracles too, the claim above is
+#     wrong and this comment must change.
+#   - LEAK: the same alloc without the free. slab_used reds as well as
+#     slab_reqs, which is the pair of signals distinguishing "thrash" from
+#     "leak" -- reqs alone rises for both.
+#   - SENTINEL: the -1 rejection is not exercised here (this zone is always
+#     initialised by the time a request runs). It is covered as a unit in
+#     ci/prober/assert_test.c, which is the right layer for it: forcing an
+#     uninitialised-stats race from a rule file would be timing-dependent.
+#
+# WHY THERE IS NO mutate.sh ROW FOR THE SLAB ASSERTIONS, AND DO NOT ADD ONE
+# WITHOUT READING THIS. The obvious row -- render slab_reqs as a constant 0 and
+# require this scenario to catch it -- was written, measured and removed: the
+# mutant SURVIVES 6/6 here. It has to. On the unmutated tree the reference
+# module allocates nothing from its zone, so the honest reading of slab_reqs is
+# also 0 across every case, and `delta <= 0` cannot distinguish an emitter
+# reporting a true zero from one hardwired to zero. The row would have reported
+# `survived` on every run forever, which is a permanently false signal about
+# corpus coverage rather than a gap in it.
+#
+# What a real row needs is a fixture that ALLOCATES -- the churn control above,
+# made permanent. That means a module with a zone allocation on its request
+# path, which the reference module deliberately does not have (see its file
+# header). So the row belongs in a consumer that owns such a path, next to that
+# consumer's own non-zero K, not here. Until then the manual controls above are
+# the evidence, and they are reproducible from this comment.
 
 name    baseline: a tiny request
 send    GET /__probe HTTP/1.1\r\n
@@ -73,10 +133,14 @@ send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
 probe   fds >= 1
 probe   pool.cycle_used >= 1
+probe   zone.slab_reqs >= 0
 delta   fds == 0
 delta   pool.cycle_used == 0
 delta   pool.cycle_blocks == 0
 delta   pool.cycle_large == 0
+delta   zone.slab_used == 0
+delta   zone.slab_reqs <= 0
+delta   zone.slab_fails == 0
 
 # A long request line: ~30 KiB of query string. nginx parses it into the first
 # large_client_header_buffer -- a request-pool allocation that scales with the
@@ -152,3 +216,11 @@ probe_baseline fds <= 2
 probe_baseline pool.cycle_used == 0
 probe_baseline pool.cycle_blocks == 0
 probe_baseline pool.cycle_large == 0
+# The cumulative form of the two slab oracles. A churn of one alloc/free pair
+# per request is invisible to every per-case `delta slab_reqs <= 0` only if it
+# is BELOW the ceiling; across the six requests above it accumulates here, so
+# this is the bound that catches a small constant churn the way the cycle-pool
+# baseline catches a small constant leak.
+probe_baseline zone.slab_used == 0
+probe_baseline zone.slab_reqs <= 0
+probe_baseline zone.slab_fails == 0

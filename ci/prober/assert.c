@@ -501,8 +501,10 @@ eval_probe(const json_value *doc, const probe_assert *pa, char *why,
 
 
 /*
- * The probe fields whose -1 is an "unreadable /proc" (or, for "timers", an
- * "uninitialised tree") sentinel rather than a real value. Kept as an explicit
+ * The probe fields whose -1 is an "unreadable /proc" (for "timers", an
+ * "uninitialised tree"; for the three "zone.slab_*" counters, a zone whose
+ * slab pool the master has mapped but not yet initialised, so stats[] is still
+ * NULL) sentinel rather than a real value. Kept as an explicit
  * list rather than a "-1 is always unavailable" blanket: a module hook could
  * legitimately render a signed field that reaches -1, and silently swallowing
  * a delta over it would be the very fail-open this check exists to prevent.
@@ -530,6 +532,9 @@ path_is_proc_sentinel_field(const char *path)
         "smaps.pss",
         "smaps.private_dirty",
         "timers",
+        "zone.slab_reqs",
+        "zone.slab_fails",
+        "zone.slab_used",
     };
     size_t i;
 

@@ -751,10 +751,10 @@ mutate "delta: timers dropped from the sentinel-rejection list" assert.c \
     '        "smaps.pss",
         "smaps.private_dirty",
         "timers",
-    };' \
+        "zone.slab_reqs",' \
     '        "smaps.pss",
         "smaps.private_dirty",
-    };' assert_test
+        "zone.slab_reqs",' assert_test
 
 # R-14 follow-up (CodeRabbit, PR #192): sentinel_fields_test.sh's "doc comment
 # claims the discipline" check reads the @sentinel-schema marker's own window,
@@ -1298,11 +1298,13 @@ mutate "schema: shm-unmapped zone falls through instead of returning present:fal
     '        return ngx_slprintf(p, last, ",\"zone\":{\"present\":false}}");
     }
 
-    ngx_shmtx_lock(&shpool->mutex);' \
+    /*
+     * pfree is the free-page count the slab allocator maintains' \
     '        (void) p;
     }
 
-    ngx_shmtx_lock(&shpool->mutex);' \
+    /*
+     * pfree is the free-page count the slab allocator maintains' \
     schema_emitter_test.sh
 
 # R-10, precise shape: only the `return` keyword dropped, so the branch falls
@@ -1317,11 +1319,13 @@ mutate "schema: shm-unmapped zone's return demoted to a fall-through assignment"
     '        return ngx_slprintf(p, last, ",\"zone\":{\"present\":false}}");
     }
 
-    ngx_shmtx_lock(&shpool->mutex);' \
+    /*
+     * pfree is the free-page count the slab allocator maintains' \
     '        p = ngx_slprintf(p, last, ",\"zone\":{\"present\":false}}");
     }
 
-    ngx_shmtx_lock(&shpool->mutex);' \
+    /*
+     * pfree is the free-page count the slab allocator maintains' \
     schema_emitter_test.sh
 
 # zone.name JSON escaping. The escape helper converts " and \ to their JSON

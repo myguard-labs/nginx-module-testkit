@@ -474,6 +474,22 @@ ngx_test_probe_timer_count(void)
  * ngx_test_probe.h for the declaration. */
 
 
+/*
+ * Renders the whole probe document, and is itself the emitter for the three
+ * slab-counter fields: unlike the fd/smaps/timer figures it delegates to
+ * helper functions, the zone's stats[] sum is computed inline here because it
+ * must happen under the slab mutex this function already holds.
+ *
+ * Those three carry the -1-sentinel discipline. shpool->stats is a pointer set
+ * by ngx_slab_init(), so a worker probing a zone the master has mapped but not
+ * yet initialised reads NULL; rendering 0 there would be a fabricated zero
+ * indistinguishable from an honest "no allocations yet", and a `delta
+ * zone.slab_reqs <= K` ceiling would pass while measuring nothing. -1 is not
+ * reachable as a real value (all three are counts), so the sentinel never
+ * masks a legitimate reading.
+ *
+ * @sentinel-schema: zone.slab_reqs zone.slab_fails zone.slab_used
+ */
 u_char *
 ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
 {
@@ -481,7 +497,10 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
     u_char          *p;
     ngx_int_t        fds, fd_sock, fd_file, fd_anon, fd_other, pss, priv_dirty;
     ngx_int_t        timers;
+    ngx_int_t        slab_reqs, slab_fails, slab_used;
     ngx_uint_t       pages_free, pool_blocks, pool_large, pool_cleanup;
+    ngx_uint_t       slot, slab_slots;
+    ngx_uint_t       reqs_sum, fails_sum, used_sum;
     ngx_slab_pool_t *shpool;
 
     fds = ngx_test_probe_fd_count();
@@ -592,14 +611,99 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
         return ngx_slprintf(p, last, ",\"zone\":{\"present\":false}}");
     }
 
+    /*
+     * pfree is the free-page count the slab allocator maintains
+     * unconditionally.
+     *
+     * pool->stats[] is the richer source, and IS portable: an earlier version
+     * of this comment claimed it was populated only under NGX_DEBUG_MALLOC-
+     * style builds, which was measured false. Every write site in
+     * src/core/ngx_slab.c is unconditional -- `stats[slot].reqs++` on each
+     * ngx_slab_alloc_locked(), `.fails++` on the exhaustion return, `.used--`
+     * in ngx_slab_free_locked(); the file's only #if is NGX_DEBUG_MALLOC
+     * around a memset, nowhere near the counters. Verified on nginx 1.31.4 and
+     * angie 1.12.1, whose ngx_slab_stat_t is layout-identical. This is NOT the
+     * ngx_stat_active situation noted above: those really are NGX_STAT_STUB-
+     * gated, these are not.
+     *
+     * WHY THE COUNTERS EARN THEIR PLACE. Every other memory oracle here reads
+     * net OCCUPANCY, which is structurally blind to churn: ten thousand
+     * matched alloc/free pairs in one request net to zero and read as a clean
+     * result. reqs is cumulative and never decreases, so it exposes the
+     * allocation TRAFFIC that occupancy cancels out -- the difference between
+     * "does this module leak" and "does this module thrash the slab".
+     *
+     * Summed across slots rather than rendered per-slot. A per-slot array
+     * would let a rule assert on one size class, but every consumer would then
+     * have to know which slot its allocation lands in -- a function of
+     * ngx_pagesize and min_shift, i.e. of the build, not of the module. The
+     * sum is the figure a ceiling oracle actually wants.
+     *
+     * The slot COUNT is ngx_pagesize_shift - min_shift, computed exactly as
+     * ngx_slab_init() sizes the array (ngx_slab.c:116). It is a runtime value,
+     * not a constant: ngx_pagesize_shift is the host's page size and min_shift
+     * is per-pool. Hardcoding a slot count here would read past the array on
+     * any build where either differs -- a shared-memory overread inside the
+     * slab mutex.
+     */
     ngx_shmtx_lock(&shpool->mutex);
 
-    /* pfree is the free-page count the slab allocator maintains
-     * unconditionally. pool->stats[] is the richer source but is only
-     * populated under NGX_DEBUG_MALLOC-style builds, so it is not a
-     * portable signal for a harness that must run on release-ish CI
-     * builds of both nginx and angie. */
     pages_free = shpool->pfree;
+
+    /*
+     * stats is a pointer INTO the zone, set by ngx_slab_init(). A worker that
+     * probes a zone the master has mapped but not yet initialised can see it
+     * NULL, the same race the shpool == NULL branch above handles. Render the
+     * -1 sentinel rather than 0: a zero here is indistinguishable from a real
+     * "no allocations yet" and would let a ceiling oracle pass vacuously,
+     * which is the failure mode this whole file exists to refuse.
+     */
+    if (shpool->stats == NULL || ngx_pagesize_shift <= shpool->min_shift) {
+        slab_reqs = -1;
+        slab_fails = -1;
+        slab_used = -1;
+
+    } else {
+        slab_slots = (ngx_uint_t) ngx_pagesize_shift - shpool->min_shift;
+
+        reqs_sum = 0;
+        fails_sum = 0;
+        used_sum = 0;
+
+        /*
+         * Accumulate in the UNSIGNED type the counters actually are, and
+         * convert once at the end. Summing straight into ngx_int_t would be
+         * signed overflow -- undefined behaviour, not a wrap -- and the
+         * saturation below could not then be trusted to run at all.
+         */
+        for (slot = 0; slot < slab_slots; slot++) {
+            reqs_sum += shpool->stats[slot].reqs;
+            fails_sum += shpool->stats[slot].fails;
+            used_sum += shpool->stats[slot].used;
+        }
+
+        /*
+         * SATURATE rather than wrap. reqs and fails are CUMULATIVE and never
+         * reset for the life of the zone, so on a 32-bit build (ngx_uint_t is
+         * 32 bits there, and .github/workflows/arch-32bit.yml builds exactly
+         * that) reqs passes NGX_MAX_INT_T_VALUE after roughly half an hour at
+         * a million allocations a second. A wrap would not merely report a
+         * wrong number: it would eventually land on -1 and impersonate the
+         * uninitialised-pool sentinel above, turning a busy zone into "this
+         * field is unavailable" and passing every ceiling built on it.
+         *
+         * NGX_MAX_INT_T_VALUE is itself outside the reachable range of an
+         * honest reading, so a delta oracle that sees it stops making sense
+         * arithmetically rather than silently certifying a bound -- the same
+         * fail-loud preference as the -1 sentinel, one value in from it.
+         */
+        slab_reqs = (reqs_sum > (ngx_uint_t) NGX_MAX_INT_T_VALUE)
+                    ? NGX_MAX_INT_T_VALUE : (ngx_int_t) reqs_sum;
+        slab_fails = (fails_sum > (ngx_uint_t) NGX_MAX_INT_T_VALUE)
+                     ? NGX_MAX_INT_T_VALUE : (ngx_int_t) fails_sum;
+        slab_used = (used_sum > (ngx_uint_t) NGX_MAX_INT_T_VALUE)
+                    ? NGX_MAX_INT_T_VALUE : (ngx_int_t) used_sum;
+    }
 
     ngx_shmtx_unlock(&shpool->mutex);
 
@@ -613,9 +717,15 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
     p = ngx_slprintf(p, last,
                      "\","
                      "\"size\":%uz,"
-                     "\"slab_pages_free\":%ui",
+                     "\"slab_pages_free\":%ui,"
+                     "\"slab_reqs\":%i,"
+                     "\"slab_fails\":%i,"
+                     "\"slab_used\":%i",
                      (size_t) zone->shm.size,
-                     pages_free);
+                     pages_free,
+                     slab_reqs,
+                     slab_fails,
+                     slab_used);
 
     /*
      * Module-specific members go inside the zone object, so a consuming

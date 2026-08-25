@@ -59,7 +59,10 @@
 
     "zone.name":             { "type": "string", "required": "when-zone-present" },
     "zone.size":             { "type": "number", "required": "when-zone-present" },
-    "zone.slab_pages_free":  { "type": "number", "required": "when-zone-present" }
+    "zone.slab_pages_free":  { "type": "number", "required": "when-zone-present" },
+    "zone.slab_reqs":        { "type": "number", "required": "when-zone-present" },
+    "zone.slab_fails":       { "type": "number", "required": "when-zone-present" },
+    "zone.slab_used":        { "type": "number", "required": "when-zone-present" }
   },
 
   "closed": ["", "connections", "fds_by_kind", "smaps", "pool"],
@@ -67,6 +70,9 @@
   "notes": {
     "fds": "-1 means /proc was unreadable, NOT zero descriptors. A delta over that sentinel cancels to a passing zero, which is why the prober rejects it explicitly rather than subtracting it.",
     "fds_by_kind": "The same descriptor total split by the kind of each /proc/self/fd link (socket/file/anon/other). Every bucket is -1 together if the scan cannot complete; the prober rejects that sentinel like it does for fds. socket:/anon_inode: links are matched by prefix, a leading '/' is a file, everything else (pipe:[...]) is other.",
+    "zone.slab_reqs": "Cumulative ngx_slab_alloc_locked() calls against this zone, summed over every size slot of pool->stats[]. Never decreases, so unlike slab_pages_free (occupancy) it exposes allocation TRAFFIC: ten thousand matched alloc/free pairs per request net to zero in occupancy and read as clean, while reqs shows the churn. The figure a `delta zone.slab_reqs <= K` ceiling asserts on; K is a property of the module under test, not of this harness, so no default is offered. -1 means the zone's slab pool is mapped but not yet initialised (stats[] still NULL); the prober rejects that sentinel like it does for fds.",
+    "zone.slab_fails": "Cumulative allocation FAILURES against this zone (pool->stats[].fails), summed over slots. Nonzero means the slab was exhausted at least once -- the condition fault_slab= arms artificially. -1 is the same uninitialised-pool sentinel as slab_reqs.",
+    "zone.slab_used": "LIVE allocated blocks in this zone (pool->stats[].used), summed over slots: incremented on alloc, decremented on free. This one is occupancy, so it is the leak oracle of the three, while slab_reqs is the churn oracle. -1 is the same uninitialised-pool sentinel as slab_reqs.",
     "smaps": "PSS and Private_Dirty in kB from /proc/self/smaps_rollup. External-observer memory lineage the cycle-pool walk cannot give -- growth in ANY mapping. Both -1 where smaps_rollup is absent (pre-4.14 kernel or a sandbox); the prober rejects that sentinel like fds.",
     "pool.cycle_cleanup": "Length of the cycle pool's cleanup-handler chain. Names a cleanup parked on the cycle pool per request -- a leak the byte count also reflects but this identifies by shape.",
     "module": "Rendered only when the module under test registers a module_render hook, and independently of any shm zone -- it is the only path into the document for a module that has no zone at all (a compression body filter keeps its state in the request pool and per-worker globals). Absent entirely otherwise, never an empty stub. Its CONTENTS belong to the consuming module, so it is an open level like zone; the top level stays closed, which is why the object itself has to be named here.",
