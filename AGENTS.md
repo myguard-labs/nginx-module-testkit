@@ -48,7 +48,7 @@ and it dilutes the signal this one exists to give.
 
 Superrepo root is `/opt/myguard` — see [/opt/myguard/AGENTS.md](../../AGENTS.md).
 Working notes for this repo live OUTSIDE it, at
-`/opt/myguard/memory/labs/nginx-test-harness/` (read `HANDOFF.md` first, then
+`/opt/myguard/memory/labs/nginx-module-testkit/` (read `HANDOFF.md` first, then
 `TODO.md`, `issues.md`, `lessons.md`).
 
 ## Layout

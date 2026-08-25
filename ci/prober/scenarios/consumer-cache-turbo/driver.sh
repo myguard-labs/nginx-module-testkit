@@ -27,7 +27,7 @@
 # builds the ref probe only -- reports SKIP, never a false pass.
 #
 # ORACLE-4-STYLE DESIGN LESSON (reused from reload-compressing/G6f, see
-# memory/labs/nginx-test-harness/HANDOFF.md "Oracle 4 design lesson"): a
+# memory/labs/nginx-module-testkit/HANDOFF.md "Oracle 4 design lesson"): a
 # per-request-leak oracle for a module that allocates per request canNOT use a
 # COLD pre-request baseline (carries a startup one-off) NOR a mid-work
 # snapshot (flakes on the module's live per-request buffers). Use TWO

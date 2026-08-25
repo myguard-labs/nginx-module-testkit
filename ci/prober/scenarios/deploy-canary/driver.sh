@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Scenario: deploy-canary (P2-H, deployment canary / shadow verifier). Design
-# pass: memory/labs/nginx-test-harness/design-p2h-canary.md -- read that file
+# pass: memory/labs/nginx-module-testkit/design-p2h-canary.md -- read that file
 # first, this header only restates the load-bearing decisions.
 #
 # WHAT THIS IS. An external sidecar that drives a FIXED, synthetic GET/HEAD
