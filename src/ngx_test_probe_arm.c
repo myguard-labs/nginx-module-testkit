@@ -24,6 +24,12 @@
  * internal to this pair of files, not part of the consumer-facing API. */
 ngx_test_probe_hooks_t  ngx_test_probe_hooks;
 
+/* The zone-independent registry, kept in a SECOND object rather than as extra
+ * members of the first: ngx_test_probe_hooks_t is frozen because downstream
+ * consumers initialise it positionally under -Wextra -Werror. See the
+ * header. */
+ngx_test_probe_module_hooks_t  ngx_test_probe_module_hooks;
+
 
 void
 ngx_test_probe_register(const ngx_test_probe_hooks_t *hooks)
@@ -34,6 +40,19 @@ ngx_test_probe_register(const ngx_test_probe_hooks_t *hooks)
     }
 
     ngx_test_probe_hooks = *hooks;
+}
+
+
+void
+ngx_test_probe_register_module(const ngx_test_probe_module_hooks_t *hooks)
+{
+    if (hooks == NULL) {
+        ngx_memzero(&ngx_test_probe_module_hooks,
+                    sizeof(ngx_test_probe_module_hooks_t));
+        return;
+    }
+
+    ngx_test_probe_module_hooks = *hooks;
 }
 
 
@@ -59,7 +78,21 @@ static const ngx_test_probe_fault_key_t  ngx_test_probe_fault_keys[] = {
     NGX_TEST_PROBE_FAULT_KEY("fault_slab=",     NGX_TEST_PROBE_FAULT_SLAB),
     NGX_TEST_PROBE_FAULT_KEY("fault_palloc=",   NGX_TEST_PROBE_FAULT_PALLOC),
     NGX_TEST_PROBE_FAULT_KEY("fault_tempfile=", NGX_TEST_PROBE_FAULT_TEMPFILE),
-    NGX_TEST_PROBE_FAULT_KEY("fault_accept=",   NGX_TEST_PROBE_FAULT_ACCEPT)
+    NGX_TEST_PROBE_FAULT_KEY("fault_accept=",   NGX_TEST_PROBE_FAULT_ACCEPT),
+
+    /*
+     * The two codec sites share the text "fault_codec" but NOT a key: every
+     * key includes its trailing '=', so "fault_codec=" cannot prefix-match
+     * "fault_codec_end=1" (the byte after "fault_codec" there is '_'). Order
+     * between these two is therefore NOT load-bearing -- verified by mutation
+     * on 2026-08-25: swapping them leaves probe_arm_test.c fully green, while
+     * mis-mapping fault_codec_end= to CODEC reddens five named cases. The
+     * discrimination is pinned in both directions there so a future key that
+     * IS a genuine prefix of another fails loudly instead of misrouting.
+     */
+    NGX_TEST_PROBE_FAULT_KEY("fault_codec_end=",
+                             NGX_TEST_PROBE_FAULT_CODEC_END),
+    NGX_TEST_PROBE_FAULT_KEY("fault_codec=", NGX_TEST_PROBE_FAULT_CODEC)
 };
 
 #define NGX_TEST_PROBE_FAULT_KEY_N \
@@ -133,11 +166,27 @@ ngx_test_probe_arm(ngx_shm_zone_t *zone, ngx_str_t *args)
     u_char      *p, *end;
     ngx_int_t    value;
 
-    if (ngx_test_probe_hooks.fault_set == NULL) {
+    /*
+     * Refuse before parsing when the module opted into no fault injection at
+     * all. Either family will do: fault_set needs a zone, fault_set_global
+     * does not, and which one actually gets the call is decided at dispatch
+     * below once the site and nth are known.
+     */
+    if (ngx_test_probe_hooks.fault_set == NULL
+        && ngx_test_probe_module_hooks.fault_set_global == NULL)
+    {
         return NGX_DECLINED;
     }
 
-    if (zone == NULL || args == NULL || args->len == 0) {
+    /*
+     * Deliberately NOT `zone == NULL` any more. A zoneless module -- a body
+     * filter keeping its counters in per-worker globals, which is every
+     * compression module -- has no zone to hand in, and refusing here meant it
+     * could register a fault hook that was never once called: a silent
+     * false green, because the module compiles, links and looks instrumented.
+     * The zone is now only a dispatch input, checked at the call below.
+     */
+    if (args == NULL || args->len == 0) {
         return NGX_DECLINED;
     }
 
@@ -174,7 +223,27 @@ ngx_test_probe_arm(ngx_shm_zone_t *zone, ngx_str_t *args)
                 return NGX_DECLINED;
             }
 
-            return ngx_test_probe_hooks.fault_set(zone, k->fault, value);
+            /*
+             * Zone-addressed hook first, and only when a zone is actually
+             * available: a module that registered just fault_set behaves
+             * exactly as it did before fault_set_global existed. Falling
+             * through on zone == NULL is what gives a zoneless module a path;
+             * falling through on fault_set == NULL is what gives a module
+             * that registered only the global hook one.
+             */
+            if (zone != NULL && ngx_test_probe_hooks.fault_set != NULL) {
+                return ngx_test_probe_hooks.fault_set(zone, k->fault, value);
+            }
+
+            if (ngx_test_probe_module_hooks.fault_set_global != NULL) {
+                return ngx_test_probe_module_hooks.fault_set_global(k->fault,
+                                                                    value);
+            }
+
+            /* fault_set is registered but there is no zone, and no global
+             * hook to fall back to. Same answer as an unimplemented site:
+             * refused, not reported applied. */
+            return NGX_DECLINED;
         }
     }
 
@@ -282,6 +351,76 @@ ngx_test_probe_escape_json_string(u_char *p, u_char *last, const ngx_str_t *str)
 
     return p;
 }
+
+/*
+ * Emit the top-level "module" object. See ngx_test_probe.h for the contract.
+ *
+ * Written with plain bounded byte copies rather than ngx_slprintf because
+ * this translation unit is deliberately shim-buildable (see the file header)
+ * and the shim has no printf family -- and because there is no formatting to
+ * do here: both pieces are fixed literals. Each literal is written only if it
+ * fits whole, so a short buffer truncates cleanly at a member boundary
+ * instead of leaving a half-written key.
+ */
+u_char *
+ngx_test_probe_render_module(u_char *p, u_char *last)
+{
+    static const char  open_lit[] = ",\"module\":{";
+
+    u_char  *p_open;
+
+    if (ngx_test_probe_module_hooks.module_render == NULL) {
+        return p;
+    }
+
+    /*
+     * `p > last` cannot happen from ngx_test_probe_json(), which only ever
+     * advances p through ngx_slprintf (bounded at last). It is checked anyway
+     * because the cast below would turn a negative difference into a huge
+     * size_t and wave the write straight through -- a guard that is correct
+     * only while every caller is well-behaved is the kind that stops being
+     * correct silently.
+     */
+    if (p > last || (size_t) (last - p) < sizeof(open_lit) - 1) {
+        return p;
+    }
+
+    ngx_memcpy(p, open_lit, sizeof(open_lit) - 1);
+    p += sizeof(open_lit) - 1;
+
+    p_open = p;
+
+    p = ngx_test_probe_module_hooks.module_render(p, last);
+
+    /*
+     * A hook that returned a pointer BEHIND where it was handed has written
+     * over the opening literal (or worse). Nothing can be salvaged from that
+     * -- appending a brace would only make a malformed document look closed
+     * -- so the render is abandoned back to the start of the object. The
+     * document then simply has no "module" member, which is a shape the
+     * schema already permits.
+     */
+    if (p < p_open) {
+        return p_open - (sizeof(open_lit) - 1);
+    }
+
+    /*
+     * The closing brace is what makes the document parseable, so it is worth
+     * one byte of reserve rather than being dropped on a full buffer. It
+     * cannot be reserved up front: the hook is handed `last` and may legally
+     * fill to it, which is why the check is here and a truncated hook render
+     * still loses the brace. `p >= p_open` needs no re-test -- the rewind
+     * check above already returned for that case. That is the same
+     * "truncation is a parse error, not a wrong answer" trade the whole
+     * document makes.
+     */
+    if (p < last) {
+        *p++ = '}';
+    }
+
+    return p;
+}
+
 
 #else
 

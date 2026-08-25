@@ -539,6 +539,15 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                      pool_large,
                      pool_cleanup);
 
+    /*
+     * The zone-independent module members, BEFORE the zone object and before
+     * either present:false early return below. A module with no shm zone
+     * reaches the document only through here; rendering it after the zone
+     * branch would put it behind two returns that a zoneless module always
+     * takes, which is the defect this ordering exists to prevent.
+     */
+    p = ngx_test_probe_render_module(p, last);
+
     if (zone == NULL) {
         return ngx_slprintf(p, last, ",\"zone\":{\"present\":false}}");
     }
