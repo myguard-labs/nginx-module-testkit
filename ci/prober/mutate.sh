@@ -1242,19 +1242,29 @@ mutate "probe: a member appended to the frozen hooks struct" ../../src/ngx_test_
 # "not present in document" rather than the clearer absent-object. schema_test's
 # rich_only handling asserts the absence.
 mutate "schema: zone-absent variant leaks a module object" schema_test.c \
-    '    "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
+    'static const char doc_zone_absent[] =
+    "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
+    "\"ppid\":1,\"config_generation\":3,"
+    "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
+    "\"fds\":9,\"timers\":6,"
+    "\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
+    "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
+    "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
-    "\"zone\":{\"present\":false}}";
-
-/*
- * R-10'"'"'s regression fixture' \
-    '    "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
+    "\"redzone\":{\"violations\":0,\"checked\":0},"
+    "\"zone\":{\"present\":false}}";' \
+    'static const char doc_zone_absent[] =
+    "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
+    "\"ppid\":1,\"config_generation\":3,"
+    "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
+    "\"fds\":9,\"timers\":6,"
+    "\"fds_by_kind\":{\"socket\":4,\"file\":3,\"anon\":1,\"other\":1},"
+    "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
+    "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
+    "\"redzone\":{\"violations\":0,\"checked\":0},"
     "\"module\":{\"frames\":7},"
-    "\"zone\":{\"present\":false}}";
-
-/*
- * R-10'"'"'s regression fixture' \
+    "\"zone\":{\"present\":false}}";' \
     schema_test
 
 # The fixture side: schema_test.c is what proves the DOCUMENT still carries
@@ -1274,6 +1284,7 @@ mutate "schema: zone-absent variant leaks a zone member" schema_test.c \
     "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
+    "\"redzone\":{\"violations\":0,\"checked\":0},"
     "\"zone\":{\"present\":false}}";' \
     'static const char doc_zone_absent[] =
     "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
@@ -1284,6 +1295,7 @@ mutate "schema: zone-absent variant leaks a zone member" schema_test.c \
     "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
+    "\"redzone\":{\"violations\":0,\"checked\":0},"
     "\"zone\":{\"present\":false,\"name\":\"stale\"}}";' \
     schema_test
 
