@@ -1209,11 +1209,201 @@ prober_config_wait() {
     return 1
 }
 
+# prober_port_owner_pids HOST PORT
+#
+# Print the pid(s) with a LISTEN socket on HOST:PORT, one per line; print
+# nothing and return 1 if none is listening. Return 2 when ownership cannot be
+# determined on this host (no working `ss`, and no readable /proc/net/tcp*) --
+# callers must treat that as a VISIBLE skip, never as agreement, same contract
+# as prober_drain_wait's pgrep gap.
+#
+# Why this exists: kill -0 on our own recorded pid proves our process is
+# ALIVE, never that it is the process holding the port. nginx retries bind()
+# on EADDRINUSE (logging [emerg]/[notice] and sleeping) instead of exiting, so
+# a squatter already on the port answers every connect while our master sits
+# in its retry sleep -- alive, correctly recorded, and not listening on
+# anything. See memory/lessons/feedback-orphaned-server-on-test-port-silently-
+# answers-your-experiment.md for the incident this closes.
+#
+# ss first: it names the pid directly and is what every human check in that
+# lesson uses. Fall back to /proc/net/tcp[6] inode matching only when ss is
+# absent or refuses -p (unprivileged callers can still read their OWN
+# processes' inodes; a foreign listener owned by another uid would be invisible
+# to the fallback too, but that case already returns "not ours" downstream --
+# the fallback only needs to recognise OUR OWN pid).
+prober_port_owner_pids() {
+    local host="$1" port="$2" hex_port pids
+
+    if command -v ss >/dev/null 2>&1; then
+        # -H drops the header, -p asks for the owning process, -l/-t/-n restrict
+        # to listening TCP sockets reported numerically. `sport = :PORT` matches
+        # on port alone, deliberately: nginx binds the HOST this repo passes,
+        # but a squatter is not obliged to bind the same address, and the whole
+        # point of this check is to catch whatever already holds the port.
+        # `|| true` on the whole pipeline is load-bearing under `set -e` +
+        # `pipefail`, which every caller of this function runs: grep -o exits
+        # 1 when the port is free (nothing to match), and an unguarded
+        # assignment from a failing command substitution aborts the CALLING
+        # SCRIPT right here rather than letting this function return 1 --
+        # exactly backwards from the "port is free" case this branch exists to
+        # report. Verified: without the guard, calling this on a free port
+        # kills the caller outright instead of returning.
+        pids="$(ss -lptnH "sport = :$port" 2>/dev/null \
+            | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u)" || true
+        if [ -n "$pids" ]; then
+            printf '%s\n' "$pids"
+            return 0
+        fi
+        # ss ran and found nothing: either the port is free, or ss lacks
+        # permission to show the owning pid for a socket it can still see as
+        # LISTEN. Distinguish those before falling back, or a permission gap
+        # would silently read as "port is free".
+        if ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
+            return 2
+        fi
+        return 1
+    fi
+
+    # No ss on this host: read /proc/net/tcp and /proc/net/tcp6 directly. Field
+    # 2 is "local_address:local_port" in hex; field 4 is st (0A = TCP_LISTEN);
+    # field 10 is the socket inode, which /proc/<pid>/fd/* symlinks back to
+    # "socket:[inode]" for whichever pid holds it.
+    [ -r /proc/net/tcp ] || return 2
+    hex_port="$(printf '%04X' "$port")"
+    local inode line st local_port fd link
+    local inodes=""
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "$f" ] || continue
+        while read -r line; do
+            # Deliberately unquoted: /proc/net/tcp's fields are single-space
+            # separated by the kernel, and this line is exactly what set --
+            # is for -- splitting it into positionals to index by field number.
+            # shellcheck disable=SC2086
+            set -- $line
+            local_port="${2#*:}"
+            st="$4"
+            inode="${10}"
+            [ "$st" = "0A" ] || continue
+            [ "$local_port" = "$hex_port" ] || continue
+            [ -n "$inode" ] && inodes="$inodes $inode"
+        done < <(tail -n +2 "$f" 2>/dev/null)
+    done
+    [ -n "$inodes" ] || return 1
+
+    pids=""
+    for d in /proc/[0-9]*; do
+        [ -d "$d/fd" ] || continue
+        for fd in "$d/fd"/*; do
+            [ -e "$fd" ] || continue
+            link="$(readlink "$fd" 2>/dev/null)" || continue
+            case "$link" in
+                socket:\[*\])
+                    for inode in $inodes; do
+                        if [ "$link" = "socket:[$inode]" ]; then
+                            pids="$pids ${d#/proc/}"
+                        fi
+                    done
+                    ;;
+            esac
+        done
+    done
+    [ -n "$pids" ] || return 2
+    # Deliberately unquoted: $pids is a space-joined accumulator (possibly with
+    # duplicate pids across tcp/tcp6), and this re-splits it into one pid per
+    # line for sort -u -- quoting it would print the whole accumulator as one
+    # line and sort -u would have nothing to dedupe.
+    # shellcheck disable=SC2086
+    printf '%s\n' $pids | sort -u
+    return 0
+}
+
+# prober_assert_port_owned MASTER_PID
+#
+# Confirm the listener on $PROBER_RESOLVED_PORT belongs to MASTER_PID or one of
+# its direct children (nginx workers are children of the master; the daemon-on
+# adopted master pid is the one prober_boot already read from nginx.pid).
+# Return 0 when ownership is confirmed, 1 when the port is owned by a DIFFERENT
+# pid (the stale-listener case), 2 when ownership cannot be determined on this
+# host (no ss, no /proc/net/tcp, or no pgrep to list children) -- a VISIBLE
+# skip the caller must log, never a silent pass.
+prober_assert_port_owned() {
+    local master="$1" owners rc kids want
+
+    # `|| rc=$?` (not a trailing `rc=$?` on its own line) is load-bearing:
+    # prober_port_owner_pids legitimately returns 1 or 2, and every caller of
+    # THIS function runs under `set -e` -- an unguarded assignment from a
+    # nonzero return aborts the caller before `rc=$?` is ever reached, the same
+    # class of bug this function's own helper just needed fixing for.
+    owners="$(prober_port_owner_pids 127.0.0.1 "$PROBER_RESOLVED_PORT")" && rc=0 || rc=$?
+    [ "$rc" -eq 2 ] && return 2
+    if [ "$rc" -ne 0 ] || [ -z "$owners" ]; then
+        # The readiness loop already required a successful connect before
+        # calling here, so "nobody is listening" now means the listener went
+        # away between that connect and this check -- report it the same as a
+        # foreign owner rather than silently agreeing.
+        echo "$owners"
+        return 1
+    fi
+
+    want="$master"
+    if command -v pgrep >/dev/null 2>&1; then
+        # `|| true`: pgrep -P exits 1 when the master has no children yet
+        # (the common daemon-off single-process shape before any worker
+        # forks) -- a real, frequent case, not an error, and the same
+        # set -e-abort-the-caller hazard as prober_port_owner_pids above.
+        kids="$(pgrep -P "$master" 2>/dev/null)" || true
+        [ -n "$kids" ] && want="$master
+$kids"
+    fi
+
+    while read -r owner; do
+        [ -z "$owner" ] && continue
+        if printf '%s\n' "$want" | grep -qx "$owner"; then
+            return 0
+        fi
+    done <<EOF
+$owners
+EOF
+
+    printf '%s\n' "$owners"
+    return 1
+}
+
 # prober_boot
 #
 # Sets: PROBER_SERVER_PID. Config-tests first so a broken conf is a bail-out
 # with the actual error, not a connect timeout.
 prober_boot() {
+    # Refuse to spawn onto an already-bound port rather than let nginx retry
+    # bind() into it. A pre-existing listener means EITHER outcome is a lie:
+    # nginx's own retry loop might eventually win the race and evict it, or it
+    # might not and every request in the scenario gets served by the squatter
+    # -- see prober_port_owner_pids for the incident. Failing before the spawn
+    # is strictly cheaper than the post-boot ownership check below and catches
+    # the common case (a leaked process from a previous cycle) without ever
+    # racing nginx's own bind().
+    local _pre_owners _pre_rc
+    # `|| _pre_rc=$?` (not a bare trailing assignment): the free-port case --
+    # every ordinary scenario boot -- returns 1 here, and this whole function
+    # runs under callers' `set -e`. An unguarded assignment from that nonzero
+    # return would abort prober_boot itself on its single most common path
+    # rather than let the "port is free, carry on" branch below ever run.
+    _pre_owners="$(prober_port_owner_pids 127.0.0.1 "$PROBER_RESOLVED_PORT")" \
+        && _pre_rc=0 || _pre_rc=$?
+    if [ "$_pre_rc" -eq 0 ] && [ -n "$_pre_owners" ]; then
+        echo "Bail out! port $PROBER_RESOLVED_PORT is already bound before" \
+             "boot -- not starting a server onto it:"
+        printf '%s\n' "$_pre_owners" | while read -r _op; do
+            [ -z "$_op" ] && continue
+            echo "#   pid $_op: $(readlink "/proc/$_op/exe" 2>/dev/null || echo "unknown (exe unreadable)")"
+        done
+        exit 1
+    elif [ "$_pre_rc" -eq 2 ]; then
+        echo "# pre-boot port-ownership check skipped: no ss and no" \
+             "readable /proc/net/tcp on this host -- cannot confirm" \
+             "$PROBER_RESOLVED_PORT is free before boot"
+    fi
+
     if ! "$PROBER_SERVER_BIN" -t -p "$PROBER_PREFIX" -c conf/nginx.conf \
         >"$PROBER_PREFIX/logs/conftest" 2>&1; then
         echo "Bail out! config test failed:"
@@ -1291,9 +1481,19 @@ prober_boot() {
     fi
 
     # Wait for the listener rather than sleeping a fixed interval: a fixed
-    # sleep is either slow or flaky, and on a loaded CI box it is both. Verify
-    # after each connect that the server is still alive: a stale listener on the
-    # port can answer TCP connects while our server exited on bind() failure.
+    # sleep is either slow or flaky, and on a loaded CI box it is both. The
+    # kill -0 re-check after each connect is a LIVENESS proof, not an IDENTITY
+    # proof: nginx does not exit on EADDRINUSE, it logs
+    # "[emerg] bind() ... failed (98: Address already in use)" and
+    # "[notice] try again to bind() after 500ms", then stays alive through its
+    # retry window. A pre-existing listener on the port answers the connect,
+    # our own master is genuinely alive in its retry sleep, and this loop
+    # breaks with the port owned by someone else's process -- kill -0 cannot
+    # tell the difference, only prober_assert_port_owned below can. This loop
+    # therefore stays a readiness gate only (is SOMETHING answering); ownership
+    # is asserted once, after the break, rather than on every iteration, since
+    # re-running ss/proc-scan 500 times per boot would slow every scenario for
+    # a property that only needs checking once the port is confirmed live.
     local _i
     for _i in $(seq 1 $((50 * PROBER_TIMEOUT_SCALE))); do
         if (exec 3<>"/dev/tcp/127.0.0.1/$PROBER_RESOLVED_PORT") 2>/dev/null; then
@@ -1317,6 +1517,69 @@ prober_boot() {
             sed 's/^/# /' "$PROBER_PREFIX/logs/server.err"
         fi
         exit 1
+    fi
+
+    # Positive identity: confirm the listener the readiness loop just found is
+    # OURS -- our master pid, or (the common daemon-off shape) one of its
+    # already-forked worker children -- not a leaked process from a previous
+    # cycle that happened to be squatting the port when we tried to bind.
+    # rc=2 means this host cannot answer the question at all (no ss, no
+    # /proc/net/tcp); that is a visible skip, logged and NOT a bail, because
+    # refusing to run every scenario on every such host would cost far more
+    # than the (already reduced, thanks to the pre-spawn refusal above) residual
+    # risk it is closing.
+    local _owner_rc
+    # `|| _owner_rc=$?`: prober_assert_port_owned returns 1 on a genuine
+    # mismatch and 2 on a visible skip, both real outcomes this function must
+    # go on to handle below -- not `set -e` aborting prober_boot mid-check on
+    # exactly the cases the whole guard exists to report.
+    prober_assert_port_owned "$PROBER_SERVER_PID" \
+        >"$PROBER_PREFIX/logs/.port-owner-check" 2>&1 && _owner_rc=0 || _owner_rc=$?
+    if [ "$_owner_rc" -eq 1 ]; then
+        echo "Bail out! port $PROBER_RESOLVED_PORT answered readiness but is" \
+             "NOT owned by our server (pid $PROBER_SERVER_PID or its" \
+             "children) -- a stale listener from another process is serving" \
+             "this scenario:"
+        sed 's/^/# /' "$PROBER_PREFIX/logs/.port-owner-check"
+        exit 1
+    elif [ "$_owner_rc" -eq 2 ]; then
+        echo "# port-ownership check skipped: no ss and no readable" \
+             "/proc/net/tcp on this host -- cannot confirm $PROBER_RESOLVED_PORT" \
+             "is served by our own process (pid $PROBER_SERVER_PID)"
+    fi
+
+    # "Address already in use" reaching the error log is fatal even when the
+    # ownership check above passed: it proves OUR OWN master hit EADDRINUSE at
+    # least once during this boot, which means it raced a squatter for the
+    # port and only incidentally won (or is still mid-retry and about to lose
+    # it later in the run). A run that started this way is not a degraded
+    # pass -- the harness must never treat a bind race it happened to survive
+    # as equivalent to a clean bind.
+    #
+    # PROBER_ALLOW_LOG must gate this exactly as it gates prober_scrape_log's
+    # alert/crit/emerg scan: deploy-canary's env file already opts out of this
+    # very line ('export PROBER_ALLOW_LOG=Address already in use') because a
+    # shared CI runner can hand two concurrent jobs adjacent ports in the same
+    # 1813x/1814x range, and that collision is not the fault the scenario
+    # exists to detect. Without this check, the fix would turn an already-
+    # accepted, already-documented tolerance into a hard scenario failure --
+    # exactly the over-tightening this repo's own env file was written to
+    # prevent.
+    if [ -f "$PROBER_PREFIX/logs/error.log" ]; then
+        local _addr_in_use
+        _addr_in_use="$(grep 'Address already in use' \
+            "$PROBER_PREFIX/logs/error.log" || true)"
+        if [ -n "${PROBER_ALLOW_LOG:-}" ] && [ -n "$_addr_in_use" ]; then
+            _addr_in_use="$(printf '%s\n' "$_addr_in_use" \
+                | grep -vE "$PROBER_ALLOW_LOG" || true)"
+        fi
+        if [ -n "$_addr_in_use" ]; then
+            echo "Bail out! error.log shows bind() Address already in use --" \
+                 "the server raced a listener already on port" \
+                 "$PROBER_RESOLVED_PORT for this run:"
+            sed 's/^/# /' "$PROBER_PREFIX/logs/error.log"
+            exit 1
+        fi
     fi
 
     # The error log must EXIST once the server is up, and this is the only place
