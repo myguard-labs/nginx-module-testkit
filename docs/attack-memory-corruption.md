@@ -309,6 +309,16 @@ corruption, never the interleaving. Helgrind and TSan model pthread races in
 one address space, which is not what nginx workers are — so neither of them
 covers this, and neither does this cover them.
 
+This is a settled decision, not an open question: a consuming module's
+helgrind/TSan soak does not get `--trace-children=yes` added to reach into its
+forked workers. Doing so would still leave the soak blind to this module's
+actual race class — pthread instrumentation cannot model a `ngx_shmtx`
+spinlock over shared `mmap`, trace-children or not — so it would only buy
+"still cannot see shm races" at several times the runtime. The cross-process shm-coherence lens in
+[attack-concurrency.md](attack-concurrency.md) (`fanout`/`quiesce`/
+`zone_invariant`) replaces that coverage rather than deepening a structurally
+blind one.
+
 ## Guard width
 
 `NGX_TEST_PROBE_CANARY` is 8 bytes per side, half the pool redzone's 16. Every
@@ -325,5 +335,9 @@ moving the `slab_reqs`/`slab_used` figures the churn oracle asserts on.
 - [attack-fault-injection.md](attack-fault-injection.md) — `fault_palloc=`
   makes the allocator fail, which is how the `NULL` return path above gets
   exercised at all.
+- [attack-concurrency.md](attack-concurrency.md) — `fanout`/`quiesce`/
+  `zone_invariant` detect a leaked or diverged shm counter *across* workers,
+  the consequence-only complement to this file's per-worker canary; point 4
+  above states why neither this lens nor that one is a race detector.
 - [COVERAGE.md](COVERAGE.md) — the control-mutation rule every test here had to
   pass.

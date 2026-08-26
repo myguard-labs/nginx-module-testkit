@@ -91,7 +91,11 @@ green run proving nothing:
   allocation becomes visible.
 - **[Concurrency](docs/attack-concurrency.md)** — `concurrent N` holds N requests
   in flight at once (`concurrent-fan`), `open_conns` parks bare connections,
-  `backpressure` attacks the write path with a reader that will not drain.
+  `backpressure` attacks the write path with a reader that will not drain, and
+  `fanout`/`quiesce`/`zone_invariant` (`shm-coherence`) catch cross-process shm
+  races that helgrind and TSan cannot see at all — a leaked or diverged counter
+  across nginx's fork()ed workers, not the interleaving itself. Verified on
+  nginx and angie 1.12.0.
 - **[Environmental hostility](docs/attack-environment.md)** — the
   `locale-hostility` CI job re-runs the self-tests under `tr_TR.UTF-8` and
   `de_DE.UTF-8` (both have caught a real bug), and `syscall-allowlist` traces

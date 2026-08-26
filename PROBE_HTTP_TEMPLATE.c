@@ -262,6 +262,14 @@ ngx_mymod_probe_handler(ngx_http_request_t *r)
      *
      * probe_zone may be NULL -- a module with no shm zone passes NULL here and
      * still gets the whole generic document plus its module_render members.
+     *
+     * The generic part already includes `zone.digest` -- an order-independent
+     * mix of this zone's slab_reqs/slab_fails/slab_used, for CROSS-WORKER
+     * comparison against a `zone_invariant coherent zone.digest` line. You do
+     * not need a zone_render hook to get it; it is computed and rendered
+     * automatically whenever probe_zone is non-NULL. See
+     * docs/attack-concurrency.md and probe-schema.json's "zone.digest" note
+     * for what it does and does not guarantee.
      */
     last = ngx_test_probe_json(buf, buf + size, mlcf->probe_zone);
 
