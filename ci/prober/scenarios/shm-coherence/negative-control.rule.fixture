@@ -1,0 +1,49 @@
+# NEGATIVE CONTROL FIXTURE -- deliberately broken, and it must stay broken.
+#
+# Not a `.rule` file, and the extension is load-bearing: run-scenario.sh globs
+# `$SCENARIO/*.rule` when a scenario has no driver, and this scenario HAS a
+# driver, but a future edit that removed driver.sh would otherwise silently
+# fold a fixture built to FAIL into the scenario's honest assertions.
+# driver.sh names this file explicitly.
+#
+# WHAT IT PROVES. The `fanout` coverage oracle is the load-bearing assertion of
+# the whole cross-process shm lens: it is what stops the lens passing having
+# sampled a single worker N times. An oracle nobody has watched fail is an
+# oracle nobody should trust, so driver.sh runs this fixture against the same
+# live four-worker server the honest cases ran against, and requires it to come
+# back RED with the coverage message.
+#
+# HOW THE FAILURE IS FORCED. `fanout 8 8` demands 8 DISTINCT answering workers
+# from a server that has exactly 4. That is unreachable by construction, not by
+# luck: no scheduling outcome, no accept-path behaviour and no load level can
+# produce a ninth worker, so this fixture is deterministically red on every box
+# and cannot flake green. Compare the alternatives, both rejected:
+#
+#   - `fanout 2 2` (hope both legs land on one worker) is red only
+#     PROBABILISTICALLY -- it would flake green, and a negative control that
+#     sometimes passes is worse than none, because it teaches the reader the
+#     oracle fired when it did not.
+#   - a second single-worker server would be a truer mirror of the real
+#     failure, but a scenario boots ONE server; forcing coverage to be
+#     unreachable from the other side of the same inequality tests the same
+#     comparison, in the same code, with no second process.
+#
+# It exercises the ceiling side of `distinct < min_workers` rather than the
+# floor side the field reports naturally, and the comparison it reddens is the
+# single one in eval_fanout_coverage. The floor side was ALSO observed red
+# unmutated on this box while sizing the honest cases: `fanout 8` with
+# min_workers 3 returned "8 of 8 responses came from 2 distinct workers, need
+# >= 3" on four consecutive runs. Both directions of the same bound have been
+# seen to fail.
+#
+# DO NOT "FIX" THIS FILE. A red here is the pass condition. If it ever comes
+# back green, the coverage oracle stopped comparing and every fanout in the
+# tree became a test that cannot fail.
+name    NEGATIVE CONTROL: coverage the server cannot reach must FAIL
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~OK
+pid_may_change
+fanout  8 8

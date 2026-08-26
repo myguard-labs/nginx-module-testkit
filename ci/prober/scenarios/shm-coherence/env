@@ -1,0 +1,30 @@
+# worker_processes 4 in nginx.conf is this scenario's ENTIRE subject: the
+# `fanout` directive counts DISTINCT answering worker pids, and a one-worker
+# server can never produce more than one. prober_check_conf bails on
+# worker_processes != 1 by default (the strict pid oracle would read a healthy
+# worker rotation as a crash); PROBER_ALLOW_MULTIWORKER=1 lifts exactly that
+# bail. The two must stay together -- dropping either one silently turns this
+# scenario into something it is not.
+#
+# The contract this pairing carries here differs from multi-worker.rule's.
+# There, every case says `pid_may_change` so the oracle degrades to "same
+# master". Here the answering pid is not merely tolerated to vary, it is the
+# measurement: `fanout N` requires at least `min_workers` DISTINCT pids and
+# FAILS when the sample did not reach them. Every case therefore still carries
+# `pid_may_change` (without it the strict same-worker oracle would redden the
+# very rotation the case is built to observe), but the coverage oracle is what
+# keeps the relaxation from being a free pass.
+PROBER_ALLOW_MULTIWORKER=1
+
+# The scenario configures its OWN zone rather than inheriting whatever the
+# caller happened to export. nginx.conf carries the @PROBE_ZONE@ placeholder
+# and the quiesce case reads `zone.slab_reqs`, which the probe renders only
+# when a zone is actually mapped -- without a zone here that case would read
+# the absent-field path and fail for a reason that has nothing to do with the
+# directive under test. Pinning it in `env` also makes the scenario runnable by
+# hand and under mutate-suite-lib.sh, neither of which supplies one.
+#
+# The name is unremarkable on purpose: zone NAME handling is
+# scenarios/zone-name-escaping's subject, and a second scenario exercising it
+# incidentally would make a failure ambiguous between two lenses.
+PROBER_PROBE_ZONE='test_ref_zone probezone 1m;'
