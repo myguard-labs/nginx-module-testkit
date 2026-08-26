@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  298
+#define PLANNED  315
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1276,6 +1276,67 @@ main(void)
                "open_conns with no argument dies");
     expect_die("name t\nsend X\nopen_conns 5\nopen_conns 6\nprobe fds >= 0\n",
                "a repeated open_conns dies");
+
+    /* ---- fanout ---------------------------------------------------------- */
+
+    n = load_str("name t\nsend X\nfanout 8\nprobe zone.digest >= 0\n");
+    ok(n == 1 && cases[0].fanout == 8 && cases[0].fanout_min_workers == 2,
+       "fanout stores the request count and defaults min_workers to 2");
+    free_all(n);
+
+    n = load_str("name t\nsend X\nfanout 8 4\nprobe zone.digest >= 0\n");
+    ok(n == 1 && cases[0].fanout == 8 && cases[0].fanout_min_workers == 4,
+       "fanout takes an explicit min_workers");
+    free_all(n);
+
+    n = load_str("name t\nsend X\nprobe fds >= 0\n");
+    ok(n == 1 && cases[0].fanout == 0,
+       "a case without fanout runs the ordinary single-request path");
+    free_all(n);
+
+    n = load_str("name a\nsend X\nfanout 4\nprobe fds >= 0\n"
+                 "name b\nsend Y\nprobe fds >= 0\n");
+    ok(n == 2 && cases[0].fanout == 4 && cases[1].fanout == 0,
+       "fanout does not leak into the following case");
+    free_all(n);
+
+    /* The floor is 2 for the same reason concurrent's is: `fanout 1` reaches
+     * one worker, so it would claim a cross-worker test while sampling one. */
+    n = load_str("name t\nsend X\nfanout 2\nprobe fds >= 0\n");
+    ok(n == 1 && cases[0].fanout == 2, "fanout 2 is the floor and loads");
+    free_all(n);
+
+    expect_die("name t\nsend X\nfanout 1\nprobe fds >= 0\n",
+               "fanout 1 dies -- one request reaches one worker");
+    expect_die("name t\nsend X\nfanout 0\nprobe fds >= 0\n",
+               "fanout 0 dies");
+    expect_die("name t\nsend X\nfanout -1\nprobe fds >= 0\n",
+               "a negative fanout dies");
+    expect_die("name t\nsend X\nfanout 65\nprobe fds >= 0\n",
+               "a fanout over MAX_CONCURRENT dies");
+    expect_die("name t\nsend X\nfanout 4junk\nprobe fds >= 0\n",
+               "a fanout count with trailing junk dies");
+    expect_die("name t\nsend X\nfanout\nprobe fds >= 0\n",
+               "fanout with no argument dies");
+    expect_die("name t\nsend X\nfanout 4\nfanout 8\nprobe fds >= 0\n",
+               "a duplicate fanout dies");
+
+    /* min_workers cannot exceed the request count -- a bound nothing could
+     * ever satisfy is a case that always fails for a reason unrelated to the
+     * code under test. */
+    expect_die("name t\nsend X\nfanout 4 5\nprobe fds >= 0\n",
+               "fanout min_workers above the request count dies");
+    expect_die("name t\nsend X\nfanout 4 1\nprobe fds >= 0\n",
+               "fanout min_workers below 2 dies -- one worker is not a fanout");
+    expect_die("name t\nsend X\nfanout 4 junk\nprobe fds >= 0\n",
+               "a non-numeric fanout min_workers dies");
+
+    /* Both orderings of the mutually-exclusive pairs, so the rejection cannot
+     * depend on which directive the file happens to name first. */
+    expect_die("name t\nsend X\nfanout 4\nconcurrent 4\nprobe fds >= 0\n",
+               "fanout then concurrent dies");
+    expect_die("name t\nsend X\nconcurrent 4\nfanout 4\nprobe fds >= 0\n",
+               "concurrent then fanout dies");
 
     /* ---- concurrent ----------------------------------------------------- */
 

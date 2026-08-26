@@ -1405,6 +1405,85 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
 
             cases[n - 1].open_conns = (int) count;
 
+        } else if (strcmp(directive, "fanout") == 0) {
+            char   *rest = trim(arg);
+            char   *stop;
+            long    count;
+            long    minw;
+
+            if (*rest == '\0') {
+                die("%s:%d: fanout needs <count> [min_workers]", file, lineno);
+            }
+
+            count = strtol(rest, &stop, 10);
+
+            if (stop == rest) {
+                die("%s:%d: fanout count \"%s\" is not a number",
+                    file, lineno, rest);
+            }
+
+            /* Same floor and reasoning as `concurrent`: `fanout 1` is the
+             * ordinary path with extra machinery, and accepting it would let a
+             * rule file claim a cross-worker test while only ever reaching one
+             * worker -- the vacuous-gate shape this harness exists to catch. */
+            if (count < 2 || count > MAX_CONCURRENT) {
+                die("%s:%d: fanout %ld out of range (2..%d)",
+                    file, lineno, count, MAX_CONCURRENT);
+            }
+
+            rest = trim(stop);
+
+            if (*rest == '\0') {
+                /*
+                 * Default: require at least 2 DISTINCT workers.
+                 *
+                 * Not 1. Worker sampling is probabilistic -- nothing lets a
+                 * client pick which worker accepts its connection -- so N
+                 * requests can legitimately all land on one worker. A default
+                 * of 1 would let the entire lens pass having sampled a single
+                 * worker N times, which is a coverage claim it never earned.
+                 * Requiring 2 makes incomplete coverage FAIL rather than pass
+                 * quietly, which is the whole point of the directive.
+                 */
+                minw = 2;
+
+            } else {
+                minw = strtol(rest, &stop, 10);
+
+                if (stop == rest || *trim(stop) != '\0') {
+                    die("%s:%d: fanout min_workers \"%s\" is not a number",
+                        file, lineno, rest);
+                }
+
+                if (minw < 2 || minw > count) {
+                    die("%s:%d: fanout min_workers %ld out of range (2..%ld)",
+                        file, lineno, minw, count);
+                }
+            }
+
+            if (cases[n - 1].fanout != 0) {
+                die("%s:%d: fanout already set for this case", file, lineno);
+            }
+
+            /* Mutually exclusive with `block`, for the reason `concurrent`
+             * refuses it: a pipeline is ordered on ONE connection, so it
+             * reaches exactly one worker and a fanout over it would assert
+             * cross-worker agreement having sampled a single worker. */
+            if (cases[n - 1].n_blocks > 0) {
+                die("%s:%d: fanout cannot be combined with block "
+                    "(a pipeline is one connection, so it reaches one worker)",
+                    file, lineno);
+            }
+
+            if (cases[n - 1].concurrent != 0) {
+                die("%s:%d: fanout cannot be combined with concurrent "
+                    "(both drive the request count; pick one)",
+                    file, lineno);
+            }
+
+            cases[n - 1].fanout = (int) count;
+            cases[n - 1].fanout_min_workers = (int) minw;
+
         } else if (strcmp(directive, "concurrent") == 0) {
             char   *count_s = trim(arg);
             char   *stop;
@@ -1436,6 +1515,15 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
 
             if (cases[n - 1].concurrent != 0) {
                 die("%s:%d: concurrent already set for this case",
+                    file, lineno);
+            }
+
+            /* The mirror of the check in `fanout` above -- the pair must be
+             * refused whichever order the two directives appear in, or the
+             * rejection depends on line order. */
+            if (cases[n - 1].fanout != 0) {
+                die("%s:%d: concurrent cannot be combined with fanout "
+                    "(both drive the request count; pick one)",
                     file, lineno);
             }
 
