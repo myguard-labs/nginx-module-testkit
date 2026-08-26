@@ -36,12 +36,36 @@ green run proving nothing:
   (`src/ngx_test_probe_arm.c`) make the
   allocator fail on demand, on the Nth call. Most module bugs live on the error
   path that nobody exercises, because in a healthy test the allocator never
-  fails. `fault-matrix` drives these.
+  fails. `fault-matrix` drives these. Arming is over HTTP (`fault <query>` in a
+  rule file), and the prober takes its before-snapshot *after* the arming
+  request, so a counter that request moved is never billed to the case. A module
+  opts in by registering a `fault_set` hook and returns `NGX_DECLINED` for the
+  sites it has no fault point for; without the hook `ngx_test_probe_arm()`
+  declines, which is the boundary `fault-matrix` documents. The second injector
+  half is `fakesrv` — upstream faults (mid-reply reset, contradicted length,
+  keepalive close at reload) a real daemon cannot be made to produce.
 - **[Resource exhaustion and leak pressure](docs/attack-leak-pressure.md)** — repeated-operation deltas on
   cycle-pool bytes, file descriptors and slab accounting. A leak of one
   descriptor per request is invisible in a functional test and fatal in
   production; `rss-slope` and the `delta` oracles pin total growth, not a
-  per-operation average that truncates to zero.
+  per-operation average that truncates to zero. **Shared-memory slabs need no
+  module C**: every nginx shm zone begins with an `ngx_slab_pool_t`, so
+  `zone->shm.addr` *is* the slab pool and the generic probe renders the zone's
+  name, size and page accounting for any module. The optional `zone_render`
+  hook is for what is private to the module on top of that.
+- **Algorithmic and allocation cost** — the module that is correct but gets
+  quadratic as its zone fills, or that churns a hundred slab allocations to
+  serve one request. Neither is a leak, so no `delta` oracle above sees it, and
+  neither shows up in review. `ci/prober/perf/cachegrind-scale.sh` is the
+  shipped instance of the technique on the prober's own JSON parser: it asserts
+  a **shape, not a speed** — parsing an 8x document must cost about 8x the
+  instructions, never ~64x. Cachegrind counts instructions exactly and
+  reproducibly, so the ratio is a host-independent proxy for asymptotic
+  complexity, which is why a wall-clock `expect time<ms` directive was
+  considered and **rejected** (load- and host-dependent, flaky by construction).
+  Generalizing that ratio to a consumer's module, and counting per-request slab
+  allocations rather than only net occupancy, are both open — see "Ideas and
+  opportunities".
 - **[Lifecycle attacks](docs/attack-lifecycle.md)** — reload, binary upgrade,
   worker death, signal storms mid-transfer (`reload-*`, `usr2-*`,
   `hup-storm-mid-transfer`, `worker-death`). Reloads are where module leaks
@@ -2130,6 +2154,35 @@ into a generator of concrete adversarial scenarios instead of a number to chase.
 - The `delta` oracles pin fds, pool bytes, slab and timers. A module can still
   leak in places nothing snapshots — cleanup handlers, resolver state. Each is
   a probe field somebody has to add before an oracle can assert on it.
+- **Allocation-count oracles.** Every memory oracle we have reads *net
+  occupancy*, which is blind to churn: ten thousand matched alloc/free pairs
+  per request net to zero and read as clean. A per-request slab
+  allocation/free **counter** in the probe turns that into a ceiling oracle —
+  not "must be 0" (a leak) but "must be <= K per request" (a bottleneck).
+  Cheapest row on this list: no new dependency, no new process, and
+  `scenarios/alloc-per-request` is already the shape. The counter itself needs
+  a hook or an interposition on the alloc path, where `fault_slab=` already
+  sits. Finds slab thrash and an allocation in a path that should reuse; blind
+  to anything CPU-bound at flat allocation.
+- **Cachegrind ratio, generalized to a consumer's module.** `perf/cachegrind-scale.sh`
+  proves the technique on `json_parse_n`; the class it catches in a *module* is
+  the per-request scan over a shm structure that goes quadratic as the zone
+  fills. The obstacle is stated in that script's own header: Cachegrind must
+  **launch** the process it measures and cannot attach to a live worker. Two
+  ways out — extract the hot function into a standalone driver the way the fuzz
+  targets do, or boot the whole server under `valgrind --tool=cachegrind`. The
+  second looks cheap here rather than expensive, because a consumer already
+  MUST run `worker_processes 1` and `daemon off;`, which is exactly the
+  single-process shape Cachegrind needs, and boot lives in one place
+  (`ci/prober/lib.sh`) so it is an env knob rather than a rewrite. Cost is the
+  ~20-50x slowdown, on that leg only. Assert the **ratio**, never an absolute
+  instruction count: the ratio survives a compiler change, the absolute does
+  not.
+- **Not a profiler, and deliberately.** `perf` and flamegraphs answer "which
+  line is slow", which is a human-read artifact and cannot red a PR — and on
+  the current build host `perf` needs `perf_event_paranoid<=1` anyway. The
+  right shape is a deterministic gate here plus a manual profiling pass when
+  that gate fires, not a profiler wired into CI.
 
 If you have a way to break a module that is not on this list, that is the most
 useful thing you can contribute.

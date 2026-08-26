@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  156
+#define PLANNED  165
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -584,6 +584,60 @@ main(void)
              "an unavailable timer count in the before snapshot fails");
     delta_is("{\"timers\":9}", "{\"timers\":-1}", "timers", "==", "-10", 0,
              "an unavailable timer count in the after snapshot fails");
+
+    /*
+     * The three zone.slab_* counters carry the same -1 discipline, on a third
+     * cause again: a zone whose slab pool the master has mapped but whose
+     * ngx_slab_init() has not yet set stats[], so the probe reads NULL. The
+     * consequence is what matters and is identical to the two cases above --
+     * -1 minus -1 cancels to a passing zero, and a `delta zone.slab_reqs <= K`
+     * ceiling would then certify "this module allocates at most K blocks per
+     * request" while measuring an uninitialised pool.
+     */
+    delta_is("{\"zone\":{\"slab_reqs\":-1}}", "{\"zone\":{\"slab_reqs\":-1}}",
+             "zone.slab_reqs", "<=", "0", 0,
+             "an uninitialised slab reqs count fails rather than cancelling");
+    delta_is("{\"zone\":{\"slab_reqs\":-1}}", "{\"zone\":{\"slab_reqs\":9}}",
+             "zone.slab_reqs", "<=", "10", 0,
+             "an uninitialised slab reqs in the before snapshot fails");
+    delta_is("{\"zone\":{\"slab_used\":4}}", "{\"zone\":{\"slab_used\":-1}}",
+             "zone.slab_used", "==", "-5", 0,
+             "an uninitialised slab used in the after snapshot fails");
+    delta_is("{\"zone\":{\"slab_fails\":-1}}", "{\"zone\":{\"slab_fails\":-1}}",
+             "zone.slab_fails", "==", "0", 0,
+             "an uninitialised slab fails count fails rather than cancelling");
+
+    /*
+     * The ceiling operator on a real reading, which is the whole point of the
+     * churn oracle: `<= K` must PASS at and below K and FAIL above it. An
+     * equality could not express this -- a module is allowed to allocate, just
+     * not without bound.
+     */
+    delta_is("{\"zone\":{\"slab_reqs\":100}}", "{\"zone\":{\"slab_reqs\":100}}",
+             "zone.slab_reqs", "<=", "0", 1,
+             "a module that allocates nothing per request is within a 0 ceiling");
+    delta_is("{\"zone\":{\"slab_reqs\":100}}", "{\"zone\":{\"slab_reqs\":104}}",
+             "zone.slab_reqs", "<=", "4", 1,
+             "four allocations are within a ceiling of four");
+    delta_is("{\"zone\":{\"slab_reqs\":100}}", "{\"zone\":{\"slab_reqs\":105}}",
+             "zone.slab_reqs", "<=", "4", 0,
+             "five allocations breach a ceiling of four");
+
+    /*
+     * Churn is what reqs sees and used cannot: a request that allocates four
+     * blocks and frees all four leaves used flat -- the reading every other
+     * memory oracle in this repo takes -- while reqs rises by four. Both
+     * assertions over the SAME pair of snapshots, because the divergence is
+     * the justification for carrying reqs at all.
+     */
+    delta_is("{\"zone\":{\"slab_used\":7,\"slab_reqs\":100}}",
+             "{\"zone\":{\"slab_used\":7,\"slab_reqs\":104}}",
+             "zone.slab_used", "==", "0", 1,
+             "matched alloc/free pairs leave slab_used flat (the blind spot)");
+    delta_is("{\"zone\":{\"slab_used\":7,\"slab_reqs\":100}}",
+             "{\"zone\":{\"slab_used\":7,\"slab_reqs\":104}}",
+             "zone.slab_reqs", "<=", "0", 0,
+             "the same matched pairs breach a zero churn ceiling (the catch)");
 
     /* A real reading of these fields still deltas normally -- the guard rejects
      * ONLY the -1 sentinel, not every value. */
