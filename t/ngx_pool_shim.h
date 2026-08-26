@@ -71,6 +71,96 @@ struct ngx_pool_s {
     u_char              *base;
 };
 
+/*
+ * A slab pool that really allocates, for ngx_test_probe_canary.c.
+ *
+ * As with the bump allocator above, the fidelity that matters is the bug class
+ * under test. Two properties are reproduced deliberately:
+ *
+ *   POWER-OF-TWO ROUNDING. ngx_slab_alloc_locked() rounds a request up to the
+ *   next power of two, so a 20-byte request is served from a 32-byte chunk and
+ *   the 12 slack bytes are invisible to any allocator-level check. That slack
+ *   is the reason the canary is placed at the caller's requested size, and a
+ *   shim that handed back exactly `size` bytes would make the tests pass for
+ *   the wrong reason -- there would be no slack to overflow into.
+ *
+ *   ADJACENCY. Chunks come out of one contiguous arena, so an overflow past
+ *   one chunk lands in the next rather than in unmapped memory.
+ *
+ * Freeing is a no-op: nothing here reuses a chunk, because none of the
+ * assertions depend on reuse and a free list would be a second allocator to
+ * get wrong. The poison-on-free path under test writes to the chunk before
+ * calling this, which is what the tests read back.
+ */
+typedef struct {
+    u_char  *base;
+    u_char  *last;
+    u_char  *end;
+} ngx_slab_pool_t;
+
+
+static inline ngx_slab_pool_t *
+ngx_slab_pool_shim_create(size_t size)
+{
+    ngx_slab_pool_t  *p;
+
+    p = malloc(sizeof(ngx_slab_pool_t));
+    if (p == NULL) {
+        return NULL;
+    }
+
+    p->base = malloc(size);
+    if (p->base == NULL) {
+        free(p);
+        return NULL;
+    }
+
+    p->last = p->base;
+    p->end = p->base + size;
+
+    return p;
+}
+
+
+static inline void
+ngx_slab_pool_shim_destroy(ngx_slab_pool_t *pool)
+{
+    free(pool->base);
+    free(pool);
+}
+
+
+static inline void *
+ngx_slab_alloc(ngx_slab_pool_t *pool, size_t size)
+{
+    size_t   rounded;
+    u_char  *m;
+
+    /* Round up to a power of two, as ngx_slab_alloc_locked() does. */
+    rounded = 8;
+    while (rounded < size) {
+        rounded <<= 1;
+    }
+
+    if ((size_t) (pool->end - pool->last) < rounded) {
+        return NULL;
+    }
+
+    m = pool->last;
+    pool->last += rounded;
+
+    return m;
+}
+
+
+static inline void
+ngx_slab_free(ngx_slab_pool_t *pool, void *p)
+{
+    (void) pool;
+    (void) p;
+}
+
+
 /* Not in ngx_shim.h, which has no allocator and so never needed them. */
 #define NGX_ALIGNMENT  sizeof(unsigned long)
 

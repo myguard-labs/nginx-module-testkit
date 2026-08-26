@@ -12,7 +12,8 @@ ngx_module_name=ngx_http_test_ref_module
 ngx_module_srcs="$ngx_addon_dir/ngx_http_test_ref_module.c \
                  $ngx_addon_dir/../../src/ngx_test_probe.c \
                  $ngx_addon_dir/../../src/ngx_test_probe_arm.c \
-                 $ngx_addon_dir/../../src/ngx_test_probe_redzone.c"
+                 $ngx_addon_dir/../../src/ngx_test_probe_redzone.c \
+                 $ngx_addon_dir/../../src/ngx_test_probe_canary.c"
 ngx_module_incs="$ngx_addon_dir/../../src"
 ngx_module_deps="$ngx_addon_dir/../../src/ngx_test_probe.h"
 

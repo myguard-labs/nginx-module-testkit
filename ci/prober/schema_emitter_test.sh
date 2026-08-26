@@ -26,7 +26,7 @@ SCHEMA=../../probe-schema.json
 # `not ok` line to grep for), it just fails at this line rather than at the
 # field you added. Kept literal because FIELDS is defined further down and
 # TAP wants the plan printed before the first result.
-PLANNED=42
+PLANNED=46
 tests_run=0
 failures=0
 
@@ -76,6 +76,10 @@ pool.cycle_cleanup:cycle_cleanup
 redzone:redzone
 redzone.violations:violations
 redzone.checked:checked
+canary:canary
+canary.violations:violations
+canary.checked:checked
+canary.live:live
 zone:zone
 zone.present:present
 zone.name:name

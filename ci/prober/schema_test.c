@@ -63,6 +63,7 @@ static const char doc_zone_present[] =
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
     "\"redzone\":{\"violations\":0,\"checked\":0},"
+    "\"canary\":{\"violations\":0,\"checked\":0,\"live\":0},"
     "\"module\":{\"frames\":7},"
     "\"zone\":{\"present\":true,\"name\":\"demo\",\"size\":1048576,"
     "\"slab_pages_free\":248,\"slab_reqs\":37,\"slab_fails\":0,"
@@ -79,6 +80,7 @@ static const char doc_zone_absent[] =
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
     "\"redzone\":{\"violations\":0,\"checked\":0},"
+    "\"canary\":{\"violations\":0,\"checked\":0,\"live\":0},"
     "\"zone\":{\"present\":false}}";
 
 /*
@@ -110,6 +112,7 @@ static const char doc_zone_shm_unmapped[] =
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
     "\"redzone\":{\"violations\":0,\"checked\":0},"
+    "\"canary\":{\"violations\":0,\"checked\":0,\"live\":0},"
     "\"zone\":{\"present\":false}}";
 
 /*
@@ -168,6 +171,10 @@ static const schema_field SCHEMA[] = {
     { "redzone",             JSON_OBJECT, 0 },
     { "redzone.violations",  JSON_NUMBER, 0 },
     { "redzone.checked",     JSON_NUMBER, 0 },
+    { "canary",              JSON_OBJECT, 0 },
+    { "canary.violations",   JSON_NUMBER, 0 },
+    { "canary.checked",      JSON_NUMBER, 0 },
+    { "canary.live",         JSON_NUMBER, 0 },
     { "module",              JSON_OBJECT, 1 },
     { "zone",                JSON_OBJECT, 0 },
     { "zone.present",        JSON_BOOL,   0 },

@@ -582,6 +582,130 @@ ngx_uint_t ngx_test_probe_redzone_checked(void);
  */
 void ngx_test_probe_redzone_reset(void);
 
+
+/*
+ * ---------------------------------------------------------------------------
+ * Slab canaries -- the same idea for SHARED memory, plus freed-chunk poison.
+ * ---------------------------------------------------------------------------
+ *
+ * THE GAP
+ *
+ * A shm zone is one mmap, created in the master before the fork. To
+ * AddressSanitizer that is a single region: it never saw a malloc for the
+ * chunks inside it, so it has no boundaries to poison and no metadata to
+ * consult. valgrind memcheck is blind for the same reason plus one more -- the
+ * region is fully addressable and fully defined after ngx_slab_init().
+ *
+ * Worse than the pool case, because shm is shared across PROCESSES. A
+ * corruption written by worker A is observed by worker B, and no
+ * single-address-space tool models that: ASan's shadow memory is per-process,
+ * so a worker's shadow says nothing about what another worker did to the
+ * shared mapping.
+ *
+ * THE SLACK PROBLEM, WHICH IS SPECIFIC TO SLAB
+ *
+ * ngx_slab_alloc_locked() rounds a request up to a power of two, so a 20-byte
+ * request is served from a 32-byte chunk. Those 12 slack bytes belong to the
+ * allocation as far as the allocator is concerned: a module overflowing 20
+ * bytes into 24 corrupts nothing the allocator can see, and no
+ * allocator-level check will ever fire.
+ *
+ * The canary is therefore placed at the CALLER'S requested size, not at the
+ * chunk boundary. The overflow into slack becomes an overflow into a guard.
+ *
+ * WHAT IT ADDS OVER THE POOL REDZONE
+ *
+ * The slab has a real free, so use-after-free is expressible here in a way it
+ * is not for a pool. ngx_test_probe_slab_free() poisons the caller's span with
+ * 0xFE before releasing the chunk: a module that keeps reading freed shm gets
+ * obviously-wrong bytes instead of plausible stale data. It does NOT detect
+ * the read -- nothing here can -- it makes the read's RESULT unmistakable. It
+ * also catches a double free and a mismatched alloc/free pair, both via the
+ * header magic.
+ *
+ * WHAT IT IS NOT
+ *
+ * Not a race detector. It observes the CONSEQUENCE of a corruption, never the
+ * interleaving, and it cannot say which worker wrote the byte -- the counters
+ * are per-worker and belong to the process that LOOKED, not the one that
+ * broke it. For cross-process invariant checking see the shm-coherence lens.
+ */
+
+/*
+ * Guard width in bytes on each side of a slab allocation.
+ *
+ * 8 rather than the pool redzone's 16: every guarded shm allocation costs this
+ * twice plus a header out of a zone whose size the operator configured, and
+ * slab rounds to powers of two -- a 16-byte guard pair would push far more
+ * allocations into the next size class than an 8-byte pair does, which both
+ * wastes the zone and moves the slab_reqs/slab_used figures the churn oracle
+ * asserts on.
+ */
+#define NGX_TEST_PROBE_CANARY  8
+
+
+#if defined(_NGX_CORE_H_INCLUDED_) || defined(NGX_TEST_PROBE_POOL_SHIM)
+
+/*
+ * Guarded slab allocation. Takes shpool->mutex itself (it calls
+ * ngx_slab_alloc, not the _locked variant), so it must NOT be called with the
+ * mutex already held.
+ *
+ * Returns NULL on pool==NULL, on allocation failure, or on a `size` that would
+ * wrap when the header and guard are added. A NULL return is an ordinary
+ * allocation failure, never a violation report.
+ */
+void *ngx_test_probe_slab_alloc(ngx_slab_pool_t *pool, size_t size);
+
+
+/*
+ * Verify, poison and release a chunk from ngx_test_probe_slab_alloc().
+ * Returns nonzero if a guard was corrupt.
+ *
+ * A pointer this probe did not allocate is REFUSED and counted as a violation
+ * rather than freed: without the header-magic check the "header" would be read
+ * from the tail of the previous chunk and the poison would run for whatever
+ * garbage size it held, destroying live shared memory in the name of checking
+ * it. A mismatched alloc/free pair is a real defect, and a detector that
+ * quietly tolerates one is how mismatches reach production.
+ */
+ngx_uint_t ngx_test_probe_slab_free(ngx_slab_pool_t *pool, void *p,
+    ngx_log_t *log);
+
+
+/*
+ * Verify one live chunk without freeing it. Returns nonzero if corrupt.
+ * A pointer this probe did not allocate is ignored (returns 0), because the
+ * caller may legitimately be sweeping a mixed structure.
+ */
+ngx_uint_t ngx_test_probe_canary_check(void *p, ngx_log_t *log);
+
+#endif /* slab type available */
+
+
+/*
+ * Cumulative per-worker counters, rendered as `canary.violations`,
+ * `canary.checked` and `canary.live`.
+ *
+ * `checked` makes `violations == 0` falsifiable, exactly as it does for the
+ * pool redzone: zero violations out of zero checked chunks is the vacuous pass
+ * a consumer gets by wiring the header in and never routing an allocation
+ * through the guarded allocator. Assert both.
+ *
+ * `live` is allocations outstanding -- incremented on alloc, decremented on
+ * free. At rest it is a leak oracle for the module's OWN bookkeeping that the
+ * slab page counters cannot express: slab_used counts what the ALLOCATOR still
+ * holds, which a chunk correctly freed by someone else also decrements, while
+ * `live` counts what this probe handed out and never got back.
+ */
+ngx_uint_t ngx_test_probe_canary_violations_get(void);
+ngx_uint_t ngx_test_probe_canary_checked_get(void);
+ngx_uint_t ngx_test_probe_canary_live_get(void);
+
+
+/* Zero all three. For a test wanting a fresh origin mid-run. */
+void ngx_test_probe_canary_reset(void);
+
 #endif /* NGX_TEST_HARNESS */
 
 #endif /* NGX_TEST_PROBE_H_INCLUDED_ */

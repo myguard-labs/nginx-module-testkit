@@ -75,9 +75,15 @@ green run proving nothing:
   `t/probe_redzone_test.c` runs that exact overflow under ASan and it exits 0
   with no diagnostic. `ngx_test_probe_palloc()` brackets an allocation with
   guard bytes and reports corruption as `redzone.violations`; `redzone.checked`
-  is what stops "no violations" from meaning "nothing was ever guarded". Not an
-  ASan replacement — it catches one class, at detection time rather than at the
-  faulting instruction. Run both.
+  is what stops "no violations" from meaning "nothing was ever guarded". The
+  shm half is `ngx_test_probe_slab_alloc()`: a zone is one mmap shared across
+  PROCESSES, which no single-address-space tool models at all, and slab's
+  power-of-two rounding means a 20-byte request lands in a 32-byte chunk whose
+  slack an overflow hides in — so the guard goes at the caller's size, not the
+  chunk's. Freeing poisons the span, which makes use-after-free on shared
+  memory obvious (a pool has no per-object free, so that half is slab-only).
+  Not an ASan replacement — it catches one class, at detection time rather than
+  at the faulting instruction. Run both.
 - **[Lifecycle attacks](docs/attack-lifecycle.md)** — reload, binary upgrade,
   worker death, signal storms mid-transfer (`reload-*`, `usr2-*`,
   `hup-storm-mid-transfer`, `worker-death`). Reloads are where module leaks
