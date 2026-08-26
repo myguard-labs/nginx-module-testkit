@@ -976,8 +976,10 @@ mutate "open_conns: probe-assertion guard removed" rules.c \
 # directive's name, so without this a rule file can claim a concurrency test that
 # holds nothing in flight and asserts nothing about overlap.
 mutate "concurrent: floor of 2 lowered to 1" rules.c \
-    '            if (count < 2 || count > MAX_CONCURRENT) {' \
-    '            if (count < 1 || count > MAX_CONCURRENT) {' rules_test
+    '            if (count < 2 || count > MAX_CONCURRENT) {
+                die("%s:%d: concurrent %ld out of range (2..%d)",' \
+    '            if (count < 1 || count > MAX_CONCURRENT) {
+                die("%s:%d: concurrent %ld out of range (2..%d)",' rules_test
 
 # The observability guard. The probe snapshots bracketing the fan are the ONLY
 # thing that observes the overlap; without this a case pays for N connections and
