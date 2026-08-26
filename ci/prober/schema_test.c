@@ -62,6 +62,7 @@ static const char doc_zone_present[] =
     "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
+    "\"redzone\":{\"violations\":0,\"checked\":0},"
     "\"module\":{\"frames\":7},"
     "\"zone\":{\"present\":true,\"name\":\"demo\",\"size\":1048576,"
     "\"slab_pages_free\":248,\"slab_reqs\":37,\"slab_fails\":0,"
@@ -77,6 +78,7 @@ static const char doc_zone_absent[] =
     "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
+    "\"redzone\":{\"violations\":0,\"checked\":0},"
     "\"zone\":{\"present\":false}}";
 
 /*
@@ -107,6 +109,7 @@ static const char doc_zone_shm_unmapped[] =
     "\"smaps\":{\"pss\":184,\"private_dirty\":112},"
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
+    "\"redzone\":{\"violations\":0,\"checked\":0},"
     "\"zone\":{\"present\":false}}";
 
 /*
@@ -162,6 +165,9 @@ static const schema_field SCHEMA[] = {
     { "pool.cycle_blocks",   JSON_NUMBER, 0 },
     { "pool.cycle_large",    JSON_NUMBER, 0 },
     { "pool.cycle_cleanup",  JSON_NUMBER, 0 },
+    { "redzone",             JSON_OBJECT, 0 },
+    { "redzone.violations",  JSON_NUMBER, 0 },
+    { "redzone.checked",     JSON_NUMBER, 0 },
     { "module",              JSON_OBJECT, 1 },
     { "zone",                JSON_OBJECT, 0 },
     { "zone.present",        JSON_BOOL,   0 },

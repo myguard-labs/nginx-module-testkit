@@ -66,6 +66,18 @@ green run proving nothing:
   Generalizing that ratio to a consumer's module, and counting per-request slab
   allocations rather than only net occupancy, are both open — see "Ideas and
   opportunities".
+- **[Memory corruption ASan cannot see](docs/attack-memory-corruption.md)** —
+  `ngx_palloc_small()` is a bump allocator, so a pool holding two hundred small
+  objects is ONE live allocation to AddressSanitizer and to valgrind. Their
+  redzones are at the two ends of that block; between the objects there is
+  nothing to poison, and an overflow from one object into its neighbour is
+  invisible to both. Demonstrated rather than asserted: the vacuity proof in
+  `t/probe_redzone_test.c` runs that exact overflow under ASan and it exits 0
+  with no diagnostic. `ngx_test_probe_palloc()` brackets an allocation with
+  guard bytes and reports corruption as `redzone.violations`; `redzone.checked`
+  is what stops "no violations" from meaning "nothing was ever guarded". Not an
+  ASan replacement — it catches one class, at detection time rather than at the
+  faulting instruction. Run both.
 - **[Lifecycle attacks](docs/attack-lifecycle.md)** — reload, binary upgrade,
   worker death, signal storms mid-transfer (`reload-*`, `usr2-*`,
   `hup-storm-mid-transfer`, `worker-death`). Reloads are where module leaks

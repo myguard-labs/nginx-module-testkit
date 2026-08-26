@@ -36,6 +36,7 @@ the harness can already do to it.
 | [attack-lifecycle.md](attack-lifecycle.md) | Reload, binary upgrade, worker death, signal storms mid-transfer | `reload-*`, `usr2-*`, `hup-storm-mid-transfer`, `worker-death` |
 | [attack-environment.md](attack-environment.md) | A hostile clock, a hostile locale, and what the worker actually syscalls | `clock-jump`, `locale-hostility`, `syscall-allowlist` |
 | [attack-concurrency.md](attack-concurrency.md) | N requests in flight at once, and the races that only exist there | `concurrent N`, `concurrent-fan`, `multi-worker`, `backpressure` |
+| [attack-memory-corruption.md](attack-memory-corruption.md) | An overflow out of one pool object into the next — which ASan and valgrind are structurally blind to, because a pool is one malloc'd block | `ngx_test_probe_palloc()`, `redzone.violations`, `redzone.checked` |
 
 The list of attacks we do **not** yet have — TLS, HTTP/2 and HTTP/3, `stream{}`,
 body-boundary hostility, allocation faults during a lifecycle event, syscall
