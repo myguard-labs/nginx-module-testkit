@@ -46,14 +46,21 @@
 # still return success (verified empirically), so only a READ (blocking on
 # actual data/EOF) is an honest oracle here.
 #
-# Two timing facts are asserted, not just the eventual close, to distinguish
-# a worker_shutdown_timeout force-close from a merely-graceful idle close
-# (the KEY discriminator vs reload-idle-keepalive/reload-mid-upload's
-# oracles): the conn must (a) SURVIVE a window shorter than
-# worker_shutdown_timeout immediately after the reload lands -- proving the
-# close is not instant/graceful the moment shutdown begins -- and (b) be
-# closed by a window comfortably LONGER than worker_shutdown_timeout --
-# proving the timer, not something else, eventually fires. The negative
+# Two INDEPENDENT facts are asserted, not just the eventual close, to
+# distinguish a worker_shutdown_timeout force-close from a merely-graceful idle
+# close (the KEY discriminator vs reload-idle-keepalive/reload-mid-upload's
+# oracles), one from each side of the connection:
+#   (a) SERVER side, assertion 4 -- the old worker's own error-log lines say it
+#       held the shutdown open for ~worker_shutdown_timeout: neither exiting in
+#       the same second it began draining (an ordinary graceful close) nor
+#       running past a ceiling derived from the configured timeout (some other
+#       cause, or none). This is read from nginx's clock, so runner load cannot
+#       perturb it -- see assertion 4's header for why that replaced a
+#       driver-side survival window in s171.
+#   (b) CLIENT side, assertion 5 -- the stalled socket comes back with a clean
+#       EOF inside a window comfortably LONGER than worker_shutdown_timeout,
+#       proving the force-close actually reached the peer.
+# The negative
 # control (assertion 1) additionally proves the converse needed for
 # calibration: absent a reload, with client_body_timeout set to 3600s, a
 # stalled body does NOT close on its own within the same total window used
@@ -86,11 +93,17 @@ FAILED=0
 # oracle in assertion 5 discriminates: a close there is reload+timeout
 # caused, not spontaneous / not client_body_timeout), (2) the real stalled
 # request is established and mid-body (in flight) before the signal, (3) the
-# reload is absorbed, (4) the stalled conn survives a window SHORTER than
-# worker_shutdown_timeout right after the reload (not an instant/graceful
-# close), (5) THE CLOSE ORACLE -- the draining worker force-closes the
-# stalled conn once worker_shutdown_timeout expires, (6) no worker died by
-# signal, (7) the post-reload prober leg folded in as diagnostics.
+# reload is absorbed, (4) THE ATTRIBUTION ORACLE -- the old worker's own log
+# lines show it held the shutdown open for ~worker_shutdown_timeout, which is
+# neither an instant graceful drain nor an unbounded wait, (5) THE CLOSE
+# ORACLE -- the stalled conn comes back with a clean EOF, so the force-close
+# reached the client, (6) no worker died by signal, (7) the post-reload prober
+# leg folded in as diagnostics.
+#
+# Assertion 5 DEPENDS on assertion 4: its polling window only opens once the
+# shutdown has been attributed to the timer. If assertion 4 failed, 5 reports
+# "not measured" rather than a duration, because nothing was polled -- the two
+# failures are then ONE event, not two independent ones.
 echo "1..7"
 
 # --- stalled-upload helper ---------------------------------------------------
@@ -182,16 +195,22 @@ STEP_MS=100
 #                1.0s for fork + connect + write is thin under ASan on a shared
 #                runner, and its failure reads as "never established in time",
 #                which is a false RED about the harness, not a finding.
-#   PRE_ITERS    the post-reload SURVIVAL window (assertion 4). This one IS an
-#                oracle: it must stay strictly SHORTER than
-#                worker_shutdown_timeout, or "survived the window" stops
-#                proving the close was not instant. Raising it would silently
-#                weaken assertion 4 -- so it is DERIVED from the conf below
-#                rather than hand-tuned next to it.
+#   PRE_ITERS    HISTORICALLY the post-reload SURVIVAL window and the whole of
+#                assertion 4's attribution: the conn had to still be alive after
+#                PRE_ITERS*STEP for the eventual close to count as the timer's.
+#                That is no longer what assertion 4 asserts (s171 -- see its
+#                header): attribution now comes from nginx's own shutdown log
+#                lines, so no driver-side wall-clock window carries an oracle
+#                any more. PRE_ITERS survives ONLY as half of the poll budget
+#                assertions 4 and 5 spend waiting for those lines and for the
+#                reader to return. It is still derived from the conf rather than
+#                hand-tuned, because a budget that did not track
+#                worker_shutdown_timeout would start timing out the moment
+#                someone raised the timeout.
 #
-# Raising the old shared constant would have fixed the flake by weakening the
-# oracle. Splitting them fixes the flake and leaves the oracle exactly as
-# tight as it was.
+# Raising the old shared constant would have fixed the first flake by weakening
+# the oracle. Splitting them fixed that one without loosening anything; moving
+# attribution off the wall clock entirely is what fixed the second.
 READY_MS=5000
 READY_ITERS=$(( READY_MS / STEP_MS ))   # 5.0s, setup only -- NOT an oracle bound
 
@@ -235,7 +254,18 @@ WST_MS=$(( 10#$WST_NUM * WST_MUL ))
 PRE_ITERS=$(( WST_MS / 2 / STEP_MS ))
 if [ "$PRE_ITERS" -lt 1 ]; then
     echo "Bail out! worker_shutdown_timeout ($WST) is too short to poll at" \
-         "${STEP}s granularity -- assertion 4 would have no window at all"
+         "${STEP}s granularity -- assertions 4 and 5 would have no poll budget" \
+         "to wait for the shutdown log lines in"
+    exit 1
+fi
+# Assertion 4 compares whole-second log timestamps, so a sub-second
+# worker_shutdown_timeout cannot be told from an instant graceful drain: both
+# land in the same second and both read as delta 0. Refuse rather than emit an
+# assertion whose failure would be a resolution artifact of the error log.
+if [ "$WST_MS" -lt 1000 ]; then
+    echo "Bail out! worker_shutdown_timeout ($WST) is under 1s, but nginx's" \
+         "error log timestamps are whole seconds only -- assertion 4 could not" \
+         "distinguish the timer firing from an ordinary graceful drain"
     exit 1
 fi
 
@@ -355,36 +385,185 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-# --- assertion 4: the stalled conn survives a window SHORTER than the ------
-# --- worker_shutdown_timeout (proves the close is not instant/graceful) ----
-# Immediately after the reload lands, poll for PRE_ITERS * STEP = 1.0s,
-# comfortably under the 2s worker_shutdown_timeout. If the conn were already
-# gone by here, the eventual close in assertion 5 could not be attributed to
-# the timer specifically -- it would look identical to an ordinary graceful
-# shutdown close (like reload-idle-keepalive's idle conn, which closes
-# near-immediately). A stalled/unsalvageable request must NOT be dropped
-# before the grace period the timer promises has elapsed.
-survived_pre=1
-for ((i = 0; i < PRE_ITERS; i++)); do
-    if ! kill -0 "$REAL_PID" 2>/dev/null; then
-        survived_pre=0
-        break
+# --- assertion 4: the OLD WORKER'S OWN SHUTDOWN took ~worker_shutdown_timeout
+# --- (attribution: the close came from the timer, not from anything else) ---
+#
+# WHY THIS IS NOT A LIVENESS POLL ANY MORE (s171). Until this revision assertion
+# 4 asked "is $REAL_PID still alive PRE_ITERS*STEP (=1.0s) after
+# prober_signal_wait returned?" and inferred attribution from a survival floor.
+# That oracle was BOTH flaky and weaker than it looked:
+#
+#   * It measured the DRIVER's wall clock, not the server's. The 1.0s floor and
+#     the 2s timer do not even share a start point -- the timer is armed when the
+#     old worker processes SIGQUIT, while the floor starts whenever the driver
+#     got scheduled after prober_signal_wait returned. On a loaded shared runner
+#     the gap between those two moments eats the margin and the conn is observed
+#     gone inside the floor, so the scenario went red with a byte-identical
+#     signature on source that was PROVEN good (PR #210 carried PR #207's diff
+#     verbatim and passed the same cell in the same hour that #207 and #211
+#     failed it). A scheduling flake, definitively -- issues.md.
+#   * Widening the floor was the obvious fix and is the WRONG one: the floor IS
+#     the attribution, so a wider floor against the same 2s timer buys stability
+#     by deleting the property being asserted. Stable-but-vacuous is the exact
+#     failure class this repo exists to catch.
+#
+# So attribution moves to the ONE clock that cannot be perturbed by runner load:
+# nginx's own. Two notice lines from the OLD WORKER'S OWN PID bracket the timer
+# exactly, and reading them is reading the server's account of its own shutdown:
+#
+#   "<pid>#0: gracefully shutting down"  -- logged by ngx_worker_process_cycle()
+#       on the SAME statement that calls ngx_set_shutdown_timer(), which is what
+#       arms worker_shutdown_timeout. This line IS the timer's start, not an
+#       approximation of it.
+#   "<pid>#0: exiting"                   -- logged once ngx_event_no_timers_left()
+#       goes NGX_OK. For a stalled, unsalvageable request that only becomes true
+#       after ngx_shutdown_timer_handler() has force-closed the connection. This
+#       line IS the timer having fired.
+#
+# (Both verified against the 1.31.4 source this scenario builds:
+# src/os/unix/ngx_process_cycle.c and ngx_set_shutdown_timer/
+# ngx_shutdown_timer_handler in src/core/ngx_cycle.c.)
+#
+# The interval between them is therefore worker_shutdown_timeout as the SERVER
+# measured it. A descheduled driver cannot corrupt it: the timestamps were
+# written before this code looked at them, so a late read yields the same two
+# numbers. That removes the flake at its root instead of padding around it.
+#
+# THE ORACLE IS TWO-SIDED, AND THAT IS LOAD-BEARING -- a lower bound alone is
+# vacuous, verified rather than assumed. With `worker_shutdown_timeout 0`
+# nginx's `if (ccf->shutdown_timeout)` arms NO timer at all, the stalled conn is
+# never force-closed, and the old worker sat in "gracefully shutting down" for
+# 6s until the harness tore the socket down -- a delta of SIX seconds. A
+# "delta >= 1s" oracle would have called that a pass. So both ends are asserted:
+#
+#   lower  the shutdown must not be INSTANT. An ordinary graceful drain (nothing
+#          unsalvageable in flight) reaches ngx_event_no_timers_left() on its
+#          first loop pass and logs "exiting" in the SAME second -- delta 0.
+#          Observed in this scenario's own log every run: the NEW worker, which
+#          never held a stalled conn, does exactly that. Delta > 0 is what
+#          separates "the timer held the shutdown open" from "there was nothing
+#          to wait for".
+#   upper  the shutdown must not be UNBOUNDED. The timer promises the worker
+#          leaves at ~worker_shutdown_timeout; a delta far past it means
+#          something other than this timer ended the wait (or nothing did).
+#
+# GRANULARITY IS WHY THE BOUNDS ARE WHOLE SECONDS AND NOT A TOLERANCE BAND.
+# nginx's error log carries whole-second timestamps only -- ngx_cached_err_log_time
+# is formatted "%4d/%02d/%02d %02d:%02d:%02d" with no msec field (src/core/ngx_times.c),
+# so a true 2s interval reads as 1, 2 or 3 depending purely on where the second
+# boundaries fell. Asserting an exact value against that would manufacture a NEW
+# flake out of rounding. The bounds below are the widest pair that still
+# excludes both failure modes, and they are DERIVED from the conf's own
+# WST_MS so a later edit to nginx.conf moves them automatically:
+#
+#   delta >= 1                      not instant (excludes the graceful path,
+#                                   whose delta is 0)
+#   delta <= WST seconds + 2        not unbounded (excludes the timer-disabled
+#                                   path, whose delta ran to 6s at WST=2s where
+#                                   this ceiling is 4)
+#
+# WHAT ATTRIBUTION IS KEPT vs THE OLD ORACLE: strictly more. The old form proved
+# only "the conn outlived a driver-side 1.0s floor" and inferred the rest. This
+# form reads the server's own start-of-timer and end-of-timer records for the
+# specific worker that was draining, and requires the interval between them to
+# be consistent with the configured timeout and inconsistent with both an
+# immediate drain and a never-firing timer. Nothing was traded away for
+# stability.
+WST_S=$(( WST_MS / 1000 ))
+# Ceiling in whole seconds. +2 absorbs the two second-boundary roundings (one at
+# each timestamp) that the log's whole-second resolution can introduce.
+DELTA_MAX=$(( WST_S + 2 ))
+
+# Wait for BOTH lines to exist before measuring -- the old worker is still
+# draining when prober_signal_wait returns (its verdict is only "a NEW worker
+# answers"), so "exiting" has certainly not been written yet. Poll on the same
+# fixed-step counted budget as every other wait here, bounded by the same
+# POST_ITERS window assertion 5 uses for the close itself.
+#
+# The pid is taken from the "gracefully shutting down" line rather than assumed,
+# so the two timestamps are guaranteed to describe ONE worker's shutdown. Two
+# different workers' lines would otherwise be subtractable into a meaningless
+# interval.
+OLD_WORKER=""
+GRACE_T=""
+EXIT_T=""
+for ((i = 0; i < PRE_ITERS + POST_ITERS; i++)); do
+    if [ -z "$OLD_WORKER" ]; then
+        # `|| true`: no match yet is "not yet", not a failure -- and under
+        # `set -o pipefail` a bare non-matching sed/grep would kill the driver.
+        OLD_WORKER="$(sed -n 's/^[0-9\/]\{10\} [0-9:]\{8\} \[notice\] \([0-9]\{1,\}\)#[0-9]\{1,\}: gracefully shutting down$/\1/p' \
+            "$ELOG" 2>/dev/null | head -n 1 || true)"
+        if [ -n "$OLD_WORKER" ]; then
+            GRACE_T="$(sed -n "s/^[0-9\/]\{10\} \([0-9:]\{8\}\) \[notice\] $OLD_WORKER#[0-9]\{1,\}: gracefully shutting down$/\1/p" \
+                "$ELOG" 2>/dev/null | head -n 1 || true)"
+        fi
+    fi
+    if [ -n "$OLD_WORKER" ]; then
+        EXIT_T="$(sed -n "s/^[0-9\/]\{10\} \([0-9:]\{8\}\) \[notice\] $OLD_WORKER#[0-9]\{1,\}: exiting$/\1/p" \
+            "$ELOG" 2>/dev/null | head -n 1 || true)"
+        # A plain `[ -n "$EXIT_T" ] && break` here would be the LAST statement
+        # of this `if` block, so on the not-yet path the false test makes the
+        # block's status 1 -- which under `set -e` kills the driver mid-TAP, and
+        # a shell that dies mid-stream reads as a PASS to a runner keying off
+        # the plan. Spelled as a full if/fi so no branch can leave a nonzero
+        # status behind. shellcheck cannot see this class at all.
+        if [ -n "$EXIT_T" ]; then
+            break
+        fi
     fi
     sleep "$STEP"
 done
 
-if [ "$survived_pre" -eq 1 ]; then
-    echo "ok 4 - the stalled conn was NOT force-closed instantly (survived < worker_shutdown_timeout)"
-else
-    echo "not ok 4 - the stalled conn closed before worker_shutdown_timeout could have expired (not attributable to the timer)"
+# HH:MM:SS -> seconds since midnight. `10#` on every field for the same
+# leading-zero-is-octal reason the timeout parse above documents: "08" and "09"
+# are ordinary in a timestamp and would otherwise abort the driver under set -e.
+hms_to_s() {
+    local hms=$1
+    printf '%s' "$(( 10#${hms:0:2} * 3600 + 10#${hms:3:2} * 60 + 10#${hms:6:2} ))"
+}
+
+survived_pre=0
+if [ -z "$OLD_WORKER" ] || [ -z "$GRACE_T" ]; then
+    echo "not ok 4 - the old worker never logged \"gracefully shutting down\" (no reload reached it; nothing to attribute)"
     FAILED=$((FAILED + 1))
+elif [ -z "$EXIT_T" ]; then
+    echo "not ok 4 - the old worker ($OLD_WORKER) began shutting down at $GRACE_T but never logged \"exiting\" within $(( (PRE_ITERS + POST_ITERS) * STEP_MS ))ms (worker_shutdown_timeout $WST never fired)"
+    FAILED=$((FAILED + 1))
+else
+    GRACE_S=$(hms_to_s "$GRACE_T")
+    EXIT_S=$(hms_to_s "$EXIT_T")
+    DELTA=$(( EXIT_S - GRACE_S ))
+    # Midnight wrap: the two lines are at most a few seconds apart, so a
+    # negative delta can only mean the clock rolled over 00:00:00 between them.
+    # if/fi, not `[ ] && x`, for the set -e reason documented in the poll loop.
+    if [ "$DELTA" -lt 0 ]; then
+        DELTA=$(( DELTA + 86400 ))
+    fi
+
+    if [ "$DELTA" -lt 1 ]; then
+        echo "not ok 4 - the old worker ($OLD_WORKER) exited in the same second it began shutting down ($GRACE_T -> $EXIT_T, ${DELTA}s): an ordinary graceful drain, NOT worker_shutdown_timeout $WST"
+        FAILED=$((FAILED + 1))
+    elif [ "$DELTA" -gt "$DELTA_MAX" ]; then
+        echo "not ok 4 - the old worker ($OLD_WORKER) took ${DELTA}s to exit ($GRACE_T -> $EXIT_T), past the ${DELTA_MAX}s ceiling for worker_shutdown_timeout $WST: the close is not attributable to that timer"
+        FAILED=$((FAILED + 1))
+    else
+        survived_pre=1
+        echo "ok 4 - the old worker ($OLD_WORKER) held the shutdown open ${DELTA}s ($GRACE_T -> $EXIT_T), consistent with worker_shutdown_timeout $WST and not with an instant graceful drain"
+    fi
 fi
 
 # --- assertion 5: THE CLOSE ORACLE ------------------------------------------
-# Continue polling from where assertion 4 left off (a further POST_ITERS *
-# STEP = 5.0s window -- comfortably longer than the 2s worker_shutdown_timeout
-# from the reload). The draining old worker must force-close the stalled conn
-# once the timer fires, since it can never otherwise finish exiting.
+# Assertion 4 is the SERVER's account of the timer (its own two log lines);
+# this is the CLIENT's, and they are deliberately independent. Poll up to a
+# further POST_ITERS * STEP = 5.0s for the stalled reader to come back, then
+# require it came back on a clean EOF. The draining old worker must force-close
+# the stalled conn once the timer fires, since it can never otherwise finish
+# exiting -- so a worker that logged the timer interval in assertion 4 while the
+# client's socket stayed open would be a real contradiction worth failing on.
+#
+# By the time assertion 4 passed, the old worker has already logged "exiting",
+# so this loop normally finds the reader gone on its first pass; the window
+# stays wide because the reader's own wakeup is a separate scheduling event.
 closed=0
 if [ "$survived_pre" -eq 1 ]; then
     for ((i = 0; i < POST_ITERS; i++)); do
@@ -410,7 +589,23 @@ fi
 # only on a clean EOF read (`cat` exit 0). A subshell that exited because its
 # read FAILED some other way (nonzero `cat`) does not certify the graceful
 # force-close path this oracle exists to prove.
-if [ "$closed" -eq 1 ] && [ -e "$REAL_CLOSED" ]; then
+if [ "$survived_pre" -eq 0 ]; then
+    # Assertion 4 could not attribute the shutdown to worker_shutdown_timeout,
+    # so the polling loop above never ran and NOTHING here was measured. Naming
+    # a duration in this branch would be arithmetic dressed up as an
+    # observation, contradicting assertion 4 and sending a reader hunting a hang
+    # that never happened. Report the dependency instead.
+    echo "not ok 5 - not measured: the shutdown was not attributable to worker_shutdown_timeout, so the close window never opened (see not ok 4)"
+    # The reader subshell may still be alive here (unlike the old liveness-poll
+    # form of assertion 4, a failed attribution says nothing about the socket),
+    # and its `cat` child can outlive it as an orphan holding the fd. Reap the
+    # subtree, and kill the subshell itself rather than `wait`-ing on a child
+    # that may be blocked forever on a socket nobody closed.
+    pkill -P "$REAL_PID" 2>/dev/null || true
+    kill "$REAL_PID" 2>/dev/null || true
+    wait "$REAL_PID" 2>/dev/null || true
+    FAILED=$((FAILED + 1))
+elif [ "$closed" -eq 1 ] && [ -e "$REAL_CLOSED" ]; then
     echo "ok 5 - the draining old worker force-closed the stalled conn once worker_shutdown_timeout expired (clean EOF)"
 elif [ "$closed" -eq 1 ]; then
     echo "not ok 5 - the stalled conn's reader exited without a clean EOF (read error, not a graceful force-close)"
