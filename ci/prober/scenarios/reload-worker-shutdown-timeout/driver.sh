@@ -91,6 +91,11 @@ FAILED=0
 # close), (5) THE CLOSE ORACLE -- the draining worker force-closes the
 # stalled conn once worker_shutdown_timeout expires, (6) no worker died by
 # signal, (7) the post-reload prober leg folded in as diagnostics.
+#
+# Assertion 5 DEPENDS on assertion 4: its polling window only opens if the
+# conn was still alive when the pre-window closed. If assertion 4 failed, 5
+# reports "not measured" rather than a duration, because nothing was polled --
+# the two failures are then ONE event, not two independent ones.
 echo "1..7"
 
 # --- stalled-upload helper ---------------------------------------------------
@@ -410,7 +415,20 @@ fi
 # only on a clean EOF read (`cat` exit 0). A subshell that exited because its
 # read FAILED some other way (nonzero `cat`) does not certify the graceful
 # force-close path this oracle exists to prove.
-if [ "$closed" -eq 1 ] && [ -e "$REAL_CLOSED" ]; then
+if [ "$survived_pre" -eq 0 ]; then
+    # Assertion 4 already found the conn gone inside the pre-window, so the
+    # polling loop above never ran and NOTHING here was measured. Saying "still
+    # open ${N}ms after the reload" in this branch would be a duration built
+    # purely from arithmetic, contradicting assertion 4 and sending a reader
+    # hunting a hang that never happened. Report the dependency instead.
+    echo "not ok 5 - not measured: the conn was already gone before the close window opened (see not ok 4)"
+    # The subshell is already gone (that is what assertion 4 observed), but its
+    # `cat` child can outlive it as an orphan holding the fd. Reap the subtree
+    # for the same reason the not-closed branch below does.
+    pkill -P "$REAL_PID" 2>/dev/null || true
+    wait "$REAL_PID" 2>/dev/null || true
+    FAILED=$((FAILED + 1))
+elif [ "$closed" -eq 1 ] && [ -e "$REAL_CLOSED" ]; then
     echo "ok 5 - the draining old worker force-closed the stalled conn once worker_shutdown_timeout expired (clean EOF)"
 elif [ "$closed" -eq 1 ]; then
     echo "not ok 5 - the stalled conn's reader exited without a clean EOF (read error, not a graceful force-close)"
