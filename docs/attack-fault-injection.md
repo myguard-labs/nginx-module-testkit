@@ -257,3 +257,4 @@ sites mapped from its diff.
 - [attack-leak-pressure.md](attack-leak-pressure.md) — the `delta` and baseline oracles every row is judged by
 - [attack-lifecycle.md](attack-lifecycle.md) — `reload-mid-fault`, a reload landing on an already-failing request
 - [attack-hostile-input.md](attack-hostile-input.md) — the fuzz corpus that routes a quarter of its cases through fakesrv
+- [fault-injection-under-tooling.md](fault-injection-under-tooling.md) — running a fault scenario under memcheck, a sanitizer or coverage, and which leak classes each one structurally misses

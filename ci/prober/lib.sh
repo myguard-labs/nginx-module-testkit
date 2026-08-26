@@ -1494,19 +1494,66 @@ prober_scrape_log() {
 # caller so a scenario run under valgrind is gated the same way whether it
 # went through the driver.sh path or the rules path -- the server-side logs
 # are what matter regardless of which one drove the requests.
+#
+# STILL-OPEN DESCRIPTORS ARE NOT A FINDING, and this is what makes the gate
+# usable on nginx at all. --track-fds=all reports every descriptor open at
+# exit, and a healthy nginx worker always exits holding several: error.log,
+# access.log, the stderr dup, the listening socket, and the AF_UNIX
+# master/worker channel. On a valgrind that counts those contexts toward
+# ERROR SUMMARY (measured on 3.24.0: nine such contexts, `definitely lost: 0`,
+# every context an "Open ..." heading), the bare `ERROR SUMMARY: [1-9]` grep
+# below can never be satisfied by ANY module, however clean -- the gate reds
+# unconditionally and stops being a signal.
+#
+# valgrind-scenarios.sh's own comment already anticipates the version split
+# ("some fleet valgrinds report it purely informationally and exit 0") and
+# names the LOG LINE as the portable guarantee. So the fix keeps the flag and
+# its diagnostics, and discounts only the open-fd contexts from the COUNT:
+# subtract the "Open (file descriptor|AF_*)" headings from ERROR SUMMARY's
+# figure and gate on what is left. A genuine fd leak still appears in the log
+# under its open() call site for a weekly triage to read -- the guarantee
+# valgrind_scrape_test.sh pins -- it just no longer makes every run red.
+#
+# `definitely lost: [1-9]` is untouched: a real leak still trips the gate on
+# its own, independently of any error count.
 prober_scrape_valgrind() {
-    local log found=""
+    local log found="" total fdctx real
 
     compgen -G "$PROBER_PREFIX/logs/valgrind.*" >/dev/null 2>&1 || return 0
 
     for log in "$PROBER_PREFIX"/logs/valgrind.*; do
         [ -f "$log" ] || continue
 
-        if grep -qE 'ERROR SUMMARY: [1-9]|definitely lost: [1-9]' "$log" 2>/dev/null; then
+        if grep -qE 'definitely lost: [1-9]' "$log" 2>/dev/null; then
             found=1
-            echo "# valgrind reported errors in $(basename "$log"):"
+            echo "# valgrind reported a definite leak in $(basename "$log"):"
             sed 's/^/# /' "$log"
+            continue
         fi
+
+        # ERROR SUMMARY's own count, minus the still-open-descriptor contexts.
+        # Both greps are bounded to this one log. A log with no ERROR SUMMARY
+        # line at all yields an empty total, which the arithmetic treats as 0.
+        total="$(sed -n 's/.*ERROR SUMMARY: \([0-9][0-9]*\) errors.*/\1/p' \
+            "$log" 2>/dev/null | tail -1)"
+        [ -n "$total" ] || total=0
+        # [[:upper:]], NOT [A-Z]: a bracket RANGE is collation-ordered, and
+        # under LC_ALL=tr_TR.UTF-8 (the locale-hostility leg runs exactly that)
+        # Turkish's dotless i reorders the alphabet so ASCII `I` falls outside
+        # A-Z -- "AF_INET" then does not match and the context is counted as a
+        # real error. Measured on GNU grep 3.11: 3 matches under C, 2 under
+        # tr_TR.UTF-8. The named class is locale-independent.
+        fdctx="$(grep -cE '^==[0-9]+== Open (file descriptor|AF_[[:upper:]]+ socket)' \
+            "$log" 2>/dev/null || true)"
+        [ -n "$fdctx" ] || fdctx=0
+
+        real=$(( total - fdctx ))
+        [ "$real" -gt 0 ] || continue
+
+        found=1
+        echo "# valgrind reported $real error(s) in $(basename "$log")" \
+             "(ERROR SUMMARY $total, less $fdctx still-open-descriptor context(s)):"
+        sed 's/^/# /' "$log"
     done
 
     [ -n "$found" ] && return 1

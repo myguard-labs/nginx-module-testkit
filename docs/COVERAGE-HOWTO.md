@@ -216,10 +216,16 @@ Into the **module's own repository**, as its own PR:
 Do **not** add a coverage-percent threshold to that CI. The gate is the control
 mutation, and it already ran — in review, by hand, on the case it proves.
 Anything needing a live worker (leak deltas, reload survival, fault injection)
-stays a harness scenario and ships separately from the portable suite.
+stays a harness scenario and ships separately from the portable suite. That
+split is about where the *test* lives, not about whether its lines count: a
+scenario run against a `--coverage` build does contribute `.gcda`, and for a
+fault site it is the only thing that reaches the error branches at all. The
+procedure, and the `.gcda` traps that make a re-measurement lie, are in
+[fault-injection-under-tooling.md](fault-injection-under-tooling.md).
 
 ## See also
 
 - [COVERAGE.md](COVERAGE.md) — the policy and its rationale
+- [fault-injection-under-tooling.md](fault-injection-under-tooling.md) — coverage of a fault path, and the memory tools that watch it
 - [../README.md](../README.md) — the harness itself, and what its own CI proves
 </content>
