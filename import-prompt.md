@@ -180,6 +180,43 @@ to extend, bend and repurpose it** for whatever gives this module real signal:
   `ngx_shmtx`. A green helgrind soak over a module whose only shared state is
   an shm zone proves nothing about that state — it is the wrong lens, not a
   weak one.
+- **Cross-worker shm coherence, which sanitizers structurally cannot reach**
+  (see the previous bullet: helgrind/TSan model races inside one address
+  space, and this is `fork()`ed processes sharing an `mmap`). `fanout N
+  [min_workers]` sends N probe requests and collects the DISTINCT answering
+  worker pids (2..64, `min_workers` defaults to 2; cannot combine with `block`
+  or `concurrent`), and the coverage oracle asserts the distinct-pid count
+  reached `min_workers` — **incomplete coverage FAILS**, which is what turns
+  "whichever worker answered" into a mechanism instead of a lens that could
+  pass having sampled one worker N times. `quiesce [timeout_ms]` polls a named
+  counter until two consecutive reads agree; expiry FAILS, never passes, and
+  it is the precondition for every at-rest invariant below — without it the
+  oracles are timing-dependent. `zone_invariant` then judges the shm state a
+  `fanout` collected, in three forms: `coherent <field>` (identical across
+  every answering pid at rest), `at_rest <field> == N` (a shared inflight
+  counter must return to exactly N — bounded by the comparison operator so an
+  `ngx_uint_t` decremented past zero, which reads as a huge value, cannot pass
+  as a match), and `monotonic <field>` (never decreases). `zone.digest` gives
+  a cheap per-zone digest for cross-worker comparison. `ci/prober/scenarios/
+  shm-coherence` is the worked live scenario: `worker_processes 4` paired with
+  `PROBER_ALLOW_MULTIWORKER=1` (the two must always be set together, or
+  `prober_check_conf` bails). **This is not a race detector** — like the
+  sanitizers above, it never observes an interleaving, only its consequence: a
+  leaked counter, a diverged view between workers, an underflow that wrapped.
+  A green run means no observed consequence in the sample it took, not that
+  the code is race-free; claiming otherwise recreates the exact vacuous-green
+  problem this lens exists to replace. And the sharpest trap is a silent one:
+  a `zone_invariant` asserted on a field the module never mutates is a
+  TAUTOLOGY that passes forever and proves nothing — measured on the
+  testkit's own reference module, `coherent`/`at_rest`/`monotonic` all pass on
+  absurd invariants because `zone.slab_*` sits at a constant 0 (nothing on its
+  request path calls `ngx_slab_alloc`), which is exactly why the shm-coherence
+  scenario carries no `zone_invariant` line at all. Point these forms at a
+  counter your module actually mutates on the path under test, and confirm it
+  moves before trusting the assertion. The remaining limit is structural, not
+  a bug: worker sampling is probabilistic and nothing lets a client pick which
+  worker answers, so the mitigation is the coverage assertion above — it fails
+  on incomplete coverage rather than passing quietly.
 - **Fault injection** — `fault_slab=`, `fault_palloc=`, `fault_tempfile=`,
   `fault_accept=` make the allocator fail on the Nth call. Most module bugs
   live on the error path nobody exercises, because in a healthy test the
