@@ -69,7 +69,8 @@
     "zone.slab_pages_free":  { "type": "number", "required": "when-zone-present" },
     "zone.slab_reqs":        { "type": "number", "required": "when-zone-present" },
     "zone.slab_fails":       { "type": "number", "required": "when-zone-present" },
-    "zone.slab_used":        { "type": "number", "required": "when-zone-present" }
+    "zone.slab_used":        { "type": "number", "required": "when-zone-present" },
+    "zone.digest":           { "type": "number", "required": "when-zone-present" }
   },
 
   "closed": ["", "connections", "fds_by_kind", "smaps", "pool"],
@@ -82,6 +83,7 @@
     "zone.slab_used": "LIVE allocated blocks in this zone (pool->stats[].used), summed over slots: incremented on alloc, decremented on free. This one is occupancy, so it is the leak oracle of the three, while slab_reqs is the churn oracle. -1 is the same uninitialised-pool sentinel as slab_reqs.",
     "smaps": "PSS and Private_Dirty in kB from /proc/self/smaps_rollup. External-observer memory lineage the cycle-pool walk cannot give -- growth in ANY mapping. Both -1 where smaps_rollup is absent (pre-4.14 kernel or a sandbox); the prober rejects that sentinel like fds.",
     "pool.cycle_cleanup": "Length of the cycle pool's cleanup-handler chain. Names a cleanup parked on the cycle pool per request -- a leak the byte count also reflects but this identifies by shape.",
+    "zone.digest": "An order-independent mix of this zone's own accounting (slab_reqs, slab_fails, slab_used), for CROSS-WORKER comparison. The zone is the same bytes in every worker, so two workers reading it AT REST must produce the same digest; a disagreement is itself a finding. NOT a cryptographic hash and never to be described as one -- it is a change detector, and a collision means two different zone states hash alike and a divergence goes unreported. Deliberately excludes slab_pages_free, which legitimately differs between two reads taken microseconds apart while a request is in flight; including it would make the digest disagree between workers under perfectly healthy load. -1 is the same uninitialised-pool sentinel as slab_reqs.",
     "canary.violations": "Slab guard-byte corruptions this WORKER has detected. A shm zone is one mmap created before the fork, so ASan and memcheck see a single region with no per-chunk boundaries to poison -- and the corruption may have been written by a DIFFERENT worker, which no single-address-space tool models at all. Counted by the process that LOOKED, never attributable to the one that broke it. Also counts a mismatched alloc/free pair (a pointer this probe did not hand out) and a double free, both caught by the in-band header magic.",
     "canary.checked": "Slab chunks this worker has verified. Exists to make canary.violations == 0 falsifiable: zero violations out of zero checked chunks is the vacuous pass a consumer gets by wiring the probe in and never routing an allocation through ngx_test_probe_slab_alloc(). Assert BOTH.",
     "canary.live": "Guarded chunks handed out and not yet returned. At rest this is a leak oracle for the module's own bookkeeping that zone.slab_used cannot express: slab_used counts what the ALLOCATOR still holds and is decremented by anyone freeing the chunk, while live counts what this probe handed out and never got back.",

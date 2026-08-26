@@ -67,7 +67,7 @@ static const char doc_zone_present[] =
     "\"module\":{\"frames\":7},"
     "\"zone\":{\"present\":true,\"name\":\"demo\",\"size\":1048576,"
     "\"slab_pages_free\":248,\"slab_reqs\":37,\"slab_fails\":0,"
-    "\"slab_used\":12,\"nodes\":2}}";
+    "\"slab_used\":12,\"digest\":99,\"nodes\":2}}";
 
 /* The zone-absent tail is a literal in the emitter, so it is a literal here. */
 static const char doc_zone_absent[] =
@@ -183,7 +183,8 @@ static const schema_field SCHEMA[] = {
     { "zone.slab_pages_free",JSON_NUMBER, 1 },
     { "zone.slab_reqs",      JSON_NUMBER, 1 },
     { "zone.slab_fails",     JSON_NUMBER, 1 },
-    { "zone.slab_used",      JSON_NUMBER, 1 }
+    { "zone.slab_used",      JSON_NUMBER, 1 },
+    { "zone.digest",         JSON_NUMBER, 1 }
 };
 
 #define SCHEMA_N  ((int) (sizeof(SCHEMA) / sizeof(SCHEMA[0])))
