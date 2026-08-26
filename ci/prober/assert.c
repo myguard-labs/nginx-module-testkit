@@ -701,3 +701,96 @@ eval_pid_stable(const json_value *before, const json_value *after,
 
     return 1;
 }
+
+
+/*
+ * Count the DISTINCT values in `pids`. O(n^2) on purpose: n is bounded by
+ * MAX_CONCURRENT (64), so the quadratic scan is a few thousand comparisons at
+ * worst and needs neither an allocation that could fail on the assertion path
+ * nor a sort that would reorder the caller's array.
+ *
+ * pids are doubles because that is how json.c stores every number it reads. A
+ * pid is far below 2^53, so the representation is exact and == here means
+ * equality of the integers the probe printed.
+ */
+size_t
+fanout_distinct_pids(const double *pids, size_t n)
+{
+    size_t  i, j, distinct = 0;
+
+    for (i = 0; i < n; i++) {
+        int seen = 0;
+
+        for (j = 0; j < i; j++) {
+            if (pids[j] == pids[i]) {
+                seen = 1;
+                break;
+            }
+        }
+
+        if (!seen) {
+            distinct++;
+        }
+    }
+
+    return distinct;
+}
+
+
+int
+eval_fanout_coverage(const double *pids, size_t n, int min_workers,
+                     size_t *distinct_out, char *why, size_t whylen)
+{
+    size_t  distinct;
+
+    /*
+     * No legs collected at all. Reached only if the caller's request loop
+     * failed to record a single pid, which means the coverage claim rests on
+     * nothing -- report it as the failure it is rather than letting a distinct
+     * count of 0 compare against a min of 0 and pass.
+     */
+    if (n == 0) {
+        snprintf(why, whylen, "fanout coverage: no responses carried a worker "
+                 "pid, so nothing was sampled");
+
+        if (distinct_out != NULL) {
+            *distinct_out = 0;
+        }
+
+        return 0;
+    }
+
+    /*
+     * A min of 0 or 1 asserts nothing: the parser floors it at 2 and defaults
+     * it to 2 precisely so an unset value cannot mean "one worker is enough".
+     * If one ever reaches here the oracle has been disarmed, and an oracle
+     * that cannot fail must say so loudly rather than return the pass it is
+     * structurally guaranteed to produce.
+     */
+    if (min_workers < 2) {
+        snprintf(why, whylen, "fanout coverage: min_workers %d asserts nothing "
+                 "(a valid bound is >= 2)", min_workers);
+
+        if (distinct_out != NULL) {
+            *distinct_out = 0;
+        }
+
+        return 0;
+    }
+
+    distinct = fanout_distinct_pids(pids, n);
+
+    if (distinct_out != NULL) {
+        *distinct_out = distinct;
+    }
+
+    if (distinct < (size_t) min_workers) {
+        snprintf(why, whylen, "fanout coverage: %zu of %zu responses came from "
+                 "%zu distinct worker%s, need >= %d -- the case sampled too few "
+                 "workers to claim cross-worker agreement",
+                 n, n, distinct, distinct == 1 ? "" : "s", min_workers);
+        return 0;
+    }
+
+    return 1;
+}

@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  165
+#define PLANNED  178
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1035,6 +1035,92 @@ main(void)
         resp.close_reason = HTTP_CLOSE_TIMEOUT;
         ok(eval_idle(&resp, 200, why, sizeof(why)) == 0,
            "a read-loop timeout fails an idle wait rather than passing");
+    }
+
+    /*
+     * fanout coverage oracle.
+     *
+     * The counting and the comparison are exercised separately because they
+     * fail differently: a broken counter reports the right verdict for the
+     * wrong reason (and would keep passing once every worker is reached), while
+     * a broken comparison passes on a sample it never earned. Each half below
+     * has at least one input that is RED today and would go green if that half
+     * were removed.
+     */
+    {
+        char    why[512];
+        size_t  distinct;
+
+        /* One worker answered four times -- the exact vacuous shape. */
+        double  same[4]    = { 4242, 4242, 4242, 4242 };
+        double  two[4]     = { 4242, 4243, 4242, 4243 };
+        double  three[4]   = { 4242, 4243, 4244, 4242 };
+
+        ok(fanout_distinct_pids(same, 4) == 1,
+           "four answers from one worker count as one distinct worker");
+
+        ok(fanout_distinct_pids(two, 4) == 2,
+           "two alternating workers count as two, not four");
+
+        ok(fanout_distinct_pids(three, 4) == 3,
+           "a repeat at the end is not counted twice");
+
+        ok(fanout_distinct_pids(same, 1) == 1,
+           "a single leg counts as one distinct worker");
+
+        /*
+         * The load-bearing red. If the comparison in eval_fanout_coverage()
+         * were dropped, this returns 1 and the whole lens passes having sampled
+         * one worker four times.
+         */
+        distinct = 99;
+        ok(eval_fanout_coverage(same, 4, 2, &distinct, why, sizeof(why)) == 0
+           && distinct == 1,
+           "four legs on ONE worker fail a min of 2 rather than passing");
+
+        (void) eval_fanout_coverage(same, 4, 2, &distinct, why, sizeof(why));
+        ok(strstr(why, "1 distinct worker") != NULL
+           && strstr(why, ">= 2") != NULL,
+           "the failure names both what was sampled and what was required");
+
+        distinct = 99;
+        ok(eval_fanout_coverage(two, 4, 2, &distinct, why, sizeof(why)) == 1
+           && distinct == 2,
+           "two distinct workers satisfy a min of 2");
+
+        distinct = 99;
+        ok(eval_fanout_coverage(two, 4, 3, &distinct, why, sizeof(why)) == 0
+           && distinct == 2,
+           "two distinct workers fail a min of 3");
+
+        distinct = 99;
+        ok(eval_fanout_coverage(three, 4, 3, &distinct, why, sizeof(why)) == 1
+           && distinct == 3,
+           "three distinct workers satisfy a min of 3");
+
+        /*
+         * Nothing sampled at all. A distinct count of 0 compared against a min
+         * of 0 would pass; both arms must refuse instead, because an oracle
+         * that cannot fail is worse than no oracle.
+         */
+        why[0] = '\0';
+        ok(eval_fanout_coverage(two, 0, 2, &distinct, why, sizeof(why)) == 0
+           && why[0] != '\0',
+           "zero collected pids fail rather than passing vacuously");
+
+        why[0] = '\0';
+        ok(eval_fanout_coverage(two, 4, 1, &distinct, why, sizeof(why)) == 0
+           && strstr(why, "asserts nothing") != NULL,
+           "a min_workers of 1 is refused as a disarmed oracle");
+
+        why[0] = '\0';
+        ok(eval_fanout_coverage(two, 4, 0, &distinct, why, sizeof(why)) == 0
+           && strstr(why, "asserts nothing") != NULL,
+           "a min_workers of 0 is refused as a disarmed oracle");
+
+        /* distinct_out is optional; the verdict must not depend on it. */
+        ok(eval_fanout_coverage(same, 4, 2, NULL, why, sizeof(why)) == 0,
+           "the oracle still fails when the caller wants no distinct count");
     }
 
     if (tests_run != PLANNED) {

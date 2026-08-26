@@ -901,6 +901,21 @@ mutate "idle: data reported as a close" http.c \
                 break;
             }' http_test
 
+# The fanout coverage oracle -- the load-bearing half of the directive. Worker
+# sampling is probabilistic, so N requests can legitimately all land on ONE
+# worker; every cross-worker assertion the case then makes is satisfied
+# trivially, because a single worker always agrees with itself. Both halves are
+# anchored separately because they fail differently: without the comparison the
+# lens passes having sampled one worker N times, and without the dedupe the
+# count is just the leg count and the bound is met by construction.
+mutate "fanout: coverage bound never enforced" assert.c \
+    '    if (distinct < (size_t) min_workers) {' \
+    '    if (0 && distinct < (size_t) min_workers) {' assert_test
+
+mutate "fanout: distinct-pid dedupe removed" assert.c \
+    '            if (pids[j] == pids[i]) {' \
+    '            if (0 && pids[j] == pids[i]) {' assert_test
+
 # The verdict. An idle wait that passes on data or a close is an assertion that
 # can never go red -- it would report green for exactly the two server bugs it
 # was written to catch.
