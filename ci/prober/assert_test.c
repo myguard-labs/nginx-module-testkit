@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  178
+#define PLANNED  217
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1121,6 +1121,273 @@ main(void)
         /* distinct_out is optional; the verdict must not depend on it. */
         ok(eval_fanout_coverage(same, 4, 2, NULL, why, sizeof(why)) == 0,
            "the oracle still fails when the caller wants no distinct count");
+    }
+
+    /*
+     * ---- quiesce_underflowed --------------------------------------------
+     *
+     * THE UNDERFLOW GUARD. An ngx_uint_t decremented past zero does not read
+     * as -1; it reads as the largest value the type holds, and every bound a
+     * rule author naturally writes for a resting counter is satisfied by it.
+     * Both callers consult this before applying any operator, so a hole here
+     * is a hole in `at_rest` and `monotonic` at once.
+     */
+    {
+        char  why[512];
+
+        (void) why;
+
+        ok(quiesce_underflowed(0) == 0,
+           "zero is an honest resting value");
+        ok(quiesce_underflowed(1) == 0,
+           "one is an honest reading");
+        ok(quiesce_underflowed(1000000) == 0,
+           "a million allocations is an honest reading");
+        ok(quiesce_underflowed(QUIESCE_SANE_MAX) == 0,
+           "the sanity ceiling itself is still honest");
+        ok(quiesce_underflowed(QUIESCE_SANE_MAX + 1) == 1,
+           "one above the ceiling is refused -- the line sits on 2^31-2");
+
+        ok(quiesce_underflowed(-1) == 1,
+           "the -1 unavailable sentinel is refused, not compared against");
+        ok(quiesce_underflowed(-0.5) == 1,
+           "any negative reading is refused -- a count cannot be negative");
+
+        /*
+         * The three values an underflow actually produces. Every one of them
+         * satisfies `>= 0` and `!= 5`, which is exactly why the operator must
+         * never be reached first.
+         */
+        ok(quiesce_underflowed(4294967295.0) == 1,
+           "a 32-bit ngx_uint_t wrapped past zero (2^32-1) is refused");
+        ok(quiesce_underflowed(18446744073709551615.0) == 1,
+           "a 64-bit ngx_uint_t wrapped past zero (2^64-1) is refused");
+        ok(quiesce_underflowed(9223372036854775807.0) == 1,
+           "the 64-bit saturation value (2^63-1) is refused");
+
+        /*
+         * The tightest of the four, and the one that sets the ceiling: a
+         * generic zone field wrapped on a 32-bit build is saturated by the
+         * emitter to 2^31-1 before it is rendered, so it arrives one above
+         * QUIESCE_SANE_MAX rather than anywhere near 2^64.
+         */
+        ok(quiesce_underflowed(2147483647.0) == 1,
+           "the 32-bit saturation value (2^31-1) is refused");
+    }
+
+    /*
+     * ---- eval_zone_coherent ---------------------------------------------
+     */
+    {
+        static const double agree[]   = { 42, 42, 42, 42 };
+        static const double diverge[] = { 42, 42, 43, 42 };
+        static const double one[]     = { 42 };
+        static const double wrapped[] = { 42, 18446744073709551615.0 };
+        char                why[512];
+
+        ok(eval_zone_coherent("zone.digest", agree, 4, why, sizeof(why)) == 1,
+           "four workers reading the same value are coherent");
+
+        /* THE RED PATH. Without it the form reports ok on exactly the torn
+         * read it was written to find. */
+        why[0] = '\0';
+        ok(eval_zone_coherent("zone.digest", diverge, 4, why, sizeof(why)) == 0
+           && why[0] != '\0',
+           "one worker reading a different value FAILS");
+
+        (void) eval_zone_coherent("zone.digest", diverge, 4, why, sizeof(why));
+        ok(strstr(why, "42") != NULL && strstr(why, "43") != NULL
+           && strstr(why, "reading 3") != NULL,
+           "the divergence names both readings and which one disagreed");
+
+        /* A single sample is trivially coherent with itself. The parser makes
+         * this unreachable from a rule file; reaching it anyway means the
+         * oracle was disarmed on the executor side, which must be loud. */
+        why[0] = '\0';
+        ok(eval_zone_coherent("zone.digest", one, 1, why, sizeof(why)) == 0
+           && strstr(why, "at least 2") != NULL,
+           "one reading FAILS rather than passing as trivially coherent");
+
+        why[0] = '\0';
+        ok(eval_zone_coherent("zone.digest", agree, 0, why, sizeof(why)) == 0
+           && why[0] != '\0',
+           "zero readings FAIL rather than passing vacuously");
+
+        /* Two equal wrapped readings AGREE with each other. Coherence alone
+         * would report ok on a zone every worker sees as broken in the same
+         * way, so the honesty check runs first here too. */
+        why[0] = '\0';
+        ok(eval_zone_coherent("zone.inflight", wrapped, 2, why,
+                              sizeof(why)) == 0
+           && strstr(why, "honest") != NULL,
+           "a wrapped reading FAILS before the equality comparison runs");
+    }
+
+    /*
+     * ---- eval_zone_at_rest ----------------------------------------------
+     *
+     * COR-5's class: a shared inflight counter incremented on entry and
+     * decremented on teardown must be back at zero once the case quiesced.
+     */
+    {
+        char  why[512];
+
+        ok(eval_zone_at_rest("zone.inflight", "==", "0", 0, why,
+                             sizeof(why)) == 1,
+           "a counter back at zero satisfies == 0");
+
+        /* THE RED PATH: the leak COR-5 was. */
+        why[0] = '\0';
+        ok(eval_zone_at_rest("zone.inflight", "==", "0", 3, why,
+                             sizeof(why)) == 0
+           && strstr(why, "3") != NULL,
+           "a counter still at 3 FAILS == 0 and names the value it read");
+
+        ok(eval_zone_at_rest("zone.inflight", "<=", "1", 1, why,
+                             sizeof(why)) == 1,
+           "a bound other than equality is honoured");
+
+        ok(eval_zone_at_rest("zone.inflight", "<=", "1", 2, why,
+                             sizeof(why)) == 0,
+           "a counter above its <= bound FAILS");
+
+        /*
+         * THE UNDERFLOW RED PATHS, and the reason the bound precedes the
+         * operator. Each of these operators is SATISFIED by the wrapped
+         * value: without the ordering the oracle reports ok on precisely the
+         * defect it exists to catch.
+         */
+        why[0] = '\0';
+        ok(eval_zone_at_rest("zone.inflight", ">=", "0",
+                             18446744073709551615.0, why, sizeof(why)) == 0
+           && strstr(why, "honest") != NULL,
+           "a wrapped counter FAILS >= 0, which it would otherwise satisfy");
+
+        ok(eval_zone_at_rest("zone.inflight", "<=", "1",
+                             4294967295.0, why, sizeof(why)) == 0,
+           "a 32-bit wrapped counter FAILS <= 1 rather than being compared");
+
+        ok(eval_zone_at_rest("zone.inflight", "!=", "5",
+                             18446744073709551615.0, why, sizeof(why)) == 0,
+           "a wrapped counter FAILS != 5, which it would otherwise satisfy");
+
+        /* The -1 unavailable sentinel. An invariant judged against a field
+         * the probe could not read is an invariant that did not run. */
+        why[0] = '\0';
+        ok(eval_zone_at_rest("zone.inflight", ">=", "0", -1, why,
+                             sizeof(why)) == 0
+           && strstr(why, "-1") != NULL,
+           "the -1 sentinel FAILS rather than satisfying >= 0");
+
+        /* Literal handling lives in the same seam as the verdict, so its
+         * failure paths are reachable here rather than in the caller. */
+        why[0] = '\0';
+        ok(eval_zone_at_rest("zone.inflight", "==", "notanumber", 0, why,
+                             sizeof(why)) == 0
+           && strstr(why, "not a number") != NULL,
+           "a non-numeric bound FAILS rather than being silently skipped");
+
+        ok(eval_zone_at_rest("zone.inflight", "==", "\"0\"", 0, why,
+                             sizeof(why)) == 1,
+           "a quoted numeric bound is unquoted before comparison");
+    }
+
+    /*
+     * ---- eval_zone_monotonic --------------------------------------------
+     */
+    {
+        static const double rising[]  = { 10, 10, 11, 40 };
+        static const double falling[] = { 10, 11, 9, 40 };
+        static const double one[]     = { 10 };
+        static const double wrapped[] = { 10, 18446744073709551615.0 };
+        char                why[512];
+
+        ok(eval_zone_monotonic("zone.slab_reqs", rising, 4, why,
+                               sizeof(why)) == 1,
+           "a cumulative counter that never decreases is monotonic");
+
+        /* THE RED PATH. */
+        why[0] = '\0';
+        ok(eval_zone_monotonic("zone.slab_reqs", falling, 4, why,
+                               sizeof(why)) == 0
+           && why[0] != '\0',
+           "a single decrease mid-sequence FAILS");
+
+        (void) eval_zone_monotonic("zone.slab_reqs", falling, 4, why,
+                                   sizeof(why));
+        ok(strstr(why, "reading 3") != NULL && strstr(why, "11") != NULL,
+           "the decrease names which reading fell and what it fell from");
+
+        why[0] = '\0';
+        ok(eval_zone_monotonic("zone.slab_reqs", one, 1, why,
+                               sizeof(why)) == 0
+           && strstr(why, "at least 2") != NULL,
+           "one reading FAILS rather than passing as trivially monotonic");
+
+        why[0] = '\0';
+        ok(eval_zone_monotonic("zone.slab_reqs", rising, 0, why,
+                               sizeof(why)) == 0
+           && why[0] != '\0',
+           "zero readings FAIL rather than passing vacuously");
+
+        /* A wrap READS as an increase, so monotonicity alone would report ok
+         * on it -- which is the whole reason the honesty check is not a
+         * refinement of the comparison but a gate ahead of it. */
+        why[0] = '\0';
+        ok(eval_zone_monotonic("zone.slab_reqs", wrapped, 2, why,
+                               sizeof(why)) == 0
+           && strstr(why, "honest") != NULL,
+           "a wrapped reading FAILS even though it looks like an increase");
+    }
+
+    /*
+     * ---- eval_quiesce ----------------------------------------------------
+     *
+     * EXPIRY FAILS, NEVER PASSES. This is the entire directive. A quiesce that
+     * timed out and let the at-rest oracles run would report their verdict on
+     * a moving counter; one that timed out and skipped them would be
+     * indistinguishable from a pass in TAP.
+     */
+    {
+        char  why[512];
+
+        ok(eval_quiesce("zone.inflight", 1, 2, 2000, 7, 7, why,
+                        sizeof(why)) == 1,
+           "two equal consecutive readings settle the quiesce");
+
+        /* THE RED PATH, and the one that must never invert. */
+        why[0] = '\0';
+        ok(eval_quiesce("zone.inflight", 0, 100, 2000, 9, 8, why,
+                        sizeof(why)) == 0
+           && why[0] != '\0',
+           "an expired quiesce FAILS rather than passing or skipping");
+
+        (void) eval_quiesce("zone.inflight", 0, 100, 2000, 9, 8, why,
+                            sizeof(why));
+        ok(strstr(why, "2000 ms") != NULL && strstr(why, "100 poll") != NULL
+           && strstr(why, "8") != NULL && strstr(why, "9") != NULL,
+           "the expiry names the budget, the poll count and the last two "
+           "readings");
+
+        /* A counter that never settled and one that settled at a surprising
+         * value are different bugs; a single poll is reported as such rather
+         * than pluralised into a claim the run did not make. */
+        why[0] = '\0';
+        ok(eval_quiesce("zone.inflight", 0, 1, 1, 5, 0, why,
+                        sizeof(why)) == 0
+           && strstr(why, "(1 poll;") != NULL,
+           "a one-poll expiry is reported in the singular");
+
+        /* The verdict follows `settled` and nothing else: a settled quiesce
+         * passes however few polls it took, and an unsettled one fails
+         * however many. */
+        ok(eval_quiesce("zone.inflight", 1, 1, 1, 0, 0, why,
+                        sizeof(why)) == 1,
+           "a quiesce that settled on its first pair passes");
+
+        ok(eval_quiesce("zone.inflight", 0, 100000, 30000, 1, 1, why,
+                        sizeof(why)) == 0,
+           "an unsettled quiesce fails even after the maximum budget");
     }
 
     if (tests_run != PLANNED) {

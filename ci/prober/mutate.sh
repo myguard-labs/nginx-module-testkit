@@ -916,6 +916,67 @@ mutate "fanout: distinct-pid dedupe removed" assert.c \
     '            if (pids[j] == pids[i]) {' \
     '            if (0 && pids[j] == pids[i]) {' assert_test
 
+# The underflow guard. An ngx_uint_t decremented past zero does not read as -1;
+# it reads as the largest value the type holds, and the operators a rule author
+# naturally writes for a resting counter (>= 0, <= 1, != 5) are EVERY ONE of
+# them satisfied by that value. Both halves are anchored: the negative arm
+# (which catches the -1 unavailable sentinel) and the ceiling arm (which catches
+# the wrap itself). Disarming either lets an oracle report ok on precisely the
+# defect it exists to catch.
+mutate "at_rest: underflow ceiling never applied" assert.c \
+    '    return (v < 0) || (v > QUIESCE_SANE_MAX);' \
+    '    return (v < 0);' assert_test
+
+mutate "at_rest: the -1 unavailable sentinel treated as honest" assert.c \
+    '    return (v < 0) || (v > QUIESCE_SANE_MAX);' \
+    '    return (v > QUIESCE_SANE_MAX);' assert_test
+
+# The three zone_invariant comparisons. Each is the load-bearing half of its
+# form: without it the form reports ok on the exact state it was written to
+# find -- a diverged worker view, a leaked counter, a counter that went
+# backwards.
+mutate "zone_invariant coherent: divergence never reported" assert.c \
+    '        if (vals[i] != vals[0]) {' \
+    '        if (0 && vals[i] != vals[0]) {' assert_test
+
+mutate "zone_invariant at_rest: the bound never enforced" assert.c \
+    '    if (!compare_number(have, op, want)) {' \
+    '    if (0 && !compare_number(have, op, want)) {' assert_test
+
+mutate "zone_invariant monotonic: a decrease never reported" assert.c \
+    '        if (vals[i] < vals[i - 1]) {' \
+    '        if (0 && vals[i] < vals[i - 1]) {' assert_test
+
+# The single-sample tautology guards. One reading is trivially coherent with
+# itself and trivially non-decreasing, so a form that accepted n < 2 would be
+# an oracle guaranteed to pass. The parser makes it unreachable from a rule
+# file; these rows prove the evaluator refuses it anyway.
+mutate "zone_invariant coherent: one reading accepted as coherent" assert.c \
+    '    if (n < 2) {
+        snprintf(why, whylen, "zone_invariant coherent %.128s: only %zu "' \
+    '    if (0) {
+        snprintf(why, whylen, "zone_invariant coherent %.128s: only %zu "' assert_test
+
+mutate "zone_invariant monotonic: one reading accepted as monotonic" assert.c \
+    '    if (n < 2) {
+        snprintf(why, whylen, "zone_invariant monotonic %.128s: only %zu "' \
+    '    if (0) {
+        snprintf(why, whylen, "zone_invariant monotonic %.128s: only %zu "' assert_test
+
+# THE quiesce row. Expiry FAILS, never passes -- that direction is the entire
+# directive. A quiesce that timed out and returned 1 would let every at-rest
+# oracle in the case run against a moving counter, which is the timing
+# dependence the directive exists to remove.
+mutate "quiesce: expiry reported as settled" assert.c \
+    '    if (settled) {
+        return 1;
+    }' \
+    '    if (settled) {
+        return 1;
+    }
+
+    return 1;' assert_test
+
 # The verdict. An idle wait that passes on data or a close is an assertion that
 # can never go red -- it would report green for exactly the two server bugs it
 # was written to catch.

@@ -478,6 +478,258 @@ eval_exchange(const char *label,
 
 
 /*
+ * Poll the probe until `path` reads the same number on two consecutive
+ * snapshots, or `timeout_ms` elapses. Returns 1 on pass, 0 on fail with the
+ * reason printed.
+ *
+ * A separate function rather than a block inside run_case() for two reasons.
+ * run_case() is already the largest function in the harness and lizard flags
+ * it, so a directive that grows it further makes the next one harder to add;
+ * and the polling has a probe-read failure path of its own, which reads far
+ * more clearly with one exit than folded into run_case()'s.
+ *
+ * A probe read that FAILS mid-poll ends the case rather than being retried:
+ * the settled-state oracles about to run all read the same endpoint, so an
+ * endpoint that stopped answering is a finding now, not a slower one later.
+ *
+ * A path that is absent or non-numeric is likewise a failure. `quiesce
+ * zone.nodes` against a document with no such field is a rule-file mistake
+ * whose only honest report is red -- treating it as "already settled" would
+ * make every at-rest oracle in the case run against a state nobody waited for.
+ */
+static int
+run_quiesce(const test_case *tc)
+{
+    char        errbuf[512];
+    char        why[512];
+    int         polls = 0;
+    int         settled = 0;
+    int         have_prev = 0;
+    double      prev = 0;
+    double      last = 0;
+    int64_t     started;
+
+    /*
+     * A MEASURED clock, not a count of the sleeps.
+     *
+     * Each iteration costs one sleep AND one probe request, and only the sleep
+     * is a known quantity. Accumulating the interval would let a case whose
+     * probe reads are slow spend several times its stated budget while still
+     * believing it was inside it -- a directive that silently overspends the
+     * number the rule file wrote is the same class of unstated timing the
+     * whole directive exists to remove.
+     *
+     * `polls == 0 ||` short-circuits the deadline on the FIRST iteration, so a
+     * timeout shorter than one round trip still takes the sample it needs to
+     * have something to report. A quiesce that expired having observed nothing
+     * would fail every case that carried it for a reason unrelated to the code
+     * under test, and its diagnostic would name two readings it never took.
+     */
+    started = prober_monotonic_ms();
+
+    while ((polls == 0
+            || prober_monotonic_ms() - started <= tc->quiesce_timeout_ms)
+           && !settled)
+    {
+        json_value        *doc;
+        const json_value  *v;
+
+        if (polls > 0) {
+            usleep(QUIESCE_POLL_US);
+        }
+
+        doc = fetch_probe(errbuf, sizeof(errbuf));
+
+        if (doc == NULL) {
+            printf("# quiesce %s: %s\n", tc->quiesce_path, errbuf);
+            return 0;
+        }
+
+        v = json_get(doc, tc->quiesce_path);
+
+        if (v == NULL || v->type != JSON_NUMBER) {
+            printf("# quiesce %s: the probe document carries no numeric value "
+                   "at that path, so there is nothing to wait for\n",
+                   tc->quiesce_path);
+            json_free(doc);
+            return 0;
+        }
+
+        last = v->number;
+        json_free(doc);
+        polls++;
+
+        if (have_prev && last == prev) {
+            settled = 1;
+
+        } else {
+            prev = last;
+            have_prev = 1;
+        }
+    }
+
+    if (!eval_quiesce(tc->quiesce_path, settled, polls,
+                      tc->quiesce_timeout_ms, last, prev, why, sizeof(why)))
+    {
+        printf("# %s\n", why);
+        return 0;
+    }
+
+    if (opt_verbose) {
+        printf("# quiesce %s: settled at %g after %d poll%s\n",
+               tc->quiesce_path, last, polls, polls == 1 ? "" : "s");
+    }
+
+    return 1;
+}
+
+
+/*
+ * Take `n_legs` probe snapshots and fill the n_invariants x n_legs matrix
+ * `vals` (row-major) with each snapshot's reading of each invariant's field.
+ * Returns 0 on failure, having printed the reason.
+ *
+ * A SEPARATE sweep from the one the coverage oracle uses, taken AFTER
+ * `quiesce`, and the separation is the point rather than an inefficiency. The
+ * coverage sweep's snapshots are interleaved with the case's own requests, so
+ * the counters they read are mid-flight by construction -- an `at_rest`
+ * oracle judged on one of them would be asking whether the counter was at rest
+ * while the case was still driving it, which it has no reason to be. Every
+ * reading here is taken once the counter the case quiesced on has settled.
+ *
+ * These are probe reads, not case requests: the probe endpoint is answered by
+ * whichever worker accepts the connection exactly as any other request is, so
+ * a sweep of n_legs reads still samples across workers.
+ *
+ * They are not, however, free of effect, and that is deliberate rather than
+ * tolerated. Each read is an HTTP request the worker serves, so it allocates
+ * in the zone like any other -- which is what keeps `monotonic` from being a
+ * tautology here. A sweep that genuinely changed nothing would leave every
+ * reading identical, and "never decreased" over a constant sequence is a claim
+ * no defect could falsify. The traffic the sweep itself generates is what
+ * gives the form something to be monotonic ABOUT.
+ *
+ * What the sweep does not do is drive the case's own request path, which is
+ * why it is safe to run after a quiesce: the counters an `at_rest` oracle
+ * names are the module's, and a probe read does not touch them.
+ *
+ * An absent or non-numeric field FAILS. A zone_invariant judged against a
+ * field the probe does not render is an invariant that did not run, and a
+ * skip is indistinguishable from a pass in TAP.
+ */
+static int
+collect_zone_readings(const test_case *tc, double *vals, size_t n_legs)
+{
+    char    errbuf[512];
+    size_t  leg;
+
+    for (leg = 0; leg < n_legs; leg++) {
+        json_value  *doc = fetch_probe(errbuf, sizeof(errbuf));
+        size_t       i;
+
+        if (doc == NULL) {
+            printf("# zone_invariant: probe read %zu/%zu failed: %s\n",
+                   leg + 1, n_legs, errbuf);
+            return 0;
+        }
+
+        for (i = 0; i < tc->n_zone_invariants; i++) {
+            const json_value *v = json_get(doc, tc->zone_invariants[i].path);
+
+            if (v == NULL || v->type != JSON_NUMBER) {
+                printf("# zone_invariant %s: the probe document carries no "
+                       "numeric value at that path, so the invariant cannot "
+                       "be judged\n", tc->zone_invariants[i].path);
+                json_free(doc);
+                return 0;
+            }
+
+            vals[i * n_legs + leg] = v->number;
+        }
+
+        json_free(doc);
+    }
+
+    return 1;
+}
+
+
+/*
+ * Judge the case's `zone_invariant` lines against the per-leg readings a
+ * `fanout` collected. Returns 1 when every line passed.
+ *
+ * `vals` is an n_invariants x n_legs matrix in row-major order: row i holds
+ * every worker's reading of invariant i's field, in the order the legs ran.
+ * Collected that way because all three forms want the same rows for different
+ * reasons -- coherent compares them to each other, monotonic compares each to
+ * its predecessor, and at_rest judges the LAST one, the reading taken closest
+ * to the quiesced state.
+ *
+ * Split out of run_case() for the same reason run_quiesce() is.
+ */
+static int
+eval_zone_invariants(const test_case *tc, const double *vals, size_t n_legs)
+{
+    char    why[512];
+    int     ok = 1;
+    size_t  i;
+
+    for (i = 0; i < tc->n_zone_invariants; i++) {
+        const zone_invariant  *zi = &tc->zone_invariants[i];
+        const double          *row = &vals[i * n_legs];
+        int                    pass;
+
+        switch (zi->kind) {
+
+        case ZONE_INV_COHERENT:
+            pass = eval_zone_coherent(zi->path, row, n_legs, why, sizeof(why));
+            break;
+
+        case ZONE_INV_MONOTONIC:
+            pass = eval_zone_monotonic(zi->path, row, n_legs, why,
+                                       sizeof(why));
+            break;
+
+        case ZONE_INV_AT_REST:
+            /*
+             * Judged on the LAST reading -- the one taken furthest from the
+             * case's own traffic. Judging the first would ask whether the
+             * counter was at rest at the start of the sweep, which is a
+             * weaker question than the directive asks.
+             *
+             * The literal is handed over raw: unquoting and conversion belong
+             * to the evaluator, so their failure paths sit in the seam that
+             * assert_test.c can drive rather than here.
+             */
+            pass = eval_zone_at_rest(zi->path, zi->op, zi->literal,
+                                     row[n_legs - 1], why, sizeof(why));
+            break;
+
+        default:
+            /*
+             * Unreachable from a rule file -- the parser accepts exactly three
+             * forms. A fourth arriving here is a harness defect, and it is
+             * reported as a FAILURE rather than defaulted to a pass for the
+             * reason eval_idle()'s default arm gives: an unhandled case must
+             * never become a silent green.
+             */
+            snprintf(why, sizeof(why), "zone_invariant %.128s: unknown form "
+                     "%d, so nothing was judged", zi->path, (int) zi->kind);
+            pass = 0;
+            break;
+        }
+
+        if (!pass) {
+            printf("# %s\n", why);
+            ok = 0;
+        }
+    }
+
+    return ok;
+}
+
+
+/*
  * Returns 1 if the case passed. Diagnostics are printed as TAP comments.
  *
  * `baseline` is the run's origin snapshot for `probe_baseline` assertions, or
@@ -770,6 +1022,50 @@ run_case(const test_case *tc, const json_value *baseline)
 
         free(pids);
 
+        /*
+         * The cross-worker invariants, judged last and only on this path: they
+         * need several workers' readings, which is exactly what a fanout
+         * produces and what the parser refuses to let them be written without.
+         *
+         * `quiesce` runs FIRST when the case carries one, because every
+         * at_rest form below is a claim about a settled counter and judging it
+         * on a moving one is the timing-dependent result the directive exists
+         * to remove. Its expiry ends the case, so the invariants are never
+         * judged against a state nobody waited for.
+         */
+        if (tc->n_zone_invariants > 0) {
+            double  *vals;
+            size_t   n_legs = (size_t) tc->fanout;
+
+            if (tc->quiesce_path != NULL && !run_quiesce(tc)) {
+                json_free(before);
+                return 0;
+            }
+
+            /* Nothing between the allocation and its owning call, same shape
+             * as the pids buffer above and for the same leak reason. */
+            vals = calloc(tc->n_zone_invariants * n_legs, sizeof(*vals));
+
+            if (vals == NULL) {
+                printf("# zone_invariant: out of memory for %zu readings\n",
+                       tc->n_zone_invariants * n_legs);
+                json_free(before);
+                return 0;
+            }
+
+            if (!collect_zone_readings(tc, vals, n_legs)) {
+                free(vals);
+                json_free(before);
+                return 0;
+            }
+
+            if (!eval_zone_invariants(tc, vals, n_legs)) {
+                ok = 0;
+            }
+
+            free(vals);
+        }
+
     } else if (tc->n_blocks == 0) {
         /*
          * Legacy single-exchange path -- one connect/write/read/close, exactly
@@ -932,6 +1228,33 @@ run_case(const test_case *tc, const json_value *baseline)
 
             held[n_held++] = cfd;
         }
+    }
+
+    /*
+     * `quiesce` for every case that is NOT driving the zone_invariant path
+     * above (which runs its own, ahead of the readings those oracles need).
+     * Placed here so the probe/delta/probe_baseline snapshots that follow are
+     * taken on a settled counter -- the same reason the invariant path
+     * quiesces before its sweep.
+     *
+     * Ahead of the open_conns close, which means the parked connections stay
+     * open across the wait as well as across the probe read. That is the
+     * correct order and not an oversight: the whole point of open_conns is
+     * that the snapshot observes the ELEVATED connection count, so closing
+     * them before the wait would leave the probe reading a state the case
+     * never asked for. The cost is that a case combining the two directives
+     * holds its fds for up to the quiesce budget, which is bounded by
+     * QUIESCE_MAX_MS and by MAX_OPEN_CONNS on the other axis.
+     */
+    if (tc->quiesce_path != NULL && tc->n_zone_invariants == 0
+        && !run_quiesce(tc))
+    {
+        for (i = 0; i < n_held; i++) {
+            http_close(held[i]);
+        }
+        free(held);
+        json_free(before);
+        return 0;
     }
 
     if (tc->n_probes > 0) {
