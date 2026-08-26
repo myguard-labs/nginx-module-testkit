@@ -916,6 +916,29 @@ mutate "fanout: distinct-pid dedupe removed" assert.c \
     '            if (pids[j] == pids[i]) {' \
     '            if (0 && pids[j] == pids[i]) {' assert_test
 
+# The same two halves again, but judged by the LIVE four-worker scenario rather
+# than by assert_test's synthetic readings. Not redundant with the rows above:
+# those prove the comparison is correct as a function, this proves the comparison
+# is actually REACHED on the path a real fanout takes -- through the executor's
+# per-leg probe reads, against pids that came from four forked workers rather
+# than from an array literal. A refactor that stopped calling the oracle from
+# prober.c, or that lost the pid on the way out of the probe document, leaves
+# every assert_test row green while the live lens asserts nothing.
+#
+# The scenario reddens because its driver runs a fixture demanding 8 distinct
+# workers from a 4-worker server and REQUIRES that fixture to fail. Disarm the
+# comparison and the fixture passes, which the driver reports as
+# "THE COVERAGE ORACLE DID NOT FIRE".
+mutate "fanout: coverage bound never enforced (live workers)" assert.c \
+    '    if (distinct < (size_t) min_workers) {' \
+    '    if (0 && distinct < (size_t) min_workers) {' \
+    scenarios/shm-coherence/mutate-suite.sh
+
+mutate "fanout: distinct-pid dedupe removed (live workers)" assert.c \
+    '            if (pids[j] == pids[i]) {' \
+    '            if (0 && pids[j] == pids[i]) {' \
+    scenarios/shm-coherence/mutate-suite.sh
+
 # The underflow guard. An ngx_uint_t decremented past zero does not read as -1;
 # it reads as the largest value the type holds, and the operators a rule author
 # naturally writes for a resting counter (>= 0, <= 1, != 5) are EVERY ONE of

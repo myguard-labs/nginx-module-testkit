@@ -601,17 +601,30 @@ run_quiesce(const test_case *tc)
  * whichever worker accepts the connection exactly as any other request is, so
  * a sweep of n_legs reads still samples across workers.
  *
- * They are not, however, free of effect, and that is deliberate rather than
- * tolerated. Each read is an HTTP request the worker serves, so it allocates
- * in the zone like any other -- which is what keeps `monotonic` from being a
- * tautology here. A sweep that genuinely changed nothing would leave every
- * reading identical, and "never decreased" over a constant sequence is a claim
- * no defect could falsify. The traffic the sweep itself generates is what
- * gives the form something to be monotonic ABOUT.
+ * What the sweep does NOT do is generate zone traffic of its own. Serving an
+ * HTTP request allocates from the request pool, not from the shm slab: on the
+ * reference module a full sweep leaves `zone.slab_reqs` at 0, measured live
+ * (nginx 1.31.4, four workers). That is a property of the module, not of this
+ * function -- the only `ngx_slab_alloc` call in the reference probe is the
+ * canary arm, which no request path reaches.
  *
- * What the sweep does not do is drive the case's own request path, which is
- * why it is safe to run after a quiesce: the counters an `at_rest` oracle
- * names are the module's, and a probe read does not touch them.
+ * The consequence is a bound on what these forms can prove, and it must be
+ * stated rather than assumed away: on a module that never allocates in the
+ * zone, every reading is identical, and `coherent`, `at_rest N` and
+ * `monotonic` are all satisfied by a constant sequence no defect could
+ * falsify. They are tautologies THERE. They are not tautologies on a module
+ * whose request path does mutate the zone -- which is the only kind of module
+ * they are meant to be pointed at, and why `scenarios/shm-coherence` asserts
+ * only `fanout` and its coverage oracle: the reference module gives the three
+ * forms nothing to be invariant ABOUT. Their real coverage arrives with a
+ * consumer zone (cache-turbo's `varidx_inflight`), where a mutating request
+ * path makes each form falsifiable. The forms' own logic is unit-tested in
+ * assert_test.c against synthetic readings, which is where a broken comparison
+ * reddens today.
+ *
+ * The sweep also does not drive the case's own request path, which is why it
+ * is safe to run after a quiesce: the counters an `at_rest` oracle names are
+ * the module's, and a probe read does not touch them.
  *
  * An absent or non-numeric field FAILS. A zone_invariant judged against a
  * field the probe does not render is an invariant that did not run, and a
