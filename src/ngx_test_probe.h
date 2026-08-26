@@ -450,6 +450,138 @@ u_char *ngx_test_probe_escape_json_string(u_char *p, u_char *last,
  */
 u_char *ngx_test_probe_render_module(u_char *p, u_char *last);
 
+
+/*
+ * ---------------------------------------------------------------------------
+ * Pool redzones -- guard bytes around a pool allocation.
+ * ---------------------------------------------------------------------------
+ *
+ * THE GAP THIS FILLS, AND WHY ASAN DOES NOT FILL IT
+ *
+ * ngx_palloc_small() is a bump allocator: it slices objects out of one large
+ * block by advancing p->d.last, so a pool holding two hundred small objects is
+ * ONE malloc'd allocation as far as AddressSanitizer is concerned. ASan's
+ * redzones are at the two ends of that block; between the objects there is
+ * nothing for it to poison. An overflow out of one small pool object into its
+ * neighbour is therefore invisible to ASan, to LeakSanitizer and to valgrind
+ * memcheck -- all three see one large, live, addressable, defined block.
+ *
+ * Demonstrated rather than assumed (2026-08-26, gcc 14 + ASan): a 4096-byte
+ * block sliced into two 16-byte objects, the first memset to 32 bytes, exits
+ * 0 with no diagnostic while the second object's contents are replaced.
+ *
+ * This is NOT an ASan replacement. It catches ONE class -- a linear overflow
+ * out of a guarded object -- and it catches it at detection time (the next
+ * check, or pool destruction), not at the faulting instruction. Where ASan can
+ * see a bug at all it remains the better tool because it reports the write
+ * itself. Run both; they overlap almost nowhere.
+ *
+ * NOT covered: use-after-free (a destroyed pool's blocks go back to libc where
+ * ASan's quarantine already applies), overflow of a LARGE allocation
+ * (ngx_palloc_large uses ngx_alloc, an ordinary malloc block ASan guards
+ * already), and any over-READ that disturbs nothing.
+ *
+ * USAGE
+ *
+ * Route the allocations under test through ngx_test_probe_palloc() instead of
+ * ngx_palloc(). Verification is automatic at pool destruction; a module may
+ * also call ngx_test_probe_redzone_check() at any point for an earlier answer.
+ * Violations are counted per worker and rendered as `redzone.violations`, so a
+ * rule file asserts on them with an ordinary `probe` line:
+ *
+ *     probe  redzone.violations == 0
+ *
+ * ALIGNMENT -- the one sharp edge. The returned pointer is NOT aligned: the
+ * padded block comes from ngx_pnalloc(), because an aligned allocation lets
+ * nginx skip bytes between the previous object and this one, and an overflow
+ * landing entirely in that skipped padding would go unreported. Immediate
+ * adjacency to the neighbour is what makes the guard meaningful. That is the
+ * ngx_pnalloc contract and it is correct for byte buffers; a caller wanting a
+ * guarded struct must round its own size up itself.
+ */
+
+/*
+ * Guard width, in bytes, on EACH side of the allocation.
+ *
+ * 16 rather than 8: the common overflow is a copy whose length was computed
+ * wrong, and byte-count mistakes cluster at small powers of two and at the
+ * width of a pointer or a length prefix. A 16-byte guard catches an 8-byte
+ * overshoot whole, which a 8-byte guard would only catch if nothing else
+ * happened to be written after it. Rather than 32+ because every guarded
+ * allocation pays twice this in pool bytes, and pool growth is itself measured
+ * by the delta oracles -- a fat guard would move the numbers those assert on.
+ */
+#define NGX_TEST_PROBE_REDZONE  16
+
+
+/*
+ * The three declarations taking an ngx_pool_t are gated on there BEING one.
+ *
+ * A real build always has it (ngx_core.h). The direct-call unit harness in t/
+ * does not: t/ngx_shim.h is deliberately minimal and stubs no allocator, and
+ * the suites built against it -- probe_arm_test, probe_escape_json_string_test
+ * -- include this header. Declaring a function in terms of a type that
+ * translation unit has never heard of is a hard error there, so the suites
+ * that do not use redzones must not be made to pay for the ones that do.
+ *
+ * NGX_TEST_PROBE_POOL_SHIM is what t/ngx_pool_shim.h sets; NGX_CORE_H_INCLUDED_
+ * is nginx's own guard, which is defined in every real build. The counters
+ * below take no pool and stay unconditional.
+ */
+#if defined(_NGX_CORE_H_INCLUDED_) || defined(NGX_TEST_PROBE_POOL_SHIM)
+
+/*
+ * Guarded allocation. Returns a pointer to `size` usable bytes with a guard
+ * on each side, or NULL -- on pool==NULL, on allocation failure, or when
+ * `size` is within 2*NGX_TEST_PROBE_REDZONE of SIZE_MAX (the padded size would
+ * wrap, and the guard writes would then scribble across the heap).
+ *
+ * A NULL return is an ordinary allocation failure and the caller must handle
+ * it exactly as it would handle ngx_palloc() returning NULL. It is emphatically
+ * not a violation report.
+ */
+void *ngx_test_probe_palloc(ngx_pool_t *pool, size_t size);
+
+
+/*
+ * Verify every guarded allocation in `pool` NOW, without waiting for the pool
+ * to be destroyed. Returns the number of allocations with at least one
+ * corrupted guard byte, and logs each at NGX_LOG_ALERT.
+ *
+ * Does not reset anything: the same corruption is reported again by the
+ * cleanup handler at pool destruction, and counted once there. This is a
+ * read-only early look, for a module that wants to localise a corruption to a
+ * specific point in its own processing rather than to "somewhere in this
+ * request".
+ */
+ngx_uint_t ngx_test_probe_redzone_check(ngx_pool_t *pool);
+
+#endif /* pool type available */
+
+
+/*
+ * Cumulative counts for this worker, rendered as `redzone.violations` and
+ * `redzone.checked`.
+ *
+ * `checked` exists to make `violations == 0` falsifiable. Zero violations out
+ * of zero checked allocations is the vacuous pass this suite hunts: it is what
+ * a consumer gets when it wires the header in but never actually routes an
+ * allocation through ngx_test_probe_palloc(), and it is indistinguishable from
+ * a clean run on the violations figure alone. An honest oracle asserts BOTH:
+ *
+ *     probe  redzone.checked    >  0
+ *     probe  redzone.violations == 0
+ */
+ngx_uint_t ngx_test_probe_redzone_violations(void);
+ngx_uint_t ngx_test_probe_redzone_checked(void);
+
+
+/*
+ * Zero both counters. For a test that wants a fresh origin mid-run; nothing in
+ * the normal path calls it.
+ */
+void ngx_test_probe_redzone_reset(void);
+
 #endif /* NGX_TEST_HARNESS */
 
 #endif /* NGX_TEST_PROBE_H_INCLUDED_ */
