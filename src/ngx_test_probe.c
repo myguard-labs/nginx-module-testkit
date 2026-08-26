@@ -540,7 +540,8 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                      "\"anon\":%i,\"other\":%i},"
                      "\"smaps\":{\"pss\":%i,\"private_dirty\":%i},"
                      "\"pool\":{\"cycle_used\":%uz,\"cycle_blocks\":%ui,"
-                     "\"cycle_large\":%ui,\"cycle_cleanup\":%ui}",
+                     "\"cycle_large\":%ui,\"cycle_cleanup\":%ui},"
+                     "\"redzone\":{\"violations\":%ui,\"checked\":%ui}",
                      (u_char *) NGX_TEST_PROBE_FLAVOR,
                      (u_char *) NGX_TEST_PROBE_FLAVOR_VER,
                      ngx_pid,
@@ -556,7 +557,9 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                      pool_used,
                      pool_blocks,
                      pool_large,
-                     pool_cleanup);
+                     pool_cleanup,
+                     ngx_test_probe_redzone_violations(),
+                     ngx_test_probe_redzone_checked());
 
     /*
      * The zone-independent module members, BEFORE the zone object and before

@@ -137,18 +137,43 @@ done
 # prober's units, so they get their own loop rather than a special case inside
 # the one above.
 #
-# Only ngx_test_probe_arm.c is reachable this way. The renderer beside it reads
-# ngx_cycle, the slab pool and /proc/self/fd, so shimming it would mean
-# reimplementing the server -- it is covered by the compile-against-real-nginx
-# and real-angie jobs in CI, and by the live prober run.
+# Two units are reachable this way: ngx_test_probe_arm.c (a query parser, which
+# needs nothing but the query bytes) and ngx_test_probe_redzone.c (an allocator
+# wrapper, which needs a pool and gets a real bump allocator from
+# t/ngx_pool_shim.h -- a malloc-per-object stub would not reproduce the
+# adjacency its tests depend on).
+#
+# The renderer beside them is NOT reachable: it reads ngx_cycle, the slab pool
+# and /proc/self/fd, so shimming it would mean reimplementing the server. It is
+# covered by the compile-against-real-nginx and real-angie jobs in CI, and by
+# the live prober run.
 for src in ../../t/*_test.c; do
     [ -e "$src" ] || continue
 
     bin="${src%.c}"
 
+    # Which src/ unit a suite links, and any extra defines it needs, is a
+    # property of the SUITE, not of this loop -- so it is selected per file
+    # rather than hardcoded. Adding a third shimmable unit means adding a case
+    # here, which is the point at which someone has to state what it links.
+    case "$(basename "$src")" in
+        probe_redzone_test.c)
+            # The redzone allocator needs a working pool, which ngx_shim.h
+            # deliberately does not provide. NGX_TEST_PROBE_POOL_SHIM selects
+            # t/ngx_pool_shim.h inside the unit under test; a real build
+            # defines nothing and takes the pool from ngx_core.h.
+            unit=../../src/ngx_test_probe_redzone.c
+            extra=-DNGX_TEST_PROBE_POOL_SHIM
+            ;;
+        *)
+            unit=../../src/ngx_test_probe_arm.c
+            extra=
+            ;;
+    esac
+
     # shellcheck disable=SC2086
-    compile $CC $CFLAGS -DNGX_TEST_HARNESS -I ../../t -I ../../src \
-        -o "$bin" "$src" ../../src/ngx_test_probe_arm.c
+    compile $CC $CFLAGS -DNGX_TEST_HARNESS $extra -I ../../t -I ../../src \
+        -o "$bin" "$src" "$unit"
 
     built="$built $(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
 done
