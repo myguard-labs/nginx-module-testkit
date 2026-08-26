@@ -35,7 +35,7 @@ the harness can already do to it.
 | [attack-leak-pressure.md](attack-leak-pressure.md) | Descriptors, cycle-pool bytes and slab pages that grow one unit at a time | `delta`, `probe_baseline`, `rss-slope`, `soak-delta`, `fd-starve` |
 | [attack-lifecycle.md](attack-lifecycle.md) | Reload, binary upgrade, worker death, signal storms mid-transfer | `reload-*`, `usr2-*`, `hup-storm-mid-transfer`, `worker-death` |
 | [attack-environment.md](attack-environment.md) | A hostile clock, a hostile locale, and what the worker actually syscalls | `clock-jump`, `locale-hostility`, `syscall-allowlist` |
-| [attack-concurrency.md](attack-concurrency.md) | N requests in flight at once, and the races that only exist there | `concurrent N`, `concurrent-fan`, `multi-worker`, `backpressure` |
+| [attack-concurrency.md](attack-concurrency.md) | N requests in flight at once, and the races that only exist there, including cross-process shm races helgrind and TSan cannot see | `concurrent N`, `concurrent-fan`, `multi-worker`, `backpressure`, `fanout`, `quiesce`, `zone_invariant`, `shm-coherence` |
 | [attack-memory-corruption.md](attack-memory-corruption.md) | An overflow out of one pool object or slab chunk into the next, and use-after-free on shared memory — all structurally invisible to ASan and valgrind, because a pool is one malloc'd block and a zone is one mmap | `ngx_test_probe_palloc()`, `ngx_test_probe_slab_alloc()`, `redzone.*`, `canary.*` |
 
 ## Running the attacks under other tooling

@@ -179,4 +179,141 @@ int eval_delta(const json_value *before, const json_value *after,
 int eval_pid_stable(const json_value *before, const json_value *after,
     int may_change, char *why, size_t whylen);
 
+/*
+ * Number of DISTINCT values in `pids` (the answering worker pid of each fanout
+ * leg). Exposed separately from the oracle below so the counting and the
+ * comparison can each be driven to red on their own.
+ */
+size_t fanout_distinct_pids(const double *pids, size_t n);
+
+/*
+ * `fanout` coverage oracle. Returns 1 when the legs reached at least
+ * `min_workers` distinct workers, 0 with `why` filled otherwise.
+ *
+ * THIS IS THE LOAD-BEARING HALF OF THE DIRECTIVE. Worker sampling is
+ * probabilistic -- nothing lets a client pick which worker accepts its
+ * connection -- so N requests can legitimately all land on ONE worker. Every
+ * cross-worker assertion the case then makes is satisfied trivially, because a
+ * single worker always agrees with itself. Without this check the whole lens
+ * passes having sampled one worker N times: a coverage claim it never earned,
+ * and the exact vacuous-green shape this harness exists to rule out.
+ *
+ * So incomplete coverage FAILS. It is never a skip and never a quiet pass, and
+ * the message names both what was sampled and what was required so a red run
+ * says which of the two it was.
+ *
+ * `distinct_out`, when non-NULL, receives the distinct count on every path
+ * including the failing ones, so the caller can report it without recounting.
+ */
+int eval_fanout_coverage(const double *pids, size_t n, int min_workers,
+    size_t *distinct_out, char *why, size_t whylen);
+
+/*
+ * Largest value a zone counter may hold and still be treated as an honest
+ * reading. 2^31 - 2, i.e. 2147483646.
+ *
+ * The line sits one BELOW the smallest value an underflow can produce, and
+ * that is the constraint that fixes it rather than a round number chosen for
+ * looks. Enumerate what a wrapped counter actually arrives as:
+ *
+ *   - a generic zone field (slab_reqs, slab_fails, slab_used, digest) is
+ *     saturated at NGX_MAX_INT_T_VALUE by the emitter before it is rendered,
+ *     so a 64-bit wrap arrives as 2^63-1 and a 32-bit wrap as 2^31-1;
+ *   - a MODULE field rendered through the zone_render hook carries no such
+ *     saturation, so a wrapped ngx_uint_t arrives raw: 2^32-1 on a 32-bit
+ *     build, 2^64-1 on a 64-bit one. COR-5's varidx_inflight is exactly this
+ *     kind of field, which is why the module case is the one that decides the
+ *     threshold.
+ *
+ * The smallest of those four is 2^31-1, so the ceiling is 2^31-2: the guard
+ * must REFUSE 2^31-1, and a ceiling equal to it would admit it as honest.
+ * Note the saturation value doubles as an honest-looking reading in a way the
+ * raw wraps do not -- it is merely "a very large counter" -- which is exactly
+ * why the threshold is pinned to it rather than to the 2^64 figures.
+ *
+ * The other half -- that nothing honest is refused -- holds because these are
+ * counters read inside a TEST CASE. Two billion allocations in one zone, in
+ * one case, is not a workload any consumer's suite produces; a real one runs
+ * in the thousands. The gap between what a case reaches and where this line
+ * sits is six orders of magnitude, so a false positive would require a
+ * counter both real and astronomically larger than any test drives.
+ */
+#define QUIESCE_SANE_MAX  2147483646.0
+
+/*
+ * 1 when `v` cannot be an honest reading of a zone counter -- negative (which
+ * includes the -1 unavailable sentinel), or above QUIESCE_SANE_MAX.
+ *
+ * THE UNDERFLOW GUARD, exposed on its own so it can be driven to red without a
+ * zone or a worker. An ngx_uint_t decremented past zero does not read as -1;
+ * it reads as the largest value the type holds, and every bound a rule author
+ * writes for a resting counter (`>= 0`, `<= 1`, `!= 5`) is satisfied by it. An
+ * oracle that applied the operator first would therefore report ok on exactly
+ * the defect it exists to catch, so both callers below consult this FIRST.
+ */
+int quiesce_underflowed(double v);
+
+/*
+ * `zone_invariant coherent <field>`. Returns 1 when every reading in `vals` is
+ * an honest value AND all of them are equal, 0 with `why` filled otherwise.
+ *
+ * The zone is one mmap shared by every worker, so at rest they cannot honestly
+ * disagree about a field of it. A divergence is a torn read, a per-worker copy
+ * that drifted, or a write that never reached the shared page.
+ *
+ * Fewer than two readings FAILS rather than passes: a single sample is
+ * trivially coherent with itself, and the parser refuses a `zone_invariant`
+ * without a `fanout` precisely so that tautology cannot be reached from a rule
+ * file. Reaching it anyway means the executor disarmed the oracle, which must
+ * be loud.
+ */
+int eval_zone_coherent(const char *path, const double *vals, size_t n,
+    char *why, size_t whylen);
+
+/*
+ * `zone_invariant at_rest <field> <op> <value>`. Returns 1 when `have` is an
+ * honest reading AND satisfies `op`/`want`, 0 with `why` filled otherwise.
+ *
+ * COR-5's class: a shared inflight counter incremented on entry and
+ * decremented on teardown must be back at its resting value once the case has
+ * quiesced. The bound is checked BEFORE the operator -- see the body for why
+ * that ordering is the underflow defence rather than a detail of it.
+ *
+ * `literal` is the rule file's raw right-hand side, unquoted and converted
+ * inside this function rather than by the caller, so that the literal-handling
+ * failure paths belong to the same seam the verdict does and can be driven to
+ * red without a server.
+ */
+int eval_zone_at_rest(const char *path, const char *op, const char *literal,
+    double have, char *why, size_t whylen);
+
+/*
+ * `zone_invariant monotonic <field>`. Returns 1 when every reading is honest
+ * and no reading is smaller than the one before it, in collection order.
+ *
+ * For a cumulative counter such as `zone.slab_reqs`, never reset for the life
+ * of the zone. Fewer than two readings FAILS, for the same tautology reason
+ * eval_zone_coherent() gives.
+ */
+int eval_zone_monotonic(const char *path, const double *vals, size_t n,
+    char *why, size_t whylen);
+
+/*
+ * The `quiesce` verdict. Returns 1 when `settled` is true, 0 with `why` filled
+ * otherwise.
+ *
+ * EXPIRY FAILS, and the failure direction is the entire directive. A quiesce
+ * that timed out and then let the at-rest oracles run would report their
+ * verdict on a moving counter -- green on an idle host, red under load, until
+ * somebody loosens the bound and it asserts nothing. A quiesce that timed out
+ * and SKIPPED them would be indistinguishable from a pass in TAP.
+ *
+ * Trivial as a function and deliberately still a function: the polling lives
+ * in the executor where a probe read is available, and the verdict lives here
+ * where it can be driven to red without a server. Splitting them is what makes
+ * "expiry fails" a testable claim rather than a comment.
+ */
+int eval_quiesce(const char *path, int settled, int polls, int timeout_ms,
+    double last, double prev, char *why, size_t whylen);
+
 #endif /* NGX_TEST_HARNESS_ASSERT_H */

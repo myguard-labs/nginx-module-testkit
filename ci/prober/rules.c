@@ -48,6 +48,16 @@ case_free(test_case *tc)
     free(tc->source);
     free(tc->request);
     free(tc->xfail_reason);
+    free(tc->quiesce_path);
+
+    /* op and literal are NULL on the coherent/monotonic forms, which take no
+     * comparison of their own; free(NULL) is the defined no-op, so the loop
+     * needs no per-form branch. */
+    for (i = 0; i < tc->n_zone_invariants; i++) {
+        free(tc->zone_invariants[i].path);
+        free(tc->zone_invariants[i].op);
+        free(tc->zone_invariants[i].literal);
+    }
 
     for (i = 0; i < tc->n_no_logs; i++) {
         free(tc->no_logs[i].pattern);
@@ -425,6 +435,111 @@ pause_cost_ms(const http_pause *p, size_t upto)
     }
 
     return pause_cost_ms_raw(p->offset, upto, p->chunk, p->ms);
+}
+
+
+/*
+ * `zone_invariant <form> <field> [<op> <value>]` -- the cross-worker oracles.
+ *
+ * Three forms, one directive, because they share their subject: one field of
+ * the shm zone as read from every worker a `fanout` reached. They are NOT
+ * three directives because a rule author choosing between them is choosing
+ * what to demand of the same readings, and splitting them would let a file
+ * carry `coherent` and `at_rest` on one field without either of them being
+ * obviously about the same measurement.
+ *
+ * `at_rest` alone takes an operator and a value; the other two take none, and
+ * a trailing argument on them is refused rather than ignored. A silently
+ * dropped comparison is the worst outcome available here -- the rule file
+ * would state a bound the harness never applies, and report ok.
+ */
+static void
+parse_zone_invariant(test_case *tc, char *arg, const char *file, int lineno)
+{
+    char            *form, *path, *op, *lit, *tail;
+    zone_invariant  *zi;
+
+    if (tc->n_zone_invariants >= MAX_ASSERTS) {
+        die("%s:%d: too many zone_invariant lines (max %d)", file, lineno,
+            MAX_ASSERTS);
+    }
+
+    /* nosem: insecure-use-strtok-fn -- single-threaded loader, tokens consumed
+     * to completion in this arm; see the note at parse_assert. */
+    form = strtok(arg, " \t");   /* nosem: insecure-use-strtok-fn */
+    path = strtok(NULL, " \t");  /* nosem: insecure-use-strtok-fn */
+
+    if (form == NULL || path == NULL) {
+        die("%s:%d: zone_invariant needs <coherent|at_rest|monotonic> <field> "
+            "[<op> <value>]", file, lineno);
+    }
+
+    zi = &tc->zone_invariants[tc->n_zone_invariants];
+    zi->op = NULL;
+    zi->literal = NULL;
+
+    if (strcmp(form, "coherent") == 0) {
+        zi->kind = ZONE_INV_COHERENT;
+
+    } else if (strcmp(form, "monotonic") == 0) {
+        zi->kind = ZONE_INV_MONOTONIC;
+
+    } else if (strcmp(form, "at_rest") == 0) {
+        zi->kind = ZONE_INV_AT_REST;
+
+    } else {
+        die("%s:%d: zone_invariant: unknown form \"%s\" "
+            "(want coherent, at_rest or monotonic)", file, lineno, form);
+    }
+
+    if (zi->kind == ZONE_INV_AT_REST) {
+        op = strtok(NULL, " \t");  /* nosem: insecure-use-strtok-fn */
+        lit = strtok(NULL, "");    /* nosem: insecure-use-strtok-fn */
+
+        if (op == NULL || lit == NULL) {
+            die("%s:%d: zone_invariant at_rest needs <field> <op> <value>",
+                file, lineno);
+        }
+
+        if (!op_is_known(op)) {
+            die("%s:%d: zone_invariant at_rest: unknown operator \"%s\" "
+                "(want ==, !=, <, <=, >, >=)", file, lineno, op);
+        }
+
+        /* `~` is a substring test. The field it would apply to is a counter,
+         * and a substring test on a number is either a type error at
+         * evaluation time or, worse, a comparison that happens to pass. Caught
+         * at the line that wrote it. */
+        if (strcmp(op, "~") == 0) {
+            die("%s:%d: zone_invariant at_rest: \"~\" is a substring test and "
+                "cannot apply to a counter", file, lineno);
+        }
+
+        lit = trim(lit);
+
+        if (*lit == '\0') {
+            die("%s:%d: zone_invariant at_rest needs <field> <op> <value>",
+                file, lineno);
+        }
+
+        zi->op = xstrdup(op);
+        zi->literal = xstrdup(lit);
+
+    } else {
+        /* Refused, not ignored: a `coherent` line carrying `== 0` states a
+         * bound this form never applies, and a file whose author believes the
+         * bound is enforced is worse off than one whose line failed to load. */
+        tail = strtok(NULL, "");  /* nosem: insecure-use-strtok-fn */
+
+        if (tail != NULL && *trim(tail) != '\0') {
+            die("%s:%d: zone_invariant %s takes only <field> "
+                "(the trailing \"%s\" would be ignored)",
+                file, lineno, form, trim(tail));
+        }
+    }
+
+    zi->path = xstrdup(path);
+    tc->n_zone_invariants++;
 }
 
 
@@ -1405,6 +1520,150 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
 
             cases[n - 1].open_conns = (int) count;
 
+        } else if (strcmp(directive, "fanout") == 0) {
+            char   *rest = trim(arg);
+            char   *stop;
+            long    count;
+            long    minw;
+
+            if (*rest == '\0') {
+                die("%s:%d: fanout needs <count> [min_workers]", file, lineno);
+            }
+
+            count = strtol(rest, &stop, 10);
+
+            if (stop == rest) {
+                die("%s:%d: fanout count \"%s\" is not a number",
+                    file, lineno, rest);
+            }
+
+            /* Same floor and reasoning as `concurrent`: `fanout 1` is the
+             * ordinary path with extra machinery, and accepting it would let a
+             * rule file claim a cross-worker test while only ever reaching one
+             * worker -- the vacuous-gate shape this harness exists to catch. */
+            if (count < 2 || count > MAX_CONCURRENT) {
+                die("%s:%d: fanout %ld out of range (2..%d)",
+                    file, lineno, count, MAX_CONCURRENT);
+            }
+
+            rest = trim(stop);
+
+            if (*rest == '\0') {
+                /*
+                 * Default: require at least 2 DISTINCT workers.
+                 *
+                 * Not 1. Worker sampling is probabilistic -- nothing lets a
+                 * client pick which worker accepts its connection -- so N
+                 * requests can legitimately all land on one worker. A default
+                 * of 1 would let the entire lens pass having sampled a single
+                 * worker N times, which is a coverage claim it never earned.
+                 * Requiring 2 makes incomplete coverage FAIL rather than pass
+                 * quietly, which is the whole point of the directive.
+                 */
+                minw = 2;
+
+            } else {
+                minw = strtol(rest, &stop, 10);
+
+                if (stop == rest || *trim(stop) != '\0') {
+                    die("%s:%d: fanout min_workers \"%s\" is not a number",
+                        file, lineno, rest);
+                }
+
+                if (minw < 2 || minw > count) {
+                    die("%s:%d: fanout min_workers %ld out of range (2..%ld)",
+                        file, lineno, minw, count);
+                }
+            }
+
+            if (cases[n - 1].fanout != 0) {
+                die("%s:%d: fanout already set for this case", file, lineno);
+            }
+
+            /* Mutually exclusive with `block`, for the reason `concurrent`
+             * refuses it: a pipeline is ordered on ONE connection, so it
+             * reaches exactly one worker and a fanout over it would assert
+             * cross-worker agreement having sampled a single worker. */
+            if (cases[n - 1].n_blocks > 0) {
+                die("%s:%d: fanout cannot be combined with block "
+                    "(a pipeline is one connection, so it reaches one worker)",
+                    file, lineno);
+            }
+
+            if (cases[n - 1].concurrent != 0) {
+                die("%s:%d: fanout cannot be combined with concurrent "
+                    "(both drive the request count; pick one)",
+                    file, lineno);
+            }
+
+            cases[n - 1].fanout = (int) count;
+            cases[n - 1].fanout_min_workers = (int) minw;
+
+        } else if (strcmp(directive, "quiesce") == 0) {
+            char   *rest = trim(arg);
+            char   *stop;
+            char   *path;
+            long    timeout;
+
+            if (*rest == '\0') {
+                die("%s:%d: quiesce needs <path> [timeout_ms]", file, lineno);
+            }
+
+            /* nosem: insecure-use-strtok-fn -- single-threaded loader, tokens
+             * consumed to completion in this arm; see parse_assert. */
+            path = strtok(rest, " \t");  /* nosem: insecure-use-strtok-fn */
+            rest = strtok(NULL, "");     /* nosem: insecure-use-strtok-fn */
+
+            if (path == NULL || *path == '\0') {
+                die("%s:%d: quiesce needs <path> [timeout_ms]", file, lineno);
+            }
+
+            if (rest == NULL || *trim(rest) == '\0') {
+                timeout = QUIESCE_DEFAULT_MS;
+
+            } else {
+                rest = trim(rest);
+                timeout = strtol(rest, &stop, 10);
+
+                /* Whole-argument check: a timeout that silently parsed as its
+                 * numeric prefix would make the case wait a different time
+                 * than the file spells, and the directive's entire value is
+                 * that the wait is stated rather than guessed. */
+                if (stop == rest || *trim(stop) != '\0') {
+                    die("%s:%d: quiesce timeout_ms \"%s\" is not a number",
+                        file, lineno, rest);
+                }
+
+                /*
+                 * A floor of 1, not 0. `quiesce <path> 0` would expire before
+                 * the first pair of samples could be compared, so it is a
+                 * directive that always fails for a reason unrelated to the
+                 * code under test -- and a rule author whose case reddens on
+                 * a typo'd zero would sooner delete the line than debug it.
+                 * Refuse it at load time with the line number instead.
+                 */
+                if (timeout < 1 || timeout > QUIESCE_MAX_MS) {
+                    die("%s:%d: quiesce timeout_ms %ld out of range (1..%d)",
+                        file, lineno, timeout, QUIESCE_MAX_MS);
+                }
+            }
+
+            if (cases[n - 1].quiesce_path != NULL) {
+                die("%s:%d: quiesce already set for this case", file, lineno);
+            }
+
+            /* The "a quiesce nothing observes is a sleep" rule is enforced in
+             * the post-parse pass, not here: at this line the case's own
+             * assertions may not have been read yet, and a rejection that
+             * depended on whether the author wrote `quiesce` above or below
+             * its `probe` would be a parser that judges line order. */
+
+            cases[n - 1].quiesce_path = xstrdup(path);
+            cases[n - 1].quiesce_timeout_ms = (int) timeout;
+
+        } else if (strcmp(directive, "zone_invariant") == 0) {
+            parse_zone_invariant(&cases[n - 1], trim(arg), file, lineno);
+
         } else if (strcmp(directive, "concurrent") == 0) {
             char   *count_s = trim(arg);
             char   *stop;
@@ -1436,6 +1695,15 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
 
             if (cases[n - 1].concurrent != 0) {
                 die("%s:%d: concurrent already set for this case",
+                    file, lineno);
+            }
+
+            /* The mirror of the check in `fanout` above -- the pair must be
+             * refused whichever order the two directives appear in, or the
+             * rejection depends on line order. */
+            if (cases[n - 1].fanout != 0) {
+                die("%s:%d: concurrent cannot be combined with fanout "
+                    "(both drive the request count; pick one)",
                     file, lineno);
             }
 
@@ -1545,6 +1813,46 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
             die("%s: case \"%s\" carries open_conns %d but no probe assertion; "
                 "the held connections would be observed by nothing", file,
                 tc->name != NULL ? tc->name : "(unnamed)", tc->open_conns);
+        }
+
+        /*
+         * A `quiesce` nothing observes is a pause, not an oracle: it costs the
+         * case its poll interval and asserts nothing about the settled state
+         * it waited for. Requiring an assertion that READS that state keeps
+         * the directive from degrading into a sleep with a justification
+         * attached -- the same vacuous-directive shape open_conns and
+         * concurrent are refused for, and the shape that matters most here,
+         * since the whole reason quiesce exists is to make the oracles that
+         * follow it trustworthy.
+         */
+        if (tc->quiesce_path != NULL
+            && tc->n_probes == 0
+            && tc->n_deltas == 0
+            && tc->n_baselines == 0
+            && tc->n_zone_invariants == 0)
+        {
+            die("%s: case \"%s\" carries quiesce but no probe/delta/"
+                "probe_baseline/zone_invariant assertion; the settled state "
+                "would be read by nothing (a quiesce nothing reads is a "
+                "sleep)", file, tc->name != NULL ? tc->name : "(unnamed)");
+        }
+
+        /*
+         * `zone_invariant` is judged against the per-leg probe snapshots a
+         * `fanout` collects. Without a fanout the case takes ONE snapshot, and
+         * all three forms then pass by construction: a single reading is
+         * trivially coherent with itself and trivially non-decreasing. That is
+         * an oracle guaranteed to report ok -- worse than no oracle, because
+         * the green is believed. Refused at load time rather than passed
+         * vacuously at run time.
+         */
+        if (tc->n_zone_invariants > 0 && tc->fanout == 0) {
+            die("%s: case \"%s\" carries %zu zone_invariant line(s) but no "
+                "fanout; one snapshot is trivially coherent with itself and "
+                "trivially monotonic, so every form would pass by "
+                "construction", file,
+                tc->name != NULL ? tc->name : "(unnamed)",
+                tc->n_zone_invariants);
         }
 
         /*

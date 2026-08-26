@@ -488,7 +488,7 @@ ngx_test_probe_timer_count(void)
  * reachable as a real value (all three are counts), so the sentinel never
  * masks a legitimate reading.
  *
- * @sentinel-schema: zone.slab_reqs zone.slab_fails zone.slab_used
+ * @sentinel-schema: zone.slab_reqs zone.slab_fails zone.slab_used zone.digest
  */
 u_char *
 ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
@@ -498,6 +498,7 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
     ngx_int_t        fds, fd_sock, fd_file, fd_anon, fd_other, pss, priv_dirty;
     ngx_int_t        timers;
     ngx_int_t        slab_reqs, slab_fails, slab_used;
+    ngx_int_t        zone_digest;
     ngx_uint_t       pages_free, pool_blocks, pool_large, pool_cleanup;
     ngx_uint_t       slot, slab_slots;
     ngx_uint_t       reqs_sum, fails_sum, used_sum;
@@ -670,6 +671,7 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
         slab_reqs = -1;
         slab_fails = -1;
         slab_used = -1;
+        zone_digest = -1;
 
     } else {
         slab_slots = (ngx_uint_t) ngx_pagesize_shift - shpool->min_shift;
@@ -709,6 +711,36 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                     ? NGX_MAX_INT_T_VALUE : (ngx_int_t) reqs_sum;
         slab_fails = (fails_sum > (ngx_uint_t) NGX_MAX_INT_T_VALUE)
                      ? NGX_MAX_INT_T_VALUE : (ngx_int_t) fails_sum;
+        /*
+         * A cheap mix of the zone's own accounting, for CROSS-WORKER
+         * comparison.
+         *
+         * The zone is the same bytes in every worker, so two workers reading
+         * it at rest must agree. Comparing the four figures individually costs
+         * four probe fields and four rule lines per worker pair; one digest
+         * compares them in a single assertion and, more importantly, is
+         * ORDER-INDEPENDENT of which worker answered -- the property that
+         * makes `whichever worker replied` usable as an oracle rather than a
+         * caveat.
+         *
+         * NOT a cryptographic hash and must never be described as one. It is a
+         * change detector: a collision means two genuinely different zone
+         * states hash alike and a divergence goes unreported. The multipliers
+         * are distinct odd primes so that a change in any one input moves the
+         * result, and the inputs are summed rather than concatenated because
+         * a slot-order change is not a state change.
+         *
+         * Deliberately does NOT include pages_free: that figure is read from
+         * the slab's free-page list, which legitimately differs between two
+         * reads taken microseconds apart while a request is in flight. Mixing
+         * it in would make the digest disagree between workers under perfectly
+         * healthy load -- an oracle that fires on correct behaviour is one
+         * that gets disabled.
+         */
+        zone_digest = (ngx_int_t) ((reqs_sum * 31 + fails_sum * 131
+                                    + used_sum * 8191)
+                                   & (ngx_uint_t) NGX_MAX_INT_T_VALUE);
+
         slab_used = (used_sum > (ngx_uint_t) NGX_MAX_INT_T_VALUE)
                     ? NGX_MAX_INT_T_VALUE : (ngx_int_t) used_sum;
     }
@@ -728,12 +760,14 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                      "\"slab_pages_free\":%ui,"
                      "\"slab_reqs\":%i,"
                      "\"slab_fails\":%i,"
-                     "\"slab_used\":%i",
+                     "\"slab_used\":%i,"
+                     "\"digest\":%i",
                      (size_t) zone->shm.size,
                      pages_free,
                      slab_reqs,
                      slab_fails,
-                     slab_used);
+                     slab_used,
+                     zone_digest);
 
     /*
      * Module-specific members go inside the zone object, so a consuming

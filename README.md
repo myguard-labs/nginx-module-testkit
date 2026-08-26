@@ -91,7 +91,11 @@ green run proving nothing:
   allocation becomes visible.
 - **[Concurrency](docs/attack-concurrency.md)** — `concurrent N` holds N requests
   in flight at once (`concurrent-fan`), `open_conns` parks bare connections,
-  `backpressure` attacks the write path with a reader that will not drain.
+  `backpressure` attacks the write path with a reader that will not drain, and
+  `fanout`/`quiesce`/`zone_invariant` (`shm-coherence`) catch cross-process shm
+  races that helgrind and TSan cannot see at all — a leaked or diverged counter
+  across nginx's fork()ed workers, not the interleaving itself. Verified on
+  nginx and angie 1.12.0.
 - **[Environmental hostility](docs/attack-environment.md)** — the
   `locale-hostility` CI job re-runs the self-tests under `tr_TR.UTF-8` and
   `de_DE.UTF-8` (both have caught a real bug), and `syscall-allowlist` traces
@@ -888,6 +892,147 @@ Three combinations are rejected at load time rather than silently resolved:
 - **`abort`, `hold`, `expect_idle`** — each ends its connection *without ever
   reading a response*, so a fan carrying one would collect nothing to assert
   against.
+
+`fanout <N> [min_workers]` is the cross-**worker** relative of `concurrent`, and
+the two answer different questions. `concurrent` asks *what happens when N
+requests overlap*, and holds them all in flight to create that overlap.
+`fanout` asks *do the workers agree about shared state*, and only needs to
+REACH several workers — whether the requests overlapped is irrelevant to it:
+
+```text
+name    every worker sees the same zone
+send    GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+fanout  8 3
+probe   zone.digest >= 0
+```
+
+It rests on a property that `multi-worker.rule` documents as a *limitation*: the
+probe reports state for whichever worker answered. That makes `fds` and
+`pool.cycle_used` meaningless under `worker_processes > 1`, because those are
+**per-worker**. The shm zone is the opposite — it is the same bytes in every
+worker, so any worker's answer is a view of shared truth and a **disagreement
+between two workers is itself a finding**. `zone.digest` exists to make that
+comparison one field wide.
+
+**What the directive guarantees, precisely:** that `N` requests were sent and
+that at least `min_workers` *distinct* worker pids answered them. It does not
+and cannot choose which worker serves a connection — nothing in the client can.
+So the coverage is **asserted, never assumed**: `min_workers` defaults to `2`
+and the case FAILS when the fan reaches fewer. That failure direction is the
+whole point. A lens that passed after sampling one worker `N` times would be
+claiming cross-worker agreement it never observed, which is precisely the
+vacuous-gate shape this harness exists to catch.
+
+A count must be `2..64` and `min_workers` must be `2..count`. Both floors are
+`2` for the same reason `concurrent`'s is: one request reaches one worker, and
+one worker cannot disagree with itself. A `min_workers` above the count is
+refused as well — a bound nothing can satisfy makes every case fail for a
+reason unrelated to the code under test.
+
+`fanout` is mutually exclusive with both `block` (a pipeline is ordered on ONE
+connection, so it reaches one worker) and `concurrent` (both drive the request
+count). Both pairs are rejected at load time in **either order**, so the
+diagnostic does not depend on which directive a file happens to name first.
+
+`quiesce <path> [timeout_ms]` polls the probe until `path` reads the **same
+value on two consecutive snapshots**, before any assertion in the case is
+judged:
+
+```text
+name    the inflight counter comes back to zero
+send    GET /cached HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n
+fanout  8
+quiesce zone.varidx_inflight
+zone_invariant at_rest zone.varidx_inflight == 0
+```
+
+It is the precondition every at-rest oracle rests on. A shared counter that a
+request bumps and the response's teardown decrements is *not* back at its
+resting value the instant the last byte reaches the client — the worker still
+has work to do. An `at_rest` assertion judged at that moment is
+**timing-dependent**: green on an idle host, red on a loaded one, and the usual
+repair is to loosen the bound until it stops firing, at which point it asserts
+nothing at all.
+
+Two consecutive equal reads rather than one read after a fixed sleep. A sleep
+encodes a guess about the host; equality of two independent samples is a
+property of the counter itself.
+
+**What it guarantees, precisely:** that two samples of `path`, taken one poll
+interval apart, were equal. It is **not** a proof of rest — a counter can sit
+still between two samples and move again afterwards — and nothing here should
+be read as claiming otherwise. It is the strongest cheap evidence available,
+and it is strictly better than judging at an arbitrary moment.
+
+**Expiry FAILS.** Never a skip, never a quiet pass. A quiesce that timed out and
+then let the at-rest oracles run would report their verdict on a moving
+counter, which is the timing dependence the directive exists to remove; one
+that timed out and *skipped* them would be indistinguishable from a pass in
+TAP. The failure names the budget, the poll count and the last two readings,
+because "never settled" and "settled at the wrong value" are different bugs.
+
+The timeout defaults to `2000` ms and must be `1..30000`. The floor is `1`, not
+`0`: a zero-millisecond quiesce expires before the two samples it needs could
+ever be compared, so it would fail every case for a reason unrelated to the
+code under test. A `quiesce` on a case with no `probe`, `delta`,
+`probe_baseline` or `zone_invariant` is refused at load time — a wait nothing
+reads is a sleep, not an oracle.
+
+`zone_invariant <form> <field> [<op> <value>]` is the lens this capability
+exists for. Three forms, judged against the readings a `fanout` collected:
+
+| form | asserts |
+| --- | --- |
+| `coherent <field>` | every answering worker read the **same** value |
+| `at_rest <field> <op> <value>` | the field returned to its resting value |
+| `monotonic <field>` | the field **never decreased** across the readings |
+
+```text
+name    the workers agree and the traffic counter only climbs
+send    GET /cached HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n
+fanout  8 3
+zone_invariant coherent  zone.digest
+zone_invariant monotonic zone.slab_reqs
+```
+
+`coherent` rests on the property the whole lens does: the zone is one mmap
+shared by every worker, so at rest they cannot honestly disagree about a field
+of it. A divergence is a torn read, a per-worker copy that drifted, or a write
+that never reached the shared page.
+
+`at_rest` is [COR-5][cor5]'s class — a shared inflight counter incremented on
+entry and decremented on teardown, which must be back at `0`. It is judged on
+the reading taken furthest from the case's own traffic, and it is the form that
+wants a `quiesce` above it.
+
+**The `at_rest` comparison is bounded, and the bound runs BEFORE the
+operator.** That ordering is the whole underflow defence rather than a detail
+of it. The counter is an `ngx_uint_t`; one decrement too many does not read as
+`-1` but as the largest value the type holds, and the operators a rule author
+naturally writes for a resting counter — `>= 0`, `<= 1`, `!= 5` — are **every
+one of them satisfied** by that value. An oracle that applied the operator
+first would report `ok` on precisely the defect it was written to catch. So a
+reading that is negative (which includes the `-1` unavailable sentinel) or
+above the sanity ceiling is refused as its own failure, and no operator is
+applied to it at all. The same guard runs ahead of `coherent` and `monotonic`,
+because two workers can agree on a wrapped value and a wrap *reads as an
+increase*.
+
+**A `zone_invariant` without a `fanout` is refused at load time.** One snapshot
+is trivially coherent with itself and trivially non-decreasing, so all three
+forms would pass by construction — an oracle guaranteed to report `ok`, which
+is worse than no oracle because the green is believed. `coherent` and
+`monotonic` take **no** comparison of their own, and a trailing `== 0` on
+either is *refused rather than ignored*: a file whose author believes a bound
+is enforced is worse off than one whose line failed to load.
+
+**What `zone_invariant` is not:** a race detector. It observes broken
+invariants, never the interleaving that broke them. It finds a leaked counter,
+a diverged view and an underflow; it cannot tell you which two workers raced or
+in what order. Claiming otherwise would recreate the vacuous-green problem this
+lens was built to fix.
+
+[cor5]: https://github.com/myguard-labs/nginx-cache-turbo-module
 
 `expect_close_within` and `recv_slow` **used to be a fourth rejection and are now
 allowed individually.** The fan drained its legs in index order with a blocking

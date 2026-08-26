@@ -901,6 +901,105 @@ mutate "idle: data reported as a close" http.c \
                 break;
             }' http_test
 
+# The fanout coverage oracle -- the load-bearing half of the directive. Worker
+# sampling is probabilistic, so N requests can legitimately all land on ONE
+# worker; every cross-worker assertion the case then makes is satisfied
+# trivially, because a single worker always agrees with itself. Both halves are
+# anchored separately because they fail differently: without the comparison the
+# lens passes having sampled one worker N times, and without the dedupe the
+# count is just the leg count and the bound is met by construction.
+mutate "fanout: coverage bound never enforced" assert.c \
+    '    if (distinct < (size_t) min_workers) {' \
+    '    if (0 && distinct < (size_t) min_workers) {' assert_test
+
+mutate "fanout: distinct-pid dedupe removed" assert.c \
+    '            if (pids[j] == pids[i]) {' \
+    '            if (0 && pids[j] == pids[i]) {' assert_test
+
+# The same two halves again, but judged by the LIVE four-worker scenario rather
+# than by assert_test's synthetic readings. Not redundant with the rows above:
+# those prove the comparison is correct as a function, this proves the comparison
+# is actually REACHED on the path a real fanout takes -- through the executor's
+# per-leg probe reads, against pids that came from four forked workers rather
+# than from an array literal. A refactor that stopped calling the oracle from
+# prober.c, or that lost the pid on the way out of the probe document, leaves
+# every assert_test row green while the live lens asserts nothing.
+#
+# The scenario reddens because its driver runs a fixture demanding 8 distinct
+# workers from a 4-worker server and REQUIRES that fixture to fail. Disarm the
+# comparison and the fixture passes, which the driver reports as
+# "THE COVERAGE ORACLE DID NOT FIRE".
+mutate "fanout: coverage bound never enforced (live workers)" assert.c \
+    '    if (distinct < (size_t) min_workers) {' \
+    '    if (0 && distinct < (size_t) min_workers) {' \
+    scenarios/shm-coherence/mutate-suite.sh
+
+mutate "fanout: distinct-pid dedupe removed (live workers)" assert.c \
+    '            if (pids[j] == pids[i]) {' \
+    '            if (0 && pids[j] == pids[i]) {' \
+    scenarios/shm-coherence/mutate-suite.sh
+
+# The underflow guard. An ngx_uint_t decremented past zero does not read as -1;
+# it reads as the largest value the type holds, and the operators a rule author
+# naturally writes for a resting counter (>= 0, <= 1, != 5) are EVERY ONE of
+# them satisfied by that value. Both halves are anchored: the negative arm
+# (which catches the -1 unavailable sentinel) and the ceiling arm (which catches
+# the wrap itself). Disarming either lets an oracle report ok on precisely the
+# defect it exists to catch.
+mutate "at_rest: underflow ceiling never applied" assert.c \
+    '    return (v < 0) || (v > QUIESCE_SANE_MAX);' \
+    '    return (v < 0);' assert_test
+
+mutate "at_rest: the -1 unavailable sentinel treated as honest" assert.c \
+    '    return (v < 0) || (v > QUIESCE_SANE_MAX);' \
+    '    return (v > QUIESCE_SANE_MAX);' assert_test
+
+# The three zone_invariant comparisons. Each is the load-bearing half of its
+# form: without it the form reports ok on the exact state it was written to
+# find -- a diverged worker view, a leaked counter, a counter that went
+# backwards.
+mutate "zone_invariant coherent: divergence never reported" assert.c \
+    '        if (vals[i] != vals[0]) {' \
+    '        if (0 && vals[i] != vals[0]) {' assert_test
+
+mutate "zone_invariant at_rest: the bound never enforced" assert.c \
+    '    if (!compare_number(have, op, want)) {' \
+    '    if (0 && !compare_number(have, op, want)) {' assert_test
+
+mutate "zone_invariant monotonic: a decrease never reported" assert.c \
+    '        if (vals[i] < vals[i - 1]) {' \
+    '        if (0 && vals[i] < vals[i - 1]) {' assert_test
+
+# The single-sample tautology guards. One reading is trivially coherent with
+# itself and trivially non-decreasing, so a form that accepted n < 2 would be
+# an oracle guaranteed to pass. The parser makes it unreachable from a rule
+# file; these rows prove the evaluator refuses it anyway.
+mutate "zone_invariant coherent: one reading accepted as coherent" assert.c \
+    '    if (n < 2) {
+        snprintf(why, whylen, "zone_invariant coherent %.128s: only %zu "' \
+    '    if (0) {
+        snprintf(why, whylen, "zone_invariant coherent %.128s: only %zu "' assert_test
+
+mutate "zone_invariant monotonic: one reading accepted as monotonic" assert.c \
+    '    if (n < 2) {
+        snprintf(why, whylen, "zone_invariant monotonic %.128s: only %zu "' \
+    '    if (0) {
+        snprintf(why, whylen, "zone_invariant monotonic %.128s: only %zu "' assert_test
+
+# THE quiesce row. Expiry FAILS, never passes -- that direction is the entire
+# directive. A quiesce that timed out and returned 1 would let every at-rest
+# oracle in the case run against a moving counter, which is the timing
+# dependence the directive exists to remove.
+mutate "quiesce: expiry reported as settled" assert.c \
+    '    if (settled) {
+        return 1;
+    }' \
+    '    if (settled) {
+        return 1;
+    }
+
+    return 1;' assert_test
+
 # The verdict. An idle wait that passes on data or a close is an assertion that
 # can never go red -- it would report green for exactly the two server bugs it
 # was written to catch.
@@ -976,8 +1075,10 @@ mutate "open_conns: probe-assertion guard removed" rules.c \
 # directive's name, so without this a rule file can claim a concurrency test that
 # holds nothing in flight and asserts nothing about overlap.
 mutate "concurrent: floor of 2 lowered to 1" rules.c \
-    '            if (count < 2 || count > MAX_CONCURRENT) {' \
-    '            if (count < 1 || count > MAX_CONCURRENT) {' rules_test
+    '            if (count < 2 || count > MAX_CONCURRENT) {
+                die("%s:%d: concurrent %ld out of range (2..%d)",' \
+    '            if (count < 1 || count > MAX_CONCURRENT) {
+                die("%s:%d: concurrent %ld out of range (2..%d)",' rules_test
 
 # The observability guard. The probe snapshots bracketing the fan are the ONLY
 # thing that observes the overlap; without this a case pays for N connections and
