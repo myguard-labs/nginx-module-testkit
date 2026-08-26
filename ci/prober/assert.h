@@ -179,4 +179,33 @@ int eval_delta(const json_value *before, const json_value *after,
 int eval_pid_stable(const json_value *before, const json_value *after,
     int may_change, char *why, size_t whylen);
 
+/*
+ * Number of DISTINCT values in `pids` (the answering worker pid of each fanout
+ * leg). Exposed separately from the oracle below so the counting and the
+ * comparison can each be driven to red on their own.
+ */
+size_t fanout_distinct_pids(const double *pids, size_t n);
+
+/*
+ * `fanout` coverage oracle. Returns 1 when the legs reached at least
+ * `min_workers` distinct workers, 0 with `why` filled otherwise.
+ *
+ * THIS IS THE LOAD-BEARING HALF OF THE DIRECTIVE. Worker sampling is
+ * probabilistic -- nothing lets a client pick which worker accepts its
+ * connection -- so N requests can legitimately all land on ONE worker. Every
+ * cross-worker assertion the case then makes is satisfied trivially, because a
+ * single worker always agrees with itself. Without this check the whole lens
+ * passes having sampled one worker N times: a coverage claim it never earned,
+ * and the exact vacuous-green shape this harness exists to rule out.
+ *
+ * So incomplete coverage FAILS. It is never a skip and never a quiet pass, and
+ * the message names both what was sampled and what was required so a red run
+ * says which of the two it was.
+ *
+ * `distinct_out`, when non-NULL, receives the distinct count on every path
+ * including the failing ones, so the caller can report it without recounting.
+ */
+int eval_fanout_coverage(const double *pids, size_t n, int min_workers,
+    size_t *distinct_out, char *why, size_t whylen);
+
 #endif /* NGX_TEST_HARNESS_ASSERT_H */

@@ -640,6 +640,136 @@ run_case(const test_case *tc, const json_value *baseline)
 
         free(resps);
 
+    } else if (tc->fanout > 0) {
+        /*
+         * Fanout -- N copies of this case's request sent so that several
+         * WORKERS answer, and the distinct answering pids counted.
+         *
+         * Deliberately SEQUENTIAL, which is the semantic difference from
+         * `concurrent` and not an implementation shortcut. `concurrent` holds
+         * N requests in flight at once because it is asking what happens when
+         * they OVERLAP; fanout only needs the requests to REACH distinct
+         * workers and does not care whether they overlapped (rules.h documents
+         * exactly this). Sequential dispatch also buys the transport back:
+         * http_request() takes tls_opt and goes through http_connect(), so
+         * unlike the concurrent path above this one works under --tls with no
+         * fallback and no skip.
+         *
+         * Every leg is evaluated against the case's own expectations, same as
+         * the concurrent path: a request answered differently by one worker is
+         * a finding in its own right, and the leg number is carried into the
+         * label so a failure names which one.
+         *
+         * The pid of each leg is read from the leg's own probe snapshot rather
+         * than from the response, because the pid the coverage oracle needs is
+         * the pid of the worker that served THAT request, which is what the
+         * probe document renders.
+         */
+        double  *pids;
+        int      leg;
+        size_t   n_pids = 0;
+        size_t   distinct = 0;
+
+        /*
+         * Allocated only once the path is committed to running. A guard placed
+         * AFTER this calloc leaks every byte of it on the early return -- gcc
+         * -fanalyzer and cppcheck both caught exactly that shape on the
+         * concurrent branch above, so there is nothing between the allocation
+         * and its owning loop here.
+         */
+        pids = calloc((size_t) tc->fanout, sizeof(*pids));
+
+        if (pids == NULL) {
+            printf("# fanout: out of memory for %d pids\n", tc->fanout);
+            json_free(before);
+            return 0;
+        }
+
+        for (leg = 0; leg < tc->fanout; leg++) {
+            char               label[256];
+            json_value        *doc;
+            const json_value  *pid;
+
+            snprintf(label, sizeof(label), "fanout leg %d/%d: ",
+                     leg + 1, tc->fanout);
+
+            if (http_request(opt_host, opt_port, tc->request, tc->request_len,
+                             opt_timeout_ms, tc->source,
+                             tc->pauses, tc->n_pauses, tc->shut_how,
+                             tc->abort_at, tc->hold_ms, &tc->recv_opt,
+                             tc->saw_close_within, tc->idle_ms, 0, &opt_tls,
+                             &resp, errbuf, sizeof(errbuf)) != 0)
+            {
+                printf("# %srequest failed: %s\n", label, errbuf);
+                free(pids);
+                json_free(before);
+                return 0;
+            }
+
+            if (opt_verbose) {
+                printf("# %s<- status %d, %zu body bytes\n",
+                       label, resp.status, resp.body_len);
+            }
+
+            if (!eval_exchange(label, tc->dechunk, tc->gunzip, tc->json_sort,
+                               tc->expects, tc->n_expects,
+                               tc->saw_close_within, tc->close_within_ms,
+                               tc->saw_idle, tc->idle_ms, &resp))
+            {
+                ok = 0;
+            }
+
+            http_response_free(&resp);
+
+            /*
+             * A leg whose pid cannot be read is a FAILURE, not a leg quietly
+             * dropped from the sample: silently shrinking n_pids would make
+             * the coverage bound easier to miss and harder to explain, which
+             * inverts the point of the oracle.
+             */
+            doc = fetch_probe(errbuf, sizeof(errbuf));
+
+            if (doc == NULL) {
+                printf("# %s%s\n", label, errbuf);
+                free(pids);
+                json_free(before);
+                return 0;
+            }
+
+            pid = json_get(doc, "pid");
+
+            if (pid == NULL || pid->type != JSON_NUMBER) {
+                printf("# %sthe probe document carries no numeric \"pid\", so "
+                       "the answering worker cannot be identified\n", label);
+                json_free(doc);
+                free(pids);
+                json_free(before);
+                return 0;
+            }
+
+            pids[n_pids++] = pid->number;
+            json_free(doc);
+        }
+
+        /*
+         * The coverage oracle. Incomplete coverage FAILS -- see
+         * eval_fanout_coverage() for why a quiet pass here would make every
+         * cross-worker assertion in the case vacuous.
+         */
+        if (!eval_fanout_coverage(pids, n_pids, tc->fanout_min_workers,
+                                  &distinct, why, sizeof(why)))
+        {
+            printf("# %s\n", why);
+            ok = 0;
+
+        } else if (opt_verbose) {
+            printf("# fanout: %zu of %d responses came from %zu distinct "
+                   "workers (need >= %d)\n",
+                   n_pids, tc->fanout, distinct, tc->fanout_min_workers);
+        }
+
+        free(pids);
+
     } else if (tc->n_blocks == 0) {
         /*
          * Legacy single-exchange path -- one connect/write/read/close, exactly
