@@ -139,9 +139,30 @@ to extend, bend and repurpose it** for whatever gives this module real signal:
   the total across a run (it catches the one-unit-per-case drip that every
   `delta` reads as zero), and `prober_slope_check` divides growth over N
   operations after a discarded warmup.
+- **Memory corruption the sanitizers cannot see** — read
+  `docs/attack-memory-corruption.md` before assuming ASan has you covered. It
+  does not, and the reason is structural rather than a matter of configuration:
+  `ngx_palloc_small()` is a bump allocator, so a pool holding two hundred
+  objects is ONE live allocation to ASan and an overflow from one object into
+  its neighbour is invisible; an shm zone is one `mmap` created before the
+  fork, so the same is true of every slab chunk *and* the corruption may have
+  been written by a different process entirely, which no single-address-space
+  tool models. Both claims are demonstrated by controls in the test suite, not
+  asserted. Route the allocations under test through
+  `ngx_test_probe_palloc()` / `ngx_test_probe_slab_alloc()` and assert
+  `redzone.violations == 0` and `canary.violations == 0` — **each paired with
+  its `checked > 0` companion**, because zero violations out of zero guarded
+  allocations is the vacuous pass you get by wiring the header in and never
+  calling the allocator. The slab half also poisons freed chunks, which is the
+  only use-after-free signal available on shared memory.
 - **Sanitizers** — `SAN=1` builds work. Note the harness's own policy: it does
   not instrument nginx core, because that spends budget re-testing upstream's
-  code. Instrument *your module*.
+  code. Instrument *your module*. And note what a sanitizer **cannot** reach in
+  an nginx module: helgrind and TSan model pthread races inside one address
+  space, while nginx workers are `fork()`ed processes sharing an `mmap` under
+  `ngx_shmtx`. A green helgrind soak over a module whose only shared state is
+  an shm zone proves nothing about that state — it is the wrong lens, not a
+  weak one.
 - **Fault injection** — `fault_slab=`, `fault_palloc=`, `fault_tempfile=`,
   `fault_accept=` make the allocator fail on the Nth call. Most module bugs
   live on the error path nobody exercises, because in a healthy test the
@@ -172,7 +193,7 @@ repo**, not only into the module you are working in.
 Open a **pull request against `myguard-labs/nginx-module-testkit`** adding a
 single new directory:
 
-```
+```text
 feedback/<YYYY-MM-DD>-<short-description>/
 ```
 
@@ -245,6 +266,11 @@ Walk the repo and ask, for each:
   `prober_slope_check`? They are complements: `delta` localises the jump,
   `probe_baseline` bounds the run total, the slope catches what both read as
   zero.
+- **Memory corruption** — is every pool or slab allocation the module makes
+  routed through the guarded allocators, or is `redzone.checked` /
+  `canary.checked` still sitting at zero while `violations == 0` reads green?
+  That pair is the whole difference between a clean run and a run that never
+  happened.
 - **Descriptors and slabs** — every path that opens an fd, maps a file, or
   allocates from a shm zone, across both a request and a reload.
 - **Sanitizers** — is there an ASan/UBSan/TSan build of *this module*, and does
