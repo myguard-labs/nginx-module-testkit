@@ -54,7 +54,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-PLANNED=10
+PLANNED=12
 tests_run=0
 failures=0
 
@@ -303,6 +303,79 @@ if grep -qiE 'Open file descriptor [0-9]+: /dev/null' "$SCRATCH/vg_fdleak_off.lo
     sed 's/^/# /' "$SCRATCH/vg_fdleak_off.log"
 else
     ok 0 "VACUITY PROOF: without --track-fds the /dev/null fd is NOT reported"
+fi
+
+# --- 11/12: still-open descriptors are DISCOUNTED from the error count
+#
+# The counterpart to 9/10. --track-fds=all is what makes an fd leak visible,
+# but on a valgrind that counts each still-open descriptor as an error (3.24
+# does; see the version note above) it also makes the ERROR SUMMARY figure
+# non-zero on a perfectly clean run. nginx always exits holding several open
+# descriptors -- the two logs, the stderr dup, the listening socket, the
+# AF_UNIX master/worker channel -- so a scrape gating on a bare
+# `ERROR SUMMARY: [1-9]` would red EVERY scenario for EVERY module, however
+# clean, and stop being a signal at all. (Measured against a real consumer:
+# nine such contexts, `definitely lost: 0`, every context an "Open ..."
+# heading.)
+#
+# So prober_scrape_valgrind subtracts the open-fd contexts from the count and
+# gates on the remainder. This pair proves BOTH directions against synthetic
+# logs -- the discount happens, and it does not swallow a real finding that
+# happens to share the log with open descriptors.
+cat > "$SCRATCH/vg_fdonly.log" <<'EOF'
+==1234== Memcheck, a memory error detector
+==1234== FILE DESCRIPTORS: 5 open (3 std) at exit.
+==1234== Open AF_INET socket 6: 127.0.0.1:8080 <-> <unbound>
+==1234== Open file descriptor 5: /tmp/prefix/logs/access.log
+==1234== Open file descriptor 4: /tmp/prefix/logs/error.log
+==1234==
+==1234== LEAK SUMMARY:
+==1234==    definitely lost: 0 bytes in 0 blocks
+==1234== ERROR SUMMARY: 3 errors from 3 contexts (suppressed: 0 from 0)
+EOF
+
+PROBER_PREFIX="$SCRATCH/fdonly_prefix"
+mkdir -p "$PROBER_PREFIX/logs"
+cp "$SCRATCH/vg_fdonly.log" "$PROBER_PREFIX/logs/valgrind.1234"
+export PROBER_PREFIX
+
+if prober_scrape_valgrind >"$SCRATCH/fdonly.out" 2>&1; then
+    ok 0 "open-fd-only contexts are discounted (clean run stays green under --track-fds)"
+else
+    ok 1 "open-fd-only contexts are discounted (clean run stays green under --track-fds)"
+    diag "scrape output:"
+    sed 's/^/# /' "$SCRATCH/fdonly.out"
+fi
+
+# VACUITY PROOF for the discount: the same log plus ONE non-fd error context
+# must still be caught. Without this, "discount the fd contexts" could have
+# been implemented as "ignore the count entirely", which would be a gate that
+# cannot fail -- exactly what the rest of this file exists to rule out.
+cat > "$SCRATCH/vg_fdplus.log" <<'EOF'
+==1234== Memcheck, a memory error detector
+==1234== Invalid read of size 4
+==1234==    at 0x400123: main (x.c:5)
+==1234== FILE DESCRIPTORS: 5 open (3 std) at exit.
+==1234== Open AF_INET socket 6: 127.0.0.1:8080 <-> <unbound>
+==1234== Open file descriptor 5: /tmp/prefix/logs/access.log
+==1234== Open file descriptor 4: /tmp/prefix/logs/error.log
+==1234==
+==1234== LEAK SUMMARY:
+==1234==    definitely lost: 0 bytes in 0 blocks
+==1234== ERROR SUMMARY: 4 errors from 4 contexts (suppressed: 0 from 0)
+EOF
+
+PROBER_PREFIX="$SCRATCH/fdplus_prefix"
+mkdir -p "$PROBER_PREFIX/logs"
+cp "$SCRATCH/vg_fdplus.log" "$PROBER_PREFIX/logs/valgrind.1234"
+export PROBER_PREFIX
+
+if prober_scrape_valgrind >"$SCRATCH/fdplus.out" 2>&1; then
+    ok 1 "VACUITY PROOF: a real error sharing the log with open fds is STILL caught"
+    diag "scrape output:"
+    sed 's/^/# /' "$SCRATCH/fdplus.out"
+else
+    ok 0 "VACUITY PROOF: a real error sharing the log with open fds is STILL caught"
 fi
 
 if [ "$tests_run" -ne "$PLANNED" ]; then

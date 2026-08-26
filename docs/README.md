@@ -31,11 +31,20 @@ the harness can already do to it.
 | Document | Attack class | Machinery |
 |---|---|---|
 | [attack-hostile-input.md](attack-hostile-input.md) | Request shapes the module's author did not think of | `property-fuzz`, `stateful-property-fuzz`, the `block` pipeline DSL, `keepalive-bleed` |
-| [attack-fault-injection.md](attack-fault-injection.md) | Allocation and upstream failures that never happen in a healthy CI run | `fault_slab=` / `fault_palloc=` / `fault_tempfile=` / `fault_accept=`, `fakesrv`, `fault-matrix` |
+| [attack-fault-injection.md](attack-fault-injection.md) | Allocation, codec and upstream failures that never happen in a healthy CI run | `fault_slab=` / `fault_palloc=` / `fault_tempfile=` / `fault_accept=` / `fault_codec=` / `fault_codec_end=`, `fakesrv`, `fault-matrix` |
 | [attack-leak-pressure.md](attack-leak-pressure.md) | Descriptors, cycle-pool bytes and slab pages that grow one unit at a time | `delta`, `probe_baseline`, `rss-slope`, `soak-delta`, `fd-starve` |
 | [attack-lifecycle.md](attack-lifecycle.md) | Reload, binary upgrade, worker death, signal storms mid-transfer | `reload-*`, `usr2-*`, `hup-storm-mid-transfer`, `worker-death` |
 | [attack-environment.md](attack-environment.md) | A hostile clock, a hostile locale, and what the worker actually syscalls | `clock-jump`, `locale-hostility`, `syscall-allowlist` |
 | [attack-concurrency.md](attack-concurrency.md) | N requests in flight at once, and the races that only exist there | `concurrent N`, `concurrent-fan`, `multi-worker`, `backpressure` |
+
+## Running the attacks under other tooling
+
+An attack scenario is a program that drives the module into a state. That state
+can be watched by more than the scenario's own oracles.
+
+| Document | What it answers |
+|---|---|
+| [fault-injection-under-tooling.md](fault-injection-under-tooling.md) | You have a fault site and a scenario that arms it. What does running that scenario under memcheck, a sanitizer, or coverage actually tell you — and which leak classes does each one structurally miss? |
 
 The list of attacks we do **not** yet have — TLS, HTTP/2 and HTTP/3, `stream{}`,
 body-boundary hostility, allocation faults during a lifecycle event, syscall
