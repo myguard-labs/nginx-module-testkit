@@ -139,6 +139,23 @@ to extend, bend and repurpose it** for whatever gives this module real signal:
   the total across a run (it catches the one-unit-per-case drip that every
   `delta` reads as zero), and `prober_slope_check` divides growth over N
   operations after a discarded warmup.
+- **Allocation churn, which net occupancy cannot see** — all three oracles
+  above read *net* memory, so ten thousand matched alloc/free pairs per request
+  net to zero and read as perfectly clean. That is a bottleneck, not a leak,
+  and no `delta` will ever show it. The probe therefore also counts slab
+  *operations*: assert on `zone.slab_reqs`, `zone.slab_fails` and
+  `zone.slab_used` to bound allocations **per request** — not `== 0`, which
+  would be a leak check, but `<= K`, which is a ceiling. `zone.slab_fails`
+  rising at all is usually the more urgent signal: it means the zone is full
+  and the module is degrading. `scenarios/alloc-per-request` is the worked
+  shape to copy. Shared-memory slabs need no module C for any of this, because
+  every nginx shm zone opens with an `ngx_slab_pool_t` at `zone->shm.addr`.
+  These three fields render `-1` when the zone is mapped but its slab pool is
+  not yet initialised, and the zone renders `"present":false` when there is no
+  zone at all. `delta` already rejects a `-1` in *either* snapshot rather than
+  letting the two cancel to a delta of `0` — keep that property if you write
+  your own check, because a subtraction that silently cancels sentinels is an
+  assertion that cannot fail.
 - **Memory corruption the sanitizers cannot see** — read
   `docs/attack-memory-corruption.md` before assuming ASan has you covered. It
   does not, and the reason is structural rather than a matter of configuration:
