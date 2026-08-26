@@ -560,12 +560,12 @@ jobs:
       # once per (source, module) pair rather than on every push to the branch.
       #
       # The key is CONTENT-addressed, which is what makes caching safe here:
-      #   - matrix.sha256 pins the exact server tarball (an attacker cannot make
-      #     a different source hash to the same key);
-      #   - hashFiles('t/module/**') busts the cache the instant the reference
-      #     module source changes, so a stale objs tree is never trusted;
-      #   - the trailing salt (bump on any configure/make change below) covers
-      #     the build recipe itself, which hashFiles cannot see.
+      #   - matrix.sha256 pins the exact server tarball (an attacker cannot
+      #     make a different source hash to the same key);
+      #   - hashFiles() busts the cache when ANY file the build compiles
+      #     changes (t/module/** and src/**, which hold the module and probe);
+      #   - the trailing salt (bump on any configure/make change below)
+      #     covers the build recipe itself, which hashFiles cannot see.
       # There is no signing or publishing in this job, so a poisoned cache can at
       # worst fail the build -- and the restored tree is never trusted blind: the
       # tarball is re-verified against its sha256 on every cache MISS anyway.
@@ -574,17 +574,14 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: /tmp/srv
-          # The trailing salt covers the CONFIGURE RECIPE, which no other term
-          # in this key does: the tarball hash pins the source and hashFiles
-          # pins the module, but the ./configure line below is workflow text
-          # neither of them sees. It went to v2 when --with-http_ssl_module was
-          # added, because a v1 entry written before that restores a tree built
-          # WITHOUT ssl and skips the rebuild -- the TLS scenario's requires
-          # gate then correctly SKIPs, test-scenarios.sh turns an
-          # un-allowlisted skip into `not ok`, and CI reds pointing at TLS
-          # rather than at a stale cache. Bump this whenever the configure line
-          # changes.
-          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-${{ hashFiles('t/module/**') }}-v2
+          # The trailing salt covers the CONFIGURE RECIPE, which hashFiles
+          # cannot see: the tarball hash pins the source, hashFiles pins module
+          # and probe sources, but ./configure below is workflow text. Went to
+          # v2 when --with-http_ssl_module was added: a v1 entry would restore
+          # a tree built WITHOUT ssl, causing reds that blame TLS not the cache.
+          # Went to v3 when src/** was added: v2 entries cached stale binaries
+          # on probe-only changes. Bump on any configure/make recipe change.
+          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-${{ hashFiles('t/module/**', 'src/**') }}-v3
 
       - name: install build deps
         run: |
