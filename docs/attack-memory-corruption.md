@@ -183,6 +183,140 @@ Not 32 or more because every guarded allocation pays twice this in pool bytes,
 and pool growth is itself measured by the `delta` oracles — a fat guard would
 move the numbers those assert on.
 
+---
+
+# The shared-memory half: slab canaries
+
+**Class:** an overflow out of one slab chunk, a use-after-free on shared
+memory, a double free, a mismatched alloc/free pair.
+
+**Machinery:** `ngx_test_probe_slab_alloc()`, `ngx_test_probe_slab_free()`,
+`canary.violations`, `canary.checked`, `canary.live`.
+
+Everything above concerns the per-request and per-cycle **pool**. The shm
+**slab** needs its own treatment, because the two allocators differ in the one
+way that decides what a guard can catch:
+
+| | Pool | Slab |
+|---|---|---|
+| Allocation | bump pointer (`p->d.last`) | real allocator, power-of-two size classes |
+| Free | none per object | `ngx_slab_free()` |
+| Catchable | overflow | overflow **and** use-after-free, double free, mismatched pair |
+| Shared across processes | no | **yes** |
+
+## Why the sanitizers miss this one too
+
+A shm zone is one `mmap`, created in the master before the fork. To ASan that
+is a single region: it never saw a malloc for the chunks inside it, so it has
+no boundaries to poison and no metadata to consult. memcheck is blind for the
+same reason plus one more — after `ngx_slab_init()` the region is fully
+addressable and fully defined.
+
+And it is **worse** than the pool case, because shm is shared across
+*processes*. A corruption written by worker A is observed by worker B, and no
+single-address-space tool models that: ASan's shadow memory is per-process, so
+a worker's shadow says nothing about what another worker did to the mapping.
+
+## The slack problem, which is specific to slab
+
+`ngx_slab_alloc_locked()` rounds a request up to the next power of two:
+
+```c
+for (s = size - 1; s >>= 1; shift++) { /* void */ }
+```
+
+A 20-byte request is served from a **32-byte chunk**. Those 12 slack bytes
+belong to the allocation as far as the allocator is concerned, so a module
+overflowing 20 bytes into 24 corrupts nothing the allocator owns — and *no
+allocator-level bounds check, however careful, could ever notice*.
+
+That is why the canary is placed at the **caller's requested size**, not at the
+chunk boundary. The overflow into slack becomes an overflow into a guard.
+
+Both halves are pinned as vacuity proofs in `t/probe_canary_test.c`, and both
+run under `-fsanitize=address,undefined`:
+
+```text
+ok 2 - VACUITY PROOF: the overflow corrupted the neighbouring chunk and neither
+       ASan nor the allocator said a word
+ok 4 - VACUITY PROOF: writing 24 bytes into a 20-byte allocation disturbs
+       nothing the allocator owns -- the overflow hides in the slack
+```
+
+## What the slab adds over the pool: poison on free
+
+A pool has no per-object free, so use-after-free is not expressible there. The
+slab does, so `ngx_test_probe_slab_free()` fills the caller's span with `0xFE`
+before releasing the chunk. A module that keeps reading freed shm gets
+obviously-wrong bytes instead of plausible stale data.
+
+**It does not detect the read** — nothing here can. It makes the read's
+*result* unmistakable. Patterns are distinct so a corrupt byte names its origin:
+
+| Byte | Meaning |
+|---|---|
+| `0xCA` | an intact slab guard |
+| `0xFE` | a freed chunk's poison |
+| `0xDB` | a pool redzone (the half above) |
+
+The header magic is cleared on free, which is what makes a **double free** and
+a **mismatched alloc/free pair** reportable rather than destructive.
+
+## Layout, and the bug that shaped it
+
+```text
+[ hdr: magic | size | size_dup ][ head guard ][ user span ][ tail guard ]
+```
+
+The head guard sits **between** the header and the user span. The first cut of
+this file overlaid the guard on the header's own trailing bytes to save space,
+and the tests caught it immediately: an overflow out of the *previous* chunk
+lands on the header before it reaches any guard, so `size` was corrupted and
+the verifier then walked `user + <garbage>` and **segfaulted**.
+
+A corruption detector that crashes on the corruption it is meant to report is
+worse than no detector. Two defences now:
+
+1. The guard is hit *before* the header by a forward-running write.
+2. `size_dup` is a redundant copy checked before either is trusted. A single
+   contiguous overflowing write cannot leave a plausible pair, so a header
+   corruption is a **reported finding** (`HEADER CORRUPT`) rather than an
+   out-of-bounds read.
+
+## How this class produces a green run proving nothing
+
+**1. `canary.violations == 0` with nothing ever guarded.** Same trap as the
+pool half, same fix — `canary.checked` makes it falsifiable. Assert both:
+
+```text
+probe  canary.checked    >  0
+probe  canary.violations == 0
+```
+
+**2. Attributing a violation to the wrong worker.** The counters are
+**per-worker process globals**, incremented by the process that *looked*, never
+by the one that *broke it*. A violation written by worker A and found by worker
+B is B's count. This lens tells you a shared zone is corrupt; it never tells
+you who corrupted it. Do not write an oracle that implies otherwise.
+
+**3. Reading `canary.live` as an allocator figure.** It counts what *this
+probe* handed out and never got back. `zone.slab_used` counts what the
+*allocator* still holds and is decremented by anyone freeing the chunk. They
+answer different questions and will legitimately disagree.
+
+**4. Mistaking it for a race detector.** It observes the *consequence* of a
+corruption, never the interleaving. Helgrind and TSan model pthread races in
+one address space, which is not what nginx workers are — so neither of them
+covers this, and neither does this cover them.
+
+## Guard width
+
+`NGX_TEST_PROBE_CANARY` is 8 bytes per side, half the pool redzone's 16. Every
+guarded allocation costs that twice plus a header out of a zone whose size the
+operator configured, and **slab rounds to powers of two** — a 16-byte pair
+would push far more allocations into the next size class, wasting the zone and
+moving the `slab_reqs`/`slab_used` figures the churn oracle asserts on.
+
 ## See also
 
 - [attack-leak-pressure.md](attack-leak-pressure.md) — the *growth* oracles.
