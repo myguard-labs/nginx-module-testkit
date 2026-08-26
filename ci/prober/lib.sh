@@ -1537,7 +1537,13 @@ prober_scrape_valgrind() {
         total="$(sed -n 's/.*ERROR SUMMARY: \([0-9][0-9]*\) errors.*/\1/p' \
             "$log" 2>/dev/null | tail -1)"
         [ -n "$total" ] || total=0
-        fdctx="$(grep -cE '^==[0-9]+== Open (file descriptor|AF_[A-Z]+ socket)' \
+        # [[:upper:]], NOT [A-Z]: a bracket RANGE is collation-ordered, and
+        # under LC_ALL=tr_TR.UTF-8 (the locale-hostility leg runs exactly that)
+        # Turkish's dotless i reorders the alphabet so ASCII `I` falls outside
+        # A-Z -- "AF_INET" then does not match and the context is counted as a
+        # real error. Measured on GNU grep 3.11: 3 matches under C, 2 under
+        # tr_TR.UTF-8. The named class is locale-independent.
+        fdctx="$(grep -cE '^==[0-9]+== Open (file descriptor|AF_[[:upper:]]+ socket)' \
             "$log" 2>/dev/null || true)"
         [ -n "$fdctx" ] || fdctx=0
 
