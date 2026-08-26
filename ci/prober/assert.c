@@ -794,3 +794,214 @@ eval_fanout_coverage(const double *pids, size_t n, int min_workers,
 
     return 1;
 }
+
+
+int
+quiesce_underflowed(double v)
+{
+    /*
+     * The probe renders every zone counter through ngx_int_t, so an
+     * ngx_uint_t decremented once past zero does not arrive as -1: it arrives
+     * as the bit pattern of ULONG_MAX reinterpreted, which the emitter prints
+     * and json.c parses back as a double either enormous or negative
+     * depending on the build's word size and the counter's own type.
+     *
+     * Both directions are refused, and NEITHER is a plausible honest reading
+     * of a counter. A negative count of anything is meaningless. A count above
+     * QUIESCE_SANE_MAX would require more allocations than the zone has bytes
+     * to describe, so it is a wrapped value being read as a large one -- the
+     * exact shape that makes an unbounded rule-file bound (`<= 1`, `>= 0`)
+     * report ok on an underflow.
+     *
+     * -1 is deliberately NOT special-cased into "unavailable" here. The
+     * @sentinel-schema fields render -1 when the pool is unmapped, and the
+     * callers below must treat that as a failure too: an invariant judged
+     * against a field the probe could not read is an invariant that did not
+     * run, and a skip is indistinguishable from a pass in TAP.
+     */
+    return (v < 0) || (v > QUIESCE_SANE_MAX);
+}
+
+
+int
+eval_zone_coherent(const char *path, const double *vals, size_t n,
+                   char *why, size_t whylen)
+{
+    size_t  i;
+
+    /*
+     * Fewer than two readings cannot disagree. Refused rather than passed:
+     * `coherent` over one worker's answer is the single-sample tautology the
+     * parser's fanout requirement exists to prevent, and if one ever reaches
+     * here the oracle has been disarmed on the executor side instead.
+     */
+    if (n < 2) {
+        snprintf(why, whylen, "zone_invariant coherent %.128s: only %zu "
+                 "reading%s collected, so nothing could disagree "
+                 "(a coherence claim needs at least 2 workers)",
+                 path, n, n == 1 ? "" : "s");
+        return 0;
+    }
+
+    for (i = 0; i < n; i++) {
+        if (quiesce_underflowed(vals[i])) {
+            snprintf(why, whylen, "zone_invariant coherent %.128s: reading %zu "
+                     "is %g, which is not an honest counter value (an unsigned "
+                     "counter decremented past zero, or the -1 unavailable "
+                     "sentinel)", path, i + 1, vals[i]);
+            return 0;
+        }
+    }
+
+    for (i = 1; i < n; i++) {
+        if (vals[i] != vals[0]) {
+            /*
+             * Names the two readings and their index, because "the workers
+             * disagree" is not actionable: which worker read what is the whole
+             * content of the finding.
+             */
+            snprintf(why, whylen, "zone_invariant coherent %.128s: worker "
+                     "reading 1 is %g but reading %zu is %g -- the zone is one "
+                     "shared mapping, so at rest the workers cannot honestly "
+                     "disagree about it", path, vals[0], i + 1, vals[i]);
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+int
+eval_zone_at_rest(const char *path, const char *op, const char *literal,
+                  double have, char *why, size_t whylen)
+{
+    char         scratch[512];
+    const char  *want_s;
+    double       want;
+
+    /*
+     * The literal is unquoted and converted HERE rather than by the caller, so
+     * that the whole at_rest verdict -- literal handling included -- is one
+     * seam that can be driven to red without a server. A caller that did the
+     * conversion would own a failure path this function's tests never reach.
+     */
+    want_s = unquote(literal, scratch, sizeof(scratch));
+
+    if (want_s == NULL) {
+        snprintf(why, whylen, "zone_invariant at_rest %.128s: literal is "
+                 "longer than %zu bytes", path, sizeof(scratch) - 1);
+        return 0;
+    }
+
+    if (!literal_number(want_s, &want)) {
+        snprintf(why, whylen, "zone_invariant at_rest %.128s: \"%.128s\" is "
+                 "not a number, so the bound cannot be applied",
+                 path, want_s);
+        return 0;
+    }
+
+    /*
+     * THE BOUND COMES FIRST, before the rule file's operator is applied.
+     *
+     * This ordering is the whole underflow defence and is not interchangeable
+     * with checking afterwards. A shared inflight counter decremented once too
+     * often reads as an enormous value, and the operators a rule author
+     * naturally writes for a resting counter -- `>= 0`, `<= 1`, `!= 5` -- are
+     * all SATISFIED by that value. The oracle would report ok on precisely the
+     * defect it was written to catch, and COR-5's class is exactly a counter
+     * that failed to return to zero.
+     */
+    if (quiesce_underflowed(have)) {
+        snprintf(why, whylen, "zone_invariant at_rest %.128s: read %g, which "
+                 "is not an honest resting value -- an unsigned counter "
+                 "decremented past zero reads as a huge number, and the "
+                 "unavailable sentinel reads as -1; either way the %.16s %g "
+                 "bound was never meaningfully applied",
+                 path, have, op, want);
+        return 0;
+    }
+
+    if (!compare_number(have, op, want)) {
+        snprintf(why, whylen, "zone_invariant at_rest %.128s: have %g, want "
+                 "%.16s %g -- the counter did not return to its resting value "
+                 "after the case quiesced", path, have, op, want);
+        return 0;
+    }
+
+    return 1;
+}
+
+
+int
+eval_zone_monotonic(const char *path, const double *vals, size_t n,
+                    char *why, size_t whylen)
+{
+    size_t  i;
+
+    /*
+     * One reading is trivially non-decreasing, so it is refused for the same
+     * reason a single-sample coherence claim is: a form that cannot fail is
+     * not an oracle.
+     */
+    if (n < 2) {
+        snprintf(why, whylen, "zone_invariant monotonic %.128s: only %zu "
+                 "reading%s collected, so nothing could decrease "
+                 "(a monotonicity claim needs at least 2 readings)",
+                 path, n, n == 1 ? "" : "s");
+        return 0;
+    }
+
+    for (i = 0; i < n; i++) {
+        if (quiesce_underflowed(vals[i])) {
+            snprintf(why, whylen, "zone_invariant monotonic %.128s: reading "
+                     "%zu is %g, which is not an honest counter value (a wrap "
+                     "past zero, or the -1 unavailable sentinel)",
+                     path, i + 1, vals[i]);
+            return 0;
+        }
+    }
+
+    for (i = 1; i < n; i++) {
+        if (vals[i] < vals[i - 1]) {
+            snprintf(why, whylen, "zone_invariant monotonic %.128s: reading "
+                     "%zu is %g but reading %zu was %g -- a cumulative counter "
+                     "that decreases was reset, wrapped, or written from a "
+                     "stale copy", path, i + 1, vals[i], i, vals[i - 1]);
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+int
+eval_quiesce(const char *path, int settled, int polls, int timeout_ms,
+             double last, double prev, char *why, size_t whylen)
+{
+    if (settled) {
+        return 1;
+    }
+
+    /*
+     * EXPIRY FAILS. Never a skip, never a quiet pass.
+     *
+     * A quiesce that timed out and let the at-rest oracles run would report
+     * their verdict on a counter still in motion -- the timing-dependent
+     * result the directive exists to remove, and one that goes green on an
+     * idle host and red under load until somebody loosens the bound. A quiesce
+     * that timed out and SKIPPED them would be indistinguishable from a pass
+     * in TAP, which is worse still.
+     *
+     * The message carries the last two readings because "did not settle" and
+     * "settled at the wrong value" are different bugs, and a counter that
+     * moved by one over the whole window reads very differently from one that
+     * doubled.
+     */
+    snprintf(why, whylen, "quiesce %.128s: did not settle within %d ms "
+             "(%d poll%s; last two readings %g then %g) -- the at-rest "
+             "oracles are not judged on a moving counter",
+             path, timeout_ms, polls, polls == 1 ? "" : "s", prev, last);
+    return 0;
+}

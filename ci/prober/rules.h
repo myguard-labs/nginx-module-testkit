@@ -390,6 +390,79 @@ typedef struct {
     char  *literal;
 } probe_assert;
 
+/*
+ * The three forms of `zone_invariant`. Kept as an enum rather than as three
+ * separate arrays because they share their subject -- one field of the shm
+ * zone, read from every worker a `fanout` reached -- and differ only in what
+ * they demand of the readings.
+ */
+typedef enum {
+    /*
+     * `zone_invariant coherent <field>` -- every answering worker read the
+     * SAME value.
+     *
+     * The zone is one mmap shared by every worker, so at rest they cannot
+     * honestly disagree. A divergence is a torn read, a per-worker copy that
+     * drifted, or a write that never reached the shared page -- the race
+     * consequence this whole lens was built to detect.
+     */
+    ZONE_INV_COHERENT,
+
+    /*
+     * `zone_invariant at_rest <field> == N` -- the field returned to N once
+     * the case quiesced. COR-5's class: a shared inflight counter incremented
+     * on entry and decremented on teardown must be back at 0.
+     *
+     * The comparison is BOUNDED, which is not a nicety. The counter is an
+     * ngx_uint_t; one decrement too many does not read as -1 but as
+     * ULONG_MAX, and the probe renders it through an ngx_int_t. An unbounded
+     * `== 0` compare is satisfied by neither reading, but a `<= 1` or a
+     * `>= 0` written by a rule author IS satisfied by a wrapped counter --
+     * silently, by the largest number the type can hold. So an underflowed
+     * reading is refused as its own failure before any operator is applied.
+     */
+    ZONE_INV_AT_REST,
+
+    /*
+     * `zone_invariant monotonic <field>` -- the field never decreased across
+     * the run's readings, in the order they were taken.
+     *
+     * For a cumulative counter such as `zone.slab_reqs`, which is never reset
+     * for the life of the zone. A decrease means the counter was reset, wrapped
+     * or was written by a worker holding a stale copy.
+     */
+    ZONE_INV_MONOTONIC
+} zone_inv_kind;
+
+typedef struct {
+    zone_inv_kind   kind;
+    char           *path;
+    /* ZONE_INV_AT_REST only: the operator and the value it compares against.
+     * NULL on the other two forms, which take no comparison of their own. */
+    char           *op;
+    char           *literal;
+} zone_invariant;
+
+/*
+ * Default and ceiling for `quiesce`'s timeout.
+ *
+ * The default is deliberately generous relative to a single request: quiesce
+ * runs once per case and only polls, so a default too tight turns a slow but
+ * correct host into a red run on the directive rather than on the code under
+ * test. The ceiling exists for the opposite reason -- a rule file that spells
+ * a multi-minute wait has written a hang, and a hang reports as a harness
+ * timeout somewhere else entirely rather than as this case's verdict.
+ */
+#define QUIESCE_DEFAULT_MS  2000
+#define QUIESCE_MAX_MS      30000
+
+/* Interval between two quiesce samples. Small enough that a counter which
+ * settles immediately costs one interval rather than a visible pause, large
+ * enough that the poll is not a busy loop against the worker it is measuring
+ * -- a probe request per microsecond would itself keep the counters moving,
+ * which is an oracle interfering with its own subject. */
+#define QUIESCE_POLL_US     20000
+
 /* One no_error_log / grep_error_log line. The pattern source text is kept
  * beside the compiled form purely for diagnostics: a failure must be able to
  * say WHICH regex missed or matched, and regex_t cannot be printed. */
@@ -584,6 +657,56 @@ typedef struct {
      * never earned. Incomplete coverage must FAIL, never pass quietly.
      */
     int             fanout_min_workers;
+
+    /*
+     * quiesce <path> [timeout_ms] -- poll the probe until `quiesce_path` reads
+     * the SAME value on two consecutive snapshots, before any at-rest oracle
+     * is judged.
+     *
+     * NULL when the case carries no `quiesce`, which is also the duplicate
+     * guard: a second `quiesce` finds a non-NULL field and dies.
+     *
+     * This is the precondition every at-rest invariant rests on. A shared
+     * counter that a request bumps and the response's teardown decrements is
+     * not back at its resting value the instant the last byte of the response
+     * reaches the client -- the worker still has work to do. An `at_rest`
+     * oracle judged at that moment is timing-dependent: green on a fast host,
+     * red on a loaded one, and the usual repair is to loosen the bound until
+     * it stops firing, at which point it asserts nothing.
+     *
+     * Two consecutive EQUAL reads, not one read after a fixed sleep. A sleep
+     * encodes a guess about the host; equality of two independent samples is
+     * a property of the counter itself. It is not a proof of rest -- a counter
+     * can sit still between two samples and move again after -- and the docs
+     * must never claim otherwise; it is the strongest cheap evidence
+     * available, and it is strictly better than judging at an arbitrary
+     * moment.
+     *
+     * EXPIRY FAILS, and that direction is the whole point. A quiesce that
+     * timed out and then let the at-rest oracles run would report their
+     * verdict on a moving counter -- exactly the timing-dependent result the
+     * directive exists to remove -- and a quiesce that timed out and SKIPPED
+     * them would be indistinguishable from a pass in TAP.
+     */
+    char           *quiesce_path;
+
+    /*
+     * Milliseconds `quiesce` may spend waiting for two equal reads before the
+     * case FAILS. Zero only when quiesce_path is NULL; the parser defaults it
+     * to QUIESCE_DEFAULT_MS so an unset value can never mean "wait forever"
+     * (a hang is a worse failure than a red) nor "do not wait" (which would
+     * disarm the directive).
+     */
+    int             quiesce_timeout_ms;
+
+    /*
+     * zone_invariant lines -- the cross-worker oracles this lens exists for.
+     * Judged against the per-leg probe snapshots a `fanout` collects, which is
+     * why the parser refuses the directive on a case with no `fanout`: a
+     * single snapshot cannot disagree with itself.
+     */
+    zone_invariant  zone_invariants[MAX_ASSERTS];
+    size_t          n_zone_invariants;
 
     /* Receive-side pacing and the client's SO_RCVBUF. Both zero by default,
      * which is "read as fast as the peer sends, system-default buffer" -- the

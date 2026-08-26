@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  315
+#define PLANNED  347
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1337,6 +1337,182 @@ main(void)
                "fanout then concurrent dies");
     expect_die("name t\nsend X\nconcurrent 4\nfanout 4\nprobe fds >= 0\n",
                "concurrent then fanout dies");
+
+    /* ---- quiesce --------------------------------------------------------- */
+
+    n = load_str("name t\nsend X\nquiesce zone.slab_used\nprobe fds >= 0\n");
+    ok(n == 1 && cases[0].quiesce_path != NULL
+       && strcmp(cases[0].quiesce_path, "zone.slab_used") == 0
+       && cases[0].quiesce_timeout_ms == QUIESCE_DEFAULT_MS,
+       "quiesce stores the path and defaults the timeout");
+    free_all(n);
+
+    n = load_str("name t\nsend X\nquiesce zone.slab_used 500\n"
+                 "probe fds >= 0\n");
+    ok(n == 1 && cases[0].quiesce_timeout_ms == 500,
+       "quiesce takes an explicit timeout_ms");
+    free_all(n);
+
+    n = load_str("name t\nsend X\nprobe fds >= 0\n");
+    ok(n == 1 && cases[0].quiesce_path == NULL
+       && cases[0].quiesce_timeout_ms == 0,
+       "a case without quiesce waits for nothing");
+    free_all(n);
+
+    n = load_str("name a\nsend X\nquiesce zone.slab_used\nprobe fds >= 0\n"
+                 "name b\nsend Y\nprobe fds >= 0\n");
+    ok(n == 2 && cases[0].quiesce_path != NULL
+       && cases[1].quiesce_path == NULL,
+       "quiesce does not leak into the following case");
+    free_all(n);
+
+    /* The floor is 1 ms, not 0: a zero-millisecond quiesce expires before the
+     * two samples it needs could ever be compared, so it is a directive that
+     * always fails for a reason unrelated to the code under test. */
+    n = load_str("name t\nsend X\nquiesce zone.slab_used 1\nprobe fds >= 0\n");
+    ok(n == 1 && cases[0].quiesce_timeout_ms == 1,
+       "a 1 ms quiesce timeout is the floor and loads");
+    free_all(n);
+
+    expect_die("name t\nsend X\nquiesce zone.slab_used 0\nprobe fds >= 0\n",
+               "a zero quiesce timeout dies -- it expires before it samples");
+    expect_die("name t\nsend X\nquiesce zone.slab_used -5\nprobe fds >= 0\n",
+               "a negative quiesce timeout dies");
+    expect_die("name t\nsend X\nquiesce zone.slab_used 30001\n"
+               "probe fds >= 0\n",
+               "a quiesce timeout over QUIESCE_MAX_MS dies");
+    expect_die("name t\nsend X\nquiesce zone.slab_used 500junk\n"
+               "probe fds >= 0\n",
+               "a quiesce timeout with trailing junk dies");
+    expect_die("name t\nsend X\nquiesce zone.slab_used junk\n"
+               "probe fds >= 0\n",
+               "a non-numeric quiesce timeout dies");
+    expect_die("name t\nsend X\nquiesce\nprobe fds >= 0\n",
+               "quiesce with no argument dies");
+    expect_die("name t\nsend X\nquiesce a\nquiesce b\nprobe fds >= 0\n",
+               "a duplicate quiesce dies");
+
+    /*
+     * A quiesce nothing reads is a sleep. Checked in the post-parse pass, so
+     * it must fire regardless of whether the assertion would have come before
+     * or after -- both orders are exercised below via the passing cases above,
+     * and the failing one carries no assertion at all.
+     */
+    expect_die("name t\nsend X\nquiesce zone.slab_used\n",
+               "quiesce with no assertion dies -- nothing reads the settled "
+               "state");
+
+    /* Each of the four assertion kinds satisfies the rule on its own, and the
+     * ordering does not matter: the check runs after the whole case is read. */
+    n = load_str("name t\nsend X\ndelta fds == 0\nquiesce zone.slab_used\n");
+    ok(n == 1 && cases[0].quiesce_path != NULL,
+       "a delta satisfies quiesce's observer requirement, written after it");
+    free_all(n);
+
+    n = load_str("name t\nsend X\nquiesce zone.slab_used\n"
+                 "probe_baseline fds == 0\n");
+    ok(n == 1 && cases[0].quiesce_path != NULL,
+       "a probe_baseline satisfies quiesce's observer requirement");
+    free_all(n);
+
+    /* ---- zone_invariant -------------------------------------------------- */
+
+    n = load_str("name t\nsend X\nfanout 4\n"
+                 "zone_invariant coherent zone.digest\n");
+    ok(n == 1 && cases[0].n_zone_invariants == 1
+       && cases[0].zone_invariants[0].kind == ZONE_INV_COHERENT
+       && strcmp(cases[0].zone_invariants[0].path, "zone.digest") == 0
+       && cases[0].zone_invariants[0].op == NULL
+       && cases[0].zone_invariants[0].literal == NULL,
+       "zone_invariant coherent stores the field and takes no comparison");
+    free_all(n);
+
+    n = load_str("name t\nsend X\nfanout 4\n"
+                 "zone_invariant monotonic zone.slab_reqs\n");
+    ok(n == 1 && cases[0].n_zone_invariants == 1
+       && cases[0].zone_invariants[0].kind == ZONE_INV_MONOTONIC
+       && cases[0].zone_invariants[0].op == NULL,
+       "zone_invariant monotonic stores the field and takes no comparison");
+    free_all(n);
+
+    n = load_str("name t\nsend X\nfanout 4\n"
+                 "zone_invariant at_rest zone.inflight == 0\n");
+    ok(n == 1 && cases[0].n_zone_invariants == 1
+       && cases[0].zone_invariants[0].kind == ZONE_INV_AT_REST
+       && strcmp(cases[0].zone_invariants[0].path, "zone.inflight") == 0
+       && strcmp(cases[0].zone_invariants[0].op, "==") == 0
+       && strcmp(cases[0].zone_invariants[0].literal, "0") == 0,
+       "zone_invariant at_rest stores the field, operator and bound");
+    free_all(n);
+
+    n = load_str("name t\nsend X\nfanout 4\n"
+                 "zone_invariant coherent zone.digest\n"
+                 "zone_invariant at_rest zone.inflight == 0\n"
+                 "zone_invariant monotonic zone.slab_reqs\n");
+    ok(n == 1 && cases[0].n_zone_invariants == 3
+       && cases[0].zone_invariants[0].kind == ZONE_INV_COHERENT
+       && cases[0].zone_invariants[1].kind == ZONE_INV_AT_REST
+       && cases[0].zone_invariants[2].kind == ZONE_INV_MONOTONIC,
+       "all three forms coexist on one case in the order written");
+    free_all(n);
+
+    n = load_str("name a\nsend X\nfanout 4\n"
+                 "zone_invariant coherent zone.digest\n"
+                 "name b\nsend Y\nprobe fds >= 0\n");
+    ok(n == 2 && cases[0].n_zone_invariants == 1
+       && cases[1].n_zone_invariants == 0,
+       "zone_invariant does not leak into the following case");
+    free_all(n);
+
+    /*
+     * THE LOAD-BEARING REJECTION. One snapshot is trivially coherent with
+     * itself and trivially non-decreasing, so a zone_invariant without a
+     * fanout is an oracle that cannot fail -- worse than no oracle, because
+     * the green is believed. Both orders, since the check is post-parse.
+     */
+    expect_die("name t\nsend X\nzone_invariant coherent zone.digest\n",
+               "zone_invariant without fanout dies -- one snapshot cannot "
+               "disagree with itself");
+    expect_die("name t\nsend X\nzone_invariant monotonic zone.slab_reqs\n",
+               "monotonic without fanout dies for the same reason");
+    expect_die("name t\nsend X\nzone_invariant at_rest zone.inflight == 0\n",
+               "at_rest without fanout dies for the same reason");
+
+    expect_die("name t\nsend X\nfanout 4\nzone_invariant bogus zone.digest\n",
+               "an unknown zone_invariant form dies");
+    expect_die("name t\nsend X\nfanout 4\nzone_invariant coherent\n",
+               "zone_invariant with a form but no field dies");
+    expect_die("name t\nsend X\nfanout 4\nzone_invariant\n",
+               "zone_invariant with no argument dies");
+
+    /*
+     * A trailing comparison on coherent/monotonic is REFUSED, not ignored. A
+     * file whose author believes the bound is enforced is worse off than one
+     * whose line failed to load.
+     */
+    expect_die("name t\nsend X\nfanout 4\n"
+               "zone_invariant coherent zone.digest == 0\n",
+               "a comparison on coherent dies rather than being ignored");
+    expect_die("name t\nsend X\nfanout 4\n"
+               "zone_invariant monotonic zone.slab_reqs >= 5\n",
+               "a comparison on monotonic dies rather than being ignored");
+
+    expect_die("name t\nsend X\nfanout 4\n"
+               "zone_invariant at_rest zone.inflight\n",
+               "at_rest without an operator and value dies");
+    expect_die("name t\nsend X\nfanout 4\n"
+               "zone_invariant at_rest zone.inflight ==\n",
+               "at_rest with an operator but no value dies");
+    expect_die("name t\nsend X\nfanout 4\n"
+               "zone_invariant at_rest zone.inflight =?= 0\n",
+               "at_rest with an unknown operator dies");
+
+    /* `~` is a substring test; the field it would apply to is a counter, so
+     * the combination is either a type error at evaluation time or, worse, a
+     * comparison that happens to pass. */
+    expect_die("name t\nsend X\nfanout 4\n"
+               "zone_invariant at_rest zone.inflight ~ 0\n",
+               "at_rest with the substring operator dies");
 
     /* ---- concurrent ----------------------------------------------------- */
 
