@@ -535,6 +535,7 @@ path_is_proc_sentinel_field(const char *path)
         "zone.slab_reqs",
         "zone.slab_fails",
         "zone.slab_used",
+        "zone.digest",
     };
     size_t i;
 

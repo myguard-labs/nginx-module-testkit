@@ -26,7 +26,7 @@ SCHEMA=../../probe-schema.json
 # `not ok` line to grep for), it just fails at this line rather than at the
 # field you added. Kept literal because FIELDS is defined further down and
 # TAP wants the plan printed before the first result.
-PLANNED=46
+PLANNED=47
 tests_run=0
 failures=0
 
@@ -88,6 +88,7 @@ zone.slab_pages_free:slab_pages_free
 zone.slab_reqs:slab_reqs
 zone.slab_fails:slab_fails
 zone.slab_used:slab_used
+zone.digest:digest
 "
 
 for entry in $FIELDS; do
