@@ -137,11 +137,14 @@ done
 # prober's units, so they get their own loop rather than a special case inside
 # the one above.
 #
-# Two units are reachable this way: ngx_test_probe_arm.c (a query parser, which
-# needs nothing but the query bytes) and ngx_test_probe_redzone.c (an allocator
-# wrapper, which needs a pool and gets a real bump allocator from
-# t/ngx_pool_shim.h -- a malloc-per-object stub would not reproduce the
-# adjacency its tests depend on).
+# Three units are reachable this way: ngx_test_probe_arm.c (a query parser,
+# which needs nothing but the query bytes), ngx_test_probe_redzone.c (a pool
+# allocator wrapper) and ngx_test_probe_canary.c (a slab allocator wrapper).
+# Both allocator wrappers get REAL allocators from t/ngx_pool_shim.h rather
+# than malloc-per-object stubs, because the bug classes they catch are created
+# by the allocators' own behaviour: bump allocation makes objects adjacent, and
+# slab's power-of-two rounding creates the slack an overflow hides in. A stub
+# would make those tests pass for the wrong reason.
 #
 # The renderer beside them is NOT reachable: it reads ngx_cycle, the slab pool
 # and /proc/self/fd, so shimming it would mean reimplementing the server. It is
@@ -157,6 +160,14 @@ for src in ../../t/*_test.c; do
     # rather than hardcoded. Adding a third shimmable unit means adding a case
     # here, which is the point at which someone has to state what it links.
     case "$(basename "$src")" in
+        probe_canary_test.c)
+            # Same shim, different unit: the canary guards SLAB allocations,
+            # so the shim additionally supplies a power-of-two-rounding slab
+            # arena (an exact-fit stub would leave no slack to overflow into,
+            # and the slack is the bug class under test).
+            unit=../../src/ngx_test_probe_canary.c
+            extra=-DNGX_TEST_PROBE_POOL_SHIM
+            ;;
         probe_redzone_test.c)
             # The redzone allocator needs a working pool, which ngx_shim.h
             # deliberately does not provide. NGX_TEST_PROBE_POOL_SHIM selects
