@@ -1252,6 +1252,7 @@ mutate "schema: zone-absent variant leaks a module object" schema_test.c \
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
     "\"redzone\":{\"violations\":0,\"checked\":0},"
+    "\"canary\":{\"violations\":0,\"checked\":0,\"live\":0},"
     "\"zone\":{\"present\":false}}";' \
     'static const char doc_zone_absent[] =
     "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
@@ -1263,6 +1264,7 @@ mutate "schema: zone-absent variant leaks a module object" schema_test.c \
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
     "\"redzone\":{\"violations\":0,\"checked\":0},"
+    "\"canary\":{\"violations\":0,\"checked\":0,\"live\":0},"
     "\"module\":{\"frames\":7},"
     "\"zone\":{\"present\":false}}";' \
     schema_test
@@ -1285,6 +1287,7 @@ mutate "schema: zone-absent variant leaks a zone member" schema_test.c \
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
     "\"redzone\":{\"violations\":0,\"checked\":0},"
+    "\"canary\":{\"violations\":0,\"checked\":0,\"live\":0},"
     "\"zone\":{\"present\":false}}";' \
     'static const char doc_zone_absent[] =
     "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
@@ -1296,6 +1299,7 @@ mutate "schema: zone-absent variant leaks a zone member" schema_test.c \
     "\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
     "\"cycle_large\":0,\"cycle_cleanup\":2},"
     "\"redzone\":{\"violations\":0,\"checked\":0},"
+    "\"canary\":{\"violations\":0,\"checked\":0,\"live\":0},"
     "\"zone\":{\"present\":false,\"name\":\"stale\"}}";' \
     schema_test
 
