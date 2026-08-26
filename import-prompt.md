@@ -226,12 +226,79 @@ end up on the hooked path.
 
 ---
 
+## Last step: sweep for every remaining place the testkit belongs
+
+Getting one scenario green is the *start* of the job, not the end of it. Once
+the CI leg works, go back over the whole repository and find every remaining
+site where this harness could be giving signal and currently is not.
+
+Do this as a deliberate pass with a written result, not as a vague intention.
+Walk the repo and ask, for each:
+
+- **Code coverage** — run `ci/prober/coverage-director.sh` and read the map for
+  what is *not* reached. For every uncovered region, decide and record: does it
+  get an adversarial case, or an honest annotation saying why it is unreachable?
+  Those are the only two acceptable outcomes; silence is not one. Chase the
+  coverage, never the percentage.
+- **Memory** — is every long-lived allocation site covered by a `delta`, a
+  `probe_baseline` *and* (where a per-op drip is plausible) a
+  `prober_slope_check`? They are complements: `delta` localises the jump,
+  `probe_baseline` bounds the run total, the slope catches what both read as
+  zero.
+- **Descriptors and slabs** — every path that opens an fd, maps a file, or
+  allocates from a shm zone, across both a request and a reload.
+- **Sanitizers** — is there an ASan/UBSan/TSan build of *this module*, and does
+  the harness run under it? If the repo has sanitizer jobs already, do they
+  cover the code the prober now reaches?
+- **Fault injection** — every error path that only executes when an allocation
+  fails. If the module has sites the generic injector cannot reach, that is what
+  the `fault_set` hook is for.
+- **Lifecycle** — reload, binary upgrade, worker death, signals mid-transfer.
+- **Concurrency and backpressure** — in-flight fan-out, parked connections, a
+  reader that will not drain.
+- **Hostile input** — the fuzzers, and the framing/pause/abort/hold directives.
+- **Performance shape** — anything that could go quadratic as a zone fills, or
+  churn allocations per request, which no leak oracle sees.
+- **CI wiring itself** — is the leg on the right cadence (PR gate vs. soak vs.
+  scheduled)? Path-gated correctly? Does it have its own port band? Does every
+  new oracle assert both directions?
+
+Existing tests count too: where the repo already tests something *indirectly*,
+check whether a probe oracle can assert it **directly** and more cheaply, and
+replace rather than accumulate. Do not leave two suites asserting the same
+thing.
+
+Produce a short table of what you covered, what you deliberately did not, and
+why. "Not applicable to this module" is a fine entry; "did not get to it" is a
+finding that belongs in the repo's `TODO.md`.
+
+### Then close the loop back to the harness
+
+The sweep is where most of the transferable material appears — a gap the
+harness could not express, a technique that generalizes, a patch that makes the
+next module's integration cheaper. **Send it back.**
+
+Open the `feedback/<YYYY-MM-DD>-<short-description>/` PR described above, with
+the code and the extended documentation. If the sweep produced several
+independent findings, open several — one per finding, so each can be judged on
+its own.
+
+This is a required step, not a courtesy. A finding that stays in one module's
+repo gets rediscovered from scratch by the next module; a finding in
+`feedback/` gets adapted into the harness and every consumer gets it for free.
+If the sweep genuinely produced nothing transferable, say so explicitly and say
+why — that is a real answer, but it should be a rare one.
+
+---
+
 ## Deliverables
 
 1. The CI leg, running on PRs, green, with both directions asserted.
 2. At least one oracle this repo did not previously have, proven non-vacuous by
    a deliberate break.
-3. A short summary: what you wired, what it asserts, what it explicitly does
+3. The coverage sweep above, with its table of what is covered, what is not, and
+   why.
+4. A short summary: what you wired, what it asserts, what it explicitly does
    **not** assert, measured cost, and where you deviated from this document.
-4. A `feedback/<date>-<description>/` PR against the testkit for anything
+5. A `feedback/<date>-<description>/` PR against the testkit for anything
    transferable — or an explicit statement that nothing was.
