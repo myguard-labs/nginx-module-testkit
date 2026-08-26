@@ -550,6 +550,41 @@ typedef struct {
      * a valid count is >= 2. Capped at MAX_CONCURRENT. */
     int             concurrent;
 
+    /*
+     * fanout N -- send N probe requests and collect the DISTINCT worker pids
+     * that answered.
+     *
+     * Where `concurrent` asks "what happens when N requests overlap", this
+     * asks "do the workers agree about shared state". They are different
+     * questions and deliberately different directives: concurrent holds
+     * requests in flight simultaneously to create overlap, while fanout only
+     * needs to REACH several workers and does not care whether the requests
+     * overlapped.
+     *
+     * The shm zone is the same bytes in every worker, so any worker's answer
+     * is a view of shared truth and a disagreement between two of them is
+     * itself a finding -- which is what makes "whichever worker answered", the
+     * limitation multi-worker.rule documents, usable as a mechanism here.
+     *
+     * Zero is off and doubles as the duplicate guard, since a valid count is
+     * >= 2. Capped at MAX_CONCURRENT, reusing that bound because the request
+     * machinery is the same.
+     */
+    int             fanout;
+
+    /*
+     * Minimum DISTINCT workers the fanout must have reached for the case to
+     * pass. Zero means "not asserted", which is only legal when the case
+     * carries no fanout at all.
+     *
+     * This exists because worker sampling is probabilistic: nothing lets a
+     * client choose which worker accepts its connection, so N requests can
+     * legitimately all land on one worker. Without this bound the whole lens
+     * passes having sampled a single worker N times -- a coverage claim it
+     * never earned. Incomplete coverage must FAIL, never pass quietly.
+     */
+    int             fanout_min_workers;
+
     /* Receive-side pacing and the client's SO_RCVBUF. Both zero by default,
      * which is "read as fast as the peer sends, system-default buffer" -- the
      * behaviour of every rule that predates these directives. Unlike the two

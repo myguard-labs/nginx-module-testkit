@@ -889,6 +889,47 @@ Three combinations are rejected at load time rather than silently resolved:
   reading a response*, so a fan carrying one would collect nothing to assert
   against.
 
+`fanout <N> [min_workers]` is the cross-**worker** relative of `concurrent`, and
+the two answer different questions. `concurrent` asks *what happens when N
+requests overlap*, and holds them all in flight to create that overlap.
+`fanout` asks *do the workers agree about shared state*, and only needs to
+REACH several workers — whether the requests overlapped is irrelevant to it:
+
+```text
+name    every worker sees the same zone
+send    GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+fanout  8 3
+probe   zone.digest >= 0
+```
+
+It rests on a property that `multi-worker.rule` documents as a *limitation*: the
+probe reports state for whichever worker answered. That makes `fds` and
+`pool.cycle_used` meaningless under `worker_processes > 1`, because those are
+**per-worker**. The shm zone is the opposite — it is the same bytes in every
+worker, so any worker's answer is a view of shared truth and a **disagreement
+between two workers is itself a finding**. `zone.digest` exists to make that
+comparison one field wide.
+
+**What the directive guarantees, precisely:** that `N` requests were sent and
+that at least `min_workers` *distinct* worker pids answered them. It does not
+and cannot choose which worker serves a connection — nothing in the client can.
+So the coverage is **asserted, never assumed**: `min_workers` defaults to `2`
+and the case FAILS when the fan reaches fewer. That failure direction is the
+whole point. A lens that passed after sampling one worker `N` times would be
+claiming cross-worker agreement it never observed, which is precisely the
+vacuous-gate shape this harness exists to catch.
+
+A count must be `2..64` and `min_workers` must be `2..count`. Both floors are
+`2` for the same reason `concurrent`'s is: one request reaches one worker, and
+one worker cannot disagree with itself. A `min_workers` above the count is
+refused as well — a bound nothing can satisfy makes every case fail for a
+reason unrelated to the code under test.
+
+`fanout` is mutually exclusive with both `block` (a pipeline is ordered on ONE
+connection, so it reaches one worker) and `concurrent` (both drive the request
+count). Both pairs are rejected at load time in **either order**, so the
+diagnostic does not depend on which directive a file happens to name first.
+
 `expect_close_within` and `recv_slow` **used to be a fourth rejection and are now
 allowed individually.** The fan drained its legs in index order with a blocking
 read each, so an earlier leg's read time was charged to every later leg's clock
