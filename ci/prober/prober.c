@@ -769,6 +769,288 @@ eval_zone_invariants(const test_case *tc, const double *vals, size_t n_legs)
 
 
 /*
+ * Concurrent fan -- N copies of this case's request held in flight at once.
+ * The parser guarantees a delta or probe assertion is present (otherwise the
+ * overlap would be observed by nothing) and rejects the directives that would
+ * make the fan read nothing, so this path only ever runs on a case whose
+ * snapshots actually bracket N collected responses.
+ *
+ * Every leg is evaluated against the case's own expectations: N overlapping
+ * requests must each be answered exactly as one sequential request is, so a
+ * leg that came back different is a finding even when the aggregate delta is
+ * clean. The leg number is carried into the label so a failure names which
+ * one.
+ *
+ * Returns 0 on a hard failure -- the caller must free `before` and return 0
+ * without evaluating anything further. Returns 1 otherwise, having cleared
+ * `*ok` to 0 on a soft (per-leg eval) failure the same way run_case()'s other
+ * arms do; `*ok` is never set back to 1, only left alone or cleared.
+ *
+ * Split out of run_case() for the same reason run_quiesce() is.
+ */
+static int
+run_concurrent_legs(const test_case *tc, char *errbuf, size_t errbuf_len,
+    int *ok)
+{
+    http_response *resps;
+    int            leg;
+
+    /*
+     * Checked BEFORE the allocation below, not after: this path returns
+     * without running the exchange, and a guard placed after the calloc
+     * leaks every byte of it (gcc -fanalyzer and cppcheck both caught
+     * exactly that).
+     *
+     * http_exchange_concurrent() has no tls_opt parameter -- it drives its
+     * own connect loop rather than going through http_connect(), so the
+     * fd->SSL* side table is never populated for the fds it opens. Under
+     * --tls it would therefore send plaintext at a TLS listener and report
+     * the handshake garbage as a protocol failure of the server.
+     *
+     * Failing is the only honest answer. A silent plaintext fallback would
+     * make a `concurrent` case pass or fail for a reason that has nothing
+     * to do with what it asserts, and a SKIP here would be invisible
+     * inside a rules run that is otherwise reporting real verdicts.
+     */
+    if (opt_tls.enable) {
+        printf("# concurrent: not supported under --tls "
+               "(http_exchange_concurrent has no TLS transport)\n");
+        return 0;
+    }
+
+    resps = calloc((size_t) tc->concurrent, sizeof(*resps));
+
+    if (resps == NULL) {
+        printf("# concurrent: out of memory for %d responses\n",
+               tc->concurrent);
+        return 0;
+    }
+
+    if (http_exchange_concurrent(opt_host, opt_port, tc->concurrent,
+                                 tc->request, tc->request_len,
+                                 opt_timeout_ms, tc->source,
+                                 tc->pauses, tc->n_pauses, tc->shut_how,
+                                 &tc->recv_opt, tc->saw_close_within,
+                                 0, resps, errbuf, errbuf_len) != 0)
+    {
+        printf("# concurrent request failed: %s\n", errbuf);
+
+        for (leg = 0; leg < tc->concurrent; leg++) {
+            http_response_free(&resps[leg]);
+        }
+
+        free(resps);
+        return 0;
+    }
+
+    for (leg = 0; leg < tc->concurrent; leg++) {
+        char  label[256];
+
+        snprintf(label, sizeof(label), "concurrent leg %d/%d: ",
+                 leg + 1, tc->concurrent);
+
+        if (opt_verbose) {
+            printf("# %s<- status %d, %zu body bytes\n",
+                   label, resps[leg].status, resps[leg].body_len);
+        }
+
+        if (!eval_exchange(label, tc->dechunk, tc->gunzip, tc->json_sort,
+                           tc->expects, tc->n_expects,
+                           tc->saw_close_within, tc->close_within_ms,
+                           tc->saw_idle, tc->idle_ms, &resps[leg]))
+        {
+            *ok = 0;
+        }
+
+        http_response_free(&resps[leg]);
+    }
+
+    free(resps);
+
+    return 1;
+}
+
+
+/*
+ * Fanout -- N copies of this case's request sent so that several WORKERS
+ * answer, and the distinct answering pids counted.
+ *
+ * Deliberately SEQUENTIAL, which is the semantic difference from `concurrent`
+ * and not an implementation shortcut. `concurrent` holds N requests in flight
+ * at once because it is asking what happens when they OVERLAP; fanout only
+ * needs the requests to REACH distinct workers and does not care whether they
+ * overlapped (rules.h documents exactly this). Sequential dispatch also buys
+ * the transport back: http_request() takes tls_opt and goes through
+ * http_connect(), so unlike the concurrent path above this one works under
+ * --tls with no fallback and no skip.
+ *
+ * Every leg is evaluated against the case's own expectations, same as the
+ * concurrent path: a request answered differently by one worker is a finding
+ * in its own right, and the leg number is carried into the label so a
+ * failure names which one.
+ *
+ * The pid of each leg is read from the leg's own probe snapshot rather than
+ * from the response, because the pid the coverage oracle needs is the pid of
+ * the worker that served THAT request, which is what the probe document
+ * renders.
+ *
+ * `quiesce` and the cross-worker zone_invariant judging run inside this arm
+ * too, not after it: they need several workers' readings, which is exactly
+ * what a fanout produces and what the parser refuses to let them be written
+ * without. `quiesce` runs FIRST when the case carries one, because every
+ * at_rest form is a claim about a settled counter and judging it on a moving
+ * one is the timing-dependent result the directive exists to remove. Its
+ * expiry ends the case, so the invariants are never judged against a state
+ * nobody waited for.
+ *
+ * Same return contract as run_concurrent_legs(): 0 is a hard failure the
+ * caller must free `before` over and return 0 for; 1 means keep going, with
+ * `*ok` cleared to 0 on any soft failure along the way.
+ *
+ * Split out of run_case() for the same reason run_quiesce() is.
+ */
+static int
+run_fanout_legs(const test_case *tc, char *errbuf, size_t errbuf_len,
+    int *ok)
+{
+    char           why[512];
+    http_response  resp;
+    double        *pids;
+    int            leg;
+    size_t         n_pids = 0;
+    size_t         distinct = 0;
+
+    /*
+     * Allocated only once the path is committed to running. A guard placed
+     * AFTER this calloc leaks every byte of it on the early return -- gcc
+     * -fanalyzer and cppcheck both caught exactly that shape on the
+     * concurrent branch above, so there is nothing between the allocation
+     * and its owning loop here.
+     */
+    pids = calloc((size_t) tc->fanout, sizeof(*pids));
+
+    if (pids == NULL) {
+        printf("# fanout: out of memory for %d pids\n", tc->fanout);
+        return 0;
+    }
+
+    for (leg = 0; leg < tc->fanout; leg++) {
+        char               label[256];
+        json_value        *doc;
+        const json_value  *pid;
+
+        snprintf(label, sizeof(label), "fanout leg %d/%d: ",
+                 leg + 1, tc->fanout);
+
+        if (http_request(opt_host, opt_port, tc->request, tc->request_len,
+                         opt_timeout_ms, tc->source,
+                         tc->pauses, tc->n_pauses, tc->shut_how,
+                         tc->abort_at, tc->hold_ms, &tc->recv_opt,
+                         tc->saw_close_within, tc->idle_ms, 0, &opt_tls,
+                         &resp, errbuf, errbuf_len) != 0)
+        {
+            printf("# %srequest failed: %s\n", label, errbuf);
+            free(pids);
+            return 0;
+        }
+
+        if (opt_verbose) {
+            printf("# %s<- status %d, %zu body bytes\n",
+                   label, resp.status, resp.body_len);
+        }
+
+        if (!eval_exchange(label, tc->dechunk, tc->gunzip, tc->json_sort,
+                           tc->expects, tc->n_expects,
+                           tc->saw_close_within, tc->close_within_ms,
+                           tc->saw_idle, tc->idle_ms, &resp))
+        {
+            *ok = 0;
+        }
+
+        http_response_free(&resp);
+
+        /*
+         * A leg whose pid cannot be read is a FAILURE, not a leg quietly
+         * dropped from the sample: silently shrinking n_pids would make
+         * the coverage bound easier to miss and harder to explain, which
+         * inverts the point of the oracle.
+         */
+        doc = fetch_probe(errbuf, errbuf_len);
+
+        if (doc == NULL) {
+            printf("# %s%s\n", label, errbuf);
+            free(pids);
+            return 0;
+        }
+
+        pid = json_get(doc, "pid");
+
+        if (pid == NULL || pid->type != JSON_NUMBER) {
+            printf("# %sthe probe document carries no numeric \"pid\", so "
+                   "the answering worker cannot be identified\n", label);
+            json_free(doc);
+            free(pids);
+            return 0;
+        }
+
+        pids[n_pids++] = pid->number;
+        json_free(doc);
+    }
+
+    /*
+     * The coverage oracle. Incomplete coverage FAILS -- see
+     * eval_fanout_coverage() for why a quiet pass here would make every
+     * cross-worker assertion in the case vacuous.
+     */
+    if (!eval_fanout_coverage(pids, n_pids, tc->fanout_min_workers,
+                              &distinct, why, sizeof(why)))
+    {
+        printf("# %s\n", why);
+        *ok = 0;
+
+    } else if (opt_verbose) {
+        printf("# fanout: %zu of %d responses came from %zu distinct "
+               "workers (need >= %d)\n",
+               n_pids, tc->fanout, distinct, tc->fanout_min_workers);
+    }
+
+    free(pids);
+
+    if (tc->n_zone_invariants > 0) {
+        double  *vals;
+        size_t   n_legs = (size_t) tc->fanout;
+
+        if (tc->quiesce_path != NULL && !run_quiesce(tc)) {
+            return 0;
+        }
+
+        /* Nothing between the allocation and its owning call, same shape
+         * as the pids buffer above and for the same leak reason. */
+        vals = calloc(tc->n_zone_invariants * n_legs, sizeof(*vals));
+
+        if (vals == NULL) {
+            printf("# zone_invariant: out of memory for %zu readings\n",
+                   tc->n_zone_invariants * n_legs);
+            return 0;
+        }
+
+        if (!collect_zone_readings(tc, vals, n_legs)) {
+            free(vals);
+            return 0;
+        }
+
+        if (!eval_zone_invariants(tc, vals, n_legs)) {
+            *ok = 0;
+        }
+
+        free(vals);
+    }
+
+    return 1;
+}
+
+
+/*
  * Returns 1 if the case passed. Diagnostics are printed as TAP comments.
  *
  * `baseline` is the run's origin snapshot for `probe_baseline` assertions, or
@@ -839,270 +1121,15 @@ run_case(const test_case *tc, const json_value *baseline)
     }
 
     if (tc->concurrent > 0) {
-        /*
-         * Concurrent fan -- N copies of this case's request held in flight at
-         * once. The parser guarantees a delta or probe assertion is present
-         * (otherwise the overlap would be observed by nothing) and rejects the
-         * directives that would make the fan read nothing, so this path only
-         * ever runs on a case whose snapshots actually bracket N collected
-         * responses.
-         *
-         * Every leg is evaluated against the case's own expectations: N
-         * overlapping requests must each be answered exactly as one sequential
-         * request is, so a leg that came back different is a finding even when
-         * the aggregate delta is clean. The leg number is carried into the
-         * label so a failure names which one.
-         */
-        http_response *resps;
-        int            leg;
-
-        /*
-         * Checked BEFORE the allocation below, not after: this path returns
-         * without running the exchange, and a guard placed after the calloc
-         * leaks every byte of it (gcc -fanalyzer and cppcheck both caught
-         * exactly that).
-         *
-         * http_exchange_concurrent() has no tls_opt parameter -- it drives its
-         * own connect loop rather than going through http_connect(), so the
-         * fd->SSL* side table is never populated for the fds it opens. Under
-         * --tls it would therefore send plaintext at a TLS listener and report
-         * the handshake garbage as a protocol failure of the server.
-         *
-         * Failing is the only honest answer. A silent plaintext fallback would
-         * make a `concurrent` case pass or fail for a reason that has nothing
-         * to do with what it asserts, and a SKIP here would be invisible
-         * inside a rules run that is otherwise reporting real verdicts.
-         */
-        if (opt_tls.enable) {
-            printf("# concurrent: not supported under --tls "
-                   "(http_exchange_concurrent has no TLS transport)\n");
+        if (!run_concurrent_legs(tc, errbuf, sizeof(errbuf), &ok)) {
             json_free(before);
             return 0;
         }
-
-        resps = calloc((size_t) tc->concurrent, sizeof(*resps));
-
-        if (resps == NULL) {
-            printf("# concurrent: out of memory for %d responses\n",
-                   tc->concurrent);
-            json_free(before);
-            return 0;
-        }
-
-        if (http_exchange_concurrent(opt_host, opt_port, tc->concurrent,
-                                     tc->request, tc->request_len,
-                                     opt_timeout_ms, tc->source,
-                                     tc->pauses, tc->n_pauses, tc->shut_how,
-                                     &tc->recv_opt, tc->saw_close_within,
-                                     0, resps, errbuf, sizeof(errbuf)) != 0)
-        {
-            printf("# concurrent request failed: %s\n", errbuf);
-
-            for (leg = 0; leg < tc->concurrent; leg++) {
-                http_response_free(&resps[leg]);
-            }
-
-            free(resps);
-            json_free(before);
-            return 0;
-        }
-
-        for (leg = 0; leg < tc->concurrent; leg++) {
-            char  label[256];
-
-            snprintf(label, sizeof(label), "concurrent leg %d/%d: ",
-                     leg + 1, tc->concurrent);
-
-            if (opt_verbose) {
-                printf("# %s<- status %d, %zu body bytes\n",
-                       label, resps[leg].status, resps[leg].body_len);
-            }
-
-            if (!eval_exchange(label, tc->dechunk, tc->gunzip, tc->json_sort,
-                               tc->expects, tc->n_expects,
-                               tc->saw_close_within, tc->close_within_ms,
-                               tc->saw_idle, tc->idle_ms, &resps[leg]))
-            {
-                ok = 0;
-            }
-
-            http_response_free(&resps[leg]);
-        }
-
-        free(resps);
 
     } else if (tc->fanout > 0) {
-        /*
-         * Fanout -- N copies of this case's request sent so that several
-         * WORKERS answer, and the distinct answering pids counted.
-         *
-         * Deliberately SEQUENTIAL, which is the semantic difference from
-         * `concurrent` and not an implementation shortcut. `concurrent` holds
-         * N requests in flight at once because it is asking what happens when
-         * they OVERLAP; fanout only needs the requests to REACH distinct
-         * workers and does not care whether they overlapped (rules.h documents
-         * exactly this). Sequential dispatch also buys the transport back:
-         * http_request() takes tls_opt and goes through http_connect(), so
-         * unlike the concurrent path above this one works under --tls with no
-         * fallback and no skip.
-         *
-         * Every leg is evaluated against the case's own expectations, same as
-         * the concurrent path: a request answered differently by one worker is
-         * a finding in its own right, and the leg number is carried into the
-         * label so a failure names which one.
-         *
-         * The pid of each leg is read from the leg's own probe snapshot rather
-         * than from the response, because the pid the coverage oracle needs is
-         * the pid of the worker that served THAT request, which is what the
-         * probe document renders.
-         */
-        double  *pids;
-        int      leg;
-        size_t   n_pids = 0;
-        size_t   distinct = 0;
-
-        /*
-         * Allocated only once the path is committed to running. A guard placed
-         * AFTER this calloc leaks every byte of it on the early return -- gcc
-         * -fanalyzer and cppcheck both caught exactly that shape on the
-         * concurrent branch above, so there is nothing between the allocation
-         * and its owning loop here.
-         */
-        pids = calloc((size_t) tc->fanout, sizeof(*pids));
-
-        if (pids == NULL) {
-            printf("# fanout: out of memory for %d pids\n", tc->fanout);
+        if (!run_fanout_legs(tc, errbuf, sizeof(errbuf), &ok)) {
             json_free(before);
             return 0;
-        }
-
-        for (leg = 0; leg < tc->fanout; leg++) {
-            char               label[256];
-            json_value        *doc;
-            const json_value  *pid;
-
-            snprintf(label, sizeof(label), "fanout leg %d/%d: ",
-                     leg + 1, tc->fanout);
-
-            if (http_request(opt_host, opt_port, tc->request, tc->request_len,
-                             opt_timeout_ms, tc->source,
-                             tc->pauses, tc->n_pauses, tc->shut_how,
-                             tc->abort_at, tc->hold_ms, &tc->recv_opt,
-                             tc->saw_close_within, tc->idle_ms, 0, &opt_tls,
-                             &resp, errbuf, sizeof(errbuf)) != 0)
-            {
-                printf("# %srequest failed: %s\n", label, errbuf);
-                free(pids);
-                json_free(before);
-                return 0;
-            }
-
-            if (opt_verbose) {
-                printf("# %s<- status %d, %zu body bytes\n",
-                       label, resp.status, resp.body_len);
-            }
-
-            if (!eval_exchange(label, tc->dechunk, tc->gunzip, tc->json_sort,
-                               tc->expects, tc->n_expects,
-                               tc->saw_close_within, tc->close_within_ms,
-                               tc->saw_idle, tc->idle_ms, &resp))
-            {
-                ok = 0;
-            }
-
-            http_response_free(&resp);
-
-            /*
-             * A leg whose pid cannot be read is a FAILURE, not a leg quietly
-             * dropped from the sample: silently shrinking n_pids would make
-             * the coverage bound easier to miss and harder to explain, which
-             * inverts the point of the oracle.
-             */
-            doc = fetch_probe(errbuf, sizeof(errbuf));
-
-            if (doc == NULL) {
-                printf("# %s%s\n", label, errbuf);
-                free(pids);
-                json_free(before);
-                return 0;
-            }
-
-            pid = json_get(doc, "pid");
-
-            if (pid == NULL || pid->type != JSON_NUMBER) {
-                printf("# %sthe probe document carries no numeric \"pid\", so "
-                       "the answering worker cannot be identified\n", label);
-                json_free(doc);
-                free(pids);
-                json_free(before);
-                return 0;
-            }
-
-            pids[n_pids++] = pid->number;
-            json_free(doc);
-        }
-
-        /*
-         * The coverage oracle. Incomplete coverage FAILS -- see
-         * eval_fanout_coverage() for why a quiet pass here would make every
-         * cross-worker assertion in the case vacuous.
-         */
-        if (!eval_fanout_coverage(pids, n_pids, tc->fanout_min_workers,
-                                  &distinct, why, sizeof(why)))
-        {
-            printf("# %s\n", why);
-            ok = 0;
-
-        } else if (opt_verbose) {
-            printf("# fanout: %zu of %d responses came from %zu distinct "
-                   "workers (need >= %d)\n",
-                   n_pids, tc->fanout, distinct, tc->fanout_min_workers);
-        }
-
-        free(pids);
-
-        /*
-         * The cross-worker invariants, judged last and only on this path: they
-         * need several workers' readings, which is exactly what a fanout
-         * produces and what the parser refuses to let them be written without.
-         *
-         * `quiesce` runs FIRST when the case carries one, because every
-         * at_rest form below is a claim about a settled counter and judging it
-         * on a moving one is the timing-dependent result the directive exists
-         * to remove. Its expiry ends the case, so the invariants are never
-         * judged against a state nobody waited for.
-         */
-        if (tc->n_zone_invariants > 0) {
-            double  *vals;
-            size_t   n_legs = (size_t) tc->fanout;
-
-            if (tc->quiesce_path != NULL && !run_quiesce(tc)) {
-                json_free(before);
-                return 0;
-            }
-
-            /* Nothing between the allocation and its owning call, same shape
-             * as the pids buffer above and for the same leak reason. */
-            vals = calloc(tc->n_zone_invariants * n_legs, sizeof(*vals));
-
-            if (vals == NULL) {
-                printf("# zone_invariant: out of memory for %zu readings\n",
-                       tc->n_zone_invariants * n_legs);
-                json_free(before);
-                return 0;
-            }
-
-            if (!collect_zone_readings(tc, vals, n_legs)) {
-                free(vals);
-                json_free(before);
-                return 0;
-            }
-
-            if (!eval_zone_invariants(tc, vals, n_legs)) {
-                ok = 0;
-            }
-
-            free(vals);
         }
 
     } else if (tc->n_blocks == 0) {

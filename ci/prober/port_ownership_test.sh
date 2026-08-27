@@ -167,6 +167,41 @@ kill_port_holders() {
     wait 2>/dev/null || true
 }
 
+# Block until `ss` no longer shows anything bound to $PORT, or the scaffolding
+# budget runs out.
+#
+# `wait "$pid"` right after a `kill -9` is NOT this suite's synchronization
+# primitive for the servers under test: every one of SRV_PID/STUCK_SRV_PID/
+# REAL_SRV_PID is read back from a pidfile or `$!` INSIDE a `boot_against` (or
+# similarly bare) subshell, so by the time that subshell has exited and handed
+# the pid back to this script, the process is no longer this script's child --
+# only the subshell's, and that subshell is already gone. `wait` on a pid that
+# is not a direct child returns immediately with no error and without pausing
+# for anything, so every call site pairing `kill -9 "$SRV_PID"` with
+# `wait "$SRV_PID"` was synchronizing on nothing: the very next line (usually
+# start_squatter, or a fresh fake_nginx on the same $PORT) could run before the
+# kernel finished tearing down the killed process's listening socket, landing
+# EADDRINUSE on a port this suite had every reason to believe was free. That
+# race is rare -- SIGKILL delivery and socket teardown are normally fast enough
+# that the next line does not catch it -- but rare is not never, and a suite
+# whose own teardown can bind() out from under itself is not proving what its
+# test names claim on the run where it loses that race.
+#
+# ss, not kill -0: kill -0 on the pid only proves the PROCESS is reaped, which
+# says nothing about how soon after that the LISTENING SOCKET itself closes --
+# the two are usually simultaneous but this is exactly the kind of "usually"
+# this suite exists to stop trusting. Polling ss for the port itself is the
+# same authority kill_port_holders already leans on for the same reason (see
+# its own comment above).
+wait_port_clear() {
+    local _i
+    for _i in $(seq 1 $((100 * SCAFFOLD_SCALE))); do
+        ss -lptnH "sport = :$PORT" 2>/dev/null | grep -q . || return 0
+        sleep 0.05
+    done
+    return 1
+}
+
 cleanup() {
     [ -n "$SRV_PID" ] && kill -9 "$SRV_PID" 2>/dev/null
     [ -n "$SQUAT_PID" ] && kill -9 "$SQUAT_PID" 2>/dev/null
@@ -309,7 +344,13 @@ ok "$s" "boot succeeds when the port is free"
 [ -n "$SRV_PID" ] || SRV_PID="$(cat "$WORK/booted.pid" 2>/dev/null || true)"
 [ -n "$SRV_PID" ] && kill -9 "$SRV_PID" 2>/dev/null
 wait "$SRV_PID" 2>/dev/null || true
+_happy_srv_pid="$SRV_PID"
 SRV_PID=""
+wait_port_clear || {
+    echo "# port $PORT still held after killing the happy-path server" \
+         "(pid $_happy_srv_pid) -- not safe to squat it yet"
+    exit 1
+}
 
 # ---- the core regression guard: pre-spawn refusal on a squatted port -------
 # Squat the port with fakesrv (a real, already-tested listener -- see
@@ -418,6 +459,11 @@ ok "$s" "prober_assert_port_owned's output names the squatting pid ($SQUAT_PID)"
 kill -9 "$STUCK_SRV_PID" 2>/dev/null
 wait "$STUCK_SRV_PID" 2>/dev/null || true
 stop_squatter
+wait_port_clear || {
+    echo "# port $PORT still held after killing the stuck server and the" \
+         "squatter -- not safe to bind our own listener on it yet"
+    exit 1
+}
 
 # ---- the counterpart: OUR OWN listener is accepted, not just liveness ------
 # Paired with the case above so neither is vacuous: if prober_assert_port_owned
@@ -445,6 +491,11 @@ done
 ok "$s" "prober_assert_port_owned accepts our own genuine listener"
 kill -9 "$REAL_SRV_PID" 2>/dev/null
 wait "$REAL_SRV_PID" 2>/dev/null || true
+wait_port_clear || {
+    echo "# port $PORT still held after killing our own listener" \
+         "(pid $REAL_SRV_PID) -- not safe to boot onto it yet"
+    exit 1
+}
 
 # ---- fatal error-log gate: EADDRINUSE in the log is never a soft pass ------
 # Independent of ownership: even a run where we eventually win the race must
