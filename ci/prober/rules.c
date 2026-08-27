@@ -245,9 +245,17 @@ parse_expect(expectation *list, size_t *count, char *arg,
 static void
 parse_alpn(test_case *tc, char *arg, const char *file, int lineno)
 {
-    unsigned char  *buf = NULL;
+    /*
+     * ALPN_SEED_CAP holds the lists rule files actually write without a single
+     * realloc: "h2,http/1.1" encodes to 12 bytes, and even the 255-byte name
+     * the ceiling check allows fits inside it with room over. Growth is still
+     * implemented below and still correct; it is just not on the common path.
+     */
+#define ALPN_SEED_CAP  320
+
+    unsigned char  *buf;
     size_t          len = 0;
-    size_t          cap = 0;
+    size_t          cap = ALPN_SEED_CAP;
     char           *list = trim(arg);
     char           *p;
 
@@ -260,6 +268,35 @@ parse_alpn(test_case *tc, char *arg, const char *file, int lineno)
         die("%s:%d: alpn needs at least one protocol name "
             "(an empty list offers no ALPN extension, which `alpn` cannot "
             "express -- simply omit the directive)", file, lineno);
+    }
+
+    /*
+     * ALLOCATED UP FRONT, unconditionally, rather than lazily on first use.
+     *
+     * The lazy shape (`buf = NULL; cap = 0` and let the growth branch make the
+     * first allocation) was copied from util.c's append_escaped(), which needs
+     * it because its buffer belongs to a CALLER who may already have one. This
+     * function owns its buffer outright, so it buys nothing here and costs two
+     * things.
+     *
+     * The first is a real invariant nobody can see: `buf != NULL` holds only
+     * because `cap == 0` on entry forces the growth branch on the first
+     * iteration. That is true, and it is three lines away from the dereference
+     * that depends on it. GCC's -fanalyzer cannot correlate `cap` with `buf`
+     * and reported the write below as a NULL dereference (CI job `analyzers`,
+     * -Werror). It was a false positive, but an analyzer that cannot follow
+     * the argument is a fair proxy for a reader who cannot either.
+     *
+     * The second is the `cap == 0 ? 64 : cap * 2` special case, which only
+     * exists to bootstrap the lazy allocation and disappears with it.
+     *
+     * So the invariant is made structural instead of argued: buf is non-NULL
+     * from here to the end of the function, on every path.
+     */
+    buf = malloc(cap);
+
+    if (buf == NULL) {
+        die("%s:%d: out of memory encoding the alpn list", file, lineno);
     }
 
     /*
@@ -311,11 +348,11 @@ parse_alpn(test_case *tc, char *arg, const char *file, int lineno)
         if (len + 1 + n > cap) {
             unsigned char *bigger;
 
-            cap = (cap == 0 ? 64 : cap * 2);
-
-            while (cap < len + 1 + n) {
+            /* No `cap == 0` bootstrap: cap is ALPN_SEED_CAP or a doubling of
+             * it, so it is always positive and the loop always terminates. */
+            do {
                 cap *= 2;
-            }
+            } while (cap < len + 1 + n);
 
             bigger = realloc(buf, cap);
 
@@ -342,6 +379,8 @@ parse_alpn(test_case *tc, char *arg, const char *file, int lineno)
     tc->alpn = buf;
     tc->alpn_len = len;
     tc->saw_alpn = 1;
+
+#undef ALPN_SEED_CAP
 }
 
 
