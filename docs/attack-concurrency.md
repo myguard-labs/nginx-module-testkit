@@ -295,9 +295,16 @@ The reference module never allocates from the shm slab on a request path
 full sweep), so against a zone nothing mutates, every reading is the same
 number and all three forms would be satisfied by a constant sequence no defect
 could falsify — green for a reason unrelated to whether the comparisons are
-correct. The forms are implemented, load-checked, and unit-tested against
-synthetic readings including their reds; their live coverage against a
-mutating zone arrives with a consumer that has one.
+correct. This holds equally for all three forms; none of `coherent`, `at_rest`
+or `monotonic` gets closer to a live negative control than the others against
+this module, and no field on `zone.*` gives one a way around it —
+`connections.free` resets to baseline between fanout legs rather than
+accumulating a fall, and `open_conns`'s held connections do not exist yet when
+`zone_invariant` takes its readings (see `collect_zone_readings` in
+`ci/prober/prober.c` and the header of `shm-coherence.rule` for both routes
+and why each is closed). The forms are implemented, load-checked, and
+unit-tested against synthetic readings including their reds; their live
+coverage against a mutating zone arrives with a consumer that has one.
 
 ## How this class produces a green run that proves nothing
 
