@@ -1275,6 +1275,57 @@ mutate "--check: flag does not take effect" prober.c \
 mutate "--tls: flag does not take effect" prober.c \
     '            opt_tls.enable = 1;' '            opt_tls.enable = 0;' tls_test.sh
 
+# ---- ALPN (H2-1) ------------------------------------------------------------
+#
+# Every row here is caught by scenarios/alpn-negotiation, which is the only
+# place the ALPN code is reachable: it needs a real `listen ... ssl` server to
+# negotiate against, and a mock cannot refuse an offer the way nginx does.
+
+# THE INVERTED RETURN. SSL_set_alpn_protos() returns 0 on SUCCESS, unlike every
+# other OpenSSL call around it, so the natural `!= 1` spelling checks the wrong
+# way round: it fires on success and never on failure. The consequence is
+# silent -- the offer is dropped, the ClientHello goes out with NO ALPN
+# extension, the server answers happily, and every malformed-list case passes
+# having sent nothing hostile. This mutation is that exact mistake.
+#
+# Caught by the scenario's refusal cases: with the offer dropped, nginx has no
+# ALPN to refuse, the handshake succeeds, and expect_alpn_refused reds with
+# "the handshake SUCCEEDED".
+mutate "ALPN: the offer is never sent" http.c \
+    '        if (SSL_set_alpn_protos(ssl, tls_opt->alpn, tls_opt->alpn_len) != 0) {' \
+    '        if (0 && SSL_set_alpn_protos(ssl, tls_opt->alpn, tls_opt->alpn_len) != 0) {' \
+    scenarios/alpn-negotiation/mutate-suite.sh
+
+# THE REFUSAL ORACLE'"'"'S FAILING DIRECTION. Without this branch a case asserting
+# expect_alpn_refused can never fail: a server that ACCEPTS every protocol it
+# is offered satisfies the directive exactly as well as one that refuses, so
+# the assertion certifies nothing at all.
+#
+# Compiled out as a whole block rather than by flipping one conjunct, because a
+# guard chain masks a single mutated term.
+#
+# CAUGHT BY alpn_test.sh, NOT BY THE SCENARIO, and the reason is the whole
+# design of that file. Every offer the scenario makes is one nginx refuses, so
+# an oracle that reported "refused" unconditionally satisfies all of them --
+# measured 2026-08-27: this row SURVIVED against the scenario. alpn_test.sh
+# stands up a TLS server that accepts any ALPN it is offered, which is the only
+# thing in this tree that can tell the two apart, and requires the assertion to
+# go red against it.
+mutate "ALPN: a refusal that never happened still passes" prober.c \
+    '    } else if (tc->expect_alpn_refused) {' \
+    '    } else if (0 && tc->expect_alpn_refused) {' \
+    alpn_test.sh
+
+# THE READBACK READS THE OFFER INSTEAD OF THE ANSWER. Reporting no protocol for
+# every connection makes `expect_alpn http/1.1` red on a healthy server, which
+# is a caught mutation; the subtler direction -- echoing the client'"'"'s offer --
+# is covered by the scenario case that offers `h2,http/1.1` and demands
+# `http/1.1`, where an echo reports `h2` and reds.
+mutate "ALPN: the negotiated protocol is never read back" http.c \
+    '    SSL_get0_alpn_selected(ssl, &proto, &proto_len);' \
+    '    SSL_get0_alpn_selected(ssl, &proto, &proto_len); proto = NULL;' \
+    scenarios/alpn-negotiation/mutate-suite.sh
+
 # ---- probe schema -----------------------------------------------------------
 
 # The schema exists to catch emitter drift on fields no rule happens to name,

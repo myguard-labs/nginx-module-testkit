@@ -421,7 +421,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                       pauses, n_pauses, shut_how, abort_at, hold_ms,
-                      recv_opt, want_close, idle_ms, 0, NULL, &resp,
+                      recv_opt, want_close, idle_ms, 0, NULL, NULL, &resp,
                       errbuf, sizeof(errbuf));
 
     if (rc == 0) {
@@ -1806,7 +1806,7 @@ run_echo_abort(const unsigned char *req, size_t req_len, size_t want_len,
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                       pauses, n_pauses, HTTP_SHUT_NONE, abort_at,
-                      HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0, NULL, &resp,
+                      HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0, NULL, NULL, &resp,
                       errbuf, sizeof(errbuf));
 
     if (rc == 0) {
@@ -3205,7 +3205,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE, 0,
-                              NULL, &resp, errbuf, sizeof(errbuf));
+                              NULL, NULL, &resp, errbuf, sizeof(errbuf));
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_FIN
                && resp.close_ms >= 100,
@@ -3256,7 +3256,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE, 0,
-                              NULL, &resp, errbuf, sizeof(errbuf));
+                              NULL, NULL, &resp, errbuf, sizeof(errbuf));
 
             /* A reset can arrive either as ECONNRESET on the read or, if the
              * response was fully buffered first, as an ordinary EOF -- the
@@ -3293,7 +3293,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE, 0,
-                              NULL, &resp, errbuf, sizeof(errbuf));
+                              NULL, NULL, &resp, errbuf, sizeof(errbuf));
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_RESET,
                "a bare reset is classified as a reset, not as an unknown close");
@@ -3332,7 +3332,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0,
-                              NULL, &resp, errbuf, sizeof(errbuf));
+                              NULL, NULL, &resp, errbuf, sizeof(errbuf));
 
             ok(rc != 0,
                "without want_close a non-closing server is a transport error");
@@ -3359,7 +3359,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE, 0,
-                              NULL, &resp, errbuf, sizeof(errbuf));
+                              NULL, NULL, &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_TIMEOUT,
@@ -3434,7 +3434,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 200, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0,
-                              NULL, &resp, errbuf, sizeof(errbuf));
+                              NULL, NULL, &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
             ok(rc != 0, "a trickling server is a failure, not an infinite read "
@@ -3502,7 +3502,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 0, 200, 0,
-                              NULL, &resp, errbuf, sizeof(errbuf));
+                              NULL, NULL, &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_IDLE,
@@ -3550,7 +3550,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 0, 2000, 0,
-                              NULL, &resp, errbuf, sizeof(errbuf));
+                              NULL, NULL, &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_DATA,
@@ -3793,7 +3793,7 @@ main(void)
         rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
                           NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                           HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
-                          NULL, &r, errbuf, sizeof(errbuf));
+                          NULL, NULL, &r, errbuf, sizeof(errbuf));
         ok(rc == 0 && r.close_reason == HTTP_CLOSE_FRAMED,
            "a framed read stops on framing against a peer that never closes");
         ok(rc == 0 && r.status == 200 && r.body_len == 5
@@ -3813,7 +3813,7 @@ main(void)
         rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
                           NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                           HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0,
-                          NULL, &r, errbuf, sizeof(errbuf));
+                          NULL, NULL, &r, errbuf, sizeof(errbuf));
         ok(rc != 0,
            "without framed mode the same server hangs to timeout and fails");
         if (rc == 0) {
@@ -3829,7 +3829,7 @@ main(void)
         rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
                           NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                           HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
-                          NULL, &r, errbuf, sizeof(errbuf));
+                          NULL, NULL, &r, errbuf, sizeof(errbuf));
         ok(rc == 0 && r.raw_len == sizeof(KA_RESP) - 1
            && r.body_len == 5 && memcmp(r.body, "hello", 5) == 0,
            "a pipelined second response is left on the wire, not read into the first");
@@ -3846,7 +3846,7 @@ main(void)
         rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
                           NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                           HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
-                          NULL, &r, errbuf, sizeof(errbuf));
+                          NULL, NULL, &r, errbuf, sizeof(errbuf));
         /* The verdict is pinned to the UNFRAMEABLE rejection, not merely to a
          * non-zero return: if the rejection is removed the loop falls through to
          * read-to-EOF and still fails -- but on the per-read TIMEOUT, a
@@ -3871,7 +3871,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
-                              NULL, &r, errbuf, sizeof(errbuf));
+                              NULL, NULL, &r, errbuf, sizeof(errbuf));
             if (rc == 0) {
                 http_dechunk(&r);
             }
@@ -3896,7 +3896,7 @@ main(void)
             rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
                               HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
-                              NULL, &r, errbuf, sizeof(errbuf));
+                              NULL, NULL, &r, errbuf, sizeof(errbuf));
             ok(rc == 0 && r.close_reason == HTTP_CLOSE_FRAMED
                && r.status == 204 && r.body_len == 0,
                "a bodiless 204 framed read ends at the terminator, no body wait");
@@ -4452,7 +4452,7 @@ main(void)
              * ever saw it.
              */
             first_fd = http_connect("127.0.0.1", tls_port, 5000, NULL, NULL,
-                                    &tls_on, errbuf, sizeof(errbuf));
+                                    &tls_on, NULL, errbuf, sizeof(errbuf));
 
             ok(first_fd >= 0, "TLS handshake completes against a locally "
                               "spawned TLS server");
@@ -4512,7 +4512,7 @@ main(void)
              * than a quiet wrong answer.
              */
             second_fd = http_connect("127.0.0.1", tls_port, 5000, NULL, NULL,
-                                     &tls_on, errbuf, sizeof(errbuf));
+                                     &tls_on, NULL, errbuf, sizeof(errbuf));
 
             ok(second_fd >= 0, "a second TLS connection is established after "
                                "the first is closed");
@@ -4591,7 +4591,7 @@ main(void)
                     close(fds[1]);
 
                     plain_fd = http_connect("127.0.0.1", plain_port, 1000,
-                                            NULL, NULL, &tls_on, perrbuf,
+                                            NULL, NULL, &tls_on, NULL, perrbuf,
                                             sizeof(perrbuf));
 
                     ok(plain_fd < 0, "TLS handshake fails loudly against a "

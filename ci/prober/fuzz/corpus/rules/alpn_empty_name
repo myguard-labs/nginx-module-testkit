@@ -1,0 +1,3 @@
+name t
+send GET / HTTP/1.1\r\n\r\n
+alpn h2,,http/1.1

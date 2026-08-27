@@ -1,0 +1,186 @@
+# Scenario: ALPN protocol negotiation, and what the worker gives up when it
+# goes WRONG.
+#
+# WHAT MAKES THIS ADMISSIBLE, stated first because it is the only question
+# worth asking of a new scenario here. "The prober can speak ALPN" is not a
+# finding: it proves nginx does what nginx does, and Test::Nginx::Socket can
+# already reach a negotiated listener. What this file asserts is what happens
+# INSIDE the worker across a negotiation that FAILS -- an offer the server must
+# refuse, a list OpenSSL rejects before a byte reaches the wire, `h2` at a
+# listener not configured for it. Each of those kills the handshake before a
+# single request byte is written, and each is asserted to cost the module under
+# test no descriptor and no cycle-pool byte.
+#
+# That accounting is invisible from outside. After a rejected ALPN a Perl
+# client has one observation available -- the connection failed -- and a clean
+# refusal and a refusal that leaked an fd produce exactly the same one. The
+# probe snapshot is the whole difference, which is why every refusal case below
+# carries `delta` and the file closes on a `probe_baseline` spanning all of
+# them.
+#
+# THE TEST THAT KEEPS THESE HONEST: remove the probe snapshot from any case
+# below and the case must stop asserting anything worth having. Every refusal
+# case here fails that test in the right direction -- with the delta gone, all
+# that is left is "the handshake failed", which a wrong port produces too.
+
+# ---------------------------------------------------------------------------
+# Baseline. Not an attack: it exists so the attacks below cannot pass vacuously
+# on a fixture that refuses EVERYTHING. If the listener rejected every ALPN
+# offer -- a broken certificate, a listener that never came up -- the refusal
+# cases would all "pass" while proving nothing. This is the case that says the
+# negotiation works when it is supposed to.
+name          a well-formed ALPN offer negotiates http/1.1
+send          GET / HTTP/1.1\r\n
+send          Host: prober\r\nConnection: close\r\n\r\n
+alpn          http/1.1
+expect_alpn   http/1.1
+expect        status=200
+expect        body~OK
+delta         fds == 0
+
+# Fallback: the server picks from the list rather than taking the first entry
+# or refusing outright. This is also the case that proves `expect_alpn` reads
+# the SERVER'S CHOICE and not the client's offer -- the offer leads with `h2`
+# and the assertion demands `http/1.1`, so a readback that echoed the request
+# fails here and nowhere else in this file.
+name          the server selects http/1.1 from a list it only partly supports
+send          GET / HTTP/1.1\r\n
+send          Host: prober\r\nConnection: close\r\n\r\n
+alpn          h2,http/1.1
+expect_alpn   http/1.1
+expect        status=200
+delta         fds == 0
+
+# ---------------------------------------------------------------------------
+# ATTACK 1 -- an ALPN list the server must refuse.
+#
+# A protocol nobody implements. nginx has nothing to select, so it answers
+# `no_application_protocol` and the handshake dies. The assertion that matters
+# is the delta: the worker accepted a connection, ran a TLS handshake far
+# enough to read the ClientHello's extensions, decided to reject it, and must
+# have given back every descriptor it took to do so.
+name                  an unsatisfiable ALPN offer is refused with no fd cost
+send                  GET / HTTP/1.1\r\n
+send                  Host: prober\r\nConnection: close\r\n\r\n
+alpn                  nosuchprotocol/9.9
+expect_alpn_refused
+delta                 fds == 0
+
+# The same attack with a LONG name, at the protocol's own ceiling (255 bytes,
+# the largest a single length octet can describe). Separate from the case above
+# because the two exercise different code: a name at the encoding boundary is
+# where an off-by-one in the length prefix lands, and a worker that mishandled
+# an extension field of that size would show it here rather than on a 18-byte
+# name.
+name                  a 255-byte ALPN protocol name is refused with no fd cost
+send                  GET / HTTP/1.1\r\n
+send                  Host: prober\r\nConnection: close\r\n\r\n
+alpn                  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+expect_alpn_refused
+delta                 fds == 0
+
+# ---------------------------------------------------------------------------
+# ATTACK 2 -- `h2` at a listener not configured for it.
+#
+# The row's named third attack, and the one closest to a real client mistake: a
+# browser or proxy that assumes h2 is available and offers only that. nginx's
+# listener carries `ssl` without `http2` (see nginx.conf), so `h2` is not among
+# the protocols it advertises and the offer is fatal.
+#
+# Worth being precise about what this does and does not show. It is NOT
+# evidence about nginx's h2 implementation -- no h2 connection is ever
+# established, and this scenario deliberately links no h2 client. It is
+# evidence that the REFUSAL path costs the module nothing, which is the only
+# claim H2-1 makes and the reason the frame layer is a separate row.
+name                  h2 offered to a listener without http2 is refused cleanly
+send                  GET / HTTP/1.1\r\n
+send                  Host: prober\r\nConnection: close\r\n\r\n
+alpn                  h2
+expect_alpn_refused
+delta                 fds == 0
+
+# ---------------------------------------------------------------------------
+# ATTACK 3 -- a malformed protocol list.
+#
+# `alpn_raw` writes these bytes into the extension with no length prefixes
+# computed, so the list is broken AS A LIST rather than merely naming a
+# protocol nobody has. OpenSSL validates the buffer before the ClientHello is
+# built and refuses it, which is a CLIENT-side rejection -- the connection
+# never leaves this process.
+#
+# THAT IS WHY THESE CASES ASSERT A DELTA AND NOT A REFUSAL. The distinction is
+# the point rather than a technicality: `expect_alpn_refused` names the server
+# rejecting our offer, and using it here would assert the server did something
+# it was never given the chance to do. What is asserted instead is that the
+# harness's own failure path costs the WORKER nothing -- the case is expected
+# to fail its connection, and the run-level probe_baseline at the end of this
+# file is what carries the evidence across it.
+#
+# The malformed forms below were each measured against OpenSSL 3.5.6 on
+# 2026-08-27 and each was rejected by SSL_set_alpn_protos():
+#   \x7fab      -- a length prefix claiming 127 bytes with two supplied
+#   \x00        -- a zero-length entry
+#   \x02h2\xff  -- a trailing byte past the end of the last name
+#
+# xfail rather than a passing case: the connection genuinely cannot be made, so
+# the case fails by construction and says so by name. A green here would mean
+# OpenSSL had silently ACCEPTED a malformed list and sent it, which is the
+# regression these three exist to catch.
+name                  a length prefix overrunning the buffer is rejected
+send                  GET / HTTP/1.1\r\n
+send                  Host: prober\r\nConnection: close\r\n\r\n
+xfail                 the ALPN list is malformed on purpose; OpenSSL refuses to send it
+alpn_raw              \x7fab
+expect                status=200
+
+name                  a zero-length ALPN entry is rejected
+send                  GET / HTTP/1.1\r\n
+send                  Host: prober\r\nConnection: close\r\n\r\n
+xfail                 the ALPN list is malformed on purpose; OpenSSL refuses to send it
+alpn_raw              \x00
+expect                status=200
+
+name                  trailing garbage past the last ALPN name is rejected
+send                  GET / HTTP/1.1\r\n
+send                  Host: prober\r\nConnection: close\r\n\r\n
+xfail                 the ALPN list is malformed on purpose; OpenSSL refuses to send it
+alpn_raw              \x02h2\xff
+expect                status=200
+
+# ---------------------------------------------------------------------------
+# A well-formed list written through the RAW form still negotiates. Without
+# this the three cases above would be satisfied by an `alpn_raw` that was
+# broken in general -- one that mangled every list it was handed, malformed or
+# not, would make all three xfail exactly as written while the directive did
+# nothing it claims. This is the case that says the raw form's bytes reach the
+# wire intact when they are valid.
+name          a hand-encoded but well-formed raw ALPN list negotiates
+send          GET / HTTP/1.1\r\n
+send          Host: prober\r\nConnection: close\r\n\r\n
+alpn_raw      \x08http/1.1
+expect_alpn   http/1.1
+expect        status=200
+delta         fds == 0
+
+# ---------------------------------------------------------------------------
+# THE CLOSING ORACLE, and the reason every case above is evidence rather than
+# anecdote.
+#
+# `probe_baseline` subtracts from the run's ORIGIN snapshot rather than from
+# this case's own, so it spans the WHOLE batch: three refused negotiations,
+# three lists OpenSSL rejected, and four completed handshakes. A descriptor
+# leaked in any one of them lands here and nowhere else -- each per-case
+# `delta` compares snapshots that already carry the leak, so a single leaked fd
+# is invisible to every one of them and visible to this.
+#
+# That is the worker-inside claim H2-1 makes, in one line: ten ALPN
+# negotiations, most of them deliberately broken, and the module under test
+# holds exactly the descriptors it started with.
+name                  no descriptor drift across the whole ALPN batch
+send                  GET / HTTP/1.1\r\n
+send                  Host: prober\r\nConnection: close\r\n\r\n
+alpn                  http/1.1
+expect_alpn           http/1.1
+expect                status=200
+delta                 fds == 0
+probe_baseline        fds == 0

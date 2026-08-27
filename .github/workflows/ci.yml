@@ -1265,21 +1265,31 @@ jobs:
       # That FORTIFY actually fired is checked the same way as the canary: an
       # undefined reference to a _chk symbol in the object.
       #
-      # rules.c and json.c have NO fortifiable call sites -- their string
-      # handling goes through strtol/strchr/memcmp/strtod and (un)bounded local
-      # copies whose sizes FORTIFY cannot see, none of which get a _chk variant.
-      # A grep for `_chk` on them would therefore either match nothing (an honest
-      # report) or be quietly excluded from the check (a vacuous gate dressed up
-      # as a pass) -- this job takes the first option and documents it here
-      # rather than faking coverage the units do not have. (json.c briefly had a
-      # snprintf("%.17g") fortifiable site; the canonical serializer now emits
-      # the source lexeme verbatim, so that site is gone and json.c is back in
-      # the not-checked camp.)
+      # json.c has NO fortifiable call sites -- its string handling goes through
+      # strtol/strchr/memcmp/strtod and (un)bounded local copies whose sizes
+      # FORTIFY cannot see, none of which get a _chk variant. A grep for `_chk`
+      # on it would therefore either match nothing (an honest report) or be
+      # quietly excluded from the check (a vacuous gate dressed up as a pass) --
+      # this job takes the first option and documents it here rather than faking
+      # coverage the unit does not have. (json.c briefly had a snprintf("%.17g")
+      # fortifiable site; the canonical serializer now emits the source lexeme
+      # verbatim, so that site is gone and json.c is back in the not-checked
+      # camp.)
+      #
+      # rules.c JOINED THE CHECKED GROUP on 2026-08-28, and the staleness guard
+      # below is what caught it. H2-1's parse_alpn() allocates its ALPN encode
+      # buffer up front at a size the compiler can see, so the single
+      # `memcpy(buf + len, p, n)` at rules.c:369 now qualifies and FORTIFY
+      # rewrites it to __memcpy_chk. That is a strengthening, not a regression:
+      # the file went from having nothing to fortify to having a fortified
+      # bounded copy, so it belongs in the positive check above rather than in
+      # the not-checked list. This is the second time that guard has moved a
+      # file between the two groups (json.c was the first); leave it in place.
       - name: fortifiable call sites were rewritten to their _chk form
         working-directory: ci/prober
         run: |
           fail=0
-          for f in http.c util.c assert.c prober.c; do
+          for f in http.c util.c assert.c prober.c rules.c; do
               obj="/tmp/canary-check-$(basename "$f" .c).o"
               hits=$(nm -A --undefined-only "$obj" | awk '$3 ~ /_chk$/ {print $3}' | sort -u)
               if [ -z "$hits" ]; then
@@ -1292,10 +1302,12 @@ jobs:
                   echo "$f: $hits"
               fi
           done
-          # rules.c and json.c are deliberately NOT checked for _chk symbols --
-          # see the step comment above. Confirm that absence is still true
-          # rather than silently trusting a comment that could go stale.
-          for f in rules.c json.c; do
+          # json.c is deliberately NOT checked for _chk symbols -- see the step
+          # comment above. Confirm that absence is still true rather than
+          # silently trusting a comment that could go stale. (rules.c was in
+          # this list until 2026-08-28, when this very guard caught it acquiring
+          # a fortifiable site and moved it to the checked loop above.)
+          for f in json.c; do
               obj="/tmp/canary-check-$(basename "$f" .c).o"
               hits=$(nm -A --undefined-only "$obj" | awk '$3 ~ /_chk$/ {print $3}')
               if [ -n "$hits" ]; then

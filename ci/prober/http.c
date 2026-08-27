@@ -820,6 +820,65 @@ tls_table_del(int fd)
 
 
 /*
+ * Report the ALPN-negotiated protocol on `fd`. Public; declared in http.h,
+ * where the contract and the reason it reads the SSL object rather than the
+ * offer are spelled out.
+ *
+ * Placed here, beside the side table, because that table is the only thing
+ * that knows an fd carries TLS at all -- and because the answer for an fd it
+ * does not know is not an error but the ordinary plaintext one. A version that
+ * failed on an unknown fd would make every plaintext caller handle a failure
+ * that means nothing.
+ *
+ * The length OpenSSL reports is bounded by the protocol (one octet of length
+ * prefix, so at most 255 bytes) and HTTP_ALPN_MAX is sized to it, but the copy
+ * is still bounded by `outlen` rather than trusting either: `out` belongs to
+ * the caller, and a readback that overran it to report a protocol name would
+ * be a buffer overflow reached from the network -- through a field a hostile
+ * peer chooses. Truncation is preferred to that, and cannot silently pass an
+ * assertion: a truncated name compares unequal to the one a rule file asked
+ * for, which is a red, not a green.
+ */
+int
+http_tls_alpn_selected(int fd, char *out, size_t outlen)
+{
+    const unsigned char  *proto = NULL;
+    unsigned int          proto_len = 0;
+    SSL                  *ssl;
+    size_t                n;
+
+    if (out == NULL || outlen == 0) {
+        return -1;
+    }
+
+    out[0] = '\0';
+
+    ssl = tls_table_get(fd);
+
+    if (ssl == NULL) {
+        return 0;
+    }
+
+    SSL_get0_alpn_selected(ssl, &proto, &proto_len);
+
+    if (proto == NULL || proto_len == 0) {
+        return 0;
+    }
+
+    n = (size_t) proto_len;
+
+    if (n > outlen - 1) {
+        n = outlen - 1;
+    }
+
+    memcpy(out, proto, n);
+    out[n] = '\0';
+
+    return 0;
+}
+
+
+/*
  * The shared client SSL_CTX, created once and reused for every TLS
  * connection. Sharing costs nothing here (the prober is single-threaded and
  * short-lived) and avoids re-parsing OpenSSL's default settings on every
@@ -862,7 +921,8 @@ tls_ctx_get(void)
  * every other failure inside it.
  */
 static SSL *
-tls_handshake(int fd, const http_tls *tls_opt, char *errbuf, size_t errlen)
+tls_handshake(int fd, const http_tls *tls_opt, int *alpn_refused,
+              char *errbuf, size_t errlen)
 {
     SSL_CTX  *ctx = tls_ctx_get();
     SSL      *ssl;
@@ -902,6 +962,43 @@ tls_handshake(int fd, const http_tls *tls_opt, char *errbuf, size_t errlen)
         SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
     }
 
+    /*
+     * The ALPN offer, in the caller's already-encoded wire form -- see
+     * http_tls.alpn in http.h for why the encoding is not done here.
+     *
+     * SSL_set_alpn_protos() RETURNS 0 ON SUCCESS AND NON-ZERO ON FAILURE,
+     * inverted from essentially every other OpenSSL call in this file
+     * (SSL_set_fd, SSL_connect: 1 is success). That inversion is not a
+     * curiosity to note and move past -- it is the single most dangerous line
+     * in this function. Written as the natural `if (SSL_set_alpn_protos(...)
+     * != 1)` the check fires on every SUCCESSFUL call and never on a failing
+     * one, so a rejected list would be reported as accepted, the ClientHello
+     * would go out carrying NO ALPN extension at all, the server would answer
+     * it perfectly happily, and a case whose entire subject is a malformed
+     * ALPN list would report a green pass having tested nothing. That is the
+     * silent-degradation failure this harness exists to catch elsewhere; the
+     * hostile-list cases in scenarios/alpn-negotiation depend on this branch
+     * being the right way round, and alpn_test.sh drives it directly.
+     *
+     * The refusal is LOUD rather than a fallback to no-ALPN, on the same
+     * reasoning tls_table_put() gives for refusing to degrade to plaintext.
+     * OpenSSL rejects a list whose length prefixes do not tile the buffer
+     * exactly -- a prefix that overruns, a zero-length entry, trailing bytes
+     * after the last name -- which are precisely the malformed lists a rule
+     * file writes on purpose, so this path is reached BY DESIGN and must say
+     * so by name.
+     */
+    if (tls_opt->alpn != NULL && tls_opt->alpn_len > 0) {
+        if (SSL_set_alpn_protos(ssl, tls_opt->alpn, tls_opt->alpn_len) != 0) {
+            snprintf(errbuf, errlen,
+                     "TLS: OpenSSL rejected the %u-byte ALPN protocol list "
+                     "(length prefixes must tile the buffer exactly)",
+                     tls_opt->alpn_len);
+            SSL_free(ssl);
+            return NULL;
+        }
+    }
+
     if (SSL_set_fd(ssl, fd) != 1) {
         snprintf(errbuf, errlen, "TLS: SSL_set_fd failed");
         SSL_free(ssl);
@@ -913,6 +1010,37 @@ tls_handshake(int fd, const http_tls *tls_opt, char *errbuf, size_t errlen)
         int  err = SSL_get_error(ssl, rc);
         unsigned long  e = ERR_get_error();
         char           ebuf[256];
+
+        /*
+         * Was this the peer refusing our ALPN offer, rather than any other
+         * handshake failure? RFC 7301 gives that refusal its own fatal alert,
+         * `no_application_protocol` (120), and OpenSSL surfaces a received
+         * alert as a distinguishable reason code -- so the question is
+         * answerable precisely, and is NOT answered by matching on the error
+         * string. A substring match on "no application protocol" would be a
+         * guess about a message OpenSSL is free to reword between releases,
+         * and the failure mode of guessing wrong is the worst available here:
+         * a refusal that stopped being recognised would be reported as an
+         * ordinary connect error, and the case asserting the refusal would go
+         * red for a reason having nothing to do with the server.
+         *
+         * Only ever set when the CALLER asked for a refusal. A case that
+         * wanted the connection gets the ordinary error path, message and all,
+         * because for it this alert genuinely is a failure -- the same bytes
+         * mean opposite things depending on what the rule file asked for, and
+         * the rule file is the only thing that knows.
+         */
+        if (alpn_refused != NULL
+            && tls_opt->alpn_required
+            && ERR_GET_REASON(e) == SSL_R_TLSV1_ALERT_NO_APPLICATION_PROTOCOL)
+        {
+            *alpn_refused = 1;
+            snprintf(errbuf, errlen,
+                     "TLS: peer refused every offered ALPN protocol "
+                     "(no_application_protocol)");
+            SSL_free(ssl);
+            return NULL;
+        }
 
         ERR_error_string_n(e, ebuf, sizeof(ebuf));
         snprintf(errbuf, errlen, "TLS handshake failed (SSL_get_error=%d): %s",
@@ -1903,7 +2031,7 @@ elapsed_since(long long start)
 int
 http_connect(const char *host, int port, int timeout_ms,
              const char *source, const http_recv *recv_opt,
-             const http_tls *tls_opt,
+             const http_tls *tls_opt, int *alpn_refused,
              char *errbuf, size_t errlen)
 {
     int                 fd, one = 1;
@@ -1996,7 +2124,7 @@ http_connect(const char *host, int port, int timeout_ms,
      * it always did.
      */
     if (tls_opt != NULL && tls_opt->enable) {
-        if (tls_handshake(fd, tls_opt, errbuf, errlen) == NULL) {
+        if (tls_handshake(fd, tls_opt, alpn_refused, errbuf, errlen) == NULL) {
             close(fd);
             return -1;
         }
@@ -3046,14 +3174,14 @@ http_request(const char *host, int port,
              int shut_how, size_t abort_at, long hold_ms,
              const http_recv *recv_opt, int want_close,
              long idle_ms, int framed,
-             const http_tls *tls_opt,
+             const http_tls *tls_opt, int *alpn_refused,
              http_response *resp,
              char *errbuf, size_t errlen)
 {
     int  fd, rc;
 
     fd = http_connect(host, port, timeout_ms, source, recv_opt, tls_opt,
-                      errbuf, errlen);
+                      alpn_refused, errbuf, errlen);
     if (fd < 0) {
         memset(resp, 0, sizeof(*resp));
         resp->status = -1;
@@ -3190,6 +3318,7 @@ http_exchange_concurrent(const char *host, int port, int n,
          * see http.h's http_tls comment. Not a limitation of the side table,
          * simply out of scope until a `concurrent` rule needs it. */
         fds[i] = http_connect(host, port, timeout_ms, source, recv_opt, NULL,
+                              NULL,
                               errbuf, errlen);
 
         if (fds[i] < 0) {

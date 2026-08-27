@@ -391,10 +391,71 @@ const char *http_json_sort_reason(int status);
  * which a rule exercising a REAL certificate (not this harness's normal case)
  * can opt into.
  */
+/*
+ * `alpn` carries the ALPN protocol list this connection OFFERS, already in
+ * OpenSSL's wire form: a sequence of length-prefixed, non-NUL-terminated
+ * protocol names ("\x08http/1.1\x02h2"). NULL, or `alpn_len` 0, means the
+ * client sends no ALPN extension at all, which is what every pre-existing
+ * caller does and must keep doing byte for byte.
+ *
+ * THE WIRE FORM IS THE INTERFACE ON PURPOSE, rather than a comma-joined
+ * string encoded down inside the transport. This harness's job in H2-1 is to
+ * offer lists a well-behaved client would not construct -- a length prefix
+ * that overruns the buffer, a zero-length entry, trailing garbage after the
+ * last name. A transport that built the wire bytes itself from a validated
+ * string could not express any of them: it would normalize precisely the
+ * malformation under test, which is the same reason http.h's opening comment
+ * gives for using raw sockets instead of libcurl. The encoder lives in the
+ * rule parser, where a rule file can also bypass it.
+ *
+ * `alpn_required` makes a REFUSED negotiation the expected outcome rather
+ * than a harness failure. It exists because an ALPN mismatch is fatal at the
+ * TLS layer -- nginx answers `no_application_protocol` (alert 120) and the
+ * handshake never completes -- so a case attacking ALPN has no response to
+ * assert on and would otherwise be indistinguishable from a broken fixture.
+ * See http_connect()'s use of it: with this set, a handshake that FAILS is
+ * reported through `alpn_refused` rather than as a connect error, and a
+ * handshake that SUCCEEDS is the failure.
+ */
 typedef struct {
-    int  enable;
-    int  verify;
+    int                   enable;
+    int                   verify;
+    const unsigned char  *alpn;
+    unsigned int          alpn_len;
+    int                   alpn_required;
 } http_tls;
+
+/*
+ * Longest ALPN protocol name this harness will report back, plus room for the
+ * terminator. RFC 7301 length-prefixes each name with a single octet, so 255
+ * is the protocol's own ceiling and nothing longer can arrive off the wire.
+ * Sized to that ceiling rather than to the names anyone expects ("h2",
+ * "http/1.1"), because a fixture that negotiated a long name and got a
+ * TRUNCATED one reported back would let an `expect_alpn` assertion compare
+ * against bytes the peer never chose.
+ */
+#define HTTP_ALPN_MAX  256
+
+/*
+ * Copy the protocol ALPN-negotiated on `fd` into `out`, NUL-terminated.
+ *
+ * Writes the empty string whenever no protocol was negotiated, which covers
+ * three distinct situations a caller must not confuse with each other: the
+ * connection carries no TLS at all, the client offered no ALPN, or both sides
+ * spoke ALPN and agreed on nothing. All three mean "there is no negotiated
+ * protocol here", and the distinction between them is knowable from what the
+ * caller asked for rather than from this readback.
+ *
+ * Returns 0 on success, -1 when `out` is NULL or `outlen` is 0. Never fails
+ * for an unknown fd: that is the ordinary plaintext answer, not an error.
+ *
+ * READ FROM THE SSL OBJECT, not from what the caller offered. The negotiated
+ * protocol is the SERVER's choice out of the client's list, so a readback
+ * echoing the offer would report `h2` for a server that picked `http/1.1` out
+ * of `h2,http/1.1` -- reporting the request as though it were the answer, and
+ * turning every `expect_alpn` assertion into a restatement of the rule file.
+ */
+int http_tls_alpn_selected(int fd, char *out, size_t outlen);
 
 /*
  * Connect to host:port, write req_len bytes verbatim, read until the peer
@@ -657,9 +718,29 @@ int http_framed_state(const char *buf, size_t len, size_t *resp_len);
  * fd, or -1 with errbuf set. `timeout_ms` sets SO_RCVTIMEO/SO_SNDTIMEO;
  * `recv_opt` is consulted only for its rcvbuf field here.
  */
+/*
+ * `alpn_refused`, when non-NULL, receives the THIRD outcome this function can
+ * now produce, and it is a third outcome rather than a flavour of failure.
+ *
+ * Without it a caller sees two states: an fd, or -1 with errbuf set. An ALPN
+ * mismatch produces the second -- nginx sends `no_application_protocol` and
+ * SSL_connect() never completes -- which is correct for a rule that wanted the
+ * connection and wrong for one whose whole purpose was to be refused. Folding
+ * the expected refusal into the error path would leave a case attacking ALPN
+ * unable to tell the server's principled rejection apart from a fixture that
+ * was never listening, and the harness would report the same red for both.
+ *
+ * So: set to 1 exactly when `tls_opt->alpn_required` was set and the handshake
+ * failed with the peer's no-application-protocol alert, 0 on every other path
+ * INCLUDING every plaintext one. The return value is still -1 in that case --
+ * there is no connection, and no caller may write on one -- but the caller can
+ * now distinguish "refused as asked" from "could not connect". NULL is
+ * accepted and means the caller does not care, which is what every pre-existing
+ * call site passes.
+ */
 int http_connect(const char *host, int port, int timeout_ms,
                  const char *source, const http_recv *recv_opt,
-                 const http_tls *tls_opt,
+                 const http_tls *tls_opt, int *alpn_refused,
                  char *errbuf, size_t errlen);
 
 /*
@@ -756,7 +837,7 @@ int http_request(const char *host, int port,
                  int shut_how, size_t abort_at, long hold_ms,
                  const http_recv *recv_opt, int want_close,
                  long idle_ms, int framed,
-                 const http_tls *tls_opt,
+                 const http_tls *tls_opt, int *alpn_refused,
                  http_response *resp,
                  char *errbuf, size_t errlen);
 
