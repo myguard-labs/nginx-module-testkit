@@ -91,8 +91,61 @@ command -v ss >/dev/null 2>&1 || {
 
 ./build.sh >/dev/null
 
+# This suite's OWN scaffolding waits (start_squatter and the two real-listener
+# waits below) time scheduler latency for a helper process, not the
+# prober_boot contract under test -- so they scale on their own
+# (SCAFFOLD_SCALE), never on PROBER_TIMEOUT_SCALE alone, which stays pinned to
+# 1 inside the per-case boot_against blocks (widening the library's own boot
+# timeout would change what layer 1/layer 2 are proven against). The true
+# failure this scale widens for is CPU-scheduling delay before a helper's
+# bind() lands: this repo's workflow runs up to four independent test.sh
+# invocations (selftest x2, hygiene x2) on the same self-hosted runner label,
+# each spawning its own fakesrv, so sharing the box is the common case, not an
+# edge one.
+#
+# The scale is a secondary safety margin, not the fix for the failure actually
+# seen in CI (see start_squatter below): a wait that times out because the
+# process it is waiting on already EXITED is a dead-process wait, and no
+# amount of scale helps that -- it only delays reporting the same wrong
+# answer. That failure is now caught directly (liveness checked every
+# iteration, captured stderr shown on bail) rather than papered over with a
+# bigger budget.
+prober_normalize_timeout_scale
+SCAFFOLD_BASE_SCALE=10
+SCAFFOLD_SCALE=$((SCAFFOLD_BASE_SCALE * PROBER_TIMEOUT_SCALE))
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/port_ownership_test.XXXXXX")"
-PORT=$((20000 + (RANDOM % 10000)))
+
+# Pick a port nothing is currently listening on. RANDOM % 10000 alone has no
+# collision check: on a runner where up to four copies of this suite (plus
+# whatever else is on the box) each draw from the same 10000-wide space, two
+# copies landing on the same port is not a corner case. A bare `ss` probe
+# right before $PORT's first real use (the happy-path boot_against below)
+# narrows that window to scheduling jitter between this check and that first
+# bind -- categorically different from the old unchecked draw, which could
+# collide with anything already on the box with no check at all. It does not
+# claim to close the window to zero: $PORT is shared for the rest of this
+# run (the squatter and fake_nginx must target the SAME port -- that
+# collision is exactly what layer 1/layer 2 test), so a redraw cannot happen
+# once any case has started using it. A collision that still lands in that
+# window surfaces as an honest, fast, named-cause diagnostic (start_squatter
+# below, or prober_boot's own bail) rather than the old 74-second silent
+# hang -- an occasional, clearly-explained re-run, not a debugging session.
+prober_pick_free_port() {
+    local _i _candidate
+    for _i in $(seq 1 50); do
+        _candidate=$((20000 + (RANDOM % 10000)))
+        if ! ss -lptnH "sport = :$_candidate" 2>/dev/null | grep -q .; then
+            echo "$_candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+PORT="$(prober_pick_free_port)" || {
+    ok 1 "could not find a free port after 50 tries"
+    exit 1
+}
 SQUAT_PID=""
 SRV_PID=""
 
@@ -190,15 +243,34 @@ echo "unused by the fake binary; prober_boot only passes the path" \
 : >"$WORK/squat.script"
 printf 'proto\tmemcached\n' > "$WORK/squat.script"
 
+# Binds $PORT with fakesrv and waits until `ss` shows a listener OWNED BY
+# SQUAT_PID specifically -- not just any listener on that port, since another
+# process (including a leftover from a prior run) could already be there.
+# Every iteration first checks SQUAT_PID is still alive: fakesrv fails fast on
+# EADDRINUSE (die() writes one line to stderr and exits immediately, see
+# fakesrv.c), so a dead squatter must be reported as "exited", never run out
+# the clock as "never came up" -- that message is only true when the process
+# is still alive and simply has not bound yet. stderr/stdout go to a file
+# under $WORK instead of /dev/null so a bail can show the real reason.
 start_squatter() {
+    : >"$WORK/squat.out"
     ./fakesrv -script "$WORK/squat.script" -listen "127.0.0.1:$PORT" \
-        -portfile "$WORK/squat.port" >/dev/null 2>&1 &
+        -portfile "$WORK/squat.port" >"$WORK/squat.out" 2>&1 &
     SQUAT_PID=$!
     local _i
-    for _i in $(seq 1 100); do
-        ss -lptnH "sport = :$PORT" 2>/dev/null | grep -q . && return 0
+    for _i in $(seq 1 $((100 * SCAFFOLD_SCALE))); do
+        if ! kill -0 "$SQUAT_PID" 2>/dev/null; then
+            echo "# fakesrv (pid $SQUAT_PID) exited before binding port $PORT:"
+            sed 's/^/#   /' "$WORK/squat.out"
+            wait "$SQUAT_PID" 2>/dev/null || true
+            SQUAT_PID=""
+            return 1
+        fi
+        ss -lptnH "sport = :$PORT" 2>/dev/null | grep -q "pid=$SQUAT_PID" && return 0
         sleep 0.05
     done
+    echo "# fakesrv (pid $SQUAT_PID) never came up on port $PORT within budget:"
+    sed 's/^/#   /' "$WORK/squat.out"
     return 1
 }
 
@@ -244,7 +316,7 @@ SRV_PID=""
 # fakesrv_test.sh) BEFORE calling prober_boot at all. The fix's layer 1 must
 # refuse to even attempt a spawn.
 rm -f "$WORK/booted.pid"
-start_squatter || { echo "# fakesrv never came up on port $PORT"; exit 1; }
+start_squatter || exit 1
 FAKE_PORT="$PORT" FAKE_STUCK=0 boot_against && s=0 || s=$?
 ok "$((s != 0 ? 0 : 1))" "pre-spawn refusal bails when the port is already bound"
 
@@ -298,12 +370,18 @@ STUCK_SRV_PID="$(cat "$WORK/stuck_srv.pid")"
 # Give the stuck server a moment to open its error.log so the "log exists"
 # gate inside prober_boot never becomes a confound for THIS case -- this suite
 # is isolating the ownership check, not re-proving the log-existence gate
-# already covered by scrape_test.sh.
-for _i in $(seq 1 50); do
+# already covered by scrape_test.sh. Same liveness discipline as
+# start_squatter: if the helper died before writing the log, say so instead of
+# burning the full budget waiting on a file a dead process will never create.
+for _i in $(seq 1 $((50 * SCAFFOLD_SCALE))); do
+    if ! kill -0 "$STUCK_SRV_PID" 2>/dev/null; then
+        echo "# fake_nginx (pid $STUCK_SRV_PID) exited before writing error.log"
+        exit 1
+    fi
     [ -s "$WORK/logs/error.log" ] && break
     sleep 0.05
 done
-start_squatter || { echo "# fakesrv never came up on port $PORT"; exit 1; }
+start_squatter || exit 1
 
 (
     cd "$WORK" || exit 1
@@ -352,7 +430,11 @@ stop_squatter
     echo $! > "$WORK/real_srv.pid"
 )
 REAL_SRV_PID="$(cat "$WORK/real_srv.pid")"
-for _i in $(seq 1 100); do
+for _i in $(seq 1 $((100 * SCAFFOLD_SCALE))); do
+    if ! kill -0 "$REAL_SRV_PID" 2>/dev/null; then
+        echo "# fake_nginx (pid $REAL_SRV_PID) exited before binding port $PORT"
+        exit 1
+    fi
     ss -lptnH "sport = :$PORT" 2>/dev/null | grep -q "pid=$REAL_SRV_PID" && break
     sleep 0.05
 done
