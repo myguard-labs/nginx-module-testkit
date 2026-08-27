@@ -1253,6 +1253,92 @@ construction — and `expect_not` would report green having looked at nothing. I
 request is a truncated request, which a healthy server answers with 400 rather
 than ignoring. See `rules/stock/idle-connection.rule`.
 
+### ALPN: `alpn`, `alpn_raw`, `expect_alpn`, `expect_alpn_refused`
+
+Four directives that attack the TLS **protocol negotiation** rather than
+anything carried over it. They need `PROBER_TLS=1` and a `listen ... ssl`
+fixture; see `scenarios/alpn-negotiation`.
+
+`alpn <proto>[,<proto>...]` offers a well-formed ALPN list, encoded to RFC 7301
+wire form (one length octet per name) by the parser. `expect_alpn <proto>`
+asserts which protocol the server **selected** — read back off the live
+connection, not echoed from the offer, so a case offering `h2,http/1.1` against
+an HTTP/1.1-only listener correctly reports `http/1.1`:
+
+```text
+name          the server picks http/1.1 out of a list it only partly supports
+alpn          h2,http/1.1
+expect_alpn   http/1.1
+expect        status=200
+delta         fds == 0
+```
+
+`expect_alpn ""` is a distinct, spellable assertion: the handshake completed and
+**no** protocol was negotiated. The quotes are required, because an unquoted
+empty argument is indistinguishable from a value lost to an edit.
+
+**`expect_alpn_refused` is the one that makes this an attack rather than a
+feature demo.** An ALPN mismatch is fatal at the TLS layer — nginx answers RFC
+7301's `no_application_protocol` alert (120) and the handshake never completes —
+so there is no response, no status and no body for an ordinary assertion to
+judge. Without this directive such a case is simply reported as a failed
+request, the executor returns early, and the `delta` / `probe_baseline`
+assertions never run at all. With it, the refusal is the *expected* outcome and
+the case proceeds to its probe snapshots:
+
+```text
+name                  a refused ALPN negotiation leaks no descriptor
+alpn                  h2
+expect_alpn_refused
+delta                 fds == 0
+probe_baseline        fds == 0
+```
+
+That is the whole point. What is being asserted is not that nginx refuses `h2`
+— nginx obviously does — but that the module under test gives up **no
+descriptor and no cycle-pool byte** across a handshake that died before a
+single request byte was written. That accounting lives inside the worker, which
+is exactly what a Perl `Test::Nginx::Socket` client cannot see after a rejected
+ALPN: from outside, a clean refusal and a refusal that leaked an fd are the same
+connection error.
+
+The oracle fails in **both** directions, which is what stops it being free: a
+server that *accepts* an offer the case asserted it would refuse fails with
+`the handshake SUCCEEDED`. A control that accepts any ALPN goes red by that
+assertion.
+
+`alpn_raw <escaped-bytes>` is the malformed-input form: the bytes go into the
+extension verbatim, with **no length prefixes computed and no validation**, so
+a rule file can offer a list that is broken *as a list* — `\x7fab` claims a
+127-byte name and supplies two, `\x00` is a zero-length entry, `\x02h2\xff`
+trails a byte past the last name. OpenSSL rejects each before a byte reaches the
+wire, and the transport must **say so by name** rather than quietly sending no
+ALPN extension and letting the case pass on a handshake that tested nothing.
+Escapes are util.c's, the same ones `send` uses.
+
+`alpn` and `alpn_raw` are mutually exclusive, and neither may be repeated: the
+two make opposite promises (`alpn` guarantees a well-formed list; `alpn_raw`
+guarantees nothing), and sharing one name is how a malformed-input test quietly
+becomes a well-formed one. `expect_alpn` and `expect_alpn_refused` are likewise
+mutually exclusive — a refused handshake negotiates no protocol, so there is
+nothing for `expect_alpn` to judge.
+
+Four load-time rules, each refusing a case whose assertions could never be
+reached:
+
+- `expect_alpn_refused` with response expectations — a refused handshake opens
+  no connection, so `expect status=` would read a buffer that is empty by
+  construction.
+- `expect_alpn_refused` with **no** `probe`/`delta`/`probe_baseline` — a refusal
+  observed by nothing proves only that *something* failed, which a wrong port or
+  a missing certificate produce just as reliably. The worker-side evidence is
+  the point, so it is required.
+- any ALPN directive with `block`/`concurrent`/`fanout` — those arms build their
+  own connections and never see the offer, so it would be silently ignored and
+  the case would pass having tested the plain path.
+- `expect_alpn <non-empty>` with no `alpn` — a client sending no ALPN extension
+  can never negotiate a protocol, so the assertion is red by construction.
+
 Beyond `expect status=` / `body~` / `header~`, a case can also carry:
 
 ```

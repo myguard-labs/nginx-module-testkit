@@ -73,7 +73,7 @@ static int          opt_verbose = 0;
  * Zeroed by default, so the tls_opt every call site now passes is an explicit
  * "off" that reaches the same plaintext code path as the NULL it replaced.
  */
-static http_tls     opt_tls = { 0, 0 };
+static http_tls     opt_tls = { 0, 0, NULL, 0, 0 };
 
 /* PROBER_TIMEOUT_SCALE, resolved once at the top of main() via
  * delta_settle_scale_from_env() (see its comment by DELTA_SETTLE_TRIES) and
@@ -230,7 +230,7 @@ arm_fault(const char *query, const char *source, char *errbuf, size_t errlen)
     if (http_request(opt_host, opt_port, (const unsigned char *) req,
                      (size_t) n, opt_timeout_ms, source, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE,
-                     NULL, 0, HTTP_IDLE_NONE, 0, &opt_tls, &resp,
+                     NULL, 0, HTTP_IDLE_NONE, 0, &opt_tls, NULL, &resp,
                      errbuf, errlen) != 0)
     {
         return -1;
@@ -270,7 +270,7 @@ fetch_probe(char *errbuf, size_t errlen)
     if (http_request(opt_host, opt_port, (const unsigned char *) req,
                      (size_t) n, opt_timeout_ms, NULL, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE,
-                     NULL, 0, HTTP_IDLE_NONE, 0, &opt_tls, &resp,
+                     NULL, 0, HTTP_IDLE_NONE, 0, &opt_tls, NULL, &resp,
                      errbuf, errlen) != 0)
     {
         return NULL;
@@ -946,7 +946,7 @@ run_fanout_legs(const test_case *tc, char *errbuf, size_t errbuf_len,
                          opt_timeout_ms, tc->source,
                          tc->pauses, tc->n_pauses, tc->shut_how,
                          tc->abort_at, tc->hold_ms, &tc->recv_opt,
-                         tc->saw_close_within, tc->idle_ms, 0, &opt_tls,
+                         tc->saw_close_within, tc->idle_ms, 0, &opt_tls, NULL,
                          &resp, errbuf, errbuf_len) != 0)
         {
             printf("# %srequest failed: %s\n", label, errbuf);
@@ -1051,6 +1051,194 @@ run_fanout_legs(const test_case *tc, char *errbuf, size_t errbuf_len,
 
 
 /*
+ * The single-exchange arm of run_case(): one connect/write/read/close, plus
+ * the ALPN negotiation the other three arms do not carry.
+ *
+ * Single-exchange path -- one connect/write/read/close.
+ *
+ * Spelled out as connect/exchange/close rather than the one
+ * http_request() call it used to be, for two reasons that both need
+ * the fd in hand:
+ *
+ *   - the ALPN-negotiated protocol is read back off the LIVE
+ *     connection (http_tls_alpn_selected() reads the SSL object out of
+ *     the side table, which http_close() clears), so an `expect_alpn`
+ *     assertion has to be evaluated before teardown;
+ *   - a case carrying `expect_alpn_refused` never gets a connection at
+ *     all, and has to continue to its probe snapshots rather than
+ *     taking the early return an ordinary connect failure takes.
+ *
+ * Behaviour for every case that carries neither directive is
+ * unchanged: http_request() IS connect+exchange+close, so this is the
+ * same three calls in the same order with the same arguments.
+ *
+ * Same return contract as run_concurrent_legs() and run_fanout_legs(): 0 is a
+ * hard failure the caller must free `before` over and return 0 for; 1 means
+ * keep going, with `*ok` cleared to 0 on any soft failure along the way.
+ *
+ * Split out of run_case() for the same reason those two were (#224): the arm
+ * grew a transport negotiation of its own, and folding it inline pushed
+ * run_case's cyclomatic complexity from 66 to 80 in one diff.
+ */
+static int
+run_single_exchange(const test_case *tc, char *errbuf, size_t errbuf_len,
+    int *ok)
+{
+    http_response  resp;
+
+    int  fd;
+    int  refused = 0;
+    http_tls  case_tls = opt_tls;
+
+    /*
+     * AN ALPN DIRECTIVE ON A CONNECTION THAT CARRIES NO TLS IS A FAILURE,
+     * not a no-op, and this guard is the difference between the two.
+     *
+     * ALPN is a TLS extension: with --tls absent, case_tls.enable is 0,
+     * tls_handshake() never runs, and the offer goes nowhere. The
+     * assertions then read whatever the plaintext path leaves behind --
+     * and http_tls_alpn_selected() answers "" for an fd it does not know,
+     * which compares EQUAL to `expect_alpn ""`. So the one spelling the
+     * README advertises as distinct and load-bearing is precisely the one
+     * that would report green having sent nothing at all.
+     *
+     * This cannot be caught at load time: the rule parser does not know
+     * whether the run will carry --tls (the flag is a property of the
+     * invocation, the directive of the file), so the check belongs here,
+     * where both are in hand. Failing the case rather than skipping it is
+     * the same rule the rest of this harness follows -- a skipped
+     * assertion is indistinguishable from a passing one in TAP.
+     */
+    if ((tc->alpn != NULL || tc->expect_alpn != NULL
+         || tc->expect_alpn_refused)
+        && !case_tls.enable)
+    {
+        printf("# alpn: this case carries an ALPN directive but the run "
+               "is not using TLS (--tls); ALPN is a TLS extension, so the "
+               "offer would go nowhere and the assertion would judge "
+               "nothing\n");
+        return 0;
+    }
+
+    /*
+     * The case's ALPN offer rides on a COPY of the global TLS options, not
+     * on opt_tls itself, and that is the design rather than an
+     * implementation detail. fetch_probe() and arm_fault() connect with
+     * opt_tls, so mutating it would carry a hostile or refused-by-design
+     * ALPN list into the probe reads -- and the probe reads are exactly
+     * the evidence a refused-negotiation case exists to collect. A case
+     * that made its own probe snapshots unreachable would report a red
+     * that says nothing about the server.
+     */
+    if (tc->alpn != NULL) {
+        case_tls.alpn = tc->alpn;
+        case_tls.alpn_len = (unsigned int) tc->alpn_len;
+    }
+
+    case_tls.alpn_required = tc->expect_alpn_refused;
+
+    fd = http_connect(opt_host, opt_port, opt_timeout_ms, tc->source,
+                      &tc->recv_opt, &case_tls, &refused,
+                      errbuf, errbuf_len);
+
+    if (fd < 0) {
+        /*
+         * A refusal the case ASKED for is not a failure: it is the
+         * observation, and everything after this point -- the probe
+         * snapshot, the delta, the pid oracle -- is the evidence that the
+         * server gave up nothing across the failed negotiation. Falling
+         * through with no connection is safe because every directive that
+         * needs one is refused at parse time for a case carrying
+         * expect_alpn_refused.
+         *
+         * An UNASKED-for connect failure still ends the case here, exactly
+         * as before.
+         */
+        if (!(tc->expect_alpn_refused && refused)) {
+            printf("# request failed: %s\n", errbuf);
+            return 0;
+        }
+
+        if (opt_verbose) {
+            printf("# <- ALPN refused as expected: %s\n", errbuf);
+        }
+
+    } else if (tc->expect_alpn_refused) {
+        /*
+         * THE REFUSAL ORACLE'S FAILING DIRECTION, and the half that makes
+         * it an oracle at all. A case asserting the server refuses its
+         * ALPN offer must go red when the server ACCEPTS it -- otherwise
+         * the directive is satisfied by any server at all, including one
+         * that negotiates every protocol it is offered, and the assertion
+         * certifies nothing. The connection is torn down here rather than
+         * used: the case asked for no exchange over it.
+         */
+        char  got[HTTP_ALPN_MAX];
+
+        http_tls_alpn_selected(fd, got, sizeof(got));
+
+        printf("# expect_alpn_refused: the handshake SUCCEEDED "
+               "(negotiated \"%s\"); the server accepted an ALPN offer it "
+               "was asserted to refuse\n",
+               got[0] != '\0' ? got : "(no protocol)");
+        *ok = 0;
+        http_close(fd);
+        fd = -1;
+    }
+
+    if (fd >= 0) {
+        if (http_exchange(fd, tc->request, tc->request_len,
+                          opt_timeout_ms, tc->pauses, tc->n_pauses,
+                          tc->shut_how, tc->abort_at, tc->hold_ms,
+                          &tc->recv_opt, tc->saw_close_within,
+                          tc->idle_ms, 0, &resp, NULL,
+                          errbuf, sizeof(errbuf)) != 0)
+        {
+            printf("# request failed: %s\n", errbuf);
+            http_close(fd);
+            return 0;
+        }
+
+        if (opt_verbose) {
+            printf("# <- status %d, %zu body bytes\n",
+                   resp.status, resp.body_len);
+        }
+
+        /*
+         * Read back BEFORE http_close(), which clears the fd's slot in the
+         * SSL side table -- after it the readback would report "no
+         * protocol" for every connection, and an `expect_alpn ""` case
+         * would pass no matter what was actually negotiated.
+         */
+        if (tc->expect_alpn != NULL) {
+            char  got[HTTP_ALPN_MAX];
+
+            http_tls_alpn_selected(fd, got, sizeof(got));
+
+            if (strcmp(got, tc->expect_alpn) != 0) {
+                printf("# expect_alpn: wanted \"%s\", negotiated \"%s\"\n",
+                       tc->expect_alpn, got);
+                *ok = 0;
+            }
+        }
+
+        if (!eval_exchange("", tc->dechunk, tc->gunzip, tc->json_sort,
+                           tc->expects, tc->n_expects,
+                           tc->saw_close_within, tc->close_within_ms,
+                           tc->saw_idle, tc->idle_ms, &resp))
+        {
+            *ok = 0;
+        }
+
+        http_response_free(&resp);
+        http_close(fd);
+    }
+
+    return 1;
+}
+
+
+/*
  * Returns 1 if the case passed. Diagnostics are printed as TAP comments.
  *
  * `baseline` is the run's origin snapshot for `probe_baseline` assertions, or
@@ -1133,38 +1321,10 @@ run_case(const test_case *tc, const json_value *baseline)
         }
 
     } else if (tc->n_blocks == 0) {
-        /*
-         * Legacy single-exchange path -- one connect/write/read/close, exactly
-         * as before the `block` directive existed. http_request wraps
-         * http_connect/http_exchange/http_close and always closes.
-         */
-        if (http_request(opt_host, opt_port, tc->request, tc->request_len,
-                         opt_timeout_ms, tc->source,
-                         tc->pauses, tc->n_pauses, tc->shut_how, tc->abort_at,
-                         tc->hold_ms, &tc->recv_opt, tc->saw_close_within,
-                         tc->idle_ms, 0, &opt_tls, &resp,
-                         errbuf, sizeof(errbuf)) != 0)
-        {
-            printf("# request failed: %s\n", errbuf);
+        if (!run_single_exchange(tc, errbuf, sizeof(errbuf), &ok)) {
             json_free(before);
             return 0;
         }
-
-        if (opt_verbose) {
-            printf("# <- status %d, %zu body bytes\n",
-                   resp.status, resp.body_len);
-        }
-
-        if (!eval_exchange("", tc->dechunk, tc->gunzip, tc->json_sort,
-                           tc->expects, tc->n_expects,
-                           tc->saw_close_within, tc->close_within_ms,
-                           tc->saw_idle, tc->idle_ms, &resp))
-        {
-            ok = 0;
-        }
-
-        http_response_free(&resp);
-
     } else {
         /*
          * Pipeline path -- N blocks driven over ONE connection. Connect once,
@@ -1190,7 +1350,7 @@ run_case(const test_case *tc, const json_value *baseline)
          * so_rcvbuf on any block but the first, so this is the only one that set
          * it. */
         fd = http_connect(opt_host, opt_port, opt_timeout_ms, tc->source,
-                          &tc->blocks[0].recv_opt, &opt_tls, errbuf,
+                          &tc->blocks[0].recv_opt, &opt_tls, NULL, errbuf,
                           sizeof(errbuf));
 
         if (fd < 0) {
@@ -1278,7 +1438,7 @@ run_case(const test_case *tc, const json_value *baseline)
 
         for (i = 0; i < (size_t) tc->open_conns; i++) {
             int cfd = http_connect(opt_host, opt_port, opt_timeout_ms,
-                                   tc->source, NULL, &opt_tls, errbuf,
+                                   tc->source, NULL, &opt_tls, NULL, errbuf,
                                    sizeof(errbuf));
 
             if (cfd < 0) {

@@ -49,6 +49,8 @@ case_free(test_case *tc)
     free(tc->request);
     free(tc->xfail_reason);
     free(tc->quiesce_path);
+    free(tc->alpn);
+    free(tc->expect_alpn);
 
     /* op and literal are NULL on the coherent/monotonic forms, which take no
      * comparison of their own; free(NULL) is the defined no-op, so the loop
@@ -213,6 +215,256 @@ parse_expect(expectation *list, size_t *count, char *arg,
     }
 
     (*count)++;
+}
+
+
+/*
+ * `alpn <proto>[,<proto>...]` -- offer this ALPN protocol list, encoded into
+ * RFC 7301's wire form: each name prefixed by its own length octet, no NULs,
+ * no separators.
+ *
+ * The encoding happens HERE rather than in the transport so that `alpn_raw`
+ * below can bypass it; see http_tls.alpn in http.h for the full reasoning.
+ * What this form guarantees, and the raw form does not, is that the bytes it
+ * produces are a WELL-FORMED list -- which is what makes a rule file's hostile
+ * cases legible as hostile rather than as typos.
+ *
+ * Both boundaries of a protocol name are refused rather than clamped:
+ *
+ *   - the EMPTY name (a doubled comma, a trailing comma, or an empty argument)
+ *     would encode as a zero length octet. That is a malformed list, and
+ *     OpenSSL rejects the whole buffer for it -- so the case would offer no
+ *     ALPN at all, the server would answer perfectly happily, and a rule that
+ *     meant to test a protocol name would pass having tested nothing. A rule
+ *     that WANTS that byte on the wire says so with `alpn_raw`.
+ *   - a name longer than 255 bytes cannot be length-prefixed by a single
+ *     octet at all. Truncating it would offer a DIFFERENT protocol than the
+ *     rule file named, which is the silent-substitution failure this harness
+ *     may not contain.
+ */
+static void
+parse_alpn(test_case *tc, char *arg, const char *file, int lineno)
+{
+    unsigned char  *buf = NULL;
+    size_t          len = 0;
+    size_t          cap = 0;
+    char           *list = trim(arg);
+    char           *p;
+
+    if (tc->saw_alpn || tc->saw_alpn_raw) {
+        die("%s:%d: alpn already set for this case (alpn and alpn_raw are "
+            "mutually exclusive and neither may be repeated)", file, lineno);
+    }
+
+    if (*list == '\0') {
+        die("%s:%d: alpn needs at least one protocol name "
+            "(an empty list offers no ALPN extension, which `alpn` cannot "
+            "express -- simply omit the directive)", file, lineno);
+    }
+
+    /*
+     * strsep-style walk rather than strtok: strtok collapses a run of
+     * separators, so "h2,,http/1.1" would silently parse as a two-element list
+     * and the empty name the rule file actually wrote would never be seen by
+     * the check above. The whole point of that check is to refuse it by name.
+     */
+    p = list;
+
+    for ( ;; ) {
+        char   *comma = strchr(p, ',');
+        size_t  n;
+
+        if (comma != NULL) {
+            *comma = '\0';
+        }
+
+        n = strlen(p);
+
+        /*
+         * `buf` is freed before each die() rather than left to the process
+         * exiting, because die() does NOT always end the process here:
+         * fuzz/fuzz_rules.c arms prober_die_jmp and longjmps back into the
+         * driver, so a leak on this path accumulates across every iteration
+         * of a fuzz run and is reported by LeakSanitizer against the fuzzer
+         * rather than against the input that caused it. The realloc-failure
+         * path below frees for the same reason; these two were the
+         * inconsistency.
+         */
+        if (n == 0) {
+            free(buf);
+            die("%s:%d: alpn contains an empty protocol name "
+                "(a zero-length entry makes the whole list malformed; use "
+                "alpn_raw to offer one on purpose)", file, lineno);
+        }
+
+        if (n > 255) {
+            free(buf);
+            die("%s:%d: alpn protocol name is %zu bytes; RFC 7301 length-"
+                "prefixes each name with one octet, so 255 is the ceiling",
+                file, lineno, n);
+        }
+
+        /* Grown the way util.c's append_escaped() grows its buffer, and
+         * checked the same way: realloc returning NULL is fatal rather than
+         * silently leaving the shorter buffer in place, which would encode a
+         * TRUNCATED list -- a different offer than the rule file wrote. */
+        if (len + 1 + n > cap) {
+            unsigned char *bigger;
+
+            cap = (cap == 0 ? 64 : cap * 2);
+
+            while (cap < len + 1 + n) {
+                cap *= 2;
+            }
+
+            bigger = realloc(buf, cap);
+
+            if (bigger == NULL) {
+                free(buf);
+                die("%s:%d: out of memory encoding the alpn list",
+                    file, lineno);
+            }
+
+            buf = bigger;
+        }
+
+        buf[len++] = (unsigned char) n;
+        memcpy(buf + len, p, n);
+        len += n;
+
+        if (comma == NULL) {
+            break;
+        }
+
+        p = comma + 1;
+    }
+
+    tc->alpn = buf;
+    tc->alpn_len = len;
+    tc->saw_alpn = 1;
+}
+
+
+/*
+ * `alpn_raw <escaped-bytes>` -- put these exact bytes in the ALPN extension,
+ * with no length prefixes computed and no validation of any kind.
+ *
+ * The malformed-input half of the directive pair, and the only way a rule file
+ * can offer a list that is broken AS A LIST: "\x7fab" claims a 127-byte name
+ * and supplies two, "\x00" is a zero-length entry, "\x02h2\xff" trails a byte
+ * past the last name. OpenSSL rejects each of those before a single byte
+ * reaches the wire, which is precisely the behaviour under test -- the
+ * transport must report that rejection by name rather than quietly sending no
+ * ALPN extension and letting the case pass on a handshake that tested nothing.
+ *
+ * Escapes are decoded by util.c's append_escaped(), the same decoder `send`
+ * uses, so \xNN means here exactly what it means there. Sharing it is
+ * deliberate: two escape tables in one rule format would drift, and a rule
+ * author would have to remember which directive spoke which dialect.
+ */
+static void
+parse_alpn_raw(test_case *tc, char *arg, const char *file, int lineno)
+{
+    size_t  cap = 0;
+
+    if (tc->saw_alpn || tc->saw_alpn_raw) {
+        die("%s:%d: alpn already set for this case (alpn and alpn_raw are "
+            "mutually exclusive and neither may be repeated)", file, lineno);
+    }
+
+    if (*trim(arg) == '\0') {
+        die("%s:%d: alpn_raw needs a non-empty byte string", file, lineno);
+    }
+
+    /*
+     * DECODED STRAIGHT INTO tc->alpn RATHER THAN INTO A LOCAL, so the buffer
+     * is owned by the case -- and therefore reclaimed by case_free() -- from
+     * the first byte appended.
+     *
+     * append_escaped() die()s on a malformed escape (`\q`, a truncated `\x`)
+     * while holding the partially grown buffer, and die() does NOT always end
+     * the process: fuzz/fuzz_rules.c arms prober_die_jmp and longjmps back
+     * into its driver. A local would be orphaned at that point, once per fuzz
+     * iteration, and the free-before-die trick parse_alpn() uses is not
+     * available here because the die happens inside the CALLEE, after which
+     * this function never runs again. Publishing first is what makes the
+     * ownership survive a non-local exit.
+     *
+     * Safe against the duplicate/conflict guards above because both have
+     * already run: nothing can overwrite a previously set tc->alpn, so
+     * assigning into it here cannot strand an earlier allocation.
+     */
+    append_escaped(&tc->alpn, &tc->alpn_len, &cap, trim(arg), "alpn_raw");
+
+    /*
+     * A decoded length of zero is unreachable from a non-empty argument -- the
+     * escape decoder emits at least one byte for any input it accepts -- but
+     * it is checked anyway because the consequence of being wrong is silent:
+     * a zero-length list means http_connect() skips SSL_set_alpn_protos()
+     * entirely, so the ClientHello carries no ALPN extension and the case
+     * tests nothing while reporting green. No free() here: tc->alpn is the
+     * case's now, and case_free() reclaims it however this run ends.
+     */
+    if (tc->alpn_len == 0) {
+        die("%s:%d: alpn_raw decoded to zero bytes", file, lineno);
+    }
+
+    tc->saw_alpn_raw = 1;
+}
+
+
+/*
+ * `expect_alpn <proto>` -- assert which protocol the server SELECTED.
+ *
+ * The argument may be the empty string, spelled `expect_alpn ""`, and that
+ * spelling is load-bearing rather than a convenience: it asserts the handshake
+ * completed while negotiating NO protocol, which is what a server answers when
+ * the client sent no ALPN extension. Distinguishing "no protocol was chosen"
+ * from "this assertion is absent" is why the field is a pointer.
+ */
+static void
+parse_expect_alpn(test_case *tc, char *arg, const char *file, int lineno)
+{
+    char  *want = trim(arg);
+    char   scratch[HTTP_ALPN_MAX];
+
+    if (tc->expect_alpn != NULL) {
+        die("%s:%d: expect_alpn already set for this case", file, lineno);
+    }
+
+    if (tc->expect_alpn_refused) {
+        die("%s:%d: expect_alpn and expect_alpn_refused are mutually "
+            "exclusive (a refused handshake negotiates no protocol, so there "
+            "is nothing for expect_alpn to judge)", file, lineno);
+    }
+
+    /*
+     * Quotes are stripped so `expect_alpn ""` can be written at all: an
+     * unquoted empty argument is indistinguishable from a directive whose
+     * value was lost to an edit, and this harness refuses assertions that
+     * cannot fail. The quoted form is an explicit statement that the empty
+     * string is the intended value.
+     */
+    if (strcmp(want, "\"\"") == 0) {
+        /* Rewrite in place rather than repointing at a string literal: `want`
+         * is a mutable pointer into the caller's line buffer, and -Wcast-qual
+         * (on in this tree) correctly refuses casting a literal's const away.
+         * Truncating the token to nothing leaves it the empty string the
+         * quoted form means. */
+        want[0] = '\0';
+
+    } else if (*want == '\0') {
+        die("%s:%d: expect_alpn needs a protocol name; write it as "
+            "expect_alpn \"\" to assert that NO protocol was negotiated",
+            file, lineno);
+    }
+
+    if (strlen(want) >= sizeof(scratch)) {
+        die("%s:%d: expect_alpn protocol name does not fit in %zu bytes",
+            file, lineno, sizeof(scratch));
+    }
+
+    tc->expect_alpn = xstrdup(want);
 }
 
 
@@ -1868,6 +2120,34 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
         } else if (strcmp(directive, "json_sort") == 0) {
             parse_json_sort(tc, blk, arg, file, lineno);
 
+        } else if (strcmp(directive, "alpn") == 0) {
+            parse_alpn(&cases[n - 1], arg, file, lineno);
+
+        } else if (strcmp(directive, "alpn_raw") == 0) {
+            parse_alpn_raw(&cases[n - 1], arg, file, lineno);
+
+        } else if (strcmp(directive, "expect_alpn") == 0) {
+            parse_expect_alpn(&cases[n - 1], arg, file, lineno);
+
+        } else if (strcmp(directive, "expect_alpn_refused") == 0) {
+            if (*trim(arg) != '\0') {
+                die("%s:%d: expect_alpn_refused takes no arguments",
+                    file, lineno);
+            }
+
+            if (cases[n - 1].expect_alpn_refused) {
+                die("%s:%d: expect_alpn_refused already set for this case",
+                    file, lineno);
+            }
+
+            if (cases[n - 1].expect_alpn != NULL) {
+                die("%s:%d: expect_alpn and expect_alpn_refused are "
+                    "mutually exclusive (a refused handshake negotiates no "
+                    "protocol)", file, lineno);
+            }
+
+            cases[n - 1].expect_alpn_refused = 1;
+
         } else if (strcmp(directive, "pid_may_change") == 0) {
             if (*trim(arg) != '\0') {
                 die("%s:%d: pid_may_change takes no arguments", file, lineno);
@@ -2121,6 +2401,102 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
                 "pacing and no longer describes when the server closed. Drop "
                 "one of the two", file,
                 tc->name != NULL ? tc->name : "(unnamed)", tc->concurrent);
+        }
+
+        /*
+         * ALPN load-time rules. Every one of these is the same trap the
+         * abort/hold/expect_idle checks below guard: a directive whose
+         * assertions can never be reached must be refused at LOAD time, not
+         * silently skipped at run time, because a skipped assertion and a
+         * passing one are the same thing in TAP.
+         */
+        if (tc->expect_alpn_refused) {
+            /*
+             * A refused handshake yields no connection, so nothing is ever
+             * written and nothing ever comes back. Response expectations on
+             * such a case would not be evaluated at all -- they would read as
+             * green having judged nothing, which is precisely the vacuous pass
+             * this file refuses everywhere else.
+             */
+            if (tc->n_expects > 0) {
+                die("%s: case \"%s\" carries expect_alpn_refused and %zu "
+                    "response expectation(s); a refused handshake opens no "
+                    "connection, so there is no response to assert on",
+                    file, tc->name != NULL ? tc->name : "(unnamed)",
+                    tc->n_expects);
+            }
+
+            /*
+             * The executor arms this directive on the SINGLE-exchange path
+             * only. The pipeline, concurrent and fanout arms each build their
+             * own connections and do not consult it, so a case combining them
+             * would send its hostile ALPN offer nowhere and report on a
+             * negotiation that never happened.
+             */
+            if (tc->n_blocks > 0 || tc->concurrent > 0 || tc->fanout > 0) {
+                die("%s: case \"%s\" combines expect_alpn_refused with "
+                    "block/concurrent/fanout; the refusal is only observed on "
+                    "the single-exchange path",
+                    file, tc->name != NULL ? tc->name : "(unnamed)");
+            }
+
+            /*
+             * THE ONE THAT KEEPS THE DIRECTIVE FROM BEING FREE. A refusal
+             * asserted and then observed by nothing else proves only that the
+             * handshake failed -- which a broken fixture, a wrong port or a
+             * missing certificate all produce just as reliably. The evidence
+             * this row exists to collect is what the server gave up ACROSS the
+             * failed negotiation, and that lives in the probe snapshot: the
+             * descriptor and pool accounting a Perl client cannot see from
+             * outside the worker. So a case may not assert a refusal without
+             * at least one probe-side assertion to carry it.
+             */
+            if (tc->n_probes == 0 && tc->n_deltas == 0
+                && tc->n_baselines == 0)
+            {
+                die("%s: case \"%s\" asserts expect_alpn_refused but carries "
+                    "no probe/delta/probe_baseline assertion; a refused "
+                    "handshake with no worker-side evidence proves only that "
+                    "something failed, not that the server leaked nothing "
+                    "across it",
+                    file, tc->name != NULL ? tc->name : "(unnamed)");
+            }
+        }
+
+        /*
+         * `alpn`/`alpn_raw`/`expect_alpn` are consulted on the single-exchange
+         * path only, for the same reason expect_alpn_refused is: the other
+         * three arms build connections that never see the case's offer. A
+         * silently-ignored ALPN offer is worse than a rejected one -- the case
+         * runs, the handshake succeeds on the DEFAULT protocol, and every
+         * assertion passes while testing the plain path.
+         */
+        if ((tc->alpn != NULL || tc->expect_alpn != NULL)
+            && (tc->n_blocks > 0 || tc->concurrent > 0 || tc->fanout > 0))
+        {
+            die("%s: case \"%s\" combines alpn/expect_alpn with "
+                "block/concurrent/fanout; the ALPN offer is only carried on "
+                "the single-exchange path",
+                file, tc->name != NULL ? tc->name : "(unnamed)");
+        }
+
+        /*
+         * An `expect_alpn` with no offer is not necessarily wrong -- a case may
+         * legitimately assert that a client sending no ALPN extension
+         * negotiates nothing, spelled `expect_alpn ""`. But a case asserting a
+         * NON-empty protocol without offering one asserts something no server
+         * can satisfy: with no ALPN extension in the ClientHello there is
+         * nothing for the server to select from, so the assertion is red by
+         * construction and the rule file almost certainly meant to offer it.
+         */
+        if (tc->expect_alpn != NULL && *tc->expect_alpn != '\0'
+            && tc->alpn == NULL)
+        {
+            die("%s: case \"%s\" expects ALPN \"%s\" but offers no `alpn` "
+                "list; a client that sends no ALPN extension can never "
+                "negotiate a protocol",
+                file, tc->name != NULL ? tc->name : "(unnamed)",
+                tc->expect_alpn);
         }
 
         /*

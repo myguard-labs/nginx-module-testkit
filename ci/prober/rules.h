@@ -584,6 +584,78 @@ typedef struct {
      * memset already leaves it strict. Doubles as its own duplicate guard. */
     int             pid_may_change;
 
+    /*
+     * The ALPN protocol list this case OFFERS, already encoded into the wire
+     * form http_tls.alpn documents (length-prefixed names, no NULs), or NULL
+     * when the case carries no `alpn` directive and the connection therefore
+     * sends no ALPN extension at all.
+     *
+     * OWNED storage, freed by case_free(). Encoded by the PARSER rather than
+     * by the transport, which is what lets a rule file reach the malformed
+     * lists this directive exists for -- see `alpn_raw` below.
+     */
+    unsigned char  *alpn;
+    size_t          alpn_len;
+
+    /*
+     * Set by `alpn_raw` instead of `alpn`: the argument is a byte-escape
+     * string written straight onto the wire with NO length prefixes computed
+     * for it, so a rule file can offer a list that is malformed AS A LIST --
+     * a prefix claiming more bytes than follow, a zero-length entry, trailing
+     * garbage past the last name.
+     *
+     * A separate directive rather than a flag on `alpn`, because the two have
+     * opposite contracts and silently sharing one name is how a malformed-input
+     * test quietly becomes a well-formed one. `alpn` PROMISES a correctly
+     * encoded list (the parser computes the prefixes and rejects a name that
+     * cannot be encoded); `alpn_raw` promises nothing and is the only way to
+     * express a list OpenSSL itself will reject. A reader seeing `alpn` in a
+     * rule file can therefore trust the wire bytes are well-formed without
+     * decoding them by hand, which is not a convenience -- it is what keeps
+     * the hostile cases legible as hostile.
+     *
+     * Recorded for the duplicate/conflict check and for the diagnostic; the
+     * encoded bytes for both directives land in `alpn`/`alpn_len` above.
+     */
+    int             saw_alpn;
+    int             saw_alpn_raw;
+
+    /*
+     * `expect_alpn <proto>` -- the protocol the server must have SELECTED, or
+     * NULL when the case does not assert one. OWNED storage.
+     *
+     * The empty string is a legitimate and DISTINCT value here, spelled
+     * `expect_alpn ""`: it asserts that the handshake completed and no
+     * protocol was negotiated, which is what a server answers when the client
+     * offered no ALPN at all. That is why the presence of the assertion is
+     * carried by the pointer being non-NULL rather than by the string being
+     * non-empty.
+     */
+    char           *expect_alpn;
+
+    /*
+     * `expect_alpn_refused` -- the case asserts the peer REFUSES every
+     * protocol it offered, so the handshake must fail with RFC 7301's
+     * `no_application_protocol` alert and no connection may be established.
+     *
+     * THIS IS THE DIRECTIVE THAT MAKES THE ATTACK CASES ADMISSIBLE, and the
+     * reason is worth stating where it will be read. A refused ALPN
+     * negotiation produces no response, so there is nothing for `expect
+     * status=` or `expect body~` to judge; without this directive the case
+     * would simply be reported as a failed request, run_case() would return
+     * early, and the `delta`/`probe_baseline` assertions -- the ONLY evidence
+     * that the server leaked no descriptor and no pool byte across the failed
+     * handshake -- would never be evaluated at all. With it, the refusal is
+     * the expected outcome, the case continues to its probe snapshots, and the
+     * worker-inside accounting across a deliberately broken negotiation
+     * becomes observable. A handshake that SUCCEEDS is the failure.
+     *
+     * Zero is the off value and doubles as the duplicate guard, exactly like
+     * pid_may_change above: the directive takes no argument, so "absent" and
+     * "not asserted" are the same state.
+     */
+    int             expect_alpn_refused;
+
     /* Number of bare idle connections to open and hold across the probe read,
      * or 0 for none. Set by `open_conns <N>` (case-level, never per-block). The
      * connections carry no request -- they exist only to occupy worker

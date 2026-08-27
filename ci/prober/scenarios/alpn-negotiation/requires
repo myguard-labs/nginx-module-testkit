@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+#
+# ALPN-NEGOTIATION GATE. Identical to the tls-listener gate, and deliberately a
+# COPY rather than a source of it: run-scenario.sh runs each scenario's own
+# ./requires, and a shared gate sourced from a sibling directory would make one
+# scenario's layout a dependency of another's. The facts are the same three,
+# because this scenario needs exactly what tls-listener needs -- an ssl-capable
+# binary, openssl(1) to mint the fixture certificate, and strings(1) to probe
+# the binary. ALPN itself adds no requirement: OpenSSL has carried
+# SSL_set_alpn_protos since 1.0.2, which is far below anything this tree builds
+# against, and nginx answers an unsatisfiable ALPN offer with RFC 7301's alert
+# whether or not ngx_http_v2_module is linked -- which is the whole reason the
+# refusal cases here do not need an h2-capable server to attack.
+#
+# Two independent environment facts, either of which makes the scenario
+# unrunnable rather than failing:
+#
+#   1. the server binary must carry ngx_http_ssl_module. `--with-compat` alone
+#      does NOT include it (that was PR #197's whole finding), and a conf with
+#      `listen ... ssl` on a build without it fails `nginx -t` -- a red that
+#      says nothing about the client leg under test.
+#   2. openssl(1) must exist, because the fixture certificate is generated at
+#      boot rather than committed. See ./env.
+#   3. strings(1) must exist -- it is the probe for (1), and a missing probe
+#      must skip rather than silently answer "no ssl" for every build.
+#
+# nonzero exit => run-scenario.sh emits "1..0 # SKIP <stdout of this gate>"
+set -eu
+
+FLAVOR="${2:-nginx}"
+VERSION="${3:-1.31.3}"
+
+# Same build-resolution as every other gate: run-scenario.sh runs this BEFORE
+# prober_resolve, so PROBER_RESOLVED_BUILD does not exist yet and the tree that
+# will actually be booted has to be derived the same way prober_resolve derives
+# it. Globbing .build/* instead would find ssl in SOME staged tree and pass on
+# a tree that is about to fail `nginx -t`.
+#
+# The root fallback MUST match ci/prober/lib.sh exactly -- $(cd ../.. && pwd) from
+# ci/prober/, which is where run-scenario.sh has already cd'd by the time this
+# gate runs. A gate computing a DIFFERENT root than the engine SKIPs on a tree
+# the engine would have booted, and that SKIP reads as a pass. In a standalone
+# checkout that fallback lands one level above the repo, so PROBER_ROOT has to
+# be set either way; matching lib.sh is still the correct contract.
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-$(cd ../.. && pwd)}/.build/${FLAVOR}-${VERSION}}"
+
+BIN="$BUILD/objs/nginx"
+[ -x "$BIN" ] || BIN="$BUILD/objs/angie"
+
+if [ ! -x "$BIN" ]; then
+    echo "no server binary under $BUILD/objs -- nothing to gate on"
+    exit 1
+fi
+
+command -v strings >/dev/null 2>&1 || {
+    echo "strings(1) not found (install binutils) -- no way to ask the binary whether ngx_http_ssl_module is linked"
+    exit 1
+}
+
+# THE BINARY IS THE ORACLE, NOT objs/ngx_modules.c. Measured 2026-08-18 on this
+# tree: .build/nginx-1.29.0 carried an ngx_modules.c naming ngx_http_ssl_module
+# three times while `objs/nginx -V` reported `--with-compat` alone and the
+# binary held no such symbol -- the .c was left over from an EARLIER configure
+# and the binary had been rebuilt from a later one. A gate reading the .c
+# passes there and the scenario then reds in `nginx -t`, which is precisely the
+# failure this gate exists to convert into a skip.
+#
+# `nginx -V` is not used either: it prints the configure LINE, which is an
+# argument list and not a statement about what got linked. The artifact is
+# asked instead.
+#
+# The probe is an ANCHORED `strings` match, not nm. nginx embeds every linked
+# module's name in ngx_module_names[], which is rodata and therefore SURVIVES
+# `strip`, while nm on a stripped binary reports "no symbols" and would SKIP a
+# perfectly good TLS build. Measured 2026-08-18 across four trees:
+#
+#   nginx 1.29.0 --with-compat --with-http_ssl_module : 4 hits, 2 after strip
+#   nginx 1.29.0 --with-compat                        : 0
+#   angie 1.12.0 (no ssl)                             : 0
+#
+# The anchors are load-bearing. An unanchored `grep ssl` matches the
+# `ssl_certificate` directive string, which is present in the angie binary
+# above even though the module is NOT linked -- that probe reports every build
+# as TLS-capable and the gate becomes vacuous.
+if ! strings "$BIN" 2>/dev/null | grep -qx 'ngx_http_ssl_module'; then
+    echo "$BIN was built without ngx_http_ssl_module (--with-compat alone omits it) -- rebuild with --with-http_ssl_module to run the ALPN scenario"
+    exit 1
+fi
+
+command -v openssl >/dev/null 2>&1 || {
+    echo "openssl(1) not found -- the fixture certificate is generated at boot, not committed"
+    exit 1
+}
+
+exit 0
