@@ -47,6 +47,31 @@
 # reporting success, which is the exact failure class this harness exists to
 # catch. Asserting them here would buy a passing line and spend the trust.
 #
+# This is true of all three forms EQUALLY. None of `coherent`, `at_rest` or
+# `monotonic` is better covered than the others against this module, and the
+# per-leg probe reads a `fanout` sweep takes do not change that for any of
+# them -- a probe read does not allocate from the zone, so more of them is not
+# more coverage.
+#
+# ROUTES ALREADY TRIED AND WHY THEY FAIL (do not re-attempt these on this
+# module without new information):
+#   - Driving `monotonic` off `connections.free`
+#     (`ngx_cycle->free_connection_n`). Rejected: it is per-worker and RESETS
+#     to baseline between fanout legs, since each leg's connection closes
+#     before the next leg's probe read. Measured live, 5/5 consecutive runs:
+#     `fanout 24 2` + `monotonic connections.free` GREEN, 24/24 responses from
+#     4 distinct workers. Never a falling sequence.
+#   - Pairing `open_conns` with `zone_invariant` to hold connections open
+#     across the probe sweep. Rejected: `open_conns` executes strictly AFTER
+#     the zone_invariant block in `run_case()` even on the same case (see
+#     collect_zone_readings and the open_conns ordering comment in prober.c),
+#     so its held connections cannot exist yet when these readings are taken.
+#   - Falling back to `eval_zone_monotonic`'s other red branches (the `n < 2`
+#     refusal, the underflow/wrap sentinel). Rejected: `n < 2` is unreachable
+#     because the fanout parser floor is already 2, and the sentinel branch
+#     prints its own message instead of the decrease line a driver would need
+#     to match -- neither gives a live case something to assert against here.
+#
 # The forms are implemented, load-checked and unit-tested (assert_test.c drives
 # each comparison against synthetic readings, including the reds); they are
 # simply not asserted from THIS scenario. They get their live coverage when a

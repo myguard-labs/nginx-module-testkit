@@ -18,6 +18,12 @@
 # honest cases are green; only a driver can assert that a deliberately broken
 # fixture comes back RED, on this box, in this run, against this server.
 #
+# This negative control is scoped to the `fanout` coverage oracle ONLY. None
+# of the three `zone_invariant` forms (`coherent`, `at_rest`, `monotonic`) has
+# a live RUN negative control anywhere in this repo, `monotonic` included --
+# see shm-coherence.rule for why, and for the routes already tried and closed
+# against this module. Do not read leg 2 below as covering them; it does not.
+#
 # Two legs, in this order:
 #
 #   1. The honest cases (shm-coherence.rule) must be GREEN. Read

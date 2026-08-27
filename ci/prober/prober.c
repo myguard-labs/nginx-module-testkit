@@ -612,15 +612,41 @@ run_quiesce(const test_case *tc)
  * stated rather than assumed away: on a module that never allocates in the
  * zone, every reading is identical, and `coherent`, `at_rest N` and
  * `monotonic` are all satisfied by a constant sequence no defect could
- * falsify. They are tautologies THERE. They are not tautologies on a module
- * whose request path does mutate the zone -- which is the only kind of module
- * they are meant to be pointed at, and why `scenarios/shm-coherence` asserts
- * only `fanout` and its coverage oracle: the reference module gives the three
- * forms nothing to be invariant ABOUT. Their real coverage arrives with a
- * consumer zone (cache-turbo's `varidx_inflight`), where a mutating request
- * path makes each form falsifiable. The forms' own logic is unit-tested in
- * assert_test.c against synthetic readings, which is where a broken comparison
- * reddens today.
+ * falsify. They are tautologies THERE, all three alike -- none of the three
+ * is better covered here than the others, and this sweep's own reads do not
+ * change that for any of them: a probe read is not a zone allocation, so
+ * sampling more of them proves nothing new. They are not tautologies on a
+ * module whose request path does mutate the zone -- which is the only kind of
+ * module they are meant to be pointed at, and why `scenarios/shm-coherence`
+ * asserts only `fanout` and its coverage oracle: the reference module gives
+ * the three forms nothing to be invariant ABOUT. Their real coverage arrives
+ * with a consumer zone (cache-turbo's `varidx_inflight`), where a mutating
+ * request path makes each form falsifiable. The forms' own logic is
+ * unit-tested in assert_test.c against synthetic readings, which is where a
+ * broken comparison reddens today.
+ *
+ * Two routes were tried, live, to give `monotonic` specifically a real
+ * negative control here without waiting for a consumer zone, and both are
+ * closed:
+ *
+ *   - `connections.free` (`ngx_cycle->free_connection_n`, rendered by
+ *     ngx_test_probe.c ~525-555) is per-worker and RESETS to baseline between
+ *     fanout legs -- each leg's connection closes before the next leg's probe
+ *     read happens, so the sequence never accumulates a fall. Measured live:
+ *     `fanout 24 2` + `monotonic connections.free` GREEN on 5/5 consecutive
+ *     runs, 24 of 24 responses from 4 distinct workers. Not a falling field.
+ *   - `open_conns` is the only directive that holds real connections open
+ *     across a probe read, but it runs strictly AFTER this zone_invariant
+ *     block in `run_case()` even when both appear on the same case (see the
+ *     ordering comment above the `open_conns` block below) -- its held
+ *     connections do not exist yet when collect_zone_readings takes its
+ *     sweep, so it cannot perturb these readings either.
+ *
+ * `eval_zone_monotonic`'s other red branches do not help close this gap: the
+ * `n < 2` refusal is unreachable from a live case (the fanout parser floor is
+ * 2, so `n_legs` here is never under 2), and the underflow/wrap sentinel
+ * branch prints its own message rather than the decrease line, so neither
+ * gives a driver a "monotonic decreased" red to match against on this module.
  *
  * The sweep also does not drive the case's own request path, which is why it
  * is safe to run after a quiesce: the counters an `at_rest` oracle names are
