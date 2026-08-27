@@ -91,6 +91,54 @@ command -v ss >/dev/null 2>&1 || {
 
 ./build.sh >/dev/null
 
+# This suite's OWN scaffolding waits -- start_squatter and the real-listener
+# wait below -- time how long fakesrv/fake_nginx take to bind and become
+# visible via `ss`. That is scheduler latency for a helper process, not the
+# prober_boot contract under test, so it must not share PROBER_TIMEOUT_SCALE
+# with the per-case boot_against blocks (those stay pinned to 1: widening the
+# library's own boot timeout would change what layer 1/layer 2 are proven
+# against). Reusing lib.sh's validated, clamped parse for the SAME env var
+# gives operators one existing knob instead of a second one to discover, while
+# each use scales only its own loop. Captured once, here, before any
+# subshell below can locally rebind PROBER_TIMEOUT_SCALE=1 for boot_against.
+#
+# Root cause this closes: on a CPU-contended self-hosted runner,
+# start_squatter's hardcoded 100 x 0.05s = 5s budget can run out before
+# fakesrv is scheduled and its bind() lands, so the suite bails via its own
+# `exit 1` (not a TAP "not ok") after test 1 -- a plan-count mismatch with no
+# failing assertion anywhere in the log. Reproduced locally: `stress-ng --cpu
+# 64 --cpu-load 95` plus several concurrent copies of this suite reliably
+# stops some copies at "ok 1" with "# fakesrv never came up on port N".
+#
+# SCAFFOLD_BASE_SCALE=10 widens the default budget on its own (50s/25s rather
+# than 5s/2.5s) because reproducing the failure needed no special override --
+# a self-hosted runner shares the box with other jobs by default, so the
+# common case must already tolerate it. This repo's own workflow runs
+# `selftest` (2 matrix legs) and `hygiene` (2 SAN legs) on the SAME
+# [self-hosted, builder02, lxc] label, so up to four independent `test.sh`
+# invocations -- each spawning its own fakesrv -- can already land on one box
+# at once with no artificial concurrency needed to explain it. Measured at that
+# realistic 4-concurrent-copies level under `stress-ng --cpu 32 --cpu-load 90`:
+# both the unfixed 1x budget and this 10x budget stayed green (0 failures
+# across several rounds each) -- CPU contention from a handful of sibling jobs
+# alone did not reproduce the starvation on this hardware. The failure only
+# reproduced under a deliberately harsher stress (16 concurrent copies of this
+# suite plus `stress-ng --cpu 64 --cpu-load 98`, an artificially extreme proxy
+# for a more heavily loaded or weaker runner than this dev box): unfixed, that
+# lost ~1/16 to 3/48 runs to "fakesrv never came up"; at 4x scale it was
+# unchanged (~1/16); at 10x it dropped but did not fully clear (1 failure
+# across 4 rounds of 16). No fixed timeout is safe against unbounded
+# contention -- 10x is a substantial, verified reduction in the failure rate
+# at the harshest level tested, not a claim that starvation is now
+# impossible. The extra budget is free in the common case: every loop here
+# breaks the moment `ss` reports the pid, so a fast bind (the overwhelming
+# majority of runs) never sleeps the difference. PROBER_TIMEOUT_SCALE still
+# multiplies on top for a caller that needs more (matching the >1 valgrind
+# consumers already set), rather than replacing the floor.
+prober_normalize_timeout_scale
+SCAFFOLD_BASE_SCALE=10
+SCAFFOLD_SCALE=$((SCAFFOLD_BASE_SCALE * PROBER_TIMEOUT_SCALE))
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/port_ownership_test.XXXXXX")"
 PORT=$((20000 + (RANDOM % 10000)))
 SQUAT_PID=""
@@ -195,7 +243,7 @@ start_squatter() {
         -portfile "$WORK/squat.port" >/dev/null 2>&1 &
     SQUAT_PID=$!
     local _i
-    for _i in $(seq 1 100); do
+    for _i in $(seq 1 $((100 * SCAFFOLD_SCALE))); do
         ss -lptnH "sport = :$PORT" 2>/dev/null | grep -q . && return 0
         sleep 0.05
     done
@@ -299,7 +347,7 @@ STUCK_SRV_PID="$(cat "$WORK/stuck_srv.pid")"
 # gate inside prober_boot never becomes a confound for THIS case -- this suite
 # is isolating the ownership check, not re-proving the log-existence gate
 # already covered by scrape_test.sh.
-for _i in $(seq 1 50); do
+for _i in $(seq 1 $((50 * SCAFFOLD_SCALE))); do
     [ -s "$WORK/logs/error.log" ] && break
     sleep 0.05
 done
@@ -352,7 +400,7 @@ stop_squatter
     echo $! > "$WORK/real_srv.pid"
 )
 REAL_SRV_PID="$(cat "$WORK/real_srv.pid")"
-for _i in $(seq 1 100); do
+for _i in $(seq 1 $((100 * SCAFFOLD_SCALE))); do
     ss -lptnH "sport = :$PORT" 2>/dev/null | grep -q "pid=$REAL_SRV_PID" && break
     sleep 0.05
 done
