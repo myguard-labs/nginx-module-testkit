@@ -621,6 +621,984 @@ parse_assert(probe_assert *list, size_t *count, const char *directive,
 
 
 /*
+ * Per-exchange directive handlers below share the PX() router (`tc`/`blk`
+ * must both be in scope by name -- see the macro's definition above) and, for
+ * the ones that append to the request buffer, the case/block's build-up
+ * `cap`. Each one is the verbatim arm body from load_rules_fp's directive
+ * ladder, unchanged down to the error text; only the routing into a named
+ * function is new. See parse_zone_invariant above for the pattern this
+ * follows.
+ */
+
+static void
+parse_send(test_case *tc, pipeline_block *blk, char *arg, size_t *cap)
+{
+    append_escaped(&PX(request), &PX(request_len), cap, arg, "send line");
+}
+
+static void
+parse_pause(test_case *tc, pipeline_block *blk, char *arg,
+            const char *file, int lineno)
+{
+    char       *ms_s = trim(arg);
+    char       *stop;
+    long        ms;
+    size_t      k;
+    long        total = 0;
+
+    if (*ms_s == '\0') {
+        die("%s:%d: pause needs <ms>", file, lineno);
+    }
+
+    /* Same whole-token check as `repeat`: a pause that silently became
+     * zero would turn a timing test into a plain request and still
+     * report ok. */
+    ms = strtol(ms_s, &stop, 10);
+
+    if (stop == ms_s || *stop != '\0') {
+        die("%s:%d: pause \"%s\" is not a number", file, lineno, ms_s);
+    }
+
+    if (ms < 1 || ms > MAX_PAUSE_MS) {
+        die("%s:%d: pause %ld out of range (1..%d ms)",
+            file, lineno, ms, MAX_PAUSE_MS);
+    }
+
+    if (PX(n_pauses) >= MAX_PAUSES) {
+        die("%s:%d: too many pause directives (max %d)",
+            file, lineno, MAX_PAUSES);
+    }
+
+    for (k = 0; k < PX(n_pauses); k++) {
+        total += PX(pauses)[k].ms;
+    }
+
+    /* The prober's read timeout bounds the whole exchange, so a case
+     * that stalls longer than that would report a harness timeout
+     * rather than whatever the server did. Fail the rule file instead
+     * of shipping a test that cannot mean what it says. */
+    if (total + ms > MAX_PAUSE_MS) {
+        die("%s:%d: pause total %ld ms exceeds the %d ms ceiling",
+            file, lineno, total + ms, MAX_PAUSE_MS);
+    }
+
+    PX(pauses)[PX(n_pauses)].offset = PX(request_len);
+    PX(pauses)[PX(n_pauses)].ms = ms;
+    PX(pauses)[PX(n_pauses)].chunk = 0;
+    PX(pauses)[PX(n_pauses)].unit = 0;
+    PX(n_pauses)++;
+}
+
+static void
+parse_send_slow(test_case *tc, pipeline_block *blk, char *arg,
+                const char *file, int lineno)
+{
+    char       *rest = trim(arg);
+    char       *stop;
+    long        chunk, ms;
+    size_t      k;
+    long        total = 0;
+
+    if (*rest == '\0') {
+        die("%s:%d: send_slow needs <chunk> <ms>", file, lineno);
+    }
+
+    chunk = strtol(rest, &stop, 10);
+
+    if (stop == rest || (*stop != ' ' && *stop != '\t')) {
+        die("%s:%d: send_slow \"%s\" is not <chunk> <ms>",
+            file, lineno, rest);
+    }
+
+    if (chunk < 1 || chunk > MAX_SEND_SLOW_CHUNK) {
+        die("%s:%d: send_slow chunk %ld out of range (1..%d bytes)",
+            file, lineno, chunk, MAX_SEND_SLOW_CHUNK);
+    }
+
+    rest = trim(stop);
+    ms = strtol(rest, &stop, 10);
+
+    if (stop == rest || *stop != '\0') {
+        die("%s:%d: send_slow \"%s\" is not a number", file, lineno,
+            rest);
+    }
+
+    if (ms < 1 || ms > MAX_PAUSE_MS) {
+        die("%s:%d: send_slow %ld out of range (1..%d ms)",
+            file, lineno, ms, MAX_PAUSE_MS);
+    }
+
+    if (PX(n_pauses) >= MAX_PAUSES) {
+        die("%s:%d: too many pause/send_slow directives (max %d)",
+            file, lineno, MAX_PAUSES);
+    }
+
+    for (k = 0; k < PX(n_pauses); k++) {
+        total += pause_cost_ms(&PX(pauses)[k],
+                               k + 1 < PX(n_pauses)
+                                   ? PX(pauses)[k + 1].offset
+                                   : PX(request_len));
+    }
+
+    /* A paced entry costs ms per chunk, not ms once. Charging it as a
+     * single pause would let a rule file declare a dribble that blows
+     * through the read timeout and then reports a harness timeout
+     * instead of whatever the server did -- the exact failure the
+     * plain-pause ceiling exists to prevent. The bytes this entry will
+     * pace are not known until the case closes, so cost it against the
+     * request as it stands and re-check at close. */
+    total += pause_cost_ms_raw(PX(request_len), PX(request_len),
+                               (size_t) chunk, ms);
+
+    if (total > MAX_PAUSE_MS) {
+        die("%s:%d: send_slow pushes the case to %ld ms, over the "
+            "%d ms ceiling", file, lineno, total, MAX_PAUSE_MS);
+    }
+
+    PX(pauses)[PX(n_pauses)].offset = PX(request_len);
+    PX(pauses)[PX(n_pauses)].ms = ms;
+    PX(pauses)[PX(n_pauses)].chunk = (size_t) chunk;
+    PX(pauses)[PX(n_pauses)].unit = 0;
+    PX(n_pauses)++;
+}
+
+static void
+parse_send_slow_chunks(test_case *tc, pipeline_block *blk, char *arg,
+                       const char *file, int lineno)
+{
+    char       *ms_s = trim(arg);
+    char       *stop;
+    long        ms;
+    size_t      k;
+    long        total = 0;
+
+    if (*ms_s == '\0') {
+        die("%s:%d: send_slow_chunks needs <ms>", file, lineno);
+    }
+
+    ms = strtol(ms_s, &stop, 10);
+
+    if (stop == ms_s || *stop != '\0') {
+        die("%s:%d: send_slow_chunks \"%s\" is not a number",
+            file, lineno, ms_s);
+    }
+
+    if (ms < 1 || ms > MAX_PAUSE_MS) {
+        die("%s:%d: send_slow_chunks %ld out of range (1..%d ms)",
+            file, lineno, ms, MAX_PAUSE_MS);
+    }
+
+    if (PX(n_pauses) >= MAX_PAUSES) {
+        die("%s:%d: too many pause/send_slow directives (max %d)",
+            file, lineno, MAX_PAUSES);
+    }
+
+    for (k = 0; k < PX(n_pauses); k++) {
+        total += pause_cost_ms(&PX(pauses)[k],
+                               k + 1 < PX(n_pauses)
+                                   ? PX(pauses)[k + 1].offset
+                                   : PX(request_len));
+    }
+
+    /* Same load-time cost check as send_slow, against the smallest unit
+     * the framing allows rather than a declared chunk size -- see
+     * MIN_CHUNK_UNIT_BYTES for why the overestimate is the safe
+     * direction. Re-checked at close, since the bytes this entry paces
+     * are not known until the case ends. */
+    total += pause_cost_ms_raw(PX(request_len), PX(request_len),
+                               MIN_CHUNK_UNIT_BYTES, ms);
+
+    if (total > MAX_PAUSE_MS) {
+        die("%s:%d: send_slow_chunks pushes the case to %ld ms, over "
+            "the %d ms ceiling", file, lineno, total, MAX_PAUSE_MS);
+    }
+
+    PX(pauses)[PX(n_pauses)].offset = PX(request_len);
+    PX(pauses)[PX(n_pauses)].ms = ms;
+    PX(pauses)[PX(n_pauses)].chunk = 0;
+    PX(pauses)[PX(n_pauses)].unit = 1;
+    PX(n_pauses)++;
+}
+
+static void
+parse_shutdown(test_case *tc, pipeline_block *blk, char *arg,
+               const char *file, int lineno)
+{
+    char       *how_s = trim(arg);
+    char       *stop;
+    long        how;
+
+    if (*how_s == '\0') {
+        die("%s:%d: shutdown needs 0|1|2", file, lineno);
+    }
+
+    how = strtol(how_s, &stop, 10);
+
+    if (stop == how_s || *stop != '\0') {
+        die("%s:%d: shutdown \"%s\" is not a number",
+            file, lineno, how_s);
+    }
+
+    if (how < 0 || how > 2) {
+        die("%s:%d: shutdown %ld out of range (0=RD, 1=WR, 2=RDWR)",
+            file, lineno, how);
+    }
+
+    /* One per case: two shutdowns would make the second a no-op at
+     * best and contradict the first at worst, and silently keeping the
+     * last would let a rule file read as if both applied. Keyed on a
+     * dedicated flag rather than on shut_how still holding the
+     * sentinel, so the check stays correct however that value is
+     * chosen. */
+    if (PX(saw_shutdown)) {
+        die("%s:%d: a case may carry only one shutdown directive",
+            file, lineno);
+    }
+
+    /* The other half of the abort/shutdown exclusion; see the abort
+     * directive below for why the two cannot both apply. */
+    if (PX(saw_abort)) {
+        die("%s:%d: abort and shutdown are mutually exclusive",
+            file, lineno);
+    }
+
+    PX(shut_how) = (int) how;
+    PX(saw_shutdown) = 1;
+}
+
+static void
+parse_abort(test_case *tc, pipeline_block *blk, char *arg,
+            const char *file, int lineno)
+{
+    char       *off_s = trim(arg);
+    char       *stop;
+    long        off;
+
+    if (*off_s == '\0') {
+        die("%s:%d: abort needs <offset>", file, lineno);
+    }
+
+    off = strtol(off_s, &stop, 10);
+
+    if (stop == off_s || *stop != '\0') {
+        die("%s:%d: abort \"%s\" is not a number", file, lineno, off_s);
+    }
+
+    /* Zero is allowed -- reset before the first byte -- but negative is
+     * not, and would otherwise wrap into an enormous size_t that reads
+     * as "never abort", turning a reset case into an ordinary request
+     * that still reports ok. */
+    if (off < 0) {
+        die("%s:%d: abort offset %ld is negative", file, lineno, off);
+    }
+
+    if (PX(saw_abort)) {
+        die("%s:%d: a case may carry only one abort directive",
+            file, lineno);
+    }
+
+    /* A half-close says "I have finished sending, answer me"; a reset
+     * says "I am gone". Applying both would send a FIN the reset then
+     * invalidates, so the case would test neither directive cleanly.
+     * Checked in both directions below, since either may come first. */
+    if (PX(saw_shutdown)) {
+        die("%s:%d: abort and shutdown are mutually exclusive",
+            file, lineno);
+    }
+
+    /* The other half of the recv_slow exclusion; see that directive. */
+    if (PX(saw_recv_slow)) {
+        die("%s:%d: recv_slow and abort are mutually exclusive",
+            file, lineno);
+    }
+
+    /* The other half of the close-deadline exclusion; see that
+     * directive. */
+    if (PX(saw_close_within)) {
+        die("%s:%d: abort and expect_close_within are mutually "
+            "exclusive -- an aborted connection is reset by the "
+            "client, so the server's close is never observed",
+            file, lineno);
+    }
+
+    /* The other half of the idle exclusion; see that directive. */
+    if (PX(saw_idle)) {
+        die("%s:%d: abort and expect_idle are mutually exclusive "
+            "-- an aborted connection is reset by the client, so the "
+            "server is never observed", file, lineno);
+    }
+
+    PX(abort_at) = (size_t) off;
+    PX(saw_abort) = 1;
+
+    /* The other half of the hold exclusion; see that directive. */
+    if (PX(saw_hold)) {
+        die("%s:%d: abort and hold are mutually exclusive",
+            file, lineno);
+    }
+}
+
+static void
+parse_hold(test_case *tc, pipeline_block *blk, char *arg,
+           const char *file, int lineno)
+{
+    char       *ms_s = trim(arg);
+    char       *stop;
+    long        ms;
+
+    if (*ms_s == '\0') {
+        die("%s:%d: hold needs <ms>", file, lineno);
+    }
+
+    ms = strtol(ms_s, &stop, 10);
+
+    if (stop == ms_s || *stop != '\0') {
+        die("%s:%d: hold \"%s\" is not a number", file, lineno, ms_s);
+    }
+
+    /* Zero is rejected rather than treated as "no hold". A rule that
+     * spells `hold 0` is asking for a behaviour it will not get, and
+     * accepting it would produce a case that reads as testing an idle
+     * connection while making an ordinary request. The ceiling is the
+     * same one send_slow answers to: the hold blocks the suite. */
+    if (ms < 1 || ms > MAX_PAUSE_MS) {
+        die("%s:%d: hold %ld out of range (1..%d ms)",
+            file, lineno, ms, MAX_PAUSE_MS);
+    }
+
+    if (PX(saw_hold)) {
+        die("%s:%d: a case may carry only one hold directive",
+            file, lineno);
+    }
+
+    /* Both end the connection without reading, so the pair is not
+     * merely redundant but contradictory: abort resets immediately at
+     * its offset, which destroys the connection hold means to keep
+     * open and idle. Whichever ran would silently win. */
+    if (PX(saw_abort)) {
+        die("%s:%d: abort and hold are mutually exclusive",
+            file, lineno);
+    }
+
+    /* hold skips the read loop entirely, so pacing reads under it
+     * would configure something that never runs -- a rule file that
+     * reads as testing backpressure while testing nothing. */
+    if (PX(saw_recv_slow)) {
+        die("%s:%d: recv_slow and hold are mutually exclusive",
+            file, lineno);
+    }
+
+    /* The other half of the close-deadline exclusion; see that
+     * directive. */
+    if (PX(saw_close_within)) {
+        die("%s:%d: hold and expect_close_within are mutually "
+            "exclusive -- a held connection is never read, so the "
+            "server's close is never observed", file, lineno);
+    }
+
+    /* The other half of the idle exclusion; see that directive. */
+    if (PX(saw_idle)) {
+        die("%s:%d: hold and expect_idle are mutually exclusive "
+            "-- hold sleeps without polling, so the server is never "
+            "observed", file, lineno);
+    }
+
+    PX(hold_ms) = ms;
+    PX(saw_hold) = 1;
+}
+
+static void
+parse_expect_close_within(test_case *tc, pipeline_block *blk, char *arg,
+                          const char *file, int lineno)
+{
+    char       *ms_s = trim(arg);
+    char       *stop;
+    long        ms;
+
+    if (*ms_s == '\0') {
+        die("%s:%d: expect_close_within needs <ms>", file, lineno);
+    }
+
+    ms = strtol(ms_s, &stop, 10);
+
+    if (stop == ms_s || *stop != '\0') {
+        die("%s:%d: expect_close_within \"%s\" is not a number",
+            file, lineno, ms_s);
+    }
+
+    /* The ceiling is the load-bearing half. A deadline at or past the
+     * prober's read timeout can never be missed -- the read gives up
+     * first -- so the assertion would report ok on a server that never
+     * closes at all. The floor rejects a negative, which would collide
+     * with the CLOSE_WITHIN_NONE sentinel; 0 is allowed through as a
+     * coherent (always-failing) request rather than special-cased. */
+    if (ms < 0 || ms > MAX_CLOSE_WITHIN_MS) {
+        die("%s:%d: expect_close_within %ld out of range (0..%d ms)",
+            file, lineno, ms, MAX_CLOSE_WITHIN_MS);
+    }
+
+    if (PX(saw_close_within)) {
+        die("%s:%d: a case may carry only one expect_close_within "
+            "directive", file, lineno);
+    }
+
+    /* Neither of these cases ever reads the socket, so no close is
+     * observable from here and the deadline would be judging nothing.
+     * abort resets from THIS side; hold closes from this side after a
+     * blind sleep. See rules.h for why hold is not the pairing it
+     * looks like. */
+    if (PX(saw_abort)) {
+        die("%s:%d: abort and expect_close_within are mutually "
+            "exclusive -- an aborted connection is reset by the "
+            "client, so the server's close is never observed",
+            file, lineno);
+    }
+
+    if (PX(saw_hold)) {
+        die("%s:%d: hold and expect_close_within are mutually "
+            "exclusive -- a held connection is never read, so the "
+            "server's close is never observed", file, lineno);
+    }
+
+    /* The other half of the idle exclusion; see that directive. */
+    if (PX(saw_idle)) {
+        die("%s:%d: expect_close_within and expect_idle are "
+            "mutually exclusive -- one asserts the server ends the "
+            "connection, the other that it leaves it open",
+            file, lineno);
+    }
+
+    PX(close_within_ms) = ms;
+    PX(saw_close_within) = 1;
+}
+
+static void
+parse_expect_idle(test_case *tc, pipeline_block *blk, char *arg,
+                  const char *file, int lineno)
+{
+    char       *ms_s = trim(arg);
+    char       *stop;
+    long        ms;
+
+    if (*ms_s == '\0') {
+        die("%s:%d: expect_idle needs <ms>", file, lineno);
+    }
+
+    ms = strtol(ms_s, &stop, 10);
+
+    if (stop == ms_s || *stop != '\0') {
+        die("%s:%d: expect_idle \"%s\" is not a number",
+            file, lineno, ms_s);
+    }
+
+    /* Floor at 1, unlike the close deadline's 0. A zero-length idle
+     * wait is not merely unsatisfiable but vacuous -- it polls for no
+     * time and passes unconditionally, which is an assertion that
+     * cannot go red. The ceiling keeps one parked case from stalling
+     * the serial suite; prober.c re-checks it against the runtime read
+     * timeout, which this parser cannot see. */
+    if (ms < 1 || ms > MAX_IDLE_MS) {
+        die("%s:%d: expect_idle %ld out of range (1..%d ms)",
+            file, lineno, ms, MAX_IDLE_MS);
+    }
+
+    if (PX(saw_idle)) {
+        die("%s:%d: a case may carry only one expect_idle "
+            "directive", file, lineno);
+    }
+
+    /* Neither observes the socket at all: abort resets from this side
+     * before any wait could run, and hold blind-sleeps with the read
+     * loop skipped. An idle wait under either would report its own
+     * behaviour as the server's. */
+    if (PX(saw_abort)) {
+        die("%s:%d: abort and expect_idle are mutually exclusive "
+            "-- an aborted connection is reset by the client, so the "
+            "server is never observed", file, lineno);
+    }
+
+    if (PX(saw_hold)) {
+        die("%s:%d: hold and expect_idle are mutually exclusive "
+            "-- hold sleeps without polling, so the server is never "
+            "observed (expect_idle is the directive hold cannot "
+            "stand in for)", file, lineno);
+    }
+
+    /* Contradictory rather than redundant: one demands the server end
+     * the connection, the other that it leave it open. Accepting both
+     * would let whichever assertion ran first decide the verdict. */
+    if (PX(saw_close_within)) {
+        die("%s:%d: expect_close_within and expect_idle are "
+            "mutually exclusive -- one asserts the server ends the "
+            "connection, the other that it leaves it open",
+            file, lineno);
+    }
+
+    /* The idle wait replaces the read loop, so receive pacing would
+     * configure something that never runs -- the same trap recv_slow
+     * already guards against under hold. */
+    if (PX(saw_recv_slow)) {
+        die("%s:%d: recv_slow and expect_idle are mutually "
+            "exclusive -- the idle wait never reads, so pacing reads "
+            "configures nothing", file, lineno);
+    }
+
+    PX(idle_ms) = ms;
+    PX(saw_idle) = 1;
+}
+
+static void
+parse_recv_slow(test_case *tc, pipeline_block *blk, char *arg,
+                const char *file, int lineno)
+{
+    char       *rest = trim(arg);
+    char       *stop;
+    long        chunk, ms;
+
+    if (*rest == '\0') {
+        die("%s:%d: recv_slow needs <chunk> <ms>", file, lineno);
+    }
+
+    chunk = strtol(rest, &stop, 10);
+
+    if (stop == rest || (*stop != ' ' && *stop != '\t')) {
+        die("%s:%d: recv_slow \"%s\" is not <chunk> <ms>",
+            file, lineno, rest);
+    }
+
+    if (chunk < 1 || chunk > MAX_RECV_SLOW_CHUNK) {
+        die("%s:%d: recv_slow chunk %ld out of range (1..%d bytes)",
+            file, lineno, chunk, MAX_RECV_SLOW_CHUNK);
+    }
+
+    rest = trim(stop);
+    ms = strtol(rest, &stop, 10);
+
+    if (stop == rest || *stop != '\0') {
+        die("%s:%d: recv_slow \"%s\" is not a number", file, lineno,
+            rest);
+    }
+
+    if (ms < 1 || ms > MAX_PAUSE_MS) {
+        die("%s:%d: recv_slow %ld out of range (1..%d ms)",
+            file, lineno, ms, MAX_PAUSE_MS);
+    }
+
+    if (PX(saw_recv_slow)) {
+        die("%s:%d: a case may carry only one recv_slow directive",
+            file, lineno);
+    }
+
+    /* Pacing reads on a case that resets the connection is incoherent:
+     * abort tears the socket down before the response is read at all,
+     * so the pacing would apply to nothing. Silently allowing it would
+     * let a rule file read as though it tested backpressure. */
+    if (PX(saw_abort)) {
+        die("%s:%d: recv_slow and abort are mutually exclusive",
+            file, lineno);
+    }
+
+    /* The other half of the hold exclusion; see that directive. */
+    if (PX(saw_hold)) {
+        die("%s:%d: recv_slow and hold are mutually exclusive",
+            file, lineno);
+    }
+
+    /* The other half of the idle exclusion; see that directive. */
+    if (PX(saw_idle)) {
+        die("%s:%d: recv_slow and expect_idle are mutually "
+            "exclusive -- the idle wait never reads, so pacing reads "
+            "configures nothing", file, lineno);
+    }
+
+    PX(recv_opt).chunk = (size_t) chunk;
+    PX(recv_opt).ms = ms;
+    PX(saw_recv_slow) = 1;
+}
+
+static void
+parse_so_rcvbuf(test_case *tc, pipeline_block *blk, char *arg,
+                const char *file, int lineno)
+{
+    char       *sz_s = trim(arg);
+    char       *stop;
+    long        sz;
+
+    if (*sz_s == '\0') {
+        die("%s:%d: so_rcvbuf needs <bytes>", file, lineno);
+    }
+
+    sz = strtol(sz_s, &stop, 10);
+
+    if (stop == sz_s || *stop != '\0') {
+        die("%s:%d: so_rcvbuf \"%s\" is not a number",
+            file, lineno, sz_s);
+    }
+
+    if (sz < MIN_RCVBUF || sz > MAX_RCVBUF) {
+        die("%s:%d: so_rcvbuf %ld out of range (%d..%d bytes)",
+            file, lineno, sz, MIN_RCVBUF, MAX_RCVBUF);
+    }
+
+    if (PX(saw_rcvbuf)) {
+        die("%s:%d: a case may carry only one so_rcvbuf directive",
+            file, lineno);
+    }
+
+    /* SO_RCVBUF is a property of the CONNECTION, not one exchange. In a
+     * pipeline the connection is opened once, before the first block, so
+     * only the first block can set the client buffer; a so_rcvbuf on a
+     * later block would parse but silently never apply. Reject it rather
+     * than accept a directive that does nothing. (The flat case and the
+     * first block are both fine: blk is NULL or the first block.) */
+    if (blk != NULL && tc->n_blocks > 1) {
+        die("%s:%d: so_rcvbuf may only appear on the FIRST block -- the "
+            "connection is opened once, so a later block's buffer size "
+            "would never take effect", file, lineno);
+    }
+
+    PX(recv_opt).rcvbuf = (int) sz;
+    PX(saw_rcvbuf) = 1;
+}
+
+static void
+parse_dechunk(test_case *tc, pipeline_block *blk, char *arg,
+              const char *file, int lineno)
+{
+    if (*trim(arg) != '\0') {
+        die("%s:%d: dechunk takes no arguments", file, lineno);
+    }
+
+    if (PX(dechunk)) {
+        die("%s:%d: dechunk already set for this case", file, lineno);
+    }
+
+    PX(dechunk) = 1;
+}
+
+static void
+parse_gunzip(test_case *tc, pipeline_block *blk, char *arg,
+             const char *file, int lineno)
+{
+    if (*trim(arg) != '\0') {
+        die("%s:%d: gunzip takes no arguments", file, lineno);
+    }
+
+    if (PX(gunzip)) {
+        die("%s:%d: gunzip already set for this case", file, lineno);
+    }
+
+    PX(gunzip) = 1;
+}
+
+static void
+parse_json_sort(test_case *tc, pipeline_block *blk, char *arg,
+                const char *file, int lineno)
+{
+    if (*trim(arg) != '\0') {
+        die("%s:%d: json_sort takes no arguments", file, lineno);
+    }
+
+    if (PX(json_sort)) {
+        die("%s:%d: json_sort already set for this case", file, lineno);
+    }
+
+    PX(json_sort) = 1;
+}
+
+static void
+parse_open_conns(test_case *tc, char *arg, const char *file, int lineno)
+{
+    char   *count_s = trim(arg);
+    char   *stop;
+    long    count;
+
+    if (*count_s == '\0') {
+        die("%s:%d: open_conns needs <count>", file, lineno);
+    }
+
+    count = strtol(count_s, &stop, 10);
+
+    /* The whole argument must be the number: "10junk" parsing as 10, or
+     * "5 20" silently keeping only the 5 (strtok did before), would open
+     * a different number of connections than the file spells, and a
+     * saturation case that silently changes its connection count is the
+     * same trap as repeat's silent size change above. trim + full-string
+     * check matches every sibling single-arg directive. */
+    if (stop == count_s || *stop != '\0') {
+        die("%s:%d: open_conns count \"%s\" is not a number",
+            file, lineno, count_s);
+    }
+
+    if (count < 1 || count > MAX_OPEN_CONNS) {
+        die("%s:%d: open_conns %ld out of range (1..%d)",
+            file, lineno, count, MAX_OPEN_CONNS);
+    }
+
+    /* A valid count is >= 1, so a non-zero field means a prior
+     * open_conns already set it -- the field is its own duplicate
+     * guard, no saw_ flag needed. Case-level like pid_may_change, so it
+     * writes cases[n - 1] directly rather than routing through PX(). */
+    if (tc->open_conns != 0) {
+        die("%s:%d: open_conns already set for this case",
+            file, lineno);
+    }
+
+    tc->open_conns = (int) count;
+}
+
+static void
+parse_fanout(test_case *tc, char *arg, const char *file, int lineno)
+{
+    char   *rest = trim(arg);
+    char   *stop;
+    long    count;
+    long    minw;
+
+    if (*rest == '\0') {
+        die("%s:%d: fanout needs <count> [min_workers]", file, lineno);
+    }
+
+    count = strtol(rest, &stop, 10);
+
+    if (stop == rest) {
+        die("%s:%d: fanout count \"%s\" is not a number",
+            file, lineno, rest);
+    }
+
+    /* Same floor and reasoning as `concurrent`: `fanout 1` is the
+     * ordinary path with extra machinery, and accepting it would let a
+     * rule file claim a cross-worker test while only ever reaching one
+     * worker -- the vacuous-gate shape this harness exists to catch. */
+    if (count < 2 || count > MAX_CONCURRENT) {
+        die("%s:%d: fanout %ld out of range (2..%d)",
+            file, lineno, count, MAX_CONCURRENT);
+    }
+
+    rest = trim(stop);
+
+    if (*rest == '\0') {
+        /*
+         * Default: require at least 2 DISTINCT workers.
+         *
+         * Not 1. Worker sampling is probabilistic -- nothing lets a
+         * client pick which worker accepts its connection -- so N
+         * requests can legitimately all land on one worker. A default
+         * of 1 would let the entire lens pass having sampled a single
+         * worker N times, which is a coverage claim it never earned.
+         * Requiring 2 makes incomplete coverage FAIL rather than pass
+         * quietly, which is the whole point of the directive.
+         */
+        minw = 2;
+
+    } else {
+        minw = strtol(rest, &stop, 10);
+
+        if (stop == rest || *trim(stop) != '\0') {
+            die("%s:%d: fanout min_workers \"%s\" is not a number",
+                file, lineno, rest);
+        }
+
+        if (minw < 2 || minw > count) {
+            die("%s:%d: fanout min_workers %ld out of range (2..%ld)",
+                file, lineno, minw, count);
+        }
+    }
+
+    if (tc->fanout != 0) {
+        die("%s:%d: fanout already set for this case", file, lineno);
+    }
+
+    /* Mutually exclusive with `block`, for the reason `concurrent`
+     * refuses it: a pipeline is ordered on ONE connection, so it
+     * reaches exactly one worker and a fanout over it would assert
+     * cross-worker agreement having sampled a single worker. */
+    if (tc->n_blocks > 0) {
+        die("%s:%d: fanout cannot be combined with block "
+            "(a pipeline is one connection, so it reaches one worker)",
+            file, lineno);
+    }
+
+    if (tc->concurrent != 0) {
+        die("%s:%d: fanout cannot be combined with concurrent "
+            "(both drive the request count; pick one)",
+            file, lineno);
+    }
+
+    tc->fanout = (int) count;
+    tc->fanout_min_workers = (int) minw;
+}
+
+static void
+parse_quiesce(test_case *tc, char *arg, const char *file, int lineno)
+{
+    char   *rest = trim(arg);
+    char   *stop;
+    char   *path;
+    long    timeout;
+
+    if (*rest == '\0') {
+        die("%s:%d: quiesce needs <path> [timeout_ms]", file, lineno);
+    }
+
+    /* nosem: insecure-use-strtok-fn -- single-threaded loader, tokens
+     * consumed to completion in this arm; see parse_assert. */
+    path = strtok(rest, " \t");  /* nosem: insecure-use-strtok-fn */
+    rest = strtok(NULL, "");     /* nosem: insecure-use-strtok-fn */
+
+    if (path == NULL || *path == '\0') {
+        die("%s:%d: quiesce needs <path> [timeout_ms]", file, lineno);
+    }
+
+    if (rest == NULL || *trim(rest) == '\0') {
+        timeout = QUIESCE_DEFAULT_MS;
+
+    } else {
+        rest = trim(rest);
+        timeout = strtol(rest, &stop, 10);
+
+        /* Whole-argument check: a timeout that silently parsed as its
+         * numeric prefix would make the case wait a different time
+         * than the file spells, and the directive's entire value is
+         * that the wait is stated rather than guessed. */
+        if (stop == rest || *trim(stop) != '\0') {
+            die("%s:%d: quiesce timeout_ms \"%s\" is not a number",
+                file, lineno, rest);
+        }
+
+        /*
+         * A floor of 1, not 0. `quiesce <path> 0` would expire before
+         * the first pair of samples could be compared, so it is a
+         * directive that always fails for a reason unrelated to the
+         * code under test -- and a rule author whose case reddens on
+         * a typo'd zero would sooner delete the line than debug it.
+         * Refuse it at load time with the line number instead.
+         */
+        if (timeout < 1 || timeout > QUIESCE_MAX_MS) {
+            die("%s:%d: quiesce timeout_ms %ld out of range (1..%d)",
+                file, lineno, timeout, QUIESCE_MAX_MS);
+        }
+    }
+
+    if (tc->quiesce_path != NULL) {
+        die("%s:%d: quiesce already set for this case", file, lineno);
+    }
+
+    /* The "a quiesce nothing observes is a sleep" rule is enforced in
+     * the post-parse pass, not here: at this line the case's own
+     * assertions may not have been read yet, and a rejection that
+     * depended on whether the author wrote `quiesce` above or below
+     * its `probe` would be a parser that judges line order. */
+
+    tc->quiesce_path = xstrdup(path);
+    tc->quiesce_timeout_ms = (int) timeout;
+}
+
+static void
+parse_concurrent(test_case *tc, char *arg, const char *file, int lineno)
+{
+    char   *count_s = trim(arg);
+    char   *stop;
+    long    count;
+
+    if (*count_s == '\0') {
+        die("%s:%d: concurrent needs <count>", file, lineno);
+    }
+
+    count = strtol(count_s, &stop, 10);
+
+    /* Whole-argument check, same reasoning as open_conns above: a case
+     * that silently runs a different number of requests than the file
+     * spells is a test whose subject changed without anyone noticing. */
+    if (stop == count_s || *stop != '\0') {
+        die("%s:%d: concurrent count \"%s\" is not a number",
+            file, lineno, count_s);
+    }
+
+    /* Floor is 2, not 1. `concurrent 1` is exactly the ordinary path
+     * with extra machinery, so accepting it would let a rule file claim
+     * a concurrency test while asserting nothing about overlap -- the
+     * vacuous-gate shape this harness exists to catch. Reject it at
+     * parse time with a line number instead. */
+    if (count < 2 || count > MAX_CONCURRENT) {
+        die("%s:%d: concurrent %ld out of range (2..%d)",
+            file, lineno, count, MAX_CONCURRENT);
+    }
+
+    if (tc->concurrent != 0) {
+        die("%s:%d: concurrent already set for this case",
+            file, lineno);
+    }
+
+    /* The mirror of the check in `fanout` above -- the pair must be
+     * refused whichever order the two directives appear in, or the
+     * rejection depends on line order. */
+    if (tc->fanout != 0) {
+        die("%s:%d: concurrent cannot be combined with fanout "
+            "(both drive the request count; pick one)",
+            file, lineno);
+    }
+
+    tc->concurrent = (int) count;
+}
+
+static void
+parse_xfail(test_case *tc, char *arg, const char *file, int lineno)
+{
+    if (tc->xfail) {
+        die("%s:%d: xfail already set for this case", file, lineno);
+    }
+
+    tc->xfail = 1;
+
+    /* A blank reason is allowed -- the annotation itself is the
+     * signal; the text is diagnostic only. */
+    {
+        char *reason = trim(arg);
+
+        tc->xfail_reason = (*reason != '\0') ? xstrdup(reason) : NULL;
+    }
+}
+
+static void
+parse_repeat(test_case *tc, pipeline_block *blk, char *arg, size_t *cap,
+             const char *file, int lineno)
+{
+    /* nosem: insecure-use-strtok-fn -- single-threaded loader, tokens
+     * consumed to completion in this arm; see the note at parse_assert. */
+    char   *count_s = strtok(arg, " \t");  /* nosem: insecure-use-strtok-fn */
+    char   *text = strtok(NULL, "");        /* nosem: insecure-use-strtok-fn */
+    char   *stop;
+    long    count;
+    long    k;
+
+    if (count_s == NULL || text == NULL) {
+        die("%s:%d: repeat needs <count> <text>", file, lineno);
+    }
+
+    count = strtol(count_s, &stop, 10);
+
+    /* The whole token has to be the number. "10junk" parsing as 10
+     * would build a different request than the file describes, and a
+     * size-driven case that silently changes size is exactly the way a
+     * limit test stops reaching its limit. */
+    if (stop == count_s || *stop != '\0') {
+        die("%s:%d: repeat count \"%s\" is not a number",
+            file, lineno, count_s);
+    }
+
+    if (count < 1 || count > 100000) {
+        die("%s:%d: repeat count %ld out of range (1..100000)",
+            file, lineno, count);
+    }
+
+    for (k = 0; k < count; k++) {
+        append_escaped(&PX(request), &PX(request_len),
+                       cap, text, "repeat line");
+    }
+}
+
+/*
  * load_rules_fp -- the whole rule-file parser, reading lines from an already
  * open FILE*. The two public entries below differ ONLY in where that FILE*
  * comes from: load_rules() fopen()s a path, load_rules_buf() fmemopen()s an
@@ -829,593 +1807,37 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
                                       ? &tc->blocks[tc->n_blocks - 1] : NULL;
 
         if (strcmp(directive, "send") == 0) {
-            append_escaped(&PX(request), &PX(request_len),
-                           &cap, arg, "send line");
+            parse_send(tc, blk, arg, &cap);
 
         } else if (strcmp(directive, "pause") == 0) {
-            char       *ms_s = trim(arg);
-            char       *stop;
-            long        ms;
-            size_t      k;
-            long        total = 0;
-
-            if (*ms_s == '\0') {
-                die("%s:%d: pause needs <ms>", file, lineno);
-            }
-
-            /* Same whole-token check as `repeat`: a pause that silently became
-             * zero would turn a timing test into a plain request and still
-             * report ok. */
-            ms = strtol(ms_s, &stop, 10);
-
-            if (stop == ms_s || *stop != '\0') {
-                die("%s:%d: pause \"%s\" is not a number", file, lineno, ms_s);
-            }
-
-            if (ms < 1 || ms > MAX_PAUSE_MS) {
-                die("%s:%d: pause %ld out of range (1..%d ms)",
-                    file, lineno, ms, MAX_PAUSE_MS);
-            }
-
-            if (PX(n_pauses) >= MAX_PAUSES) {
-                die("%s:%d: too many pause directives (max %d)",
-                    file, lineno, MAX_PAUSES);
-            }
-
-            for (k = 0; k < PX(n_pauses); k++) {
-                total += PX(pauses)[k].ms;
-            }
-
-            /* The prober's read timeout bounds the whole exchange, so a case
-             * that stalls longer than that would report a harness timeout
-             * rather than whatever the server did. Fail the rule file instead
-             * of shipping a test that cannot mean what it says. */
-            if (total + ms > MAX_PAUSE_MS) {
-                die("%s:%d: pause total %ld ms exceeds the %d ms ceiling",
-                    file, lineno, total + ms, MAX_PAUSE_MS);
-            }
-
-            PX(pauses)[PX(n_pauses)].offset = PX(request_len);
-            PX(pauses)[PX(n_pauses)].ms = ms;
-            PX(pauses)[PX(n_pauses)].chunk = 0;
-            PX(pauses)[PX(n_pauses)].unit = 0;
-            PX(n_pauses)++;
+            parse_pause(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "send_slow") == 0) {
-            char       *rest = trim(arg);
-            char       *stop;
-            long        chunk, ms;
-            size_t      k;
-            long        total = 0;
-
-            if (*rest == '\0') {
-                die("%s:%d: send_slow needs <chunk> <ms>", file, lineno);
-            }
-
-            chunk = strtol(rest, &stop, 10);
-
-            if (stop == rest || (*stop != ' ' && *stop != '\t')) {
-                die("%s:%d: send_slow \"%s\" is not <chunk> <ms>",
-                    file, lineno, rest);
-            }
-
-            if (chunk < 1 || chunk > MAX_SEND_SLOW_CHUNK) {
-                die("%s:%d: send_slow chunk %ld out of range (1..%d bytes)",
-                    file, lineno, chunk, MAX_SEND_SLOW_CHUNK);
-            }
-
-            rest = trim(stop);
-            ms = strtol(rest, &stop, 10);
-
-            if (stop == rest || *stop != '\0') {
-                die("%s:%d: send_slow \"%s\" is not a number", file, lineno,
-                    rest);
-            }
-
-            if (ms < 1 || ms > MAX_PAUSE_MS) {
-                die("%s:%d: send_slow %ld out of range (1..%d ms)",
-                    file, lineno, ms, MAX_PAUSE_MS);
-            }
-
-            if (PX(n_pauses) >= MAX_PAUSES) {
-                die("%s:%d: too many pause/send_slow directives (max %d)",
-                    file, lineno, MAX_PAUSES);
-            }
-
-            for (k = 0; k < PX(n_pauses); k++) {
-                total += pause_cost_ms(&PX(pauses)[k],
-                                       k + 1 < PX(n_pauses)
-                                           ? PX(pauses)[k + 1].offset
-                                           : PX(request_len));
-            }
-
-            /* A paced entry costs ms per chunk, not ms once. Charging it as a
-             * single pause would let a rule file declare a dribble that blows
-             * through the read timeout and then reports a harness timeout
-             * instead of whatever the server did -- the exact failure the
-             * plain-pause ceiling exists to prevent. The bytes this entry will
-             * pace are not known until the case closes, so cost it against the
-             * request as it stands and re-check at close. */
-            total += pause_cost_ms_raw(PX(request_len), PX(request_len),
-                                       (size_t) chunk, ms);
-
-            if (total > MAX_PAUSE_MS) {
-                die("%s:%d: send_slow pushes the case to %ld ms, over the "
-                    "%d ms ceiling", file, lineno, total, MAX_PAUSE_MS);
-            }
-
-            PX(pauses)[PX(n_pauses)].offset = PX(request_len);
-            PX(pauses)[PX(n_pauses)].ms = ms;
-            PX(pauses)[PX(n_pauses)].chunk = (size_t) chunk;
-            PX(pauses)[PX(n_pauses)].unit = 0;
-            PX(n_pauses)++;
+            parse_send_slow(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "send_slow_chunks") == 0) {
-            char       *ms_s = trim(arg);
-            char       *stop;
-            long        ms;
-            size_t      k;
-            long        total = 0;
-
-            if (*ms_s == '\0') {
-                die("%s:%d: send_slow_chunks needs <ms>", file, lineno);
-            }
-
-            ms = strtol(ms_s, &stop, 10);
-
-            if (stop == ms_s || *stop != '\0') {
-                die("%s:%d: send_slow_chunks \"%s\" is not a number",
-                    file, lineno, ms_s);
-            }
-
-            if (ms < 1 || ms > MAX_PAUSE_MS) {
-                die("%s:%d: send_slow_chunks %ld out of range (1..%d ms)",
-                    file, lineno, ms, MAX_PAUSE_MS);
-            }
-
-            if (PX(n_pauses) >= MAX_PAUSES) {
-                die("%s:%d: too many pause/send_slow directives (max %d)",
-                    file, lineno, MAX_PAUSES);
-            }
-
-            for (k = 0; k < PX(n_pauses); k++) {
-                total += pause_cost_ms(&PX(pauses)[k],
-                                       k + 1 < PX(n_pauses)
-                                           ? PX(pauses)[k + 1].offset
-                                           : PX(request_len));
-            }
-
-            /* Same load-time cost check as send_slow, against the smallest unit
-             * the framing allows rather than a declared chunk size -- see
-             * MIN_CHUNK_UNIT_BYTES for why the overestimate is the safe
-             * direction. Re-checked at close, since the bytes this entry paces
-             * are not known until the case ends. */
-            total += pause_cost_ms_raw(PX(request_len), PX(request_len),
-                                       MIN_CHUNK_UNIT_BYTES, ms);
-
-            if (total > MAX_PAUSE_MS) {
-                die("%s:%d: send_slow_chunks pushes the case to %ld ms, over "
-                    "the %d ms ceiling", file, lineno, total, MAX_PAUSE_MS);
-            }
-
-            PX(pauses)[PX(n_pauses)].offset = PX(request_len);
-            PX(pauses)[PX(n_pauses)].ms = ms;
-            PX(pauses)[PX(n_pauses)].chunk = 0;
-            PX(pauses)[PX(n_pauses)].unit = 1;
-            PX(n_pauses)++;
+            parse_send_slow_chunks(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "shutdown") == 0) {
-            char       *how_s = trim(arg);
-            char       *stop;
-            long        how;
-
-            if (*how_s == '\0') {
-                die("%s:%d: shutdown needs 0|1|2", file, lineno);
-            }
-
-            how = strtol(how_s, &stop, 10);
-
-            if (stop == how_s || *stop != '\0') {
-                die("%s:%d: shutdown \"%s\" is not a number",
-                    file, lineno, how_s);
-            }
-
-            if (how < 0 || how > 2) {
-                die("%s:%d: shutdown %ld out of range (0=RD, 1=WR, 2=RDWR)",
-                    file, lineno, how);
-            }
-
-            /* One per case: two shutdowns would make the second a no-op at
-             * best and contradict the first at worst, and silently keeping the
-             * last would let a rule file read as if both applied. Keyed on a
-             * dedicated flag rather than on shut_how still holding the
-             * sentinel, so the check stays correct however that value is
-             * chosen. */
-            if (PX(saw_shutdown)) {
-                die("%s:%d: a case may carry only one shutdown directive",
-                    file, lineno);
-            }
-
-            /* The other half of the abort/shutdown exclusion; see the abort
-             * directive below for why the two cannot both apply. */
-            if (PX(saw_abort)) {
-                die("%s:%d: abort and shutdown are mutually exclusive",
-                    file, lineno);
-            }
-
-            PX(shut_how) = (int) how;
-            PX(saw_shutdown) = 1;
+            parse_shutdown(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "abort") == 0) {
-            char       *off_s = trim(arg);
-            char       *stop;
-            long        off;
-
-            if (*off_s == '\0') {
-                die("%s:%d: abort needs <offset>", file, lineno);
-            }
-
-            off = strtol(off_s, &stop, 10);
-
-            if (stop == off_s || *stop != '\0') {
-                die("%s:%d: abort \"%s\" is not a number", file, lineno, off_s);
-            }
-
-            /* Zero is allowed -- reset before the first byte -- but negative is
-             * not, and would otherwise wrap into an enormous size_t that reads
-             * as "never abort", turning a reset case into an ordinary request
-             * that still reports ok. */
-            if (off < 0) {
-                die("%s:%d: abort offset %ld is negative", file, lineno, off);
-            }
-
-            if (PX(saw_abort)) {
-                die("%s:%d: a case may carry only one abort directive",
-                    file, lineno);
-            }
-
-            /* A half-close says "I have finished sending, answer me"; a reset
-             * says "I am gone". Applying both would send a FIN the reset then
-             * invalidates, so the case would test neither directive cleanly.
-             * Checked in both directions below, since either may come first. */
-            if (PX(saw_shutdown)) {
-                die("%s:%d: abort and shutdown are mutually exclusive",
-                    file, lineno);
-            }
-
-            /* The other half of the recv_slow exclusion; see that directive. */
-            if (PX(saw_recv_slow)) {
-                die("%s:%d: recv_slow and abort are mutually exclusive",
-                    file, lineno);
-            }
-
-            /* The other half of the close-deadline exclusion; see that
-             * directive. */
-            if (PX(saw_close_within)) {
-                die("%s:%d: abort and expect_close_within are mutually "
-                    "exclusive -- an aborted connection is reset by the "
-                    "client, so the server's close is never observed",
-                    file, lineno);
-            }
-
-            /* The other half of the idle exclusion; see that directive. */
-            if (PX(saw_idle)) {
-                die("%s:%d: abort and expect_idle are mutually exclusive "
-                    "-- an aborted connection is reset by the client, so the "
-                    "server is never observed", file, lineno);
-            }
-
-            PX(abort_at) = (size_t) off;
-            PX(saw_abort) = 1;
-
-            /* The other half of the hold exclusion; see that directive. */
-            if (PX(saw_hold)) {
-                die("%s:%d: abort and hold are mutually exclusive",
-                    file, lineno);
-            }
+            parse_abort(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "hold") == 0) {
-            char       *ms_s = trim(arg);
-            char       *stop;
-            long        ms;
-
-            if (*ms_s == '\0') {
-                die("%s:%d: hold needs <ms>", file, lineno);
-            }
-
-            ms = strtol(ms_s, &stop, 10);
-
-            if (stop == ms_s || *stop != '\0') {
-                die("%s:%d: hold \"%s\" is not a number", file, lineno, ms_s);
-            }
-
-            /* Zero is rejected rather than treated as "no hold". A rule that
-             * spells `hold 0` is asking for a behaviour it will not get, and
-             * accepting it would produce a case that reads as testing an idle
-             * connection while making an ordinary request. The ceiling is the
-             * same one send_slow answers to: the hold blocks the suite. */
-            if (ms < 1 || ms > MAX_PAUSE_MS) {
-                die("%s:%d: hold %ld out of range (1..%d ms)",
-                    file, lineno, ms, MAX_PAUSE_MS);
-            }
-
-            if (PX(saw_hold)) {
-                die("%s:%d: a case may carry only one hold directive",
-                    file, lineno);
-            }
-
-            /* Both end the connection without reading, so the pair is not
-             * merely redundant but contradictory: abort resets immediately at
-             * its offset, which destroys the connection hold means to keep
-             * open and idle. Whichever ran would silently win. */
-            if (PX(saw_abort)) {
-                die("%s:%d: abort and hold are mutually exclusive",
-                    file, lineno);
-            }
-
-            /* hold skips the read loop entirely, so pacing reads under it
-             * would configure something that never runs -- a rule file that
-             * reads as testing backpressure while testing nothing. */
-            if (PX(saw_recv_slow)) {
-                die("%s:%d: recv_slow and hold are mutually exclusive",
-                    file, lineno);
-            }
-
-            /* The other half of the close-deadline exclusion; see that
-             * directive. */
-            if (PX(saw_close_within)) {
-                die("%s:%d: hold and expect_close_within are mutually "
-                    "exclusive -- a held connection is never read, so the "
-                    "server's close is never observed", file, lineno);
-            }
-
-            /* The other half of the idle exclusion; see that directive. */
-            if (PX(saw_idle)) {
-                die("%s:%d: hold and expect_idle are mutually exclusive "
-                    "-- hold sleeps without polling, so the server is never "
-                    "observed", file, lineno);
-            }
-
-            PX(hold_ms) = ms;
-            PX(saw_hold) = 1;
+            parse_hold(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "expect_close_within") == 0) {
-            char       *ms_s = trim(arg);
-            char       *stop;
-            long        ms;
-
-            if (*ms_s == '\0') {
-                die("%s:%d: expect_close_within needs <ms>", file, lineno);
-            }
-
-            ms = strtol(ms_s, &stop, 10);
-
-            if (stop == ms_s || *stop != '\0') {
-                die("%s:%d: expect_close_within \"%s\" is not a number",
-                    file, lineno, ms_s);
-            }
-
-            /* The ceiling is the load-bearing half. A deadline at or past the
-             * prober's read timeout can never be missed -- the read gives up
-             * first -- so the assertion would report ok on a server that never
-             * closes at all. The floor rejects a negative, which would collide
-             * with the CLOSE_WITHIN_NONE sentinel; 0 is allowed through as a
-             * coherent (always-failing) request rather than special-cased. */
-            if (ms < 0 || ms > MAX_CLOSE_WITHIN_MS) {
-                die("%s:%d: expect_close_within %ld out of range (0..%d ms)",
-                    file, lineno, ms, MAX_CLOSE_WITHIN_MS);
-            }
-
-            if (PX(saw_close_within)) {
-                die("%s:%d: a case may carry only one expect_close_within "
-                    "directive", file, lineno);
-            }
-
-            /* Neither of these cases ever reads the socket, so no close is
-             * observable from here and the deadline would be judging nothing.
-             * abort resets from THIS side; hold closes from this side after a
-             * blind sleep. See rules.h for why hold is not the pairing it
-             * looks like. */
-            if (PX(saw_abort)) {
-                die("%s:%d: abort and expect_close_within are mutually "
-                    "exclusive -- an aborted connection is reset by the "
-                    "client, so the server's close is never observed",
-                    file, lineno);
-            }
-
-            if (PX(saw_hold)) {
-                die("%s:%d: hold and expect_close_within are mutually "
-                    "exclusive -- a held connection is never read, so the "
-                    "server's close is never observed", file, lineno);
-            }
-
-            /* The other half of the idle exclusion; see that directive. */
-            if (PX(saw_idle)) {
-                die("%s:%d: expect_close_within and expect_idle are "
-                    "mutually exclusive -- one asserts the server ends the "
-                    "connection, the other that it leaves it open",
-                    file, lineno);
-            }
-
-            PX(close_within_ms) = ms;
-            PX(saw_close_within) = 1;
+            parse_expect_close_within(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "expect_idle") == 0) {
-            char       *ms_s = trim(arg);
-            char       *stop;
-            long        ms;
-
-            if (*ms_s == '\0') {
-                die("%s:%d: expect_idle needs <ms>", file, lineno);
-            }
-
-            ms = strtol(ms_s, &stop, 10);
-
-            if (stop == ms_s || *stop != '\0') {
-                die("%s:%d: expect_idle \"%s\" is not a number",
-                    file, lineno, ms_s);
-            }
-
-            /* Floor at 1, unlike the close deadline's 0. A zero-length idle
-             * wait is not merely unsatisfiable but vacuous -- it polls for no
-             * time and passes unconditionally, which is an assertion that
-             * cannot go red. The ceiling keeps one parked case from stalling
-             * the serial suite; prober.c re-checks it against the runtime read
-             * timeout, which this parser cannot see. */
-            if (ms < 1 || ms > MAX_IDLE_MS) {
-                die("%s:%d: expect_idle %ld out of range (1..%d ms)",
-                    file, lineno, ms, MAX_IDLE_MS);
-            }
-
-            if (PX(saw_idle)) {
-                die("%s:%d: a case may carry only one expect_idle "
-                    "directive", file, lineno);
-            }
-
-            /* Neither observes the socket at all: abort resets from this side
-             * before any wait could run, and hold blind-sleeps with the read
-             * loop skipped. An idle wait under either would report its own
-             * behaviour as the server's. */
-            if (PX(saw_abort)) {
-                die("%s:%d: abort and expect_idle are mutually exclusive "
-                    "-- an aborted connection is reset by the client, so the "
-                    "server is never observed", file, lineno);
-            }
-
-            if (PX(saw_hold)) {
-                die("%s:%d: hold and expect_idle are mutually exclusive "
-                    "-- hold sleeps without polling, so the server is never "
-                    "observed (expect_idle is the directive hold cannot "
-                    "stand in for)", file, lineno);
-            }
-
-            /* Contradictory rather than redundant: one demands the server end
-             * the connection, the other that it leave it open. Accepting both
-             * would let whichever assertion ran first decide the verdict. */
-            if (PX(saw_close_within)) {
-                die("%s:%d: expect_close_within and expect_idle are "
-                    "mutually exclusive -- one asserts the server ends the "
-                    "connection, the other that it leaves it open",
-                    file, lineno);
-            }
-
-            /* The idle wait replaces the read loop, so receive pacing would
-             * configure something that never runs -- the same trap recv_slow
-             * already guards against under hold. */
-            if (PX(saw_recv_slow)) {
-                die("%s:%d: recv_slow and expect_idle are mutually "
-                    "exclusive -- the idle wait never reads, so pacing reads "
-                    "configures nothing", file, lineno);
-            }
-
-            PX(idle_ms) = ms;
-            PX(saw_idle) = 1;
+            parse_expect_idle(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "recv_slow") == 0) {
-            char       *rest = trim(arg);
-            char       *stop;
-            long        chunk, ms;
-
-            if (*rest == '\0') {
-                die("%s:%d: recv_slow needs <chunk> <ms>", file, lineno);
-            }
-
-            chunk = strtol(rest, &stop, 10);
-
-            if (stop == rest || (*stop != ' ' && *stop != '\t')) {
-                die("%s:%d: recv_slow \"%s\" is not <chunk> <ms>",
-                    file, lineno, rest);
-            }
-
-            if (chunk < 1 || chunk > MAX_RECV_SLOW_CHUNK) {
-                die("%s:%d: recv_slow chunk %ld out of range (1..%d bytes)",
-                    file, lineno, chunk, MAX_RECV_SLOW_CHUNK);
-            }
-
-            rest = trim(stop);
-            ms = strtol(rest, &stop, 10);
-
-            if (stop == rest || *stop != '\0') {
-                die("%s:%d: recv_slow \"%s\" is not a number", file, lineno,
-                    rest);
-            }
-
-            if (ms < 1 || ms > MAX_PAUSE_MS) {
-                die("%s:%d: recv_slow %ld out of range (1..%d ms)",
-                    file, lineno, ms, MAX_PAUSE_MS);
-            }
-
-            if (PX(saw_recv_slow)) {
-                die("%s:%d: a case may carry only one recv_slow directive",
-                    file, lineno);
-            }
-
-            /* Pacing reads on a case that resets the connection is incoherent:
-             * abort tears the socket down before the response is read at all,
-             * so the pacing would apply to nothing. Silently allowing it would
-             * let a rule file read as though it tested backpressure. */
-            if (PX(saw_abort)) {
-                die("%s:%d: recv_slow and abort are mutually exclusive",
-                    file, lineno);
-            }
-
-            /* The other half of the hold exclusion; see that directive. */
-            if (PX(saw_hold)) {
-                die("%s:%d: recv_slow and hold are mutually exclusive",
-                    file, lineno);
-            }
-
-            /* The other half of the idle exclusion; see that directive. */
-            if (PX(saw_idle)) {
-                die("%s:%d: recv_slow and expect_idle are mutually "
-                    "exclusive -- the idle wait never reads, so pacing reads "
-                    "configures nothing", file, lineno);
-            }
-
-            PX(recv_opt).chunk = (size_t) chunk;
-            PX(recv_opt).ms = ms;
-            PX(saw_recv_slow) = 1;
+            parse_recv_slow(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "so_rcvbuf") == 0) {
-            char       *sz_s = trim(arg);
-            char       *stop;
-            long        sz;
-
-            if (*sz_s == '\0') {
-                die("%s:%d: so_rcvbuf needs <bytes>", file, lineno);
-            }
-
-            sz = strtol(sz_s, &stop, 10);
-
-            if (stop == sz_s || *stop != '\0') {
-                die("%s:%d: so_rcvbuf \"%s\" is not a number",
-                    file, lineno, sz_s);
-            }
-
-            if (sz < MIN_RCVBUF || sz > MAX_RCVBUF) {
-                die("%s:%d: so_rcvbuf %ld out of range (%d..%d bytes)",
-                    file, lineno, sz, MIN_RCVBUF, MAX_RCVBUF);
-            }
-
-            if (PX(saw_rcvbuf)) {
-                die("%s:%d: a case may carry only one so_rcvbuf directive",
-                    file, lineno);
-            }
-
-            /* SO_RCVBUF is a property of the CONNECTION, not one exchange. In a
-             * pipeline the connection is opened once, before the first block, so
-             * only the first block can set the client buffer; a so_rcvbuf on a
-             * later block would parse but silently never apply. Reject it rather
-             * than accept a directive that does nothing. (The flat case and the
-             * first block are both fine: blk is NULL or the first block.) */
-            if (blk != NULL && tc->n_blocks > 1) {
-                die("%s:%d: so_rcvbuf may only appear on the FIRST block -- the "
-                    "connection is opened once, so a later block's buffer size "
-                    "would never take effect", file, lineno);
-            }
-
-            PX(recv_opt).rcvbuf = (int) sz;
-            PX(saw_rcvbuf) = 1;
+            parse_so_rcvbuf(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "expect") == 0) {
             parse_expect(&PX(expects)[0], &PX(n_expects), trim(arg),
@@ -1438,37 +1860,13 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
                              directive, arg, file, lineno);
 
         } else if (strcmp(directive, "dechunk") == 0) {
-            if (*trim(arg) != '\0') {
-                die("%s:%d: dechunk takes no arguments", file, lineno);
-            }
-
-            if (PX(dechunk)) {
-                die("%s:%d: dechunk already set for this case", file, lineno);
-            }
-
-            PX(dechunk) = 1;
+            parse_dechunk(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "gunzip") == 0) {
-            if (*trim(arg) != '\0') {
-                die("%s:%d: gunzip takes no arguments", file, lineno);
-            }
-
-            if (PX(gunzip)) {
-                die("%s:%d: gunzip already set for this case", file, lineno);
-            }
-
-            PX(gunzip) = 1;
+            parse_gunzip(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "json_sort") == 0) {
-            if (*trim(arg) != '\0') {
-                die("%s:%d: json_sort takes no arguments", file, lineno);
-            }
-
-            if (PX(json_sort)) {
-                die("%s:%d: json_sort already set for this case", file, lineno);
-            }
-
-            PX(json_sort) = 1;
+            parse_json_sort(tc, blk, arg, file, lineno);
 
         } else if (strcmp(directive, "pid_may_change") == 0) {
             if (*trim(arg) != '\0') {
@@ -1483,281 +1881,25 @@ load_rules_fp(FILE *fp, const char *file, test_case *cases, size_t max)
             cases[n - 1].pid_may_change = 1;
 
         } else if (strcmp(directive, "open_conns") == 0) {
-            char   *count_s = trim(arg);
-            char   *stop;
-            long    count;
-
-            if (*count_s == '\0') {
-                die("%s:%d: open_conns needs <count>", file, lineno);
-            }
-
-            count = strtol(count_s, &stop, 10);
-
-            /* The whole argument must be the number: "10junk" parsing as 10, or
-             * "5 20" silently keeping only the 5 (strtok did before), would open
-             * a different number of connections than the file spells, and a
-             * saturation case that silently changes its connection count is the
-             * same trap as repeat's silent size change above. trim + full-string
-             * check matches every sibling single-arg directive. */
-            if (stop == count_s || *stop != '\0') {
-                die("%s:%d: open_conns count \"%s\" is not a number",
-                    file, lineno, count_s);
-            }
-
-            if (count < 1 || count > MAX_OPEN_CONNS) {
-                die("%s:%d: open_conns %ld out of range (1..%d)",
-                    file, lineno, count, MAX_OPEN_CONNS);
-            }
-
-            /* A valid count is >= 1, so a non-zero field means a prior
-             * open_conns already set it -- the field is its own duplicate
-             * guard, no saw_ flag needed. Case-level like pid_may_change, so it
-             * writes cases[n - 1] directly rather than routing through PX(). */
-            if (cases[n - 1].open_conns != 0) {
-                die("%s:%d: open_conns already set for this case",
-                    file, lineno);
-            }
-
-            cases[n - 1].open_conns = (int) count;
+            parse_open_conns(&cases[n - 1], arg, file, lineno);
 
         } else if (strcmp(directive, "fanout") == 0) {
-            char   *rest = trim(arg);
-            char   *stop;
-            long    count;
-            long    minw;
-
-            if (*rest == '\0') {
-                die("%s:%d: fanout needs <count> [min_workers]", file, lineno);
-            }
-
-            count = strtol(rest, &stop, 10);
-
-            if (stop == rest) {
-                die("%s:%d: fanout count \"%s\" is not a number",
-                    file, lineno, rest);
-            }
-
-            /* Same floor and reasoning as `concurrent`: `fanout 1` is the
-             * ordinary path with extra machinery, and accepting it would let a
-             * rule file claim a cross-worker test while only ever reaching one
-             * worker -- the vacuous-gate shape this harness exists to catch. */
-            if (count < 2 || count > MAX_CONCURRENT) {
-                die("%s:%d: fanout %ld out of range (2..%d)",
-                    file, lineno, count, MAX_CONCURRENT);
-            }
-
-            rest = trim(stop);
-
-            if (*rest == '\0') {
-                /*
-                 * Default: require at least 2 DISTINCT workers.
-                 *
-                 * Not 1. Worker sampling is probabilistic -- nothing lets a
-                 * client pick which worker accepts its connection -- so N
-                 * requests can legitimately all land on one worker. A default
-                 * of 1 would let the entire lens pass having sampled a single
-                 * worker N times, which is a coverage claim it never earned.
-                 * Requiring 2 makes incomplete coverage FAIL rather than pass
-                 * quietly, which is the whole point of the directive.
-                 */
-                minw = 2;
-
-            } else {
-                minw = strtol(rest, &stop, 10);
-
-                if (stop == rest || *trim(stop) != '\0') {
-                    die("%s:%d: fanout min_workers \"%s\" is not a number",
-                        file, lineno, rest);
-                }
-
-                if (minw < 2 || minw > count) {
-                    die("%s:%d: fanout min_workers %ld out of range (2..%ld)",
-                        file, lineno, minw, count);
-                }
-            }
-
-            if (cases[n - 1].fanout != 0) {
-                die("%s:%d: fanout already set for this case", file, lineno);
-            }
-
-            /* Mutually exclusive with `block`, for the reason `concurrent`
-             * refuses it: a pipeline is ordered on ONE connection, so it
-             * reaches exactly one worker and a fanout over it would assert
-             * cross-worker agreement having sampled a single worker. */
-            if (cases[n - 1].n_blocks > 0) {
-                die("%s:%d: fanout cannot be combined with block "
-                    "(a pipeline is one connection, so it reaches one worker)",
-                    file, lineno);
-            }
-
-            if (cases[n - 1].concurrent != 0) {
-                die("%s:%d: fanout cannot be combined with concurrent "
-                    "(both drive the request count; pick one)",
-                    file, lineno);
-            }
-
-            cases[n - 1].fanout = (int) count;
-            cases[n - 1].fanout_min_workers = (int) minw;
+            parse_fanout(&cases[n - 1], arg, file, lineno);
 
         } else if (strcmp(directive, "quiesce") == 0) {
-            char   *rest = trim(arg);
-            char   *stop;
-            char   *path;
-            long    timeout;
-
-            if (*rest == '\0') {
-                die("%s:%d: quiesce needs <path> [timeout_ms]", file, lineno);
-            }
-
-            /* nosem: insecure-use-strtok-fn -- single-threaded loader, tokens
-             * consumed to completion in this arm; see parse_assert. */
-            path = strtok(rest, " \t");  /* nosem: insecure-use-strtok-fn */
-            rest = strtok(NULL, "");     /* nosem: insecure-use-strtok-fn */
-
-            if (path == NULL || *path == '\0') {
-                die("%s:%d: quiesce needs <path> [timeout_ms]", file, lineno);
-            }
-
-            if (rest == NULL || *trim(rest) == '\0') {
-                timeout = QUIESCE_DEFAULT_MS;
-
-            } else {
-                rest = trim(rest);
-                timeout = strtol(rest, &stop, 10);
-
-                /* Whole-argument check: a timeout that silently parsed as its
-                 * numeric prefix would make the case wait a different time
-                 * than the file spells, and the directive's entire value is
-                 * that the wait is stated rather than guessed. */
-                if (stop == rest || *trim(stop) != '\0') {
-                    die("%s:%d: quiesce timeout_ms \"%s\" is not a number",
-                        file, lineno, rest);
-                }
-
-                /*
-                 * A floor of 1, not 0. `quiesce <path> 0` would expire before
-                 * the first pair of samples could be compared, so it is a
-                 * directive that always fails for a reason unrelated to the
-                 * code under test -- and a rule author whose case reddens on
-                 * a typo'd zero would sooner delete the line than debug it.
-                 * Refuse it at load time with the line number instead.
-                 */
-                if (timeout < 1 || timeout > QUIESCE_MAX_MS) {
-                    die("%s:%d: quiesce timeout_ms %ld out of range (1..%d)",
-                        file, lineno, timeout, QUIESCE_MAX_MS);
-                }
-            }
-
-            if (cases[n - 1].quiesce_path != NULL) {
-                die("%s:%d: quiesce already set for this case", file, lineno);
-            }
-
-            /* The "a quiesce nothing observes is a sleep" rule is enforced in
-             * the post-parse pass, not here: at this line the case's own
-             * assertions may not have been read yet, and a rejection that
-             * depended on whether the author wrote `quiesce` above or below
-             * its `probe` would be a parser that judges line order. */
-
-            cases[n - 1].quiesce_path = xstrdup(path);
-            cases[n - 1].quiesce_timeout_ms = (int) timeout;
+            parse_quiesce(&cases[n - 1], arg, file, lineno);
 
         } else if (strcmp(directive, "zone_invariant") == 0) {
             parse_zone_invariant(&cases[n - 1], trim(arg), file, lineno);
 
         } else if (strcmp(directive, "concurrent") == 0) {
-            char   *count_s = trim(arg);
-            char   *stop;
-            long    count;
-
-            if (*count_s == '\0') {
-                die("%s:%d: concurrent needs <count>", file, lineno);
-            }
-
-            count = strtol(count_s, &stop, 10);
-
-            /* Whole-argument check, same reasoning as open_conns above: a case
-             * that silently runs a different number of requests than the file
-             * spells is a test whose subject changed without anyone noticing. */
-            if (stop == count_s || *stop != '\0') {
-                die("%s:%d: concurrent count \"%s\" is not a number",
-                    file, lineno, count_s);
-            }
-
-            /* Floor is 2, not 1. `concurrent 1` is exactly the ordinary path
-             * with extra machinery, so accepting it would let a rule file claim
-             * a concurrency test while asserting nothing about overlap -- the
-             * vacuous-gate shape this harness exists to catch. Reject it at
-             * parse time with a line number instead. */
-            if (count < 2 || count > MAX_CONCURRENT) {
-                die("%s:%d: concurrent %ld out of range (2..%d)",
-                    file, lineno, count, MAX_CONCURRENT);
-            }
-
-            if (cases[n - 1].concurrent != 0) {
-                die("%s:%d: concurrent already set for this case",
-                    file, lineno);
-            }
-
-            /* The mirror of the check in `fanout` above -- the pair must be
-             * refused whichever order the two directives appear in, or the
-             * rejection depends on line order. */
-            if (cases[n - 1].fanout != 0) {
-                die("%s:%d: concurrent cannot be combined with fanout "
-                    "(both drive the request count; pick one)",
-                    file, lineno);
-            }
-
-            cases[n - 1].concurrent = (int) count;
+            parse_concurrent(&cases[n - 1], arg, file, lineno);
 
         } else if (strcmp(directive, "xfail") == 0) {
-            if (cases[n - 1].xfail) {
-                die("%s:%d: xfail already set for this case", file, lineno);
-            }
-
-            cases[n - 1].xfail = 1;
-
-            /* A blank reason is allowed -- the annotation itself is the
-             * signal; the text is diagnostic only. */
-            {
-                char *reason = trim(arg);
-
-                cases[n - 1].xfail_reason =
-                    (*reason != '\0') ? xstrdup(reason) : NULL;
-            }
+            parse_xfail(&cases[n - 1], arg, file, lineno);
 
         } else if (strcmp(directive, "repeat") == 0) {
-            /* nosem: insecure-use-strtok-fn -- single-threaded loader, tokens
-             * consumed to completion in this arm; see the note at parse_assert. */
-            char   *count_s = strtok(arg, " \t");  /* nosem: insecure-use-strtok-fn */
-            char   *text = strtok(NULL, "");        /* nosem: insecure-use-strtok-fn */
-            char   *stop;
-            long    count;
-            long    k;
-
-            if (count_s == NULL || text == NULL) {
-                die("%s:%d: repeat needs <count> <text>", file, lineno);
-            }
-
-            count = strtol(count_s, &stop, 10);
-
-            /* The whole token has to be the number. "10junk" parsing as 10
-             * would build a different request than the file describes, and a
-             * size-driven case that silently changes size is exactly the way a
-             * limit test stops reaching its limit. */
-            if (stop == count_s || *stop != '\0') {
-                die("%s:%d: repeat count \"%s\" is not a number",
-                    file, lineno, count_s);
-            }
-
-            if (count < 1 || count > 100000) {
-                die("%s:%d: repeat count %ld out of range (1..100000)",
-                    file, lineno, count);
-            }
-
-            for (k = 0; k < count; k++) {
-                append_escaped(&PX(request), &PX(request_len),
-                               &cap, text, "repeat line");
-            }
+            parse_repeat(tc, blk, arg, &cap, file, lineno);
 
         } else if (strcmp(directive, "from") == 0) {
             cases[n - 1].source = xstrdup(trim(arg));

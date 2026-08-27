@@ -842,16 +842,16 @@ mutate "close_within: FIN time not measured" http.c \
 # The ceiling. A deadline past the read timeout can never be missed, so without
 # this bound the directive accepts values at which it cannot go red.
 mutate "close_within: ceiling removed" rules.c \
-    '            if (ms < 0 || ms > MAX_CLOSE_WITHIN_MS) {' \
-    '            if (ms < 0) {' rules_test
+    '    if (ms < 0 || ms > MAX_CLOSE_WITHIN_MS) {' \
+    '    if (ms < 0) {' rules_test
 
 # The guards against the two directives that never read the socket. Without
 # them a case can ask for a deadline nothing will ever measure.
 mutate "close_within: abort exclusion removed" rules.c \
-    '            if (PX(saw_abort)) {
-                die("%s:%d: abort and expect_close_within are mutually "' \
-    '            if (0) {
-                die("%s:%d: abort and expect_close_within are mutually "' \
+    '    if (PX(saw_abort)) {
+        die("%s:%d: abort and expect_close_within are mutually "' \
+    '    if (0) {
+        die("%s:%d: abort and expect_close_within are mutually "' \
     rules_test
 
 # The slot reset. Without it a second load into the same array inherits the
@@ -1021,10 +1021,10 @@ mutate "idle: an unperformed wait treated as a pass" assert.c \
 # The floor. Zero is rejected because a wait of no time polls for nothing and
 # passes unconditionally; without the bound a rule file can spell exactly that.
 mutate "idle: zero-wait floor removed" rules.c \
-    '            if (ms < 1 || ms > MAX_IDLE_MS) {
-                die("%s:%d: expect_idle %ld out of range (1..%d ms)",' \
-    '            if (ms < 0 || ms > MAX_IDLE_MS) {
-                die("%s:%d: expect_idle %ld out of range (1..%d ms)",' \
+    '    if (ms < 1 || ms > MAX_IDLE_MS) {
+        die("%s:%d: expect_idle %ld out of range (1..%d ms)",' \
+    '    if (ms < 0 || ms > MAX_IDLE_MS) {
+        die("%s:%d: expect_idle %ld out of range (1..%d ms)",' \
     rules_test
 
 # The guard against asserting on a response the wait never collected. Without
@@ -1037,10 +1037,10 @@ mutate "idle: response-expectation guard removed" rules.c \
 # The exclusion against the opposite assertion. Both directives would run, and
 # whichever was evaluated first would decide a verdict the other contradicts.
 mutate "idle: close-deadline exclusion removed" rules.c \
-    '            if (PX(saw_close_within)) {
-                die("%s:%d: expect_close_within and expect_idle are "' \
-    '            if (0) {
-                die("%s:%d: expect_close_within and expect_idle are "' \
+    '    if (PX(saw_close_within)) {
+        die("%s:%d: expect_close_within and expect_idle are "' \
+    '    if (0) {
+        die("%s:%d: expect_close_within and expect_idle are "' \
     rules_test
 
 # The runtime bound, the idle-wait counterpart of the close-deadline guard
@@ -1059,8 +1059,8 @@ mutate "idle: wait-past-timeout guard removed" prober.c \
 # accepted and parses to the off value, so a saturation case silently opens
 # nothing -- the same class as repeat's count check.
 mutate "open_conns: lower-bound check removed" rules.c \
-    '            if (count < 1 || count > MAX_OPEN_CONNS) {' \
-    '            if (count < 0 || count > MAX_OPEN_CONNS) {' rules_test
+    '    if (count < 1 || count > MAX_OPEN_CONNS) {' \
+    '    if (count < 0 || count > MAX_OPEN_CONNS) {' rules_test
 
 # The vacuity guard. Held connections that no probe assertion reads are a test
 # that asserts nothing; without this a case can park connections and report
@@ -1075,10 +1075,10 @@ mutate "open_conns: probe-assertion guard removed" rules.c \
 # directive's name, so without this a rule file can claim a concurrency test that
 # holds nothing in flight and asserts nothing about overlap.
 mutate "concurrent: floor of 2 lowered to 1" rules.c \
-    '            if (count < 2 || count > MAX_CONCURRENT) {
-                die("%s:%d: concurrent %ld out of range (2..%d)",' \
-    '            if (count < 1 || count > MAX_CONCURRENT) {
-                die("%s:%d: concurrent %ld out of range (2..%d)",' rules_test
+    '    if (count < 2 || count > MAX_CONCURRENT) {
+        die("%s:%d: concurrent %ld out of range (2..%d)",' \
+    '    if (count < 1 || count > MAX_CONCURRENT) {
+        die("%s:%d: concurrent %ld out of range (2..%d)",' rules_test
 
 # The observability guard. The probe snapshots bracketing the fan are the ONLY
 # thing that observes the overlap; without this a case pays for N connections and
