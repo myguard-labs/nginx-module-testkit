@@ -1368,13 +1368,25 @@ mutate "h2: the request path is never taken from the request line" h2.c \
 # the shape reload-idle-keepalive's drain-ordering row uses (see its comment
 # for why mutating a driver.sh is the right target when the suite IS the
 # assertion). A weakened COMPARISON (`=` loosened, or an `if true`) cannot be
-# caught here: the three attacks are genuinely neutral against a correct
-# nginx, so a vacuous comparison and a real one both exit 0 against the SAME
-# unmutated server -- MEASURED 2026-08-28 by hand (an `if true` stand-in for
-# each of the three fd/pool/slab checks stayed green). What DOES falsify the
-# claim is corrupting the READBACK the comparison runs on: bump the `after`
-# reading by one so a genuinely neutral run now disagrees with itself, and
-# require the case that oracle backs to go red.
+# caught by mutating the readback rows below alone: the two attacks are
+# genuinely neutral against a correct nginx, so a vacuous comparison and a
+# real one both exit 0 against the SAME unmutated server -- MEASURED
+# 2026-08-28 by hand (an `if true` stand-in for each of the fd/pool/slab
+# checks stayed green). What DOES falsify the readback claim is corrupting
+# the READBACK the comparison runs on: bump the `after` reading by one so a
+# genuinely neutral run now disagrees with itself.
+#
+# The readback rows alone left a real hole (caught in PR #228 review,
+# 2026-08-29): they say nothing about whether the ATTACK ITSELF is still the
+# illegal frame it claims to be. Flip ATTACK_A's stream id back to odd, or
+# ATTACK_B's increment back under the overflow threshold, and every readback
+# comparison stays intact and green -- the frame is simply accepted as an
+# ordinary request/window update and nginx never has anything to reject in
+# the first place. The two rows after the readback ones below close that:
+# they target the ATTACK_* literals and require driver.sh's own delivery
+# check (a GOAWAY, frame type 7 -- see run_attack_case) to go red once the
+# frame is no longer actually illegal.
+#
 # SC2016: each single-quoted string below is a line of driver.sh's own bash
 # being patched, not a shell expansion at THIS file's parse time -- must stay
 # literal, same discipline as property-fuzz's and stateful-property-fuzz's
@@ -1398,6 +1410,30 @@ mutate "h2-hostile: slab-page-neutrality readback never compares reality" \
     scenarios/h2-hostile-framing/driver.sh \
     'after_fds="$SNAP_FDS"; after_pool="$SNAP_POOL"; after_slab="$SNAP_SLAB"' \
     'after_fds="$SNAP_FDS"; after_pool="$SNAP_POOL"; after_slab="$((SNAP_SLAB + 1))"' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# Attack A's stream id flipped from 2 (even, illegal) to 1 (odd, legal) --
+# same HPACK payload, same length, so this is purely the parity bit that
+# makes the frame hostile in the first place. A correctly-behaving nginx has
+# nothing to reject: no GOAWAY, and the new delivery assertion in
+# run_attack_case goes red.
+# shellcheck disable=SC2016
+mutate "h2-hostile: HEADERS attack stream id mutated back to legal (odd)" \
+    scenarios/h2-hostile-framing/driver.sh \
+    'ATTACK_A="00000b010500000002${HPACK_MINIMAL_GET}"' \
+    'ATTACK_A="00000b010500000001${HPACK_MINIMAL_GET}"' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# Attack B's increment dropped from 0x7fffffff (overflows the 65535-byte
+# default window past 2^31-1) to 0x00000001 (an ordinary, legal increment) --
+# same frame shape, same length, so this is purely the arithmetic that makes
+# it hostile. A correctly-behaving nginx just applies the credit: no GOAWAY,
+# and the delivery assertion goes red.
+# shellcheck disable=SC2016
+mutate "h2-hostile: WINDOW_UPDATE overflow mutated to a legal increment" \
+    scenarios/h2-hostile-framing/driver.sh \
+    'ATTACK_B="0000040800000000007fffffff"' \
+    'ATTACK_B="00000408000000000000000001"' \
     scenarios/h2-hostile-framing/mutate-suite.sh
 
 # ---- probe schema -----------------------------------------------------------

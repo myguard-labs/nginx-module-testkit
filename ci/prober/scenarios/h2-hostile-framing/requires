@@ -9,8 +9,8 @@
 # on a build that never linked the module).
 #
 # python3 is the second requirement: driver.sh hand-crafts raw HTTP/2 frames
-# (illegal stream ids, flow-control overflow, RST_STREAM on an idle stream) --
-# bytes no HTTP/1-shaped bash /dev/tcp write and no well-behaved h2 client
+# (illegal stream ids, flow-control overflow) -- bytes no HTTP/1-shaped bash
+# /dev/tcp write and no well-behaved h2 client
 # library would ever construct on purpose. bash has no clean way to emit
 # fixed-width big-endian binary integers; python3's struct/bytes primitives are
 # already an established driver.sh dependency in this tree (clock-jump,
