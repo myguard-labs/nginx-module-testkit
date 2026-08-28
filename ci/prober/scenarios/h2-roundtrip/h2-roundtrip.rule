@@ -1,0 +1,39 @@
+# Scenario: one end-to-end HTTP/2 round trip over the nghttp2-driven arm
+# H2-2 adds, and the worker-inside evidence that makes it admissible.
+#
+# WHAT MAKES THIS ADMISSIBLE, stated first because it is the only question
+# worth asking of a new scenario here (H2-1's alpn-negotiation.rule opens the
+# same way, and this file inherits the argument). "The prober can speak h2"
+# is not a finding on its own: it proves nginx does what nginx does, and
+# Test::Nginx::Socket's HTTP/2 support (where it exists) can already reach a
+# listener configured for it. What makes this row admissible is the same
+# thing that made H2-1's: the `delta` assertion below is evidence that came
+# from INSIDE the worker, not from the client's own observation that the
+# exchange completed. A client watching the wire cannot tell "the worker
+# served this h2 request and gave back every descriptor it used" apart from
+# "the worker leaked one and got lucky this run" -- the probe snapshot is the
+# only place that distinction is visible.
+#
+# THE TEST THAT KEEPS THIS HONEST: remove the probe snapshot below and the
+# case still reports a pass on the exact same server behaviour a descriptor
+# leak would also produce, because nothing else here asserts on the module's
+# internal state. That is the wrong-oracle failure this file is built not to
+# have.
+#
+# WHAT THIS ROW IS NOT. H2-2's own scope, restated from the TODO row: this is
+# the MECHANISM plus one clean round trip, not an attack. The case below sends
+# a well-formed request over a well-formed h2 connection and expects the
+# well-formed response any h2 client would get. Hostile h2 framing (oversized
+# HEADERS, HPACK attacks, stream-lifecycle abuse) is H2-3/H2-4/H2-5's job, not
+# this file's -- adding one here would be scope creep against the row this
+# file exists to close.
+
+name          a well-formed h2 request round-trips end to end
+send          GET / HTTP/1.1\r\n
+send          Host: prober\r\nConnection: close\r\n\r\n
+alpn           h2
+expect_alpn    h2
+expect         status=200
+expect         body~OK
+delta          fds == 0
+probe_baseline fds == 0

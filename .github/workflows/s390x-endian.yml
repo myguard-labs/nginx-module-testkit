@@ -70,7 +70,13 @@ jobs:
                   # bounded-probe server). bookworm-slim ships without it, so
                   # without this the emulated leg fails that one suite with
                   # "python3: command not found" -- not a big-endian defect.
-                  apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev zlib1g-dev python3 >/dev/null
+                  # libnghttp2-dev (H2-2, SUPERVISOR D2): bookworm ships
+                  # libnghttp2 1.52.x whose ssize_t-based API the h2.c arm
+                  # uses deliberately (the newer nghttp2_ssize names only
+                  # exist since 1.58 -- keeping the old names is what lets
+                  # this leg build without a backport). A hard link dep of
+                  # the prober LIB the same way libssl-dev already is.
+                  apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev zlib1g-dev libnghttp2-dev python3 >/dev/null
                   cd ci/prober
                   CC=gcc ./build.sh
                   # qemu-user emulation runs ~10-20x slower than native, so the
@@ -103,7 +109,9 @@ jobs:
               debian:bookworm-slim \
               bash -euo pipefail -c '
                   apt-get update -qq
-                  apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev zlib1g-dev >/dev/null
+                  # libnghttp2-dev: same hard link dep as the main leg above
+                  # (H2-2, SUPERVISOR D2 -- see that step comment).
+                  apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev zlib1g-dev libnghttp2-dev >/dev/null
                   cd ci/prober
                   CC=gcc ./build.sh
               ' >/tmp/endian-nc-build.log 2>&1

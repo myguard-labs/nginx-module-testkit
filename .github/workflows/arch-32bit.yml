@@ -46,7 +46,11 @@ jobs:
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-multilib libc6-dev-i386 libssl-dev:i386 zlib1g-dev:i386
+          # libnghttp2-dev:i386 (H2-2, SUPERVISOR D2): the h2 arm is a hard
+          # link dep of the prober LIB (build.sh:72), the same as
+          # libssl-dev:i386/zlib1g-dev:i386 already are here -- a 32-bit build
+          # links a 32-bit libnghttp2 same as it links 32-bit OpenSSL/zlib.
+          sudo apt-get install -y --no-install-recommends gcc-multilib libc6-dev-i386 libssl-dev:i386 zlib1g-dev:i386 libnghttp2-dev:i386
 
       - name: build the prober + self-tests as 32-bit
         working-directory: ci/prober

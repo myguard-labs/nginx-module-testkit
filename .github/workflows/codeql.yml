@@ -64,6 +64,17 @@ jobs:
           # all.
           queries: security-extended
 
+      # build.sh links the h2 arm (H2-2) via libnghttp2, which ubuntu-latest
+      # does not ship in the default image. Installed explicitly so a missing
+      # package fails with a clear apt error rather than a mystery link failure
+      # against undefined nghttp2_* symbols (SUPERVISOR D2). libssl-dev and
+      # zlib1g-dev are the two other explicit link deps; the same discipline
+      # already applied in fuzz-replay and cachegrind.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libssl-dev zlib1g-dev libnghttp2-dev
+
       # The manual build declared above. autobuild guesses at a build system and
       # this tree has no configure/make for it to find -- ci/prober/build.sh is the
       # entry point test.sh itself calls, so naming it directly is both what CI

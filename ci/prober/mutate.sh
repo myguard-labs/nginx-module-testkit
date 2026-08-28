@@ -1326,6 +1326,40 @@ mutate "ALPN: the negotiated protocol is never read back" http.c \
     '    SSL_get0_alpn_selected(ssl, &proto, &proto_len); proto = NULL;' \
     scenarios/alpn-negotiation/mutate-suite.sh
 
+# ---- h2 frame layer (H2-2) ---------------------------------------------------
+#
+# Every row here is caught by scenarios/h2-roundtrip, the only place any of
+# this is reachable: it needs a real `listen ... ssl; http2 on;` server to
+# negotiate h2 against and answer a real request over it.
+
+# THE DISPATCH ITSELF. Without this comparison an ALPN-negotiated h2
+# connection falls through to the h1 read/write path below it, which writes
+# the request bytes as plain text onto a connection now speaking HTTP/2
+# framing -- the peer never sees a valid HEADERS frame, so the exchange times
+# out or reads garbage rather than the response the case expects.
+mutate "h2: the ALPN dispatch never fires" http.c \
+    '                && strcmp(alpn, "h2") == 0)' \
+    '                && 0 && strcmp(alpn, "h2") == 0)' \
+    scenarios/h2-roundtrip/mutate-suite.sh
+
+# THE STATUS READBACK. Without this branch c->status stays -1 (its init
+# value) for every response, so `expect status=200` reds on a server that
+# answered correctly -- the same failure shape as ALPN's readback mutation
+# above, one layer up the stack.
+mutate "h2: the :status pseudo-header is never read" h2.c \
+    '    if (namelen == 7 && memcmp(name, ":status", 7) == 0) {' \
+    '    if (0 && namelen == 7 && memcmp(name, ":status", 7) == 0) {' \
+    scenarios/h2-roundtrip/mutate-suite.sh
+
+# THE REQUEST-LINE PARSE. Without this assignment :path is sent as whatever
+# uninitialized/stale value `path` held rather than the request's actual
+# path, which nginx answers with either a 400 or the wrong location's body --
+# either way `expect status=200` / `expect body~OK` reds.
+mutate "h2: the request path is never taken from the request line" h2.c \
+    '    *path = sp1 + 1;' \
+    '    *path = sp1;' \
+    scenarios/h2-roundtrip/mutate-suite.sh
+
 # ---- probe schema -----------------------------------------------------------
 
 # The schema exists to catch emitter drift on fields no rule happens to name,

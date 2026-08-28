@@ -45,13 +45,14 @@ jobs:
         with:
           persist-credentials: false
 
-      # clang for -fsanitize=fuzzer; libssl/zlib dev for the library link line
-      # (the fuzz targets link the whole prober library, which pulls OpenSSL and
-      # zlib even though these targets do not exercise those paths).
+      # clang for -fsanitize=fuzzer; libssl/zlib/libnghttp2 dev for the library
+      # link line (the fuzz targets link the whole prober library, which pulls
+      # OpenSSL, zlib, and -- since H2-2 -- libnghttp2, even though these
+      # targets do not exercise those paths -- SUPERVISOR D2: hard link dep).
       - name: install clang + deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends clang libssl-dev zlib1g-dev
+          sudo apt-get install -y --no-install-recommends clang libssl-dev zlib1g-dev libnghttp2-dev
           clang --version | head -1
 
       # Default 300s/target on a scheduled run; the dispatch input overrides it.
