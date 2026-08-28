@@ -1502,6 +1502,93 @@ mutate "h2-hostile: failed settle snapshot cannot retain stale predecessor" \
             prev_slab="${SNAP_SLAB:-}"' \
     h2_hostile_framing_parser_test.sh
 
+# ---- ordinary h2 stream cancellation cleanup (H2-5) -----------------------
+#
+# The scenario owns both sides of the claim: exact RST_STREAM(CANCEL) bytes
+# and the worker-inside cleanup readback.  Each mutation must make its named
+# live TAP assertion red against the otherwise unchanged server.
+mutate "h2-stream-cancel: cleanup cannot run without a completed warm-up" \
+    scenarios/h2-stream-cancel/driver.sh \
+    '        sock.sendall(preface + client_settings + headers_frame(1, b"/"))' \
+    '        sock.sendall(preface + client_settings)' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-stream-cancel: outer timeout exceeds all internal phase budgets" \
+    scenarios/h2-stream-cancel/driver.sh \
+    '    outer_timeout=$((4 * phase_timeout))' \
+    '    outer_timeout=$((3 * phase_timeout))' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+mutate "h2-stream-cancel: SETTINGS negotiation readback is required" \
+    scenarios/h2-stream-cancel/driver.sh \
+    'negotiated = int(server_settings and client_settings_ack)' \
+    'negotiated = int(server_settings and client_settings_ack and False)' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+mutate "h2-stream-cancel: concurrent second-stream evidence is required" \
+    scenarios/h2-stream-cancel/driver.sh \
+    'print("STREAM3_DATA_BEFORE_RST=%d" % before[3])' \
+    'print("STREAM3_DATA_BEFORE_RST=%d" % 0)' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+mutate "h2-stream-cancel: cancellation stimulus must be CANCEL code 8" \
+    scenarios/h2-stream-cancel/driver.sh \
+    '        rst_payload = (8).to_bytes(4, "big")  # RFC 9113 CANCEL' \
+    '        rst_payload = (0).to_bytes(4, "big")  # mutated to NO_ERROR' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+mutate "h2-stream-cancel: server-side cancellation readback is required" \
+    scenarios/h2-stream-cancel/driver.sh \
+    'print("STREAM1_CANCELLED_BY_SERVER=%d" % int(server_cancelled_stream1))' \
+    'print("STREAM1_CANCELLED_BY_SERVER=%d" % 0)' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+mutate "h2-stream-cancel: lifecycle log matcher reads the cancelled request" \
+    scenarios/h2-stream-cancel/driver.sh \
+    '        if uri != b"/cancel.bin":' \
+    '        if uri != b"/survive.bin":' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+mutate "h2-stream-cancel: normal completion cannot satisfy cancellation" \
+    scenarios/h2-stream-cancel/driver.sh \
+    '        if 0 < sent < payload_size:' \
+    '        if sent == payload_size:' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+mutate "h2-stream-cancel: cancelled stream cannot complete after reset" \
+    scenarios/h2-stream-cancel/driver.sh \
+    'print("STREAM1_ENDED_AFTER_RST=%d" % int(stream1_ended_after))' \
+    'print("STREAM1_ENDED_AFTER_RST=%d" % 1)' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+mutate "h2-stream-cancel: surviving stream continuation is required" \
+    scenarios/h2-stream-cancel/driver.sh \
+    'print("STREAM3_DATA_AFTER_RST=%d" % after_stream3)' \
+    'print("STREAM3_DATA_AFTER_RST=%d" % 0)' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-stream-cancel: fd cleanup readback compares reality" \
+    scenarios/h2-stream-cancel/driver.sh \
+    'after_fds="$SNAP_FDS"; after_pool="$SNAP_POOL"; after_slab="$SNAP_SLAB"' \
+    'after_fds="$((SNAP_FDS + 1))"; after_pool="$SNAP_POOL"; after_slab="$SNAP_SLAB"' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-stream-cancel: cycle-pool cleanup readback compares reality" \
+    scenarios/h2-stream-cancel/driver.sh \
+    'after_fds="$SNAP_FDS"; after_pool="$SNAP_POOL"; after_slab="$SNAP_SLAB"' \
+    'after_fds="$SNAP_FDS"; after_pool="$((SNAP_POOL + 1))"; after_slab="$SNAP_SLAB"' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-stream-cancel: slab-page cleanup readback compares reality" \
+    scenarios/h2-stream-cancel/driver.sh \
+    'after_fds="$SNAP_FDS"; after_pool="$SNAP_POOL"; after_slab="$SNAP_SLAB"' \
+    'after_fds="$SNAP_FDS"; after_pool="$SNAP_POOL"; after_slab="$((SNAP_SLAB + 1))"' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
 # ---- probe schema -----------------------------------------------------------
 
 # The schema exists to catch emitter drift on fields no rule happens to name,
