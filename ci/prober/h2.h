@@ -36,12 +36,16 @@
  * is made to normalize a malformed one, since a case exercising malformed h1
  * framing on this path is H2-3's job, not this one's.
  *
- * `resp` is filled the same way http_exchange() always fills it: `raw` holds
- * a synthesized "HTTP/1.1 <status> <reason>\r\n<headers>\r\n\r\n<body>"
+ * `resp` gets the fields the assertion layer reads: `raw` holds a
+ * synthesized "HTTP/1.1 <status> <reason>\r\n<headers>\r\n\r\n<body>"
  * buffer (never what actually crossed the wire -- h2 has no such bytes) so
  * every existing assertion (`expect status=`, `expect body~`,
  * http_has_header()) keeps working unmodified against an h2 response, the
- * same way it already does against an h1 one. `close_reason` is set to
+ * same way it already does against an h1 one. The h1-side diagnostic
+ * fields with no h2 analogue -- `reads`, `paced_sleep_ms`, `send_paced_ms`,
+ * `close_ms` -- stay at the zero http_exchange() memsets them to (there is
+ * no per-read pacing and no measured close latency on this path); an
+ * assertion on any of them after an h2 exchange would be vacuous. `close_reason` is set to
  * HTTP_CLOSE_FIN once the stream and connection both end, since this function
  * always closes the h2 session at the end of the one exchange it drives --
  * H2-2 ships one request per connection, not a multiplexed session a caller

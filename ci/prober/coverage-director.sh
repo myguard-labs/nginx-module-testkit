@@ -51,7 +51,7 @@ if ! command -v "$CC" >/dev/null 2>&1 || ! command -v "$GCOVR" >/dev/null 2>&1; 
     exit 0
 fi
 
-LIB="json.c http.c util.c rules.c assert.c backend.c"
+LIB="json.c http.c h2.c util.c rules.c assert.c backend.c"
 OUT_JSON="coverage-map.json"
 
 # CWE-59: refuse to write the map through a pre-existing symlink or other
@@ -65,13 +65,15 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/coverage-director.XXXXXX")"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
-# body_sha256/gunzip oracles need OpenSSL/zlib, same as build.sh.
+# body_sha256/gunzip oracles need OpenSSL/zlib, and http.c's h2 dispatch
+# needs libnghttp2, same as build.sh.
 LDFLAGS="${LDFLAGS:-}"
 if command -v pkg-config >/dev/null 2>&1; then
     LDFLAGS="$LDFLAGS $(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
     LDFLAGS="$LDFLAGS $(pkg-config --libs zlib 2>/dev/null || echo '-lz')"
+    LDFLAGS="$LDFLAGS $(pkg-config --libs libnghttp2 2>/dev/null || echo '-lnghttp2')"
 else
-    LDFLAGS="$LDFLAGS -lssl -lcrypto -lz"
+    LDFLAGS="$LDFLAGS -lssl -lcrypto -lz -lnghttp2"
 fi
 
 COV_CFLAGS="-O0 -g --coverage -std=c11"

@@ -1482,8 +1482,8 @@ jobs:
           # links it for the body_sha256 oracle). Keep in sync with build.sh.
           # shellcheck disable=SC2086
           gcc -O1 -g -std=c11 $WARN -D_FORTIFY_SOURCE=3 -fstack-protector-strong \
-              -o /tmp/http_locale_check http_locale_check.c http.c json.c \
-              util.c -lz -lssl -lcrypto
+              -o /tmp/http_locale_check http_locale_check.c http.c h2.c json.c \
+              util.c -lz -lssl -lcrypto -lnghttp2
           /tmp/http_locale_check
 
   # License-header gate: all .c and .h files must carry BSD-2-Clause SPDX

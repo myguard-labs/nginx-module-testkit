@@ -121,12 +121,22 @@ on_header_cb(nghttp2_session *session, const nghttp2_frame *frame,
      * same way it does against an h1 one.
      */
     if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
-        char  tmp[8];
-        size_t  n = valuelen < sizeof(tmp) - 1 ? valuelen : sizeof(tmp) - 1;
-
-        memcpy(tmp, value, n);
-        tmp[n] = '\0';
-        c->status = atoi(tmp);
+        /* RFC 9113 8.3.2: :status is exactly 3DIGIT, same as the h1 status
+         * code. The bounded walk mirrors http.c's status-line scan -- atoi
+         * and strtol both accept signs, whitespace and stray digit counts,
+         * which is how "204junk" once scored 204 on the h1 side. Anything
+         * that is not exactly three digits leaves c->status untouched (-1
+         * unless a well-formed :status already arrived), which the caller
+         * already treats as "no status seen". */
+        if (valuelen == 3
+            && value[0] >= '0' && value[0] <= '9'
+            && value[1] >= '0' && value[1] <= '9'
+            && value[2] >= '0' && value[2] <= '9')
+        {
+            c->status = (value[0] - '0') * 100
+                        + (value[1] - '0') * 10
+                        + (value[2] - '0');
+        }
         return 0;
     }
 
@@ -137,20 +147,21 @@ on_header_cb(nghttp2_session *session, const nghttp2_frame *frame,
         return 0;
     }
 
+    /* All four appends are checked: a failed ": " or "\r\n" would leave a
+     * structurally corrupt h1-shaped block (name fused to value, or two
+     * fields fused into one line) that http_parse_response() could read as
+     * a wrong-but-plausible header set instead of a failure. */
     if (h2_append(&c->headers, &c->headers_len, &c->headers_cap,
-                  (const char *) name, namelen) != 0)
+                  (const char *) name, namelen) != 0
+        || h2_append(&c->headers, &c->headers_len, &c->headers_cap,
+                     ": ", 2) != 0
+        || h2_append(&c->headers, &c->headers_len, &c->headers_cap,
+                     (const char *) value, valuelen) != 0
+        || h2_append(&c->headers, &c->headers_len, &c->headers_cap,
+                     "\r\n", 2) != 0)
     {
         c->oom = 1;
-        return 0;
     }
-    h2_append(&c->headers, &c->headers_len, &c->headers_cap, ": ", 2);
-    if (h2_append(&c->headers, &c->headers_len, &c->headers_cap,
-                  (const char *) value, valuelen) != 0)
-    {
-        c->oom = 1;
-        return 0;
-    }
-    h2_append(&c->headers, &c->headers_len, &c->headers_cap, "\r\n", 2);
 
     return 0;
 }
@@ -289,6 +300,7 @@ h2_exchange(int fd, SSL *ssl, const unsigned char *req, size_t req_len,
     size_t                       method_len, path_len, host_len;
     int32_t                      sid;
     int                          poll_ms;
+    int                          rc;
 
     memset(&c, 0, sizeof(c));
     c.status = -1;
@@ -329,8 +341,7 @@ h2_exchange(int fd, SSL *ssl, const unsigned char *req, size_t req_len,
      * settings is not part of the mechanism H2-2 ships. */
     if (nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, NULL, 0) != 0) {
         snprintf(errbuf, errlen, "h2: submit_settings failed");
-        nghttp2_session_del(session);
-        return -1;
+        goto fail;
     }
 
     nva[0].name = nv_bytes(":method");
@@ -364,8 +375,7 @@ h2_exchange(int fd, SSL *ssl, const unsigned char *req, size_t req_len,
     if (sid < 0) {
         snprintf(errbuf, errlen, "h2: submit_request failed: %s",
                  nghttp2_strerror(sid));
-        nghttp2_session_del(session);
-        return -1;
+        goto fail;
     }
 
     poll_ms = (timeout_ms < 0) ? 0 : timeout_ms;
@@ -381,8 +391,7 @@ h2_exchange(int fd, SSL *ssl, const unsigned char *req, size_t req_len,
             if (sent < 0) {
                 snprintf(errbuf, errlen, "h2: mem_send failed: %s",
                          nghttp2_strerror((int) sent));
-                nghttp2_session_del(session);
-                return -1;
+                goto fail;
             }
 
             if (sent == 0) {
@@ -408,8 +417,7 @@ h2_exchange(int fd, SSL *ssl, const unsigned char *req, size_t req_len,
                         snprintf(errbuf, errlen,
                                  "h2: SSL_write failed (SSL_get_error=%d)",
                                  se);
-                        nghttp2_session_del(session);
-                        return -1;
+                        goto fail;
                     }
 
                     off += (size_t) w;
@@ -437,8 +445,7 @@ h2_exchange(int fd, SSL *ssl, const unsigned char *req, size_t req_len,
             snprintf(errbuf, errlen,
                      "h2: timed out waiting for the response "
                      "(%d ms, stream %d)", timeout_ms, sid);
-            nghttp2_session_del(session);
-            return -1;
+            goto fail;
         }
 
         if (n < 0) {
@@ -447,8 +454,7 @@ h2_exchange(int fd, SSL *ssl, const unsigned char *req, size_t req_len,
             }
 
             snprintf(errbuf, errlen, "h2: poll: %s", strerror(errno));
-            nghttp2_session_del(session);
-            return -1;
+            goto fail;
         }
 
         {
@@ -473,8 +479,7 @@ h2_exchange(int fd, SSL *ssl, const unsigned char *req, size_t req_len,
 
                 snprintf(errbuf, errlen,
                          "h2: SSL_read failed (SSL_get_error=%d)", se);
-                nghttp2_session_del(session);
-                return -1;
+                goto fail;
             }
 
             consumed = nghttp2_session_mem_recv(session, buf, (size_t) r);
@@ -482,19 +487,18 @@ h2_exchange(int fd, SSL *ssl, const unsigned char *req, size_t req_len,
             if (consumed < 0) {
                 snprintf(errbuf, errlen, "h2: mem_recv failed: %s",
                          nghttp2_strerror((int) consumed));
-                nghttp2_session_del(session);
-                return -1;
+                goto fail;
             }
         }
     }
 
     nghttp2_session_del(session);
 
+    session = NULL;
+
     if (c.oom) {
-        free(c.body);
-        free(c.headers);
         snprintf(errbuf, errlen, "h2: out of memory collecting the response");
-        return -1;
+        goto fail;
     }
 
     /*
@@ -525,10 +529,8 @@ h2_exchange(int fd, SSL *ssl, const unsigned char *req, size_t req_len,
 
         resp->raw = malloc(total + 1);
         if (resp->raw == NULL) {
-            free(c.body);
-            free(c.headers);
             snprintf(errbuf, errlen, "h2: out of memory (raw)");
-            return -1;
+            goto fail;
         }
 
         memcpy(resp->raw, head, (size_t) head_len);
@@ -544,11 +546,27 @@ h2_exchange(int fd, SSL *ssl, const unsigned char *req, size_t req_len,
         resp->raw_len = total;
     }
 
-    free(c.body);
-    free(c.headers);
-
     http_parse_response(resp);
     resp->close_reason = HTTP_CLOSE_FIN;
 
-    return 0;
+    rc = 0;
+    goto out;
+
+fail:
+    /* Every error exit after the session exists lands here; errbuf is
+     * already written at the goto site. */
+    rc = -1;
+
+out:
+    /* The one cleanup site, success and failure alike: the collect buffers
+     * may hold a partial response (a HEADERS frame that arrived before a
+     * timeout, say), free(NULL) covers the paths where nothing had arrived
+     * yet, and the post-loop exits NULL the session before jumping so it is
+     * not deleted twice. */
+    if (session != NULL) {
+        nghttp2_session_del(session);
+    }
+    free(c.body);
+    free(c.headers);
+    return rc;
 }

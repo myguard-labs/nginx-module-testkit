@@ -60,9 +60,10 @@ fi
 
 # --- build ---------------------------------------------------------------
 # The same library set build.sh links, minus the files carrying main(); the
-# harness brings its own. OpenSSL (body_sha256) and zlib (gunzip) are link deps
-# of the library even though this workload exercises neither.
-LIB="json.c http.c util.c rules.c assert.c backend.c"
+# harness brings its own. OpenSSL (body_sha256), zlib (gunzip) and libnghttp2
+# (the h2 arm) are link deps of the library even though this workload
+# exercises none of them.
+LIB="json.c http.c h2.c util.c rules.c assert.c backend.c"
 LIBPATHS=""
 for f in $LIB; do
     LIBPATHS="$LIBPATHS $PROOT/$f"
@@ -70,8 +71,9 @@ done
 if command -v pkg-config >/dev/null 2>&1; then
     LDLIBS="$(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
     LDLIBS="$LDLIBS $(pkg-config --libs zlib 2>/dev/null || echo '-lz')"
+    LDLIBS="$LDLIBS $(pkg-config --libs libnghttp2 2>/dev/null || echo '-lnghttp2')"
 else
-    LDLIBS="-lssl -lcrypto -lz"
+    LDLIBS="-lssl -lcrypto -lz -lnghttp2"
 fi
 CC="${CC:-cc}"
 BIN="$HERE/cg_scale.bin"
