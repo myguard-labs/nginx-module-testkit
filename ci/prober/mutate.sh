@@ -1461,6 +1461,24 @@ mutate "h2-hostile: HPACK GOAWAY must carry COMPRESSION_ERROR" \
     'run_attack_case "HPACK dynamic-table update above the 4096-byte limit" "$ATTACK_C" 1' \
     scenarios/h2-hostile-framing/mutate-suite.sh
 
+# The live server only sends complete GOAWAYs, so it cannot falsify either
+# response-decoder boundary. h2_hostile_framing_parser_test.sh injects each
+# malformed response at send_attack's attack-side capture boundary and asserts
+# the exact fields the delivery oracle consumes. Removing the complete-frame
+# guard must red assertion 1; weakening the eight-byte GOAWAY minimum must red
+# assertion 2 rather than merely changing an unobserved parser detail.
+mutate "h2-hostile: truncated response frame cannot become a GOAWAY delivery marker" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '    if end > len(data):' \
+    '    if False:' \
+    h2_hostile_framing_parser_test.sh
+
+mutate "h2-hostile: short GOAWAY payload cannot forge an HPACK error code" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '    if frame_type == 7 and length >= 8:' \
+    '    if frame_type == 7 and length >= 0:' \
+    h2_hostile_framing_parser_test.sh
+
 # ---- probe schema -----------------------------------------------------------
 
 # The schema exists to catch emitter drift on fields no rule happens to name,

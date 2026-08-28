@@ -129,31 +129,36 @@ import os, socket, sys
 host = os.environ["H"]
 port = int(os.environ["P"])
 frame = bytes.fromhex(os.environ["F"])
+capture = (os.environ.get("H2_CAPTURE_HEX")
+           if os.environ.get("H2_FRAME_PARSE_TEST") == "1" else None)
 
-preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-client_settings = bytes([0, 0, 0, 4, 0, 0, 0, 0, 0])  # len=0 type=SETTINGS flags=0 stream=0
+if capture is None:
+    preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    client_settings = bytes([0, 0, 0, 4, 0, 0, 0, 0, 0])  # len=0 type=SETTINGS flags=0 stream=0
 
-try:
-    s = socket.create_connection((host, port), 5)
-    s.settimeout(2)
-    s.sendall(preface + client_settings + frame)
-except Exception as e:
-    print("DELIVERY_FAIL:%s" % e)
-    print("")
-    sys.exit(1)
-
-data = b""
-try:
     try:
-        while True:
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            data += chunk
-    except socket.timeout:
-        pass
-finally:
-    s.close()
+        s = socket.create_connection((host, port), 5)
+        s.settimeout(2)
+        s.sendall(preface + client_settings + frame)
+    except Exception as e:
+        print("DELIVERY_FAIL:%s" % e)
+        print("")
+        sys.exit(1)
+
+    data = b""
+    try:
+        try:
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        except socket.timeout:
+            pass
+    finally:
+        s.close()
+else:
+    data = bytes.fromhex(capture)
 
 types = []
 goaway_errors = []
@@ -204,6 +209,44 @@ csv_contains() {
     done
     return 1
 }
+
+# H2_FRAME_PARSE_TEST=1 runs the two malformed-response controls below without
+# a server. H2_CAPTURE_HEX enters at send_attack's response-decoder boundary,
+# so the observed fields are the same ATTACK_RESP_TYPES and
+# ATTACK_GOAWAY_ERRORS that run_attack_case's delivery oracle consumes. A real
+# server must not emit either malformed shape, making this direct attack-side
+# input the narrowest honest control for the decoder guards.
+if [ "${H2_FRAME_PARSE_TEST:-0}" = 1 ]; then
+    echo "1..2"
+
+    # Header declares an 8-byte GOAWAY payload but carries only its four-byte
+    # last-stream-id field. It is not a complete frame and therefore must not
+    # become a type-7 delivery marker or an error code for the HPACK oracle.
+    H2_CAPTURE_HEX="00000807000000000000000000" send_attack "" || true
+    if [ "$ATTACK_STATUS" = "DELIVERY_OK" ] \
+       && [ -z "$ATTACK_RESP_TYPES" ] \
+       && [ -z "$ATTACK_GOAWAY_ERRORS" ]; then
+        echo "ok 1 - h2 parser: truncated frame never reaches the GOAWAY delivery oracle"
+    else
+        echo "not ok 1 - h2 parser: truncated frame never reaches the GOAWAY delivery oracle (types: ${ATTACK_RESP_TYPES:-<none>}; errors: ${ATTACK_GOAWAY_ERRORS:-<none>}; status: $ATTACK_STATUS)"
+        exit 1
+    fi
+
+    # This complete frame has a GOAWAY type but only the four-byte last-stream
+    # id. Its missing error-code field must stay absent rather than becoming a
+    # forged code consumed by the HPACK COMPRESSION_ERROR (9) delivery oracle.
+    H2_CAPTURE_HEX="00000407000000000000000000" send_attack "" || true
+    if [ "$ATTACK_STATUS" = "DELIVERY_OK" ] \
+       && [ "$ATTACK_RESP_TYPES" = 7 ] \
+       && [ -z "$ATTACK_GOAWAY_ERRORS" ]; then
+        echo "ok 2 - h2 parser: short GOAWAY payload never reaches the HPACK error-code oracle"
+    else
+        echo "not ok 2 - h2 parser: short GOAWAY payload never reaches the HPACK error-code oracle (types: ${ATTACK_RESP_TYPES:-<none>}; errors: ${ATTACK_GOAWAY_ERRORS:-<none>}; status: $ATTACK_STATUS)"
+        exit 1
+    fi
+
+    exit 0
+fi
 
 # A minimal, well-formed HPACK header block: :method GET (static idx 2),
 # :path / (static idx 4), :scheme http (static idx 6), :authority "prober"
@@ -302,7 +345,20 @@ run_attack_case() {
     local after_fds after_pool after_slab
     local delivered=1
 
-    wait_quiescent || echo "# $label: pre-attack snapshot never settled; racing a moving baseline"
+    if ! wait_quiescent; then
+        # A last successful SNAP_* reading belongs to an earlier probe, not to
+        # this case. Do not send an attack or compare against that stale state:
+        # keep the four reserved TAP points, but fail the entire resource
+        # oracle case with the unavailable-baseline diagnostic instead.
+        echo "# $label: pre-attack snapshot never settled within 5s; attack skipped and stale SNAP_* refused"
+        echo "not ok $((TP + 1)) - $label: resource oracle unavailable (no stable pre-attack baseline)"
+        echo "not ok $((TP + 2)) - $label: fd neutrality unavailable (no stable pre-attack baseline)"
+        echo "not ok $((TP + 3)) - $label: cycle-pool neutrality unavailable (no stable pre-attack baseline)"
+        echo "not ok $((TP + 4)) - $label: slab-page neutrality unavailable (no stable pre-attack baseline)"
+        FAILED=$((FAILED + 4))
+        TP=$((TP + 4))
+        return
+    fi
     before_fds="$SNAP_FDS"; before_pool="$SNAP_POOL"; before_slab="$SNAP_SLAB"
 
     if ! send_attack "$hex"; then
