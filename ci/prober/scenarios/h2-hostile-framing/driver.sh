@@ -169,8 +169,11 @@ while i + 9 <= len(data):
     end = i + 9 + length
     if end > len(data):
         break
-    types.append(str(frame_type))
-    if frame_type == 7 and length >= 8:
+    stream_id = int.from_bytes(data[i + 5:i + 9], "big")
+    is_connection_goaway = frame_type == 7 and stream_id == 0
+    if frame_type != 7 or is_connection_goaway:
+        types.append(str(frame_type))
+    if is_connection_goaway and length >= 8:
         goaway_errors.append(str(int.from_bytes(data[i + 13:i + 17], "big")))
     i = end
 
@@ -307,7 +310,7 @@ wait_quiescent() {
 # matching snapshot()'s ordinary failure behavior. A later matching success
 # must become the NEW predecessor, so settling is correct only on call four.
 if [ "${H2_HOSTILE_FRAMING_SELF_TEST:-0}" = 1 ]; then
-    echo "1..3"
+    echo "1..4"
 
     # Header declares an 8-byte GOAWAY payload but carries only its four-byte
     # last-stream-id field. It is not a complete frame and therefore must not
@@ -335,6 +338,18 @@ if [ "${H2_HOSTILE_FRAMING_SELF_TEST:-0}" = 1 ]; then
         exit 1
     fi
 
+    # GOAWAY is connection-scoped. A type-7 frame on stream 1 must not become
+    # delivery evidence or forge COMPRESSION_ERROR (9) for the HPACK oracle.
+    H2_CAPTURE_HEX="0000080700000000010000000000000009" send_attack "" || true
+    if [ "$ATTACK_STATUS" = "DELIVERY_OK" ] \
+       && [ -z "$ATTACK_RESP_TYPES" ] \
+       && [ -z "$ATTACK_GOAWAY_ERRORS" ]; then
+        echo "ok 3 - h2 parser: nonzero-stream GOAWAY cannot reach the HPACK delivery oracle"
+    else
+        echo "not ok 3 - h2 parser: nonzero-stream GOAWAY cannot reach the HPACK delivery oracle (types: ${ATTACK_RESP_TYPES:-<none>}; errors: ${ATTACK_GOAWAY_ERRORS:-<none>}; status: $ATTACK_STATUS)"
+        exit 1
+    fi
+
     snapshot_calls=0
     snapshot() {
         snapshot_calls=$((snapshot_calls + 1))
@@ -356,10 +371,10 @@ if [ "${H2_HOSTILE_FRAMING_SELF_TEST:-0}" = 1 ]; then
     sleep() { :; }
 
     if wait_quiescent && [ "$snapshot_calls" -eq 4 ]; then
-        echo "ok 3 - h2 settle: a failed snapshot cannot bridge two matching successes"
+        echo "ok 4 - h2 settle: a failed snapshot cannot bridge two matching successes"
         exit 0
     fi
-    echo "not ok 3 - h2 settle: failure-then-success settled after $snapshot_calls snapshots (expected 4)"
+    echo "not ok 4 - h2 settle: failure-then-success settled after $snapshot_calls snapshots (expected 4)"
     exit 1
 fi
 

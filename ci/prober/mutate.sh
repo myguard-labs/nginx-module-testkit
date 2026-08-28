@@ -1479,6 +1479,15 @@ mutate "h2-hostile: short GOAWAY payload cannot forge an HPACK error code" \
     '    if frame_type == 7 and length >= 0:' \
     h2_hostile_framing_parser_test.sh
 
+# GOAWAY is valid only on connection stream 0. Weakening this bound makes a
+# complete type-7 frame on stream 1 forge both delivery evidence and error 9;
+# the parser self-test's named assertion 3 must red.
+mutate "h2-hostile: nonzero-stream GOAWAY cannot forge HPACK delivery evidence" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '    is_connection_goaway = frame_type == 7 and stream_id == 0' \
+    '    is_connection_goaway = frame_type == 7 and stream_id >= 0' \
+    h2_hostile_framing_parser_test.sh
+
 # A failed snapshot must invalidate its predecessor.  The focused control
 # returns success, failure, then two matching successes; retaining the stale
 # first success makes wait_quiescent return on call three instead of four.
