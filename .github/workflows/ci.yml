@@ -45,6 +45,14 @@ jobs:
         with:
           persist-credentials: false
 
+      # h2.c includes nghttp2/nghttp2.h (H2-2); the LXC image ships libssl-dev
+      # and zlib1g-dev but not libnghttp2-dev, so every job that compiles the
+      # prober installs it explicitly.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnghttp2-dev
+
       - name: build + run self-tests
         env:
           CC: ${{ matrix.cc }}
@@ -69,6 +77,12 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
+
+      # libnghttp2-dev: h2.c link dep (H2-2), absent from the LXC image.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnghttp2-dev
 
       # MUT_KIND=c because this job is a bare checkout: no nginx tarball, no
       # .build/<flavor>-<version>/objs, so a scenario suite cannot boot a server
@@ -103,14 +117,18 @@ jobs:
           persist-credentials: false
 
       # The fuzz targets link the whole prober library, which pulls OpenSSL
-      # (body_sha256) and zlib (gunzip). ubuntu-latest ships both -dev packages,
-      # but install them explicitly rather than rely on the image: an image that
-      # drops one would fail this step with a clear apt error instead of a
-      # mystery link failure, and it keeps parity with fuzz.yml's install step.
+      # (body_sha256), zlib (gunzip) and, since H2-2, libnghttp2 (the h2 arm --
+      # SUPERVISOR D2: a hard build dependency of the prober LIB, so every leg
+      # that links it needs the -dev package, the same way libssl-dev/
+      # zlib1g-dev already are here). ubuntu-latest ships the -dev packages,
+      # but install them explicitly rather than rely on the image: an image
+      # that drops one would fail this step with a clear apt error instead of
+      # a mystery link failure, and it keeps parity with fuzz.yml's install
+      # step.
       - name: install link deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libssl-dev zlib1g-dev
+          sudo apt-get install -y --no-install-recommends libssl-dev zlib1g-dev libnghttp2-dev
 
       - name: replay parser fuzz corpus
         run: ci/prober/fuzz/fuzz.sh replay
@@ -129,13 +147,14 @@ jobs:
         with:
           persist-credentials: false
 
-      # valgrind for cachegrind; libssl/zlib are link deps of the prober library
-      # the harness links (same set as fuzz-replay). Installed explicitly so a
-      # missing one fails with a clear apt error, not a mystery link failure.
+      # valgrind for cachegrind; libssl/zlib/libnghttp2 are link deps of the
+      # prober library the harness links (same set as fuzz-replay, libnghttp2
+      # added by H2-2 -- SUPERVISOR D2). Installed explicitly so a missing one
+      # fails with a clear apt error, not a mystery link failure.
       - name: install cachegrind + link deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends valgrind libssl-dev zlib1g-dev
+          sudo apt-get install -y --no-install-recommends valgrind libssl-dev zlib1g-dev libnghttp2-dev
 
       - name: json parser instruction-count scaling gate
         run: ci/prober/perf/cachegrind-scale.sh
@@ -580,15 +599,26 @@ jobs:
           # v2 when --with-http_ssl_module was added: a v1 entry would restore
           # a tree built WITHOUT ssl, causing reds that blame TLS not the cache.
           # Went to v3 when src/** was added: v2 entries cached stale binaries
-          # on probe-only changes. Bump on any configure/make recipe change.
-          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-${{ hashFiles('t/module/**', 'src/**') }}-v3
+          # on probe-only changes. Went to v4 when --with-http_v2_module was
+          # added (H2-2): a v3 entry would restore a tree built WITHOUT h2,
+          # causing scenarios/h2-roundtrip's `requires` gate to SKIP every run
+          # rather than exercise the new arm -- the same failure shape v2 was
+          # added to prevent, one flag later. Bump on any configure/make
+          # recipe change.
+          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-${{ hashFiles('t/module/**', 'src/**') }}-v4
 
       - name: install build deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends eatmydata
           sudo eatmydata apt-get install -y --no-install-recommends \
-              libpcre2-dev zlib1g-dev libssl-dev strace faketime
+              libpcre2-dev zlib1g-dev libssl-dev libnghttp2-dev strace faketime
+          # libnghttp2-dev: this job builds ci/prober/build.sh's output (the
+          # "build the prober" step below), which links the h2 arm (H2-2) --
+          # SUPERVISOR D2, a hard link dep the same way libssl-dev already is.
+          # Without it the prober fails to link here with an undefined
+          # reference to nghttp2_* symbols, not a subtle runtime skip.
+          #
           # strace: the syscall-allowlist scenario attaches a tracer to the
           # worker and asserts on its per-request syscall set. Without it the
           # driver SKIPs (it guards on `command -v strace`), which would make
@@ -627,7 +657,16 @@ jobs:
           cd /tmp/srv
           # Build with ssl to allow TLS scenarios to lift their requires-gate
           # instead of skipping. libssl-dev is already installed on this leg.
-          ./configure --with-compat --with-http_ssl_module \
+          #
+          # --with-http_v2_module (H2-2): nginx's own ./configure defaults
+          # HTTP_V2=NO even on the mainline/stable trees this job builds today
+          # (measured 2026-08-27 against nginx 1.29.0's and angie 1.12.0's
+          # ./configure -- both default to NO and both accept the flag
+          # identically). Without it scenarios/h2-roundtrip's own `requires`
+          # gate SKIPs every run rather than exercising the h2 arm H2-2 adds,
+          # which would make that row vacuous on the only CI leg that boots a
+          # live server for it.
+          ./configure --with-compat --with-http_ssl_module --with-http_v2_module \
               --add-dynamic-module="$GITHUB_WORKSPACE/t/module" >/dev/null
           eatmydata make -j"$(nproc)" >/dev/null
 
@@ -940,6 +979,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # libnghttp2-dev: h2.c link dep (H2-2), absent from the LXC image; the
+      # build-and-check step below compiles the prober.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnghttp2-dev
+
       # PR #6 committed a compiled assert_test binary. Nothing caught it: the
       # file was tracked, so .gitignore no longer applied to it, and every
       # other job happily rebuilt over the top. Ask `file` about every tracked
@@ -1026,6 +1072,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # libnghttp2-dev: h2.c link dep (H2-2), absent from the LXC image.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnghttp2-dev
+
       - name: the same source builds byte-identically twice
         env:
           SOURCE_DATE_EPOCH: "1"
@@ -1106,7 +1158,8 @@ jobs:
       - name: install analyzers
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends cppcheck clang-tidy
+          sudo apt-get install -y --no-install-recommends \
+              cppcheck clang-tidy libnghttp2-dev
 
           echo "--- analyzer versions ---"
           gcc --version | head -1
@@ -1119,7 +1172,7 @@ jobs:
       - name: gcc -fanalyzer
         working-directory: ci/prober
         run: |
-          for f in json.c http.c util.c rules.c assert.c prober.c; do
+          for f in json.c http.c h2.c util.c rules.c assert.c prober.c; do
               gcc -fanalyzer -Werror -c -O1 -std=c11 -I. "$f" -o /dev/null
           done
 
@@ -1144,7 +1197,7 @@ jobs:
               --std=c11 --check-level=exhaustive \
               --error-exitcode=2 --quiet \
               --suppress=normalCheckLevelMaxBranches \
-              -I. json.c http.c util.c rules.c assert.c prober.c
+              -I. json.c http.c h2.c util.c rules.c assert.c prober.c
 
       # clang-tidy. --warnings-as-errors mirrors the enabled list so a finding
       # fails the job.
@@ -1194,7 +1247,7 @@ jobs:
           clang-tidy --quiet \
               --checks="$checks" \
               --warnings-as-errors="$checks" \
-              json.c http.c util.c rules.c assert.c prober.c \
+              json.c http.c h2.c util.c rules.c assert.c prober.c \
               -- -std=c11 -I.
 
   # Build-flags + canary gate. DECIDED downgrade of the old "checksec" TODO
@@ -1220,6 +1273,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # libnghttp2-dev: h2.c link dep (H2-2), absent from the LXC image.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnghttp2-dev
+
       - name: build with canary + fortify flags
         working-directory: ci/prober
         run: |
@@ -1242,7 +1301,7 @@ jobs:
         working-directory: ci/prober
         run: |
           fail=0
-          for f in json.c http.c util.c rules.c assert.c prober.c; do
+          for f in json.c http.c h2.c util.c rules.c assert.c prober.c; do
               obj="/tmp/canary-check-$(basename "$f" .c).o"
               gcc -c -O1 -std=c11 -D_FORTIFY_SOURCE=3 -fstack-protector-strong \
                   -o "$obj" "$f"
@@ -1358,6 +1417,12 @@ jobs:
               }
           done
 
+      # libnghttp2-dev: h2.c link dep (H2-2), absent from the LXC image.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnghttp2-dev
+
       - name: build
         working-directory: ci/prober
         run: ./build.sh
@@ -1417,8 +1482,8 @@ jobs:
           # links it for the body_sha256 oracle). Keep in sync with build.sh.
           # shellcheck disable=SC2086
           gcc -O1 -g -std=c11 $WARN -D_FORTIFY_SOURCE=3 -fstack-protector-strong \
-              -o /tmp/http_locale_check http_locale_check.c http.c json.c \
-              util.c -lz -lssl -lcrypto
+              -o /tmp/http_locale_check http_locale_check.c http.c h2.c json.c \
+              util.c -lz -lssl -lcrypto -lnghttp2
           /tmp/http_locale_check
 
   # License-header gate: all .c and .h files must carry BSD-2-Clause SPDX

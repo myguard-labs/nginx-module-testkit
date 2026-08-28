@@ -135,6 +135,14 @@ FALLBACK	ci/prober/backend.c	ALL_UNIT_TESTS	fast
 FALLBACK	ci/prober/util.c	ALL_UNIT_TESTS	fast
 FALLBACK	ci/prober/assert.c	ALL_UNIT_TESTS	fast
 
+# h2.c (H2-2) has no dedicated *_test.c: its whole mechanism is reachable only
+# against a real h2-capable `listen ... ssl; http2 on;` server (same reason
+# alpn-negotiation's ALPN code in http.c has no unit-test PRIMARY row either),
+# so it gets the LIB-wide fallback rather than a PRIMARY pointing at a unit
+# binary that does not exist, plus the SEMANTIC row below naming its actual
+# owner.
+FALLBACK	ci/prober/h2.c	ALL_UNIT_TESTS	fast
+
 # --- SEMANTIC: fuzz targets keyed to the parser they drive (fuzz/fuzz.sh) ---
 SEMANTIC	ci/prober/json.c	fuzz/fuzz_json	fast
 SEMANTIC	ci/prober/http.c	fuzz/fuzz_http	fast

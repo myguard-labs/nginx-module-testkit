@@ -20,20 +20,24 @@ here="$PWD"
 proot="$here/.."          # ci/prober/ -- holds the library .c files
 
 # The same library set build.sh links, minus prober.c/fakesrv.c (they hold
-# main()). Fuzz targets bring their own entry point.
-LIB="json.c http.c util.c rules.c assert.c backend.c"
+# main()). Fuzz targets bring their own entry point. h2.c is included because
+# http.c calls h2_exchange() on ALPN-negotiated connections; without it the
+# link fails on undefined nghttp2_* references (H2-2, SUPERVISOR D2).
+LIB="json.c http.c h2.c util.c rules.c assert.c backend.c"
 LIBPATHS=""
 for f in $LIB; do
     LIBPATHS="$LIBPATHS $proot/$f"
 done
 
-# Match build.sh's link deps (OpenSSL for body_sha256, zlib for gunzip) so the
-# whole library links even though these targets do not exercise those paths.
+# Match build.sh's link deps (OpenSSL for body_sha256, zlib for gunzip,
+# libnghttp2 for the h2 arm added by H2-2 -- SUPERVISOR D2) so the whole
+# library links even though these targets do not exercise those paths.
 if command -v pkg-config >/dev/null 2>&1; then
     LDLIBS="$(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
     LDLIBS="$LDLIBS $(pkg-config --libs zlib 2>/dev/null || echo '-lz')"
+    LDLIBS="$LDLIBS $(pkg-config --libs libnghttp2 2>/dev/null || echo '-lnghttp2')"
 else
-    LDLIBS="-lssl -lcrypto -lz"
+    LDLIBS="-lssl -lcrypto -lz -lnghttp2"
 fi
 
 TARGETS="json http memcached resp rules backend"

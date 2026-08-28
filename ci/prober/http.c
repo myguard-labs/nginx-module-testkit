@@ -10,6 +10,7 @@
 #define _GNU_SOURCE
 
 #include "http.h"
+#include "h2.h"
 #include "json.h"
 #include "util.h"
 
@@ -2207,6 +2208,41 @@ http_exchange(int fd,
      * error return leaves it 0, so a driver never reuses a broken fd. */
     if (conn_open != NULL) {
         *conn_open = 0;
+    }
+
+    /*
+     * THE H2 DISPATCH (H2-2). Every parameter below this point -- pauses,
+     * abort_at, hold_ms, framed, want_close, idle_ms -- is an h1 BYTE-STREAM
+     * concept: a stall mid-write, a truncated request, a read that trusts
+     * Content-Length framing. None of it has a meaning over h2, whose framing
+     * is multiplexed and length-prefixed at the HTTP/2 layer itself, so this
+     * function forks to the nghttp2-driven arm BEFORE any of that machinery
+     * runs rather than threading h2 through it.
+     *
+     * The fork condition is deliberately "ALPN already negotiated h2 on this
+     * fd" and nothing else -- no new parameter, no flag a caller has to pass.
+     * http_connect() is what negotiates ALPN (H2-1), so by the time a caller
+     * reaches http_exchange() the outcome is already decided on the wire; this
+     * reads it back the same way http_tls_alpn_selected() does, from the SSL
+     * object in the side table, never from what the caller offered. A
+     * plaintext fd (tls_table_get() returns NULL) or a TLS fd that negotiated
+     * anything else (http/1.1, or nothing at all) takes the h1 path below
+     * completely unchanged -- this is the whole reason H2-2 can add a second
+     * transport without moving a single existing h1 caller.
+     */
+    {
+        SSL  *ssl = tls_table_get(fd);
+
+        if (ssl != NULL) {
+            char  alpn[HTTP_ALPN_MAX];
+
+            if (http_tls_alpn_selected(fd, alpn, sizeof(alpn)) == 0
+                && strcmp(alpn, "h2") == 0)
+            {
+                return h2_exchange(fd, ssl, req, req_len, timeout_ms,
+                                   resp, errbuf, errlen);
+            }
+        }
     }
 
     /*

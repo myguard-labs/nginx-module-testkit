@@ -100,9 +100,18 @@ EOF
 # copy of the script with LIB overridden, rather than editing the real
 # script's LIB list for a 2-function fixture. sed swaps the one line; the
 # rest of the script (isolation, jq folding, determinism) runs unmodified.
+# The pattern matches any double-quoted list rather than spelling out the
+# current members: the H2-2 h2.c addition broke the spelled-out version
+# silently -- the un-substituted copy then died in the fixture dir with no
+# `not ok` at all -- so the grep below turns a future miss into a loud
+# failure instead.
 make_director_copy() {   # $1 = dest path
-    sed 's/^LIB="json\.c http\.c util\.c rules\.c assert\.c backend\.c"$/LIB="lib.c"/' \
-        "$COVERAGE_DIRECTOR" >"$1"
+    sed 's/^LIB="[^"]*"$/LIB="lib.c"/' "$COVERAGE_DIRECTOR" >"$1"
+    grep -q '^LIB="lib\.c"$' "$1" || {
+        echo "make_director_copy: no LIB=\"...\" line matched in" \
+             "$COVERAGE_DIRECTOR -- update the sed in $0" >&2
+        exit 1
+    }
     chmod +x "$1"
 }
 

@@ -1,0 +1,50 @@
+# Sourced into run-scenario.sh's own shell, after prober_resolve and BEFORE the
+# conf is rendered -- which is the only window in which a fixture can be put on
+# disk in time for the conf to reference it.
+#
+# PROBER_TLS is what makes the rules run speak TLS: run-scenario.sh expands
+# ${PROBER_TLS:+--tls} into the prober invocation. The listener below carries
+# `ssl`, so a plaintext client would be answered with a handshake failure and
+# the scenario would report it as a broken server.
+export PROBER_TLS=1
+
+# THE CERTIFICATE IS GENERATED, NOT COMMITTED. Three reasons, each sufficient:
+#
+#   - a committed key is a private key in git. The repo's own pre-commit
+#     detect-private-key and gitleaks hooks exist to stop exactly that, and a
+#     fixture is not an exemption worth carving.
+#   - a committed certificate has a fixed notAfter, so the suite is green now
+#     and permanently red after that date, with a failure that points at TLS
+#     code rather than at the fixture. A cert minted at boot cannot age.
+#   - it costs one openssl(1) call, gated by ./requires.
+#
+# prober_make_prefix is idempotent (prober_render_conf reuses an existing
+# prefix rather than stranding it), so calling it here is free and gives the
+# cert somewhere inside the sandbox the EXIT trap already owns. The trap is
+# armed above this point precisely so these two files cannot leak.
+prober_make_prefix
+
+# -nodes: the key must be readable by a worker with no passphrase prompt.
+# 2048-bit RSA rather than a curve: it is what every OpenSSL build in reach can
+# do without a named-curve negotiation, and this scenario asserts nothing about
+# the algorithm.
+#
+# Errors go to the prefix rather than to stderr: openssl writes progress there
+# unconditionally, and run-scenario.sh's stdout IS the TAP stream. Leaking a
+# key-generation banner into it produces output no TAP consumer can parse.
+openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "$PROBER_PREFIX/probe.key" \
+    -out "$PROBER_PREFIX/probe.crt" \
+    -days 1 -subj '/CN=prober' \
+    >"$PROBER_PREFIX/openssl.log" 2>&1 || {
+    # A bail here rather than a skip: ./requires already established that
+    # openssl exists, so a failure at this point is a real fault on the box and
+    # not an unmet environment requirement.
+    echo "Bail out! openssl failed to mint the fixture certificate; see $PROBER_PREFIX/openssl.log"
+    exit 1
+}
+
+# The worker runs as whoever started the harness, so no chown is needed, but
+# the key must not be world-readable -- an 0644 private key in a shared /tmp is
+# a real exposure even for a fixture that lives for one run.
+chmod 600 "$PROBER_PREFIX/probe.key"

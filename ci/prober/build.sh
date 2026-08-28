@@ -69,16 +69,22 @@ fi
 # whole set rather than a hand-maintained per-test list, so adding a module does
 # not mean editing N link lines -- and a test that reaches into another unit
 # keeps working instead of failing at link time for a bookkeeping reason.
-LIB="json.c http.c util.c rules.c assert.c backend.c"
+LIB="json.c http.c h2.c util.c rules.c assert.c backend.c"
 
 # body_sha256 oracle uses OpenSSL for SHA256 hashing; the gunzip oracle uses
-# zlib for inflate.
+# zlib for inflate; the h2 arm (H2-2) uses libnghttp2 for HTTP/2 framing --
+# SUPERVISOR DECISION D1: a hard build dependency wired the same way as the
+# other two, not an optional `#ifdef HAVE_NGHTTP2` -- this file has never used
+# that idiom for OpenSSL or zlib and h2 does not become the first. Do NOT
+# hand-roll HTTP/2 framing; that is precisely the class of parser this harness
+# exists to attack from the OUTSIDE, not to reimplement on the client side.
 LDFLAGS="${LDFLAGS:-}"
 if command -v pkg-config >/dev/null 2>&1; then
     LDFLAGS="$LDFLAGS $(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
     LDFLAGS="$LDFLAGS $(pkg-config --libs zlib 2>/dev/null || echo '-lz')"
+    LDFLAGS="$LDFLAGS $(pkg-config --libs libnghttp2 2>/dev/null || echo '-lnghttp2')"
 else
-    LDFLAGS="$LDFLAGS -lssl -lcrypto -lz"
+    LDFLAGS="$LDFLAGS -lssl -lcrypto -lz -lnghttp2"
 fi
 
 # Every $CC invocation below is independent -- each links a self-contained

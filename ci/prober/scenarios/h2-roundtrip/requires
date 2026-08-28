@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+#
+# H2-ROUNDTRIP GATE. A copy of alpn-negotiation's gate (deliberately -- see
+# that file's header for why a shared gate sourced from a sibling directory
+# is the wrong shape) plus ONE additional fact ALPN-negotiation does not need:
+# the server binary must also carry ngx_http_v2_module, because this scenario
+# does not merely OFFER "h2" in ALPN and expect a clean refusal (H2-1's job) --
+# it expects the listener to ACCEPT the offer and speak real HTTP/2 back
+# (H2-2's job). A build without the module still links ngx_http_ssl_module and
+# still answers a plaintext-refused ALPN offer, but has nothing to select "h2"
+# with, so it answers RFC 7301's no_application_protocol alert exactly like a
+# listener that never carries `http2 on;` -- which would make this scenario's
+# one round trip fail at the TLS handshake and report "nginx is broken" for
+# what is actually "this build cannot do what the scenario needs".
+#
+# Two independent environment facts, either of which makes the scenario
+# unrunnable rather than failing:
+#
+#   1. the server binary must carry ngx_http_ssl_module AND ngx_http_v2_module.
+#      `--with-compat --with-http_ssl_module` alone omits the latter -- nginx's
+#      own ./configure defaults HTTP_V2=NO even in the trees this repo builds
+#      today (measured 2026-08-27 against nginx 1.29.0's ./configure). A conf
+#      with `listen ... ssl; http2 on;` on a build without the module fails
+#      `nginx -t` with "unknown directive \"http2\"" -- a red that says nothing
+#      about the client leg under test.
+#   2. openssl(1) must exist, because the fixture certificate is generated at
+#      boot rather than committed. See ./env.
+#   3. strings(1) must exist -- it is the probe for (1), and a missing probe
+#      must skip rather than silently answer "no h2" for every build.
+#
+# nonzero exit => run-scenario.sh emits "1..0 # SKIP <stdout of this gate>"
+set -eu
+
+FLAVOR="${2:-nginx}"
+VERSION="${3:-1.31.3}"
+
+# Same build-resolution as every other gate: run-scenario.sh runs this BEFORE
+# prober_resolve, so PROBER_RESOLVED_BUILD does not exist yet and the tree that
+# will actually be booted has to be derived the same way prober_resolve derives
+# it. Globbing .build/* instead would find h2 in SOME staged tree and pass on
+# a tree that is about to fail `nginx -t`.
+#
+# The root fallback MUST match ci/prober/lib.sh exactly -- $(cd ../.. && pwd) from
+# ci/prober/, which is where run-scenario.sh has already cd'd by the time this
+# gate runs. A gate computing a DIFFERENT root than the engine SKIPs on a tree
+# the engine would have booted, and that SKIP reads as a pass. In a standalone
+# checkout that fallback lands one level above the repo, so PROBER_ROOT has to
+# be set either way; matching lib.sh is still the correct contract.
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-$(cd ../.. && pwd)}/.build/${FLAVOR}-${VERSION}}"
+
+BIN="$BUILD/objs/nginx"
+[ -x "$BIN" ] || BIN="$BUILD/objs/angie"
+
+if [ ! -x "$BIN" ]; then
+    echo "no server binary under $BUILD/objs -- nothing to gate on"
+    exit 1
+fi
+
+command -v strings >/dev/null 2>&1 || {
+    echo "strings(1) not found (install binutils) -- no way to ask the binary whether ngx_http_ssl_module/ngx_http_v2_module are linked"
+    exit 1
+}
+
+# THE BINARY IS THE ORACLE, NOT objs/ngx_modules.c -- see tls-listener/requires
+# for the full 2026-08-18 measurement backing this. The anchors are ANCHORED
+# `strings` matches (grep -qx), not an unanchored substring: `grep h2` would
+# match the `http2` DIRECTIVE STRING nginx embeds for its own config parser
+# even on a build that never linked the module, which would make this gate
+# vacuous for exactly the failure it exists to catch.
+if ! strings "$BIN" 2>/dev/null | grep -qx 'ngx_http_ssl_module'; then
+    echo "$BIN was built without ngx_http_ssl_module (--with-compat alone omits it) -- rebuild with --with-http_ssl_module to run the h2 round-trip scenario"
+    exit 1
+fi
+
+if ! strings "$BIN" 2>/dev/null | grep -qx 'ngx_http_v2_module'; then
+    echo "$BIN was built without ngx_http_v2_module (nginx defaults HTTP_V2=NO; needs --with-http_v2_module explicitly) -- rebuild with it to run the h2 round-trip scenario"
+    exit 1
+fi
+
+command -v openssl >/dev/null 2>&1 || {
+    echo "openssl(1) not found -- the fixture certificate is generated at boot, not committed"
+    exit 1
+}
+
+exit 0
