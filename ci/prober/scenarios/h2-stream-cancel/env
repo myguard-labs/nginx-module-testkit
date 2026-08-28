@@ -1,0 +1,4 @@
+# A real zone is required for the slab-page cleanup oracle.  The reference
+# module has no zone unless this directive is present.
+PROBER_PROBE="test_ref_probe;"
+PROBER_PROBE_ZONE='test_ref_zone h2_stream_cancel 1m;'

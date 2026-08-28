@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# H2-5 needs the linked HTTP/2 module and python3 for exact binary framing.
+set -eu
+
+FLAVOR="${2:-nginx}"
+VERSION="${3:-1.31.3}"
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-$(cd ../.. && pwd)}/.build/${FLAVOR}-${VERSION}}"
+
+BIN="$BUILD/objs/nginx"
+[ -x "$BIN" ] || BIN="$BUILD/objs/angie"
+
+if [ ! -x "$BIN" ]; then
+    echo "no server binary under $BUILD/objs -- nothing to gate on"
+    exit 1
+fi
+
+command -v strings >/dev/null 2>&1 || {
+    echo "strings(1) not found -- cannot verify ngx_http_v2_module linkage"
+    exit 1
+}
+
+if ! strings "$BIN" 2>/dev/null | grep -qx 'ngx_http_v2_module'; then
+    echo "$BIN was built without ngx_http_v2_module"
+    exit 1
+fi
+
+command -v python3 >/dev/null 2>&1 || {
+    echo "python3 not found -- driver.sh needs exact HTTP/2 frame encoding"
+    exit 1
+}
