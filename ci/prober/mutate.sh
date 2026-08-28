@@ -1475,8 +1475,8 @@ mutate "h2-hostile: truncated response frame cannot become a GOAWAY delivery mar
 
 mutate "h2-hostile: short GOAWAY payload cannot forge an HPACK error code" \
     scenarios/h2-hostile-framing/driver.sh \
-    '    if frame_type == 7 and length >= 8:' \
-    '    if frame_type == 7 and length >= 0:' \
+    '    if is_connection_goaway and length >= 8:' \
+    '    if is_connection_goaway and length >= 0:' \
     h2_hostile_framing_parser_test.sh
 
 # GOAWAY is valid only on connection stream 0. Weakening this bound makes a
