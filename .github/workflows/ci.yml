@@ -45,6 +45,14 @@ jobs:
         with:
           persist-credentials: false
 
+      # h2.c includes nghttp2/nghttp2.h (H2-2); the LXC image ships libssl-dev
+      # and zlib1g-dev but not libnghttp2-dev, so every job that compiles the
+      # prober installs it explicitly.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnghttp2-dev
+
       - name: build + run self-tests
         env:
           CC: ${{ matrix.cc }}
@@ -69,6 +77,12 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
+
+      # libnghttp2-dev: h2.c link dep (H2-2), absent from the LXC image.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnghttp2-dev
 
       # MUT_KIND=c because this job is a bare checkout: no nginx tarball, no
       # .build/<flavor>-<version>/objs, so a scenario suite cannot boot a server
@@ -965,6 +979,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # libnghttp2-dev: h2.c link dep (H2-2), absent from the LXC image; the
+      # build-and-check step below compiles the prober.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnghttp2-dev
+
       # PR #6 committed a compiled assert_test binary. Nothing caught it: the
       # file was tracked, so .gitignore no longer applied to it, and every
       # other job happily rebuilt over the top. Ask `file` about every tracked
@@ -1051,6 +1072,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # libnghttp2-dev: h2.c link dep (H2-2), absent from the LXC image.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnghttp2-dev
+
       - name: the same source builds byte-identically twice
         env:
           SOURCE_DATE_EPOCH: "1"
@@ -1131,7 +1158,8 @@ jobs:
       - name: install analyzers
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends cppcheck clang-tidy
+          sudo apt-get install -y --no-install-recommends \
+              cppcheck clang-tidy libnghttp2-dev
 
           echo "--- analyzer versions ---"
           gcc --version | head -1
@@ -1244,6 +1272,12 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
+
+      # libnghttp2-dev: h2.c link dep (H2-2), absent from the LXC image.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnghttp2-dev
 
       - name: build with canary + fortify flags
         working-directory: ci/prober
@@ -1382,6 +1416,12 @@ jobs:
                   exit 1
               }
           done
+
+      # libnghttp2-dev: h2.c link dep (H2-2), absent from the LXC image.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnghttp2-dev
 
       - name: build
         working-directory: ci/prober
