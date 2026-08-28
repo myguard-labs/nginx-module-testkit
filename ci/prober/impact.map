@@ -70,6 +70,7 @@ PRIMARY	ci/prober/check_conf_test.sh	check_conf_test.sh	fast
 PRIMARY	ci/prober/docs_directives_test.sh	docs_directives_test.sh	fast
 PRIMARY	ci/prober/schema_emitter_test.sh	schema_emitter_test.sh	fast
 PRIMARY	ci/prober/tls_test.sh	tls_test.sh	fast
+PRIMARY	ci/prober/h2_hostile_framing_parser_test.sh	h2_hostile_framing_parser_test.sh	fast
 
 # The strace summary parser (prober_strace_counts, prober_strace_family_sum)
 # lives in lib.sh but is only exercised end-to-end by the syscall-allowlist
@@ -169,6 +170,11 @@ SEMANTIC	ci/prober/rules.c	mutate:send_slow	fast
 # real nginx/angie -- no #include links ci/prober/scenarios/** back to src/, the
 # link is "this scenario's driver.sh boots a probe built from this source".
 SEMANTIC	ci/prober/scenarios	scenarios/*	fast
+
+# The raw hostile-H2 driver's response decoder and settle loop are pure-shell
+# attack-side logic.  This focused self-test injects malformed frames and a
+# failed probe between matching snapshots without booting a server.
+SEMANTIC	ci/prober/scenarios/h2-hostile-framing/driver.sh	h2_hostile_framing_parser_test.sh	fast
 
 # The TLS scenario's own files. The rule file and conf are covered by the
 # scenarios glob above; these two are called out because they are EXECUTABLE
