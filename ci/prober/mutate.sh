@@ -1479,6 +1479,20 @@ mutate "h2-hostile: short GOAWAY payload cannot forge an HPACK error code" \
     '    if frame_type == 7 and length >= 0:' \
     h2_hostile_framing_parser_test.sh
 
+# A failed snapshot must invalidate its predecessor.  The focused control
+# returns success, failure, then two matching successes; retaining the stale
+# first success makes wait_quiescent return on call three instead of four.
+# shellcheck disable=SC2016
+mutate "h2-hostile: failed settle snapshot cannot retain stale predecessor" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '            prev_fds=""
+            prev_pool=""
+            prev_slab=""' \
+    '            prev_fds="${SNAP_FDS:-}"
+            prev_pool="${SNAP_POOL:-}"
+            prev_slab="${SNAP_SLAB:-}"' \
+    h2_hostile_framing_parser_test.sh
+
 # ---- probe schema -----------------------------------------------------------
 
 # The schema exists to catch emitter drift on fields no rule happens to name,
