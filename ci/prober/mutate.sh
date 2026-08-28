@@ -1513,6 +1513,13 @@ mutate "h2-stream-cancel: cleanup cannot run without a completed warm-up" \
     '        sock.sendall(preface + client_settings)' \
     scenarios/h2-stream-cancel/mutate-suite.sh
 
+# shellcheck disable=SC2016
+mutate "h2-stream-cancel: outer timeout exceeds all internal phase budgets" \
+    scenarios/h2-stream-cancel/driver.sh \
+    '    outer_timeout=$((4 * phase_timeout))' \
+    '    outer_timeout=$((3 * phase_timeout))' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
 mutate "h2-stream-cancel: SETTINGS negotiation readback is required" \
     scenarios/h2-stream-cancel/driver.sh \
     'negotiated = int(server_settings and client_settings_ack)' \
@@ -1529,6 +1536,24 @@ mutate "h2-stream-cancel: cancellation stimulus must be CANCEL code 8" \
     scenarios/h2-stream-cancel/driver.sh \
     '        rst_payload = (8).to_bytes(4, "big")  # RFC 9113 CANCEL' \
     '        rst_payload = (0).to_bytes(4, "big")  # mutated to NO_ERROR' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+mutate "h2-stream-cancel: server-side cancellation readback is required" \
+    scenarios/h2-stream-cancel/driver.sh \
+    'print("STREAM1_CANCELLED_BY_SERVER=%d" % int(server_cancelled_stream1))' \
+    'print("STREAM1_CANCELLED_BY_SERVER=%d" % 0)' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+mutate "h2-stream-cancel: cancellation log matcher reads the server outcome" \
+    scenarios/h2-stream-cancel/driver.sh \
+    '    return any(b"client canceled stream 1" in line' \
+    '    return any(b"client completed stream 1" in line' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+mutate "h2-stream-cancel: cancelled stream cannot complete after reset" \
+    scenarios/h2-stream-cancel/driver.sh \
+    'print("STREAM1_ENDED_AFTER_RST=%d" % int(stream1_ended_after))' \
+    'print("STREAM1_ENDED_AFTER_RST=%d" % 1)' \
     scenarios/h2-stream-cancel/mutate-suite.sh
 
 mutate "h2-stream-cancel: surviving stream continuation is required" \

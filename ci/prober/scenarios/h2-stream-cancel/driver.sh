@@ -66,8 +66,22 @@ wait_quiescent() {
 # stream exchange and prints the observations consumed below.  This remains a
 # scenario-local driver; the prober's public one-exchange API is unchanged.
 run_h2_client() {
-    local mode="$1"
-    H="$HOST" P="$PORT" MODE="$mode" timeout 12 python3 - <<'PY'
+    local mode="$1" phase_timeout outer_timeout required_timeout
+    phase_timeout=$((5 * ${PROBER_TIMEOUT_SCALE:-1}))
+    required_timeout=$((3 * phase_timeout))
+    outer_timeout=$((4 * phase_timeout))
+
+    # The cancel exchange has at most one connect phase and two receive
+    # phases.  Keep timeout(1) outside that complete budget, with one phase of
+    # teardown grace, so it remains a backstop rather than the first deadline.
+    if [ "$outer_timeout" -le "$required_timeout" ]; then
+        echo "h2 client outer timeout must exceed its three phase budgets" >&2
+        return 1
+    fi
+
+    H="$HOST" P="$PORT" MODE="$mode" PHASE_TIMEOUT="$phase_timeout" \
+        ERROR_LOG="$PROBER_PREFIX/logs/error.log" \
+        timeout "$outer_timeout" python3 - <<'PY'
 import os
 import socket
 import time
@@ -75,6 +89,8 @@ import time
 host = os.environ["H"]
 port = int(os.environ["P"])
 mode = os.environ["MODE"]
+phase_timeout = float(os.environ["PHASE_TIMEOUT"])
+error_log = os.environ["ERROR_LOG"]
 
 
 def frame(frame_type, flags, stream_id, payload=b""):
@@ -92,10 +108,14 @@ def headers_frame(stream_id, path):
     return frame(1, 0x5, stream_id, block)  # END_HEADERS | END_STREAM
 
 
-def recv_exact(sock, length):
+def recv_exact(sock, length, deadline):
     chunks = []
     remaining = length
     while remaining:
+        wait = deadline - time.monotonic()
+        if wait <= 0:
+            raise TimeoutError("HTTP/2 receive phase deadline expired")
+        sock.settimeout(wait)
         chunk = sock.recv(remaining)
         if not chunk:
             raise RuntimeError("EOF while receiving an HTTP/2 frame")
@@ -104,12 +124,24 @@ def recv_exact(sock, length):
     return b"".join(chunks)
 
 
-def recv_frame(sock):
-    header = recv_exact(sock, 9)
+def recv_frame(sock, deadline):
+    header = recv_exact(sock, 9, deadline)
     length = int.from_bytes(header[:3], "big")
     return (header[3], header[4],
             int.from_bytes(header[5:9], "big") & 0x7fffffff,
-            recv_exact(sock, length))
+            recv_exact(sock, length, deadline))
+
+
+def cancellation_logged(path, offset):
+    try:
+        with open(path, "rb") as log:
+            log.seek(offset)
+            appended = log.read()
+    except FileNotFoundError:
+        return False
+    return any(b"client canceled stream 1" in line
+               and b'request: "GET /cancel.bin HTTP/2.0"' in line
+               for line in appended.splitlines())
 
 
 server_settings = False
@@ -119,19 +151,22 @@ ended_before = {1: False, 3: False}
 rst_code = -1
 after_stream3 = 0
 stream3_ended = False
+after_stream1 = 0
+stream1_ended_after = False
+server_cancelled_stream1 = False
 
 try:
-    sock = socket.create_connection((host, port), 5)
-    sock.settimeout(5)
+    sock = socket.create_connection((host, port), phase_timeout)
+    sock.settimeout(phase_timeout)
     preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
     client_settings = frame(4, 0, 0)
 
     if mode == "warmup":
         sock.sendall(preface + client_settings + headers_frame(1, b"/"))
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + phase_timeout
         warmup_done = False
         while time.monotonic() < deadline and not warmup_done:
-            frame_type, flags, stream_id, payload = recv_frame(sock)
+            frame_type, flags, stream_id, payload = recv_frame(sock, deadline)
             if frame_type == 4 and flags == 0:
                 server_settings = True
                 sock.sendall(frame(4, 1, 0))
@@ -146,12 +181,12 @@ try:
         # progress; no stream credit is added until after cancellation.
         conn_credit = frame(8, 0, 0, (1048576).to_bytes(4, "big"))
         sock.sendall(preface + client_settings + conn_credit
-                     + headers_frame(1, b"/payload.bin")
-                     + headers_frame(3, b"/payload.bin"))
+                     + headers_frame(1, b"/cancel.bin")
+                     + headers_frame(3, b"/survive.bin"))
 
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + phase_timeout
         while time.monotonic() < deadline and not (before[1] and before[3]):
-            frame_type, flags, stream_id, payload = recv_frame(sock)
+            frame_type, flags, stream_id, payload = recv_frame(sock, deadline)
             if frame_type == 4 and flags == 0:
                 server_settings = True
                 sock.sendall(frame(4, 1, 0))
@@ -170,6 +205,11 @@ try:
         if ended_before[1] or ended_before[3]:
             raise RuntimeError("a stream ended before the cancellation point")
 
+        try:
+            error_log_offset = os.path.getsize(error_log)
+        except FileNotFoundError:
+            error_log_offset = 0
+
         rst_payload = (8).to_bytes(4, "big")  # RFC 9113 CANCEL
         rst = frame(3, 0, 1, rst_payload)
         sock.sendall(rst)
@@ -182,9 +222,9 @@ try:
         sock.sendall(frame(8, 0, 0, more_credit)
                      + frame(8, 0, 3, more_credit))
 
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + phase_timeout
         while time.monotonic() < deadline and not stream3_ended:
-            frame_type, flags, stream_id, payload = recv_frame(sock)
+            frame_type, flags, stream_id, payload = recv_frame(sock, deadline)
             if frame_type == 4 and flags == 0:
                 server_settings = True
                 sock.sendall(frame(4, 1, 0))
@@ -192,13 +232,32 @@ try:
                 client_settings_ack = True
             elif frame_type == 7:
                 raise RuntimeError("server sent GOAWAY after standard cancellation")
-            if stream_id == 3:
+            if stream_id == 1:
+                # RFC 9113 permits frames queued before the reset to arrive.
+                # Track and drain that DATA, but only END_STREAM is impossible:
+                # the 256 KiB body exceeds stream 1's unextended 65535 window.
+                if frame_type == 0:
+                    after_stream1 += len(payload)
+                if flags & 1 and frame_type in (0, 1):
+                    stream1_ended_after = True
+            elif stream_id == 3:
                 if frame_type == 0:
                     after_stream3 += len(payload)
                 if flags & 1 and frame_type in (0, 1):
                     stream3_ended = True
         if not stream3_ended:
             raise RuntimeError("surviving stream did not reach END_STREAM")
+
+        # The server logs this only after it has parsed and acted on RST_STREAM.
+        # Poll while the multiplexed connection remains open, so connection
+        # teardown cannot forge the server-side cancellation observation.
+        while (time.monotonic() < deadline
+               and not cancellation_logged(error_log, error_log_offset)):
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+        server_cancelled_stream1 = cancellation_logged(error_log,
+                                                        error_log_offset)
+        if not server_cancelled_stream1:
+            raise RuntimeError("server did not record stream 1 cancellation")
 finally:
     try:
         sock.close()
@@ -212,6 +271,9 @@ print("STREAM3_DATA_BEFORE_RST=%d" % before[3])
 print("STREAM1_ENDED_BEFORE_RST=%d" % int(ended_before[1]))
 print("STREAM3_ENDED_BEFORE_RST=%d" % int(ended_before[3]))
 print("RST_SENT=%d" % rst_code)
+print("STREAM1_DATA_AFTER_RST=%d" % after_stream1)
+print("STREAM1_ENDED_AFTER_RST=%d" % int(stream1_ended_after))
+print("STREAM1_CANCELLED_BY_SERVER=%d" % int(server_cancelled_stream1))
 print("STREAM3_DATA_AFTER_RST=%d" % after_stream3)
 print("STREAM3_ENDED_AFTER_RST=%d" % int(stream3_ended))
 PY
@@ -258,6 +320,9 @@ stream3_before="$(field STREAM3_DATA_BEFORE_RST)"
 stream1_ended="$(field STREAM1_ENDED_BEFORE_RST)"
 stream3_ended_before="$(field STREAM3_ENDED_BEFORE_RST)"
 rst_sent="$(field RST_SENT)"
+stream1_after="$(field STREAM1_DATA_AFTER_RST)"
+stream1_ended_after="$(field STREAM1_ENDED_AFTER_RST)"
+stream1_cancelled_by_server="$(field STREAM1_CANCELLED_BY_SERVER)"
 stream3_after="$(field STREAM3_DATA_AFTER_RST)"
 stream3_ended_after="$(field STREAM3_ENDED_AFTER_RST)"
 
@@ -287,10 +352,11 @@ else
 fi
 
 if [ "$rst_sent" = 8 ] && positive_integer "$stream1_before" \
-   && [ "$stream1_ended" = 0 ]; then
-    echo "ok 3 - active stream 1 was cancelled with RST_STREAM CANCEL (code 8)"
+   && [ "$stream1_ended" = 0 ] && [ "$stream1_ended_after" = 0 ] \
+   && [ "$stream1_cancelled_by_server" = 1 ]; then
+    echo "ok 3 - server acted on RST_STREAM CANCEL for active stream 1 (code 8; ${stream1_after:-0} queued DATA bytes drained)"
 else
-    echo "not ok 3 - active stream cancellation stimulus was not delivered (RST=${rst_sent:-<missing>})"
+    echo "not ok 3 - active stream cancellation was not observed by the server (RST=${rst_sent:-<missing>}, ended=${stream1_ended_after:-<missing>}, server=${stream1_cancelled_by_server:-<missing>})"
     FAILED=$((FAILED + 1))
 fi
 
