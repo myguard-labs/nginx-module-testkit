@@ -20,6 +20,7 @@ set -euo pipefail
 
 HOST=127.0.0.1
 PORT="$PROBER_RESOLVED_PORT"
+PAYLOAD_SIZE=262144
 FAILED=0
 
 SNAP_FDS=""
@@ -80,7 +81,8 @@ run_h2_client() {
     fi
 
     H="$HOST" P="$PORT" MODE="$mode" PHASE_TIMEOUT="$phase_timeout" \
-        ERROR_LOG="$PROBER_PREFIX/logs/error.log" \
+        PAYLOAD_SIZE="$PAYLOAD_SIZE" \
+        LIFECYCLE_LOG="$PROBER_PREFIX/logs/h2-lifecycle.log" \
         timeout "$outer_timeout" python3 - <<'PY'
 import os
 import socket
@@ -90,7 +92,8 @@ host = os.environ["H"]
 port = int(os.environ["P"])
 mode = os.environ["MODE"]
 phase_timeout = float(os.environ["PHASE_TIMEOUT"])
-error_log = os.environ["ERROR_LOG"]
+lifecycle_log = os.environ["LIFECYCLE_LOG"]
+payload_size = int(os.environ["PAYLOAD_SIZE"])
 
 
 def frame(frame_type, flags, stream_id, payload=b""):
@@ -132,16 +135,46 @@ def recv_frame(sock, deadline):
             recv_exact(sock, length, deadline))
 
 
-def cancellation_logged(path, offset):
+def finalized_cancel_bytes(data):
+    for line in data.splitlines():
+        fields = line.split(b"|", 1)
+        if len(fields) != 2:
+            continue
+        uri, sent_text = fields
+        if uri != b"/cancel.bin":
+            continue
+        try:
+            sent = int(sent_text)
+        except ValueError:
+            continue
+        if 0 < sent < payload_size:
+            return sent
+    return None
+
+
+def verify_lifecycle_parser():
+    cases = (
+        (b"/cancel.bin|65535\n", 65535),
+        (b"/cancel.bin|262144\n", None),
+        (b"/survive.bin|65535\n", None),
+        (b"/cancel.bin|invalid\n", None),
+    )
+    for data, expected in cases:
+        if finalized_cancel_bytes(data) != expected:
+            raise RuntimeError("lifecycle log parser control failed")
+
+
+def read_finalized_cancel_bytes(path, offset):
     try:
         with open(path, "rb") as log:
             log.seek(offset)
             appended = log.read()
     except FileNotFoundError:
-        return False
-    return any(b"client canceled stream 1" in line
-               and b'request: "GET /cancel.bin HTTP/2.0"' in line
-               for line in appended.splitlines())
+        return None
+    return finalized_cancel_bytes(appended)
+
+
+verify_lifecycle_parser()
 
 
 server_settings = False
@@ -154,6 +187,7 @@ stream3_ended = False
 after_stream1 = 0
 stream1_ended_after = False
 server_cancelled_stream1 = False
+stream1_finalized_bytes = -1
 
 try:
     sock = socket.create_connection((host, port), phase_timeout)
@@ -206,9 +240,9 @@ try:
             raise RuntimeError("a stream ended before the cancellation point")
 
         try:
-            error_log_offset = os.path.getsize(error_log)
+            lifecycle_log_offset = os.path.getsize(lifecycle_log)
         except FileNotFoundError:
-            error_log_offset = 0
+            lifecycle_log_offset = 0
 
         rst_payload = (8).to_bytes(4, "big")  # RFC 9113 CANCEL
         rst = frame(3, 0, 1, rst_payload)
@@ -248,16 +282,21 @@ try:
         if not stream3_ended:
             raise RuntimeError("surviving stream did not reach END_STREAM")
 
-        # The server logs this only after it has parsed and acted on RST_STREAM.
-        # Poll while the multiplexed connection remains open, so connection
-        # teardown cannot forge the server-side cancellation observation.
-        while (time.monotonic() < deadline
-               and not cancellation_logged(error_log, error_log_offset)):
+        # Access logging happens when the request is finalized.  Stream 1 has
+        # no post-reset flow-control credit and therefore cannot finish its
+        # 256 KiB body normally.  A partial finalization record while this
+        # connection remains open is portable evidence that the server acted
+        # on RST_STREAM; connection teardown cannot forge it.
+        while time.monotonic() < deadline:
+            finalized = read_finalized_cancel_bytes(lifecycle_log,
+                                                    lifecycle_log_offset)
+            if finalized is not None:
+                stream1_finalized_bytes = finalized
+                break
             time.sleep(min(0.01, max(0, deadline - time.monotonic())))
-        server_cancelled_stream1 = cancellation_logged(error_log,
-                                                        error_log_offset)
+        server_cancelled_stream1 = stream1_finalized_bytes > 0
         if not server_cancelled_stream1:
-            raise RuntimeError("server did not record stream 1 cancellation")
+            raise RuntimeError("server did not finalize cancelled stream 1")
 finally:
     try:
         sock.close()
@@ -274,6 +313,7 @@ print("RST_SENT=%d" % rst_code)
 print("STREAM1_DATA_AFTER_RST=%d" % after_stream1)
 print("STREAM1_ENDED_AFTER_RST=%d" % int(stream1_ended_after))
 print("STREAM1_CANCELLED_BY_SERVER=%d" % int(server_cancelled_stream1))
+print("STREAM1_FINALIZED_BODY_BYTES=%d" % stream1_finalized_bytes)
 print("STREAM3_DATA_AFTER_RST=%d" % after_stream3)
 print("STREAM3_ENDED_AFTER_RST=%d" % int(stream3_ended))
 PY
@@ -289,7 +329,7 @@ positive_integer() {
 }
 
 # Create the response body before either h2 connection asks for it.
-dd if=/dev/zero of="$PROBER_PREFIX/payload.bin" bs=262144 count=1 status=none
+dd if=/dev/zero of="$PROBER_PREFIX/payload.bin" bs="$PAYLOAD_SIZE" count=1 status=none
 
 warmup_rc=0
 run_h2_client warmup >/dev/null 2>"$PROBER_PREFIX/h2-warmup.err" || warmup_rc=$?
@@ -323,6 +363,7 @@ rst_sent="$(field RST_SENT)"
 stream1_after="$(field STREAM1_DATA_AFTER_RST)"
 stream1_ended_after="$(field STREAM1_ENDED_AFTER_RST)"
 stream1_cancelled_by_server="$(field STREAM1_CANCELLED_BY_SERVER)"
+stream1_finalized_bytes="$(field STREAM1_FINALIZED_BODY_BYTES)"
 stream3_after="$(field STREAM3_DATA_AFTER_RST)"
 stream3_ended_after="$(field STREAM3_ENDED_AFTER_RST)"
 
@@ -353,10 +394,12 @@ fi
 
 if [ "$rst_sent" = 8 ] && positive_integer "$stream1_before" \
    && [ "$stream1_ended" = 0 ] && [ "$stream1_ended_after" = 0 ] \
-   && [ "$stream1_cancelled_by_server" = 1 ]; then
-    echo "ok 3 - server acted on RST_STREAM CANCEL for active stream 1 (code 8; ${stream1_after:-0} queued DATA bytes drained)"
+   && [ "$stream1_cancelled_by_server" = 1 ] \
+   && positive_integer "$stream1_finalized_bytes" \
+   && [ "$stream1_finalized_bytes" -lt "$PAYLOAD_SIZE" ]; then
+    echo "ok 3 - server finalized stream 1 after RST_STREAM CANCEL (code 8; ${stream1_after:-0} queued DATA bytes drained; $stream1_finalized_bytes body bytes sent)"
 else
-    echo "not ok 3 - active stream cancellation was not observed by the server (RST=${rst_sent:-<missing>}, ended=${stream1_ended_after:-<missing>}, server=${stream1_cancelled_by_server:-<missing>})"
+    echo "not ok 3 - active stream cancellation was not observed by the server (RST=${rst_sent:-<missing>}, ended=${stream1_ended_after:-<missing>}, server=${stream1_cancelled_by_server:-<missing>}, finalized_bytes=${stream1_finalized_bytes:-<missing>})"
     FAILED=$((FAILED + 1))
 fi
 

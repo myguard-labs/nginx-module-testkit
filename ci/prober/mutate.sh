@@ -1544,10 +1544,16 @@ mutate "h2-stream-cancel: server-side cancellation readback is required" \
     'print("STREAM1_CANCELLED_BY_SERVER=%d" % 0)' \
     scenarios/h2-stream-cancel/mutate-suite.sh
 
-mutate "h2-stream-cancel: cancellation log matcher reads the server outcome" \
+mutate "h2-stream-cancel: lifecycle log matcher reads the cancelled request" \
     scenarios/h2-stream-cancel/driver.sh \
-    '    return any(b"client canceled stream 1" in line' \
-    '    return any(b"client completed stream 1" in line' \
+    '        if uri != b"/cancel.bin":' \
+    '        if uri != b"/survive.bin":' \
+    scenarios/h2-stream-cancel/mutate-suite.sh
+
+mutate "h2-stream-cancel: normal completion cannot satisfy cancellation" \
+    scenarios/h2-stream-cancel/driver.sh \
+    '        if 0 < sent < payload_size:' \
+    '        if sent == payload_size:' \
     scenarios/h2-stream-cancel/mutate-suite.sh
 
 mutate "h2-stream-cancel: cancelled stream cannot complete after reset" \
