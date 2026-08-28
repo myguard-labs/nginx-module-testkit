@@ -1,0 +1,10 @@
+# This scenario asserts slab-page neutrality (one of the three worker-inside
+# oracles the H2-3 done criterion names), which needs a REAL shm zone -- the
+# reference module takes none by default (t/module/ngx_http_test_ref_module.c),
+# so `test_ref_zone` is the opt-in, same as zone-name-escaping's env. The name
+# and size carry no significance to this scenario (nothing here exercises
+# escaping or exhaustion); 1m is comfortably larger than anything a rejected
+# h2 frame could touch, and any growth would itself be the leak this scenario
+# is built to catch.
+PROBER_PROBE="test_ref_probe;"
+PROBER_PROBE_ZONE='test_ref_zone h2_hostile_framing 1m;'

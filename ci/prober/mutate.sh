@@ -1360,6 +1360,46 @@ mutate "h2: the request path is never taken from the request line" h2.c \
     '    *path = sp1;' \
     scenarios/h2-roundtrip/mutate-suite.sh
 
+# ---- hostile h2 framing oracles (H2-3) --------------------------------------
+#
+# Every row here targets scenarios/h2-hostile-framing/driver.sh itself, not
+# nginx's own h2 module -- that module is not this repo's code, so the thing
+# with a claim to falsify is the harness's OWN before/after readback, exactly
+# the shape reload-idle-keepalive's drain-ordering row uses (see its comment
+# for why mutating a driver.sh is the right target when the suite IS the
+# assertion). A weakened COMPARISON (`=` loosened, or an `if true`) cannot be
+# caught here: the three attacks are genuinely neutral against a correct
+# nginx, so a vacuous comparison and a real one both exit 0 against the SAME
+# unmutated server -- MEASURED 2026-08-28 by hand (an `if true` stand-in for
+# each of the three fd/pool/slab checks stayed green). What DOES falsify the
+# claim is corrupting the READBACK the comparison runs on: bump the `after`
+# reading by one so a genuinely neutral run now disagrees with itself, and
+# require the case that oracle backs to go red.
+# SC2016: each single-quoted string below is a line of driver.sh's own bash
+# being patched, not a shell expansion at THIS file's parse time -- must stay
+# literal, same discipline as property-fuzz's and stateful-property-fuzz's
+# rows above.
+# shellcheck disable=SC2016
+mutate "h2-hostile: fd-neutrality readback never compares reality" \
+    scenarios/h2-hostile-framing/driver.sh \
+    'after_fds="$SNAP_FDS"; after_pool="$SNAP_POOL"; after_slab="$SNAP_SLAB"' \
+    'after_fds="$((SNAP_FDS + 1))"; after_pool="$SNAP_POOL"; after_slab="$SNAP_SLAB"' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: cycle-pool-neutrality readback never compares reality" \
+    scenarios/h2-hostile-framing/driver.sh \
+    'after_fds="$SNAP_FDS"; after_pool="$SNAP_POOL"; after_slab="$SNAP_SLAB"' \
+    'after_fds="$SNAP_FDS"; after_pool="$((SNAP_POOL + 1))"; after_slab="$SNAP_SLAB"' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: slab-page-neutrality readback never compares reality" \
+    scenarios/h2-hostile-framing/driver.sh \
+    'after_fds="$SNAP_FDS"; after_pool="$SNAP_POOL"; after_slab="$SNAP_SLAB"' \
+    'after_fds="$SNAP_FDS"; after_pool="$SNAP_POOL"; after_slab="$((SNAP_SLAB + 1))"' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
 # ---- probe schema -----------------------------------------------------------
 
 # The schema exists to catch emitter drift on fields no rule happens to name,

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# H2-HOSTILE-FRAMING GATE. Narrower than h2-roundtrip/requires: this scenario's
+# listener carries no `ssl`, so only ngx_http_v2_module has to be linked --
+# ngx_http_ssl_module is irrelevant to a prior-knowledge h2c connection. See
+# h2-roundtrip/requires for the full 2026-08-27 measurement backing the
+# strings(1)-anchored-match technique this copies (same reasoning applies
+# here: `grep h2` would match nginx's own `http2` directive-name string even
+# on a build that never linked the module).
+#
+# python3 is the second requirement: driver.sh hand-crafts raw HTTP/2 frames
+# (illegal stream ids, flow-control overflow, RST_STREAM on an idle stream) --
+# bytes no HTTP/1-shaped bash /dev/tcp write and no well-behaved h2 client
+# library would ever construct on purpose. bash has no clean way to emit
+# fixed-width big-endian binary integers; python3's struct/bytes primitives are
+# already an established driver.sh dependency in this tree (clock-jump,
+# reload-compressing).
+set -eu
+
+FLAVOR="${2:-nginx}"
+VERSION="${3:-1.31.3}"
+
+# Same build-resolution as every other gate; see h2-roundtrip/requires for why
+# this must match ci/prober/lib.sh's PROBER_ROOT fallback exactly.
+BUILD="${PROBER_BUILD:-${PROBER_ROOT:-$(cd ../.. && pwd)}/.build/${FLAVOR}-${VERSION}}"
+
+BIN="$BUILD/objs/nginx"
+[ -x "$BIN" ] || BIN="$BUILD/objs/angie"
+
+if [ ! -x "$BIN" ]; then
+    echo "no server binary under $BUILD/objs -- nothing to gate on"
+    exit 1
+fi
+
+command -v strings >/dev/null 2>&1 || {
+    echo "strings(1) not found (install binutils) -- no way to ask the binary whether ngx_http_v2_module is linked"
+    exit 1
+}
+
+if ! strings "$BIN" 2>/dev/null | grep -qx 'ngx_http_v2_module'; then
+    echo "$BIN was built without ngx_http_v2_module (nginx defaults HTTP_V2=NO; needs --with-http_v2_module explicitly) -- rebuild with it to run the h2 hostile-framing scenario"
+    exit 1
+fi
+
+command -v python3 >/dev/null 2>&1 || {
+    echo "python3 not found -- driver.sh needs it to hand-craft raw HTTP/2 frames"
+    exit 1
+}
+
+exit 0
