@@ -1436,6 +1436,31 @@ mutate "h2-hostile: WINDOW_UPDATE overflow mutated to a legal increment" \
     'ATTACK_B="00000408000000000000000001"' \
     scenarios/h2-hostile-framing/mutate-suite.sh
 
+# Attack C's HPACK Dynamic Table Size Update changes from 4097, one byte above
+# the default 4096-byte SETTINGS_HEADER_TABLE_SIZE limit, to the exact legal
+# 4096-byte boundary. Frame shape and the GET that follows are unchanged, so
+# the HPACK decoder is the only thing that stops this from being an ordinary
+# request. A conformant server must not send GOAWAY for the legal boundary;
+# run_attack_case's delivery assertion therefore goes red only if the C attack
+# remains bound to the claimed hostile dynamic-table update.
+# shellcheck disable=SC2016
+mutate "h2-hostile: HPACK dynamic-table update mutated to the legal limit" \
+    scenarios/h2-hostile-framing/driver.sh \
+    'ATTACK_C="00000e0105000000013fe21f${HPACK_MINIMAL_GET}"' \
+    'ATTACK_C="00000e0105000000013fe11f${HPACK_MINIMAL_GET}"' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# A GOAWAY frame alone is not the HPACK contract: the standard requires the
+# error code COMPRESSION_ERROR (9). Mutating the required code to PROTOCOL_ERROR
+# must red the named HPACK delivery oracle while leaving the hostile bytes and
+# server response untouched.
+# shellcheck disable=SC2016
+mutate "h2-hostile: HPACK GOAWAY must carry COMPRESSION_ERROR" \
+    scenarios/h2-hostile-framing/driver.sh \
+    'run_attack_case "HPACK dynamic-table update above the 4096-byte limit" "$ATTACK_C" 9' \
+    'run_attack_case "HPACK dynamic-table update above the 4096-byte limit" "$ATTACK_C" 1' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
 # ---- probe schema -----------------------------------------------------------
 
 # The schema exists to catch emitter drift on fields no rule happens to name,

@@ -24,8 +24,8 @@
 # "the worker rejected this frame and leaked a descriptor/pool block/slab page
 # doing it" reading as a pass.
 #
-# WHY TWO ATTACKS AND NOT SEVEN. The roadmap row lists seven hostile shapes.
-# Five are not here. Four (oversized/zero-length frames, CONTINUATION without
+# WHY THREE ATTACKS AND NOT SEVEN. The roadmap row lists seven hostile shapes.
+# Four are not here. Four (oversized/zero-length frames, CONTINUATION without
 # END_HEADERS, SETTINGS floods) each need either a real, fully-negotiated
 # request in flight first or a multi-frame sequence whose ordering matters --
 # more moving parts than a single malformed frame on a fresh connection, and
@@ -40,8 +40,8 @@
 # from "nginx silently discarded a frame for a stream id it has no interest
 # in, illegal or not" -- there is no oracle, worker-inside or on the wire, an
 # admissible row could assert on. A follow-up row is the honest way to grow
-# this file with the five remaining shapes, not a bigger diff now with a case
-# that cannot fail. The two shipped here are each a SINGLE frame, each
+# this file with the four remaining shapes, not a bigger diff now with a case
+# that cannot fail. The three attacks here are each a SINGLE frame, each
 # unambiguously illegal under RFC 9113, and each MEASURED to make nginx answer
 # with a GOAWAY:
 #
@@ -53,6 +53,14 @@
 #      that overflows a 31-bit signed value is a connection error
 #      (FLOW_CONTROL_ERROR). The default initial window is 65535, so a single
 #      increment of 0x7fffffff (2147483647) already overflows it in one frame.
+#   C. A Dynamic Table Size Update of 4097 bytes at the start of a HEADERS
+#      block. RFC 7541 SS6.3 caps that update at the peer's advertised decoder
+#      limit; with no SETTINGS_HEADER_TABLE_SIZE override, HTTP/2 starts at
+#      4096 bytes (RFC 9113 SS4.3.1). This update is therefore an HPACK
+#      decoding error, which RFC 9113 SS4.3 requires to be a connection-level
+#      COMPRESSION_ERROR. The test includes an otherwise ordinary GET after
+#      the update, so it reaches the decoder rather than failing on an empty
+#      or structurally malformed header block.
 #
 # WHY RAW PYTHON SOCKETS AND NOT h2.c. h2_exchange() is built on the system
 # nghttp2 CLIENT session, which enforces frame validity on its own outgoing
@@ -110,6 +118,8 @@ SNAP_SLAB=""
 #                      response (may be empty even on DELIVERY_OK -- a
 #                      connection that hung up with no bytes back is still a
 #                      completed send). A frame type of 7 is GOAWAY.
+#   ATTACK_GOAWAY_ERRORS comma-separated HTTP/2 error codes from complete
+#                      GOAWAY payloads (empty if no complete GOAWAY arrived).
 send_attack() {
     local hex_frame="$1" out rc=0
 
@@ -146,14 +156,22 @@ finally:
     s.close()
 
 types = []
+goaway_errors = []
 i = 0
 while i + 9 <= len(data):
     length = int.from_bytes(data[i:i + 3], "big")
-    types.append(str(data[i + 3]))
-    i += 9 + length
+    frame_type = data[i + 3]
+    end = i + 9 + length
+    if end > len(data):
+        break
+    types.append(str(frame_type))
+    if frame_type == 7 and length >= 8:
+        goaway_errors.append(str(int.from_bytes(data[i + 13:i + 17], "big")))
+    i = end
 
 print("DELIVERY_OK")
 print(",".join(types))
+print(",".join(goaway_errors))
 PY
 )" || rc=$?
 
@@ -165,11 +183,13 @@ PY
         ATTACK_STATUS="${out%%$'\n'*}"
         [ -n "$ATTACK_STATUS" ] || ATTACK_STATUS="DELIVERY_FAIL:python3 exited $rc with no output"
         ATTACK_RESP_TYPES=""
+        ATTACK_GOAWAY_ERRORS=""
         return 1
     fi
 
     ATTACK_STATUS="$(printf '%s\n' "$out" | sed -n '1p')"
     ATTACK_RESP_TYPES="$(printf '%s\n' "$out" | sed -n '2p')"
+    ATTACK_GOAWAY_ERRORS="$(printf '%s\n' "$out" | sed -n '3p')"
 }
 
 # csv_contains CSV VALUE -- true if VALUE is one of CSV's comma-separated
@@ -207,6 +227,16 @@ ATTACK_A="00000b010500000002${HPACK_MINIMAL_GET}"
 #   increment value -- it is the ARITHMETIC that is illegal, not the encoding:
 #   65535 (default initial window) + 2147483647 > 2^31-1)
 ATTACK_B="0000040800000000007fffffff"
+
+# Attack C: HEADERS, stream 1, with the standard minimal GET after a Dynamic
+# Table Size Update. HPACK encodes an update with the 001 prefix and a 5-bit
+# integer. 4097 is `3f e2 1f`: 31 in the prefix, then (4097 - 31) as a base-128
+# continuation integer (0xe2, 0x1f). The 4096-byte peer limit makes only that
+# number hostile; `3f e1 1f` is the conformant 4096 boundary used by the
+# mutation control below. The total HPACK block is 14 bytes.
+#   length = 00000e, type = 01, flags = 05, stream = 00000001
+#   payload = 3fe21f + HPACK_MINIMAL_GET
+ATTACK_C="00000e0105000000013fe21f${HPACK_MINIMAL_GET}"
 
 
 # --- worker-inside evidence --------------------------------------------------
@@ -254,7 +284,7 @@ wait_quiescent() {
     return 1
 }
 
-# run_attack_case LABEL HEX_FRAME
+# run_attack_case LABEL HEX_FRAME [GOAWAY_ERROR]
 #
 # TAP numbering: the Nth call occupies test points (4N-3) delivery-confirmed,
 # (4N-2) neutral-fds, (4N-1) neutral-pool-bytes, (4N) neutral-slab-pages,
@@ -267,7 +297,7 @@ wait_quiescent() {
 # attack does not earn a GOAWAY needs its own delivery assertion, not a silent
 # third option threaded through this function ahead of having one.
 run_attack_case() {
-    local label="$1" hex="$2"
+    local label="$1" hex="$2" want_goaway_error="${3:-}"
     local before_fds before_pool before_slab
     local after_fds after_pool after_slab
     local delivered=1
@@ -284,10 +314,17 @@ run_attack_case() {
     # connect/sendall failure used to leave before==after trivially, which
     # read as "attack sent, worker neutral" for a harness that never touched
     # the server at all.
-    if [ "$delivered" -eq 1 ] && csv_contains "$ATTACK_RESP_TYPES" 7; then
-        echo "ok $((TP + 1)) - $label: server responded with GOAWAY (frame type 7)"
+    if [ "$delivered" -eq 1 ] && csv_contains "$ATTACK_RESP_TYPES" 7 \
+       && { [ -z "$want_goaway_error" ] \
+            || csv_contains "$ATTACK_GOAWAY_ERRORS" "$want_goaway_error"; }
+    then
+        if [ -n "$want_goaway_error" ]; then
+            echo "ok $((TP + 1)) - $label: server responded with GOAWAY COMPRESSION_ERROR (code $want_goaway_error)"
+        else
+            echo "ok $((TP + 1)) - $label: server responded with GOAWAY (frame type 7)"
+        fi
     elif [ "$delivered" -eq 1 ]; then
-        echo "not ok $((TP + 1)) - $label: no GOAWAY seen (types: ${ATTACK_RESP_TYPES:-<none>})"
+        echo "not ok $((TP + 1)) - $label: no expected GOAWAY seen (types: ${ATTACK_RESP_TYPES:-<none>}; errors: ${ATTACK_GOAWAY_ERRORS:-<none>})"
         FAILED=$((FAILED + 1))
     else
         echo "not ok $((TP + 1)) - $label: attack was never delivered ($ATTACK_STATUS)"
@@ -341,13 +378,14 @@ send_attack "$WARMUP" || echo "# warm-up: delivery failed ($ATTACK_STATUS) -- ba
 wait_quiescent || echo "# warm-up: baseline never settled; racing a moving reading"
 
 TP=0
-echo "1..8"
+echo "1..12"
 
-# Both were MEASURED (2026-08-28, this same server/build) to make nginx
+# All three were MEASURED (2026-08-28, this same server/build) to make nginx
 # answer with a GOAWAY (response types "4,8,4,7" for both), which is what
 # run_attack_case's delivery check asserts on.
 run_attack_case "HEADERS on an even (illegal) stream id" "$ATTACK_A"
 run_attack_case "WINDOW_UPDATE overflow at the connection level" "$ATTACK_B"
+run_attack_case "HPACK dynamic-table update above the 4096-byte limit" "$ATTACK_C" 9
 
 # --- the worker must still be the SAME worker, not a crash-and-respawn -----
 #
