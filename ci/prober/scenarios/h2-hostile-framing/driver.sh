@@ -95,6 +95,16 @@ IDLE_GOAWAY_ERRORS=""
 IDLE_PING_ACK=""
 IDLE_EOF=""
 
+MULTI_STATUS=""
+MULTI_NEGOTIATED=""
+MULTI_INFLIGHT=""
+MULTI_SENT_MARKER=""
+MULTI_GOAWAY_ERRORS=""
+MULTI_PING_ACK=""
+MULTI_SETTINGS_ACKS=""
+MULTI_MAX_FRAME=""
+MULTI_EOF=""
+
 # --- raw h2 attack delivery --------------------------------------------------
 #
 # send_attack HEX_FRAME
@@ -233,6 +243,7 @@ state = {
     "ping_ack": False,
     "eof": False,
 }
+
 status = "DELIVERY_OK"
 sent_hex = ""
 
@@ -350,6 +361,30 @@ PY
     fi
 }
 
+# Every H2-3c shape completes both SETTINGS legs and leaves request stream 1
+# in flight before sending one ordered multi-frame attack. multiframe.py emits
+# an exact digest of the bytes passed to sendall plus response readbacks.
+send_multiframe() {
+    local kind="$1" out rc=0
+
+    out="$(H="$HOST" P="$PORT" G="$HPACK_MINIMAL_GET" K="$kind" \
+        timeout 15 python3 "$(dirname "$0")/multiframe.py")" || rc=$?
+    MULTI_STATUS="$(printf '%s\n' "$out" | sed -n '1p')"
+    MULTI_NEGOTIATED="$(printf '%s\n' "$out" | sed -n '2p')"
+    MULTI_INFLIGHT="$(printf '%s\n' "$out" | sed -n '3p')"
+    MULTI_SENT_MARKER="$(printf '%s\n' "$out" | sed -n '4p')"
+    MULTI_GOAWAY_ERRORS="$(printf '%s\n' "$out" | sed -n '5p')"
+    MULTI_PING_ACK="$(printf '%s\n' "$out" | sed -n '6p')"
+    MULTI_SETTINGS_ACKS="$(printf '%s\n' "$out" | sed -n '7p')"
+    MULTI_MAX_FRAME="$(printf '%s\n' "$out" | sed -n '8p')"
+    MULTI_EOF="$(printf '%s\n' "$out" | sed -n '9p')"
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$MULTI_STATUS" ] \
+            || MULTI_STATUS="DELIVERY_FAIL:python3 exited $rc with no output"
+        return 1
+    fi
+}
+
 # csv_contains CSV VALUE -- true if VALUE is one of CSV's comma-separated
 # fields. Used to check for a GOAWAY (frame type 7) in ATTACK_RESP_TYPES
 # without a false match against a longer type number ("17" must not match
@@ -460,7 +495,7 @@ wait_quiescent() {
 # matching snapshot()'s ordinary failure behavior. A later matching success
 # must become the NEW predecessor, so settling is correct only on call four.
 if [ "${H2_HOSTILE_FRAMING_SELF_TEST:-0}" = 1 ]; then
-    echo "1..4"
+    echo "1..8"
 
     # Header declares an 8-byte GOAWAY payload but carries only its four-byte
     # last-stream-id field. It is not a complete frame and therefore must not
@@ -522,10 +557,34 @@ if [ "${H2_HOSTILE_FRAMING_SELF_TEST:-0}" = 1 ]; then
 
     if wait_quiescent && [ "$snapshot_calls" -eq 4 ]; then
         echo "ok 4 - h2 settle: a failed snapshot cannot bridge two matching successes"
-        exit 0
+    else
+        echo "not ok 4 - h2 settle: failure-then-success settled after $snapshot_calls snapshots (expected 4)"
+        exit 1
     fi
-    echo "not ok 4 - h2 settle: failure-then-success settled after $snapshot_calls snapshots (expected 4)"
-    exit 1
+
+    multi_self=""
+    multi_rc=0
+    multi_self="$(H2_MULTIFRAME_SELF_TEST=1 \
+        python3 "$(dirname "$0")/multiframe.py")" || multi_rc=$?
+    for self_point in \
+        "5:SELFTEST_BOUNDARIES_OK:zero DATA plus exact and one-over PING boundaries" \
+        "6:SELFTEST_SHAPES_OK:all four ordered attack shapes" \
+        "7:SELFTEST_MALFORMED_OK:truncated response frame retention" \
+        "8:SELFTEST_ERROR_OK:unknown attack kind fails closed"
+    do
+        self_n="${self_point%%:*}"
+        self_rest="${self_point#*:}"
+        self_marker="${self_rest%%:*}"
+        self_label="${self_rest#*:}"
+        if [ "$multi_rc" -eq 0 ] \
+           && grep -qxF "$self_marker" <<<"$multi_self"; then
+            echo "ok $self_n - h2 multiframe helper: $self_label"
+        else
+            echo "not ok $self_n - h2 multiframe helper: $self_label (rc=$multi_rc; output=${multi_self:-<none>})"
+            exit 1
+        fi
+    done
+    exit 0
 fi
 
 # run_attack_case LABEL HEX_FRAME [GOAWAY_ERROR]
@@ -705,6 +764,84 @@ run_idle_rst_gap_case() {
     TP=$((TP + 5))
 }
 
+# run_multiframe_case LABEL KIND EXACT_MARKER RESPONSE
+#
+# Five points per ordered attack: exact wire delivery after negotiation with a
+# request in flight, a response readback unique to the attack, then the three
+# worker-inside resource-neutrality readings.
+run_multiframe_case() {
+    local label="$1" kind="$2" expected_marker="$3" response="$4"
+    local before_fds before_pool before_slab
+    local multi_after_fds multi_after_pool multi_after_slab delivered=1 readback=0
+
+    if ! wait_quiescent; then
+        echo "# $label: pre-attack snapshot never settled within 5s; attack skipped"
+        echo "not ok $((TP + 1)) - $label: delivery unavailable (no stable baseline)"
+        echo "not ok $((TP + 2)) - $label: response unavailable (no stable baseline)"
+        echo "not ok $((TP + 3)) - $label: fd neutrality unavailable (no stable baseline)"
+        echo "not ok $((TP + 4)) - $label: cycle-pool neutrality unavailable (no stable baseline)"
+        echo "not ok $((TP + 5)) - $label: slab-page neutrality unavailable (no stable baseline)"
+        FAILED=$((FAILED + 5)); TP=$((TP + 5)); return
+    fi
+    before_fds="$SNAP_FDS"; before_pool="$SNAP_POOL"; before_slab="$SNAP_SLAB"
+
+    if ! send_multiframe "$kind"; then delivered=0; fi
+    echo "# $label: $MULTI_STATUS; marker=${MULTI_SENT_MARKER:-<none>}; GOAWAY=${MULTI_GOAWAY_ERRORS:-<none>}; ping_ack=${MULTI_PING_ACK:-?}; settings_acks=${MULTI_SETTINGS_ACKS:-?}; max_frame=${MULTI_MAX_FRAME:-?}; eof=${MULTI_EOF:-?}"
+    if [ "$delivered" -eq 1 ] && [ "$MULTI_NEGOTIATED" = 1 ] \
+       && [ "$MULTI_INFLIGHT" = 1 ] \
+       && [ "$MULTI_SENT_MARKER" = "$expected_marker" ]; then
+        echo "ok $((TP + 1)) - $label: exact ordered attack followed negotiation with request stream 1 in flight"
+    else
+        echo "not ok $((TP + 1)) - $label: ordered delivery unproven (negotiated=${MULTI_NEGOTIATED:-?}; inflight=${MULTI_INFLIGHT:-?}; max_frame=${MULTI_MAX_FRAME:-?}; marker=${MULTI_SENT_MARKER:-<none>})"
+        FAILED=$((FAILED + 1))
+    fi
+
+    case "$response" in
+        goaway-1) csv_contains "$MULTI_GOAWAY_ERRORS" 1 && readback=1 ;;
+        goaway-6) csv_contains "$MULTI_GOAWAY_ERRORS" 6 && readback=1 ;;
+        settings-129)
+            [ "$MULTI_PING_ACK" = 1 ] \
+                && [ "$MULTI_SETTINGS_ACKS" = 129 ] \
+                && [ -z "$MULTI_GOAWAY_ERRORS" ] \
+                && readback=1
+            ;;
+        ping)
+            [ "$MULTI_PING_ACK" = 1 ] \
+                && [ "$MULTI_SETTINGS_ACKS" = 1 ] \
+                && [ -z "$MULTI_GOAWAY_ERRORS" ] \
+                && readback=1
+            ;;
+    esac
+    if [ "$readback" -eq 1 ]; then
+        echo "ok $((TP + 2)) - $label: attack-specific response readback matched $response"
+    else
+        echo "not ok $((TP + 2)) - $label: response readback missed $response (GOAWAY=${MULTI_GOAWAY_ERRORS:-<none>}; ping_ack=${MULTI_PING_ACK:-?}; settings_acks=${MULTI_SETTINGS_ACKS:-?}; eof=${MULTI_EOF:-?})"
+        FAILED=$((FAILED + 1))
+    fi
+
+    if wait_quiescent; then
+        multi_after_fds="$SNAP_FDS"; multi_after_pool="$SNAP_POOL"; multi_after_slab="$SNAP_SLAB"
+    else
+        multi_after_fds="<unsettled>"; multi_after_pool="<unsettled>"; multi_after_slab="<unsettled>"
+    fi
+    if [ "$before_fds" = "$multi_after_fds" ]; then
+        echo "ok $((TP + 3)) - $label: fd count neutral ($before_fds)"
+    else
+        echo "not ok $((TP + 3)) - $label: fd count moved ($before_fds -> $multi_after_fds)"; FAILED=$((FAILED + 1))
+    fi
+    if [ "$before_pool" = "$multi_after_pool" ]; then
+        echo "ok $((TP + 4)) - $label: cycle-pool bytes neutral ($before_pool)"
+    else
+        echo "not ok $((TP + 4)) - $label: cycle-pool bytes moved ($before_pool -> $multi_after_pool)"; FAILED=$((FAILED + 1))
+    fi
+    if [ "$before_slab" = "$multi_after_slab" ]; then
+        echo "ok $((TP + 5)) - $label: slab pages neutral ($before_slab)"
+    else
+        echo "not ok $((TP + 5)) - $label: slab pages moved ($before_slab -> $multi_after_slab)"; FAILED=$((FAILED + 1))
+    fi
+    TP=$((TP + 5))
+}
+
 # A throwaway, entirely well-formed h2c connection (preface + client SETTINGS
 # + a valid GET on stream 1, END_HEADERS|END_STREAM) run ONCE before any
 # attack and never scored. MEASURED 2026-08-28: the first h2c connection this
@@ -721,7 +858,7 @@ send_attack "$WARMUP" || echo "# warm-up: delivery failed ($ATTACK_STATUS) -- ba
 wait_quiescent || echo "# warm-up: baseline never settled; racing a moving reading"
 
 TP=0
-echo "1..17"
+echo "1..37"
 
 # All three were MEASURED (2026-08-28, this same server/build) to make nginx
 # answer with a GOAWAY (response types "4,8,4,7" for both), which is what
@@ -730,6 +867,22 @@ run_attack_case "HEADERS on an even (illegal) stream id" "$ATTACK_A"
 run_attack_case "WINDOW_UPDATE overflow at the connection level" "$ATTACK_B"
 run_attack_case "HPACK dynamic-table update above the 4096-byte limit" "$ATTACK_C" 9
 run_idle_rst_gap_case
+run_multiframe_case "empty DATA then oversized PING on an active request" \
+    oversized-zero \
+    oversized-zero:61:e28c05bbd8d6f2641b7480dc5ad2f82ef218abdbb71d6b51202a214abc977800 \
+    goaway-6
+run_multiframe_case "CONTINUATION without END_HEADERS interrupted by PING" \
+    continuation \
+    continuation:37:49b5fd939f2947ae2c889e627fd7e099d59e4b799dae177ba2cd4b4eb272c009 \
+    goaway-1
+run_multiframe_case "128-frame SETTINGS flood" \
+    settings-flood \
+    settings-flood:1169:ba9d326662c4faf92c626ece80c989a3510c3c2c15bbed0e7429f4b6785f6f36 \
+    settings-129
+run_multiframe_case "33-stream RST_STREAM(CANCEL) storm" \
+    rst-storm \
+    rst-storm:1086:40926e971f926093a3ab255083ce7eca2de7a13b40bfca5e37aa4cc960a328d5 \
+    ping
 
 # --- the worker must still be the SAME worker, not a crash-and-respawn -----
 #

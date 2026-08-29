@@ -1643,6 +1643,85 @@ mutate "h2-hostile: idle-RST slab-page-neutrality readback never compares realit
     '        idle_after_fds="$SNAP_FDS"; idle_after_pool="$SNAP_POOL"; idle_after_slab="$((SNAP_SLAB + 1))"' \
     scenarios/h2-hostile-framing/mutate-suite.sh
 
+# ---- ordered multi-frame hostile h2 cases (H2-3c) --------------------------
+#
+# These rows pin the new H2-3c evidence in both layers: multiframe.py must send
+# the exact ordered byte flight for each shape, and driver.sh must reject missing
+# negotiation, missing request-in-flight state, missing response readback, and
+# corrupted worker-inside resource readings.
+
+mutate "h2-hostile: multi-frame zero/DATA boundary must include one-over PING" \
+    scenarios/h2-hostile-framing/multiframe.py \
+    '            + frame(6, 0, 0, b"oversized")' \
+    '            + frame(6, 0, 0, b"boundary")' \
+    h2_hostile_framing_parser_test.sh
+
+mutate "h2-hostile: multi-frame CONTINUATION must stay unfinished before PING" \
+    scenarios/h2-hostile-framing/multiframe.py \
+    '        return frame(1, 0, 3, b"\x82") + frame(9, 0, 3, b"\x84") + ping' \
+    '        return frame(1, 4, 3, b"\x82") + frame(9, 4, 3, b"\x84") + ping' \
+    h2_hostile_framing_parser_test.sh
+
+mutate "h2-hostile: multi-frame SETTINGS flood count cannot shrink" \
+    scenarios/h2-hostile-framing/multiframe.py \
+    '        return b"".join(frame(4, 0, 0) for _ in range(128)) + ping' \
+    '        return b"".join(frame(4, 0, 0) for _ in range(2)) + ping' \
+    h2_hostile_framing_parser_test.sh
+
+mutate "h2-hostile: multi-frame RST storm stream range cannot shrink" \
+    scenarios/h2-hostile-framing/multiframe.py \
+    '            for stream_id in range(1, 67, 2)' \
+    '            for stream_id in range(1, 5, 2)' \
+    h2_hostile_framing_parser_test.sh
+
+mutate "h2-hostile: multi-frame exact marker cannot be ignored" \
+    scenarios/h2-hostile-framing/multiframe.py \
+    '        marker = f"{kind}:{len(attack)}:{hashlib.sha256(attack).hexdigest()}"' \
+    '        marker = kind + ":" + str(len(attack)) + ":" + ("0" * 64)' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: multi-frame delivery requires completed negotiation" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '    MULTI_NEGOTIATED="$(printf '"'"'%s\n'"'"' "$out" | sed -n '"'"'2p'"'"')"' \
+    '    MULTI_NEGOTIATED=0' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: multi-frame delivery requires request in flight" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '    MULTI_INFLIGHT="$(printf '"'"'%s\n'"'"' "$out" | sed -n '"'"'3p'"'"')"' \
+    '    MULTI_INFLIGHT=0' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: multi-frame response readback cannot be skipped" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '        goaway-6) csv_contains "$MULTI_GOAWAY_ERRORS" 6 && readback=1 ;;' \
+    '        goaway-6) csv_contains "$MULTI_GOAWAY_ERRORS" 1 && readback=1 ;;' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: multi-frame fd-neutrality readback never compares reality" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '        multi_after_fds="$SNAP_FDS"; multi_after_pool="$SNAP_POOL"; multi_after_slab="$SNAP_SLAB"' \
+    '        multi_after_fds="$((SNAP_FDS + 1))"; multi_after_pool="$SNAP_POOL"; multi_after_slab="$SNAP_SLAB"' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: multi-frame cycle-pool-neutrality readback never compares reality" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '        multi_after_fds="$SNAP_FDS"; multi_after_pool="$SNAP_POOL"; multi_after_slab="$SNAP_SLAB"' \
+    '        multi_after_fds="$SNAP_FDS"; multi_after_pool="$((SNAP_POOL + 1))"; multi_after_slab="$SNAP_SLAB"' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: multi-frame slab-page-neutrality readback never compares reality" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '        multi_after_fds="$SNAP_FDS"; multi_after_pool="$SNAP_POOL"; multi_after_slab="$SNAP_SLAB"' \
+    '        multi_after_fds="$SNAP_FDS"; multi_after_pool="$SNAP_POOL"; multi_after_slab="$((SNAP_SLAB + 1))"' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
 # ---- ordinary h2 stream cancellation cleanup (H2-5) -----------------------
 #
 # The scenario owns both sides of the claim: exact RST_STREAM(CANCEL) bytes
