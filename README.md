@@ -63,9 +63,10 @@ green run proving nothing:
   reproducibly, so the ratio is a host-independent proxy for asymptotic
   complexity, which is why a wall-clock `expect time<ms` directive was
   considered and **rejected** (load- and host-dependent, flaky by construction).
-  Generalizing that ratio to a consumer's module, and counting per-request slab
-  allocations rather than only net occupancy, are both open — see "Ideas and
-  opportunities".
+  Generalizing that ratio to a consumer's module is still open. The
+  per-request slab allocation counter has graduated: `zone.slab_reqs` and
+  `zone.slab_used` are rendered by the probe and `alloc-per-request` asserts a
+  ceiling on request-local churn.
 - **[Memory corruption ASan cannot see](docs/attack-memory-corruption.md)** —
   `ngx_palloc_small()` is a bump allocator, so a pool holding two hundred small
   objects is ONE live allocation to AddressSanitizer and to valgrind. Their
@@ -2309,13 +2310,32 @@ test by any means available. This is the running list of means we do **not** yet
 have, kept here rather than in a private note so a consumer can see the shape of
 what is coming and argue for what they need.
 
-Each entry says what it would attack and what is missing today. None is
-committed work; a row graduates by becoming a scenario with a mutation-proven
-oracle. Ordered roughly by attack value per unit of effort.
+Each entry says what it would attack and what is missing today. A row graduates
+by becoming a scenario with a mutation-proven oracle. The table below is the
+public status contract; `ci/prober/capability_inventory_test.sh` fails if a row
+loses its scenario, probe field or blocker anchor.
 
-**Protocol surface we never exercise.** Every scenario speaks HTTP/1.1 cleartext.
-A module that touches request bodies, headers or connection state behaves
-differently under other protocols, and none of those paths are attacked:
+<!-- markdownlint-disable MD013 MD060 -->
+<!-- capability-inventory:start -->
+| Status | Capability | Evidence |
+|---|---|---|
+| shipped | hostile-input | `ci/prober/scenarios/property-fuzz`, `ci/prober/scenarios/stateful-property-fuzz`, and `ci/prober/scenarios/keepalive-bleed` own the hostile request generators and reader negative control. |
+| shipped | protocol-tls | `ci/prober/scenarios/tls-listener` exercises the TLS transport; ALPN protocol negotiation is covered by `ci/prober/scenarios/alpn-negotiation`. |
+| shipped | protocol-h2 | `ci/prober/scenarios/h2-roundtrip`, `ci/prober/scenarios/h2-hostile-framing`, and `ci/prober/scenarios/h2-stream-cancel` cover the current HTTP/2 transport, hostile-frame, and stream-cleanup claims. |
+| open | protocol-h3 | blocker: no QUIC/HTTP/3 transport leg or scenario exists yet. |
+| parked | protocol-stream | blocker: no stream-shaped consumer module is in scope yet. |
+| shipped | request-body-boundary | `ci/prober/scenarios/property-fuzz`, `rules/stock/short-body.rule`, `rules/stock/huge-content-length.rule`, and `rules/stock/chunked-trickle.rule` cover the graduated request-body boundary attacks. |
+| partial | lifecycle-fault-allocation | `ci/prober/scenarios/reload-mid-fault` covers upstream faults during reload; blocker: allocation-failure during lifecycle still needs a consumer `.so` with a real `fault_set` or `fault_set_global` site. |
+| shipped | alloc-counter | `ci/prober/scenarios/alloc-per-request`; probe field: `zone.slab_reqs` and `zone.slab_used`. |
+| open | cachegrind-consumer-ratio | blocker: no consumer hot function or whole-worker Cachegrind launch path is wired yet. |
+| open | cleanup-resolver-fields | blocker: no probe field exists yet for cleanup handlers or resolver state. |
+<!-- capability-inventory:end -->
+<!-- markdownlint-enable MD013 MD060 -->
+
+**Protocol surface beyond ordinary HTTP/1.1.** A module that touches request
+bodies, headers or connection state can behave differently under other
+protocols; the shipped rows below cover TLS and the current HTTP/2 attack set,
+while HTTP/3 remains open.
 
 - **TLS.** Shipped, both halves. The prober has a TLS client leg —
   `http_connect()` and `http_request()` take an optional `http_tls`, and
@@ -2337,10 +2357,12 @@ differently under other protocols, and none of those paths are attacked:
   something at the connection layer: the SSL handshake is a rich source of
   allocation-failure and lifecycle bugs, and nothing yet drives a fault into
   one.
-- **HTTP/2 and HTTP/3.** Different framing, different body delivery, different
-  connection lifecycle. A module correct on HTTP/1.1 can leak per-stream state
-  on h2. Larger effort (the prober's reader is HTTP/1.1-framed), but this is
-  where real production bugs live for anything stream-aware.
+- **HTTP/2.** Shipped for the current claim set. `h2-roundtrip` drives a
+  well-formed nghttp2-backed request over a live HTTP/2 listener,
+  `h2-hostile-framing` sends frames no well-behaved client would construct, and
+  `h2-stream-cancel` pins per-stream cleanup when one active stream is reset
+  while another continues.
+- **HTTP/3.** Open. No QUIC/HTTP/3 transport leg or scenario exists yet.
 - **`stream{}` (raw TCP/UDP).** Already parked pending a consumer that targets
   stream; the trigger to unpark is a stream-shaped module asking.
 
@@ -2403,16 +2425,11 @@ into a generator of concrete adversarial scenarios instead of a number to chase.
 - The `delta` oracles pin fds, pool bytes, slab and timers. A module can still
   leak in places nothing snapshots — cleanup handlers, resolver state. Each is
   a probe field somebody has to add before an oracle can assert on it.
-- **Allocation-count oracles.** Every memory oracle we have reads *net
-  occupancy*, which is blind to churn: ten thousand matched alloc/free pairs
-  per request net to zero and read as clean. A per-request slab
-  allocation/free **counter** in the probe turns that into a ceiling oracle —
-  not "must be 0" (a leak) but "must be <= K per request" (a bottleneck).
-  Cheapest row on this list: no new dependency, no new process, and
-  `scenarios/alloc-per-request` is already the shape. The counter itself needs
-  a hook or an interposition on the alloc path, where `fault_slab=` already
-  sits. Finds slab thrash and an allocation in a path that should reuse; blind
-  to anything CPU-bound at flat allocation.
+- **Allocation-count oracles.** Shipped for slab churn. `zone.slab_reqs` and
+  `zone.slab_used` expose cumulative allocation counters, and
+  `scenarios/alloc-per-request` asserts ceilings against those probe fields.
+  That finds slab thrash and an allocation in a path that should reuse; it is
+  still blind to anything CPU-bound at flat allocation.
 - **Cachegrind ratio, generalized to a consumer's module.** `perf/cachegrind-scale.sh`
   proves the technique on `json_parse_n`; the class it catches in a *module* is
   the per-request scan over a shm structure that goes quadratic as the zone

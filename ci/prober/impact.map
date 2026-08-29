@@ -70,6 +70,7 @@ PRIMARY	ci/prober/stale_so_test.sh	stale_so_test.sh	fast
 PRIMARY	ci/prober/check_conf_test.sh	check_conf_test.sh	fast
 PRIMARY	ci/prober/heap_env_test.sh	heap_env_test.sh	fast
 PRIMARY	ci/prober/docs_directives_test.sh	docs_directives_test.sh	fast
+PRIMARY	ci/prober/capability_inventory_test.sh	capability_inventory_test.sh	fast
 PRIMARY	ci/prober/schema_emitter_test.sh	schema_emitter_test.sh	fast
 PRIMARY	ci/prober/tls_test.sh	tls_test.sh	fast
 PRIMARY	ci/prober/h2_hostile_framing_parser_test.sh	h2_hostile_framing_parser_test.sh	fast
@@ -197,6 +198,9 @@ SEMANTIC	src/ngx_test_probe_arm.c	t/*	fast
 SEMANTIC	src/ngx_test_probe.c	schema_test	fast
 SEMANTIC	src/ngx_test_probe.c	scenarios/*	fast
 SEMANTIC	probe-schema.json	schema_test	fast
+SEMANTIC	README.md	capability_inventory_test.sh	fast
+SEMANTIC	docs/README.md	capability_inventory_test.sh	fast
+SEMANTIC	docs/attack-hostile-input.md	capability_inventory_test.sh	fast
 
 # --- SEMANTIC: the selector's own inputs. impact.map and verify-impact are
 # proven by their own self-test, not by any unit/fuzz/scenario target above.

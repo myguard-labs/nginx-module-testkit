@@ -1502,6 +1502,15 @@ mutate "h2-hostile: failed settle snapshot cannot retain stale predecessor" \
             prev_slab="${SNAP_SLAB:-}"' \
     h2_hostile_framing_parser_test.sh
 
+# ---- public capability inventory ------------------------------------------
+
+bt='`'
+mutate "capability inventory: shipped HTTP/2 row cannot claim open" \
+    ../../README.md \
+    "| shipped | protocol-h2 | ${bt}ci/prober/scenarios/h2-roundtrip${bt}, ${bt}ci/prober/scenarios/h2-hostile-framing${bt}, and ${bt}ci/prober/scenarios/h2-stream-cancel${bt} cover the current HTTP/2 transport, hostile-frame, and stream-cleanup claims. |" \
+    "| open | protocol-h2 | ${bt}ci/prober/scenarios/h2-roundtrip${bt}, ${bt}ci/prober/scenarios/h2-hostile-framing${bt}, and ${bt}ci/prober/scenarios/h2-stream-cancel${bt} cover the current HTTP/2 transport, hostile-frame, and stream-cleanup claims. |" \
+    capability_inventory_test.sh
+
 # ---- idle-stream RST_STREAM known-gap evidence (H2-3b) ---------------------
 #
 # The peer's real non-conformance is itself the observed-red control for the
