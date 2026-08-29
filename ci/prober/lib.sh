@@ -209,10 +209,10 @@ prober_detect_load() {
 # Exports ASAN_OPTIONS always, MALLOC_PERTURB_/MALLOC_CHECK_ on unsanitized
 # builds.
 #
-# nginx never frees its configuration pool, so LeakSanitizer reports the whole
-# config parse as leaked on `nginx -t` and on every clean shutdown -- against an
-# ASan build that turns the config test into a "Bail out!" before a single case
-# runs. Everything else ASan catches (use-after-free, overflow) stays on.
+# LeakSanitizer stays enabled for the real server. nginx never frees its
+# configuration pool, though, so prober_boot overrides detect_leaks=0 for its
+# `nginx -t` invocation only. Everything else ASan catches (use-after-free,
+# overflow) stays on in both invocations.
 #
 # detect_odr_violation=0 is disabled for the same reason: a dynamic module and
 # the nginx binary each carry their own generated *_modules.c defining the
@@ -239,7 +239,7 @@ prober_detect_load() {
 # under ASan). Such an assertion must be skipped there, visibly -- widening its
 # band until the sanitizer fits would leave a gate that can no longer fail.
 prober_heap_env() {
-    export ASAN_OPTIONS="detect_leaks=0:detect_odr_violation=0:halt_on_error=1:abort_on_error=1${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
+    export ASAN_OPTIONS="detect_leaks=1:detect_odr_violation=0:halt_on_error=1:abort_on_error=1${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
 
     if grep -qa '__asan_\|__ubsan_' "$PROBER_SERVER_BIN"; then
         export PROBER_SANITIZED=1
@@ -1404,7 +1404,12 @@ prober_boot() {
              "$PROBER_RESOLVED_PORT is free before boot"
     fi
 
-    if ! "$PROBER_SERVER_BIN" -t -p "$PROBER_PREFIX" -c conf/nginx.conf \
+    # LeakSanitizer sees nginx's intentionally process-lifetime configuration
+    # pool as leaked under -t. Append the override so it wins even when the
+    # caller supplied a detect_leaks setting; the real launch below inherits
+    # prober_heap_env's unchanged detect_leaks=1 default.
+    if ! ASAN_OPTIONS="${ASAN_OPTIONS:-}:detect_leaks=0" \
+        "$PROBER_SERVER_BIN" -t -p "$PROBER_PREFIX" -c conf/nginx.conf \
         >"$PROBER_PREFIX/logs/conftest" 2>&1; then
         echo "Bail out! config test failed:"
         sed 's/^/# /' "$PROBER_PREFIX/logs/conftest"

@@ -2862,9 +2862,10 @@ the compile-against-real-nginx/angie jobs and the live prober run.
   gains without being declared is also red. Adding a member to the probe means
   adding it to the schema.
 - **Measure the cycle pool, not the request pool.** See above.
-- **ASan needs `detect_leaks=0`.** nginx never frees its configuration pool, so
-  LeakSanitizer reports the whole config parse as leaked and turns `nginx -t`
-  into a bail-out. Everything else ASan catches stays on.
+- **ASan config checks need `detect_leaks=0`.** nginx never frees its
+  configuration pool, so LeakSanitizer reports the whole config parse as
+  leaked and turns `nginx -t` into a bail-out. `prober_boot` scopes that
+  override to `nginx -t`; the real server keeps leak detection enabled.
 
 ## Never ship it
 

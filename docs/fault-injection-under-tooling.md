@@ -20,15 +20,15 @@ order they were actually hit, with the measurements that settled each one.
 | Tool | Sees a leak on an error path? | Why |
 |---|---|---|
 | LSan at process exit | **No** | Nginx frees the request pool on teardown, so anything leaked into `r->pool` is reclaimed before LSan reports. A chain link leaked per request is invisible. |
-| ASan under this harness | **No** | `prober_heap_env` exports `detect_leaks=0` unconditionally (`lib.sh`), because nginx never frees its configuration pool. LSan is off; ASan's *memory-error* detection still works. |
+| ASan under this harness | **Only non-pool leaks** | Leak detection stays enabled for the real server; only the `nginx -t` config check gets `detect_leaks=0`, because nginx never frees its configuration pool. Request-pool leaks remain invisible after nginx reclaims the pool. ASan's *memory-error* detection works in both invocations. |
 | valgrind memcheck | **Yes** | Reports at exit against real allocations, independent of pool semantics. This is the oracle for the class. |
 | A `delta` / cycle-pool oracle | **Yes, for the pool classes** | Compares counters across two quiescent snapshots. Catches a leak into a pool nginx never frees, which memcheck also catches, and catches per-request pool growth that memcheck would call "still reachable". |
 
 The two right-hand columns are the point: **ASan and memcheck are not
-interchangeable here**, and a consumer that runs the fault scenario under ASan
-and calls the leak class covered has covered nothing. Use ASan for memory
-*errors* on the error path (a use-after-free in cleanup, an overflow in a
-partially-initialised struct), and memcheck or a delta oracle for leaks.
+interchangeable here**, and a consumer that runs a request-pool leak scenario
+under ASan and calls that leak class covered has covered nothing. Use ASan for
+memory *errors* on the error path (a use-after-free in cleanup, an overflow in
+a partially-initialised struct), and memcheck or a delta oracle for pool leaks.
 
 ## Trap 1 — `--track-fds=all` makes the gate unsatisfiable on nginx
 
