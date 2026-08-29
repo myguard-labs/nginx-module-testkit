@@ -1502,6 +1502,59 @@ mutate "h2-hostile: failed settle snapshot cannot retain stale predecessor" \
             prev_slab="${SNAP_SLAB:-}"' \
     h2_hostile_framing_parser_test.sh
 
+# ---- idle-stream RST_STREAM known-gap evidence (H2-3b) ---------------------
+#
+# The peer's real non-conformance is itself the observed-red control for the
+# RFC oracle (`not ok ... # TODO`).  These rows prove the surrounding harness
+# cannot preserve that finding with a legal/no-op frame, a missing negotiated
+# predecessor, or corrupted cleanup readbacks.
+
+mutate "h2-hostile: idle-stream RST stimulus cannot become a harmless PING" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '    rst = frame(3, 0, 3, (8).to_bytes(4, "big"))' \
+    '    rst = frame(6, 0, 0, b"rst-noop")' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+mutate "h2-hostile: idle-stream RST requires completed SETTINGS negotiation" \
+    scenarios/h2-hostile-framing/driver.sh \
+    'negotiated = int(state["server_settings"] and state["client_settings_ack"])' \
+    'negotiated = 0' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+mutate "h2-hostile: idle-stream RST requires the preceding stream to finish" \
+    scenarios/h2-hostile-framing/driver.sh \
+    'valid_end = int(state["valid_end"])' \
+    'valid_end = 0' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: idle-RST TODO gate cannot absorb a missing PING witness" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '    IDLE_PING_ACK="$(printf '"'"'%s\n'"'"' "$out" | sed -n '"'"'6p'"'"')"' \
+    '    IDLE_PING_ACK=0' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: idle-RST fd-neutrality readback never compares reality" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '        idle_after_fds="$SNAP_FDS"; idle_after_pool="$SNAP_POOL"; idle_after_slab="$SNAP_SLAB"' \
+    '        idle_after_fds="$((SNAP_FDS + 1))"; idle_after_pool="$SNAP_POOL"; idle_after_slab="$SNAP_SLAB"' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: idle-RST cycle-pool-neutrality readback never compares reality" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '        idle_after_fds="$SNAP_FDS"; idle_after_pool="$SNAP_POOL"; idle_after_slab="$SNAP_SLAB"' \
+    '        idle_after_fds="$SNAP_FDS"; idle_after_pool="$((SNAP_POOL + 1))"; idle_after_slab="$SNAP_SLAB"' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: idle-RST slab-page-neutrality readback never compares reality" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '        idle_after_fds="$SNAP_FDS"; idle_after_pool="$SNAP_POOL"; idle_after_slab="$SNAP_SLAB"' \
+    '        idle_after_fds="$SNAP_FDS"; idle_after_pool="$SNAP_POOL"; idle_after_slab="$((SNAP_SLAB + 1))"' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
 # ---- ordinary h2 stream cancellation cleanup (H2-5) -----------------------
 #
 # The scenario owns both sides of the claim: exact RST_STREAM(CANCEL) bytes
