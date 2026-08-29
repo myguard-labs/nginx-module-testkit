@@ -15,35 +15,27 @@
 # nginx tearing down a connection that sent it garbage is the CORRECT, boring
 # outcome, and a case that only checked for that would pass identically
 # whether the worker freed every byte it touched or quietly leaked one on the
-# error path. Each case below FIRST asserts the attack was actually delivered
-# and actually treated as illegal (a GOAWAY, frame type 7 -- see send_attack),
-# then takes a probe snapshot (fd count, cycle-pool bytes, slab pages) BEFORE
+# error path. Each case below FIRST asserts the attack was actually delivered;
+# the three conformant-rejection cases then require GOAWAY, while the idle
+# RST_STREAM case exposes the measured missing GOAWAY as a visible TAP TODO.
+# Every case takes a probe snapshot (fd count, cycle-pool bytes, slab pages) BEFORE
 # the attack and again AFTER the attacking connection has been reaped, and
 # asserts the two are IDENTICAL. The delivery check rules out "the harness
 # never touched the server" reading as a pass; the snapshot pair rules out
 # "the worker rejected this frame and leaked a descriptor/pool block/slab page
 # doing it" reading as a pass.
 #
-# WHY THREE ATTACKS AND NOT SEVEN. The roadmap row lists seven hostile shapes.
-# Four are not here. Four (oversized/zero-length frames, CONTINUATION without
-# END_HEADERS, SETTINGS floods) each need either a real, fully-negotiated
-# request in flight first or a multi-frame sequence whose ordering matters --
-# more moving parts than a single malformed frame on a fresh connection, and
-# more than this row can ship with a real observed-red control on each. The
-# fifth, RST_STREAM on an idle stream, WAS implemented and then pulled after
-# measurement (2026-08-29): this nginx build does not treat it as an error at
-# all -- no GOAWAY, no connection close, no EOF, and a second frame on the
-# same socket right after it still gets answered, identically to sending a
-# harmless PING first. RFC 9113 SS5.1's state diagram has no transition out of
-# "idle" on RST_STREAM, so the frame is illegal by the spec, but nothing
-# observable here distinguishes "nginx silently discarded an illegal frame"
-# from "nginx silently discarded a frame for a stream id it has no interest
-# in, illegal or not" -- there is no oracle, worker-inside or on the wire, an
-# admissible row could assert on. A follow-up row is the honest way to grow
-# this file with the four remaining shapes, not a bigger diff now with a case
-# that cannot fail. The three attacks here are each a SINGLE frame, each
-# unambiguously illegal under RFC 9113, and each MEASURED to make nginx answer
-# with a GOAWAY:
+# H2-3B'S BOUNDED SLICE. Oversized/zero-length frames, CONTINUATION ordering,
+# SETTINGS floods and RST_STREAM storms remain separate multi-frame cases; each
+# needs its own delivery witness and mutation controls. This slice restores the
+# dropped RST_STREAM-on-idle case without pretending the peer conforms. It
+# first completes a negotiated stream 1, then sends RST_STREAM(CANCEL) on the
+# never-opened stream 3 followed by PING on the same ordered connection. RFC
+# 9113 SS5.1 requires connection PROTOCOL_ERROR; nginx 1.28/1.29 and Angie 1.12
+# instead ACK the PING with no GOAWAY or EOF (matrix evidence is emitted by the
+# scenario). That exact response is a TODO-known gap, while an unrecognised
+# third behavior is still a hard failure. The other three attacks remain
+# single-frame cases measured to produce GOAWAY:
 #
 #   A. HEADERS on an EVEN stream id. RFC 9113 SS5.1.1: streams a client
 #      initiates MUST use odd-numbered ids; an even one from a client is a
@@ -91,6 +83,17 @@ FAILED=0
 SNAP_FDS=""
 SNAP_POOL=""
 SNAP_SLAB=""
+
+# Filled by send_idle_rst.  Kept separate from send_attack's globals because
+# this case has an ordering contract: negotiate SETTINGS, complete stream 1,
+# then send RST_STREAM(CANCEL) on never-opened stream 3 and a PING behind it.
+IDLE_STATUS=""
+IDLE_SENT_HEX=""
+IDLE_NEGOTIATED=""
+IDLE_VALID_END=""
+IDLE_GOAWAY_ERRORS=""
+IDLE_PING_ACK=""
+IDLE_EOF=""
 
 # --- raw h2 attack delivery --------------------------------------------------
 #
@@ -198,6 +201,153 @@ PY
     ATTACK_STATUS="$(printf '%s\n' "$out" | sed -n '1p')"
     ATTACK_RESP_TYPES="$(printf '%s\n' "$out" | sed -n '2p')"
     ATTACK_GOAWAY_ERRORS="$(printf '%s\n' "$out" | sed -n '3p')"
+}
+
+# send_idle_rst
+#
+# Exercises the deliberately recorded RFC 9113 SS5.1 interoperability gap.
+# One ordinary request on stream 1 must finish only after both SETTINGS legs
+# complete; stream 3 is therefore still idle when the client sends exactly one
+# RST_STREAM(CANCEL).  A PING immediately behind it is the ordered-wire witness:
+# an ACK proves the peer continued parsing bytes after the reset rather than
+# closing with the required connection-level PROTOCOL_ERROR.
+#
+# IDLE_SENT_HEX is derived from the bytes actually passed to sendall(), not from
+# a label.  The mutation row changes that frame to a harmless PING and requires
+# the delivery assertion to red on the resulting wire hex.
+send_idle_rst() {
+    local out rc=0
+
+    out="$(H="$HOST" P="$PORT" G="$HPACK_MINIMAL_GET" timeout 7 python3 - <<'PY'
+import os, socket, sys, time
+
+host = os.environ["H"]
+port = int(os.environ["P"])
+sock = None
+buf = bytearray()
+state = {
+    "server_settings": False,
+    "client_settings_ack": False,
+    "valid_end": False,
+    "goaway_errors": [],
+    "ping_ack": False,
+    "eof": False,
+}
+status = "DELIVERY_OK"
+sent_hex = ""
+
+
+def frame(frame_type, flags, stream_id, payload=b""):
+    return (len(payload).to_bytes(3, "big") + bytes([frame_type, flags])
+            + stream_id.to_bytes(4, "big") + payload)
+
+
+def process_frame(frame_type, flags, stream_id, payload):
+    if frame_type == 4 and stream_id == 0:
+        if flags & 1:
+            state["client_settings_ack"] = True
+        else:
+            state["server_settings"] = True
+            sock.sendall(frame(4, 1, 0))
+    if stream_id == 1 and frame_type in (0, 1) and flags & 1:
+        state["valid_end"] = True
+    if frame_type == 7 and stream_id == 0 and len(payload) >= 8:
+        state["goaway_errors"].append(str(int.from_bytes(payload[4:8], "big")))
+    if (frame_type == 6 and stream_id == 0 and flags & 1
+            and payload == b"idle-rst"):
+        state["ping_ack"] = True
+
+
+def drain():
+    while len(buf) >= 9:
+        length = int.from_bytes(buf[0:3], "big")
+        end = 9 + length
+        if len(buf) < end:
+            return
+        frame_type = buf[3]
+        flags = buf[4]
+        stream_id = int.from_bytes(buf[5:9], "big") & 0x7fffffff
+        payload = bytes(buf[9:end])
+        del buf[:end]
+        process_frame(frame_type, flags, stream_id, payload)
+
+
+def pump(deadline, stop):
+    drain()
+    while time.monotonic() < deadline:
+        if stop():
+            return
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            continue
+        except OSError:
+            # A conformant peer can send GOAWAY then reset the connection
+            # while the trailing PING is unread.  The parsed GOAWAY is the
+            # delivery evidence; treat that transport close as EOF.
+            drain()
+            state["eof"] = True
+            return
+        if not chunk:
+            drain()
+            state["eof"] = True
+            return
+        buf.extend(chunk)
+        drain()
+
+
+try:
+    sock = socket.create_connection((host, port), 5)
+    sock.settimeout(0.2)
+    preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    client_settings = frame(4, 0, 0)
+    minimal_get = bytes.fromhex(os.environ["G"])
+    sock.sendall(preface + client_settings + frame(1, 5, 1, minimal_get))
+
+    pump(time.monotonic() + 3, lambda: (
+        state["server_settings"] and state["client_settings_ack"]
+        and state["valid_end"]))
+    negotiated = state["server_settings"] and state["client_settings_ack"]
+    if not negotiated or not state["valid_end"]:
+        raise RuntimeError("ordinary stream did not negotiate and finish")
+
+    rst = frame(3, 0, 3, (8).to_bytes(4, "big"))
+    ping = frame(6, 0, 0, b"idle-rst")
+    sock.sendall(rst + ping)
+    sent_hex = rst.hex()
+    pump(time.monotonic() + 2, lambda: False)
+except Exception as exc:
+    status = "DELIVERY_FAIL:%s" % str(exc).replace("\n", " ")
+finally:
+    if sock is not None:
+        sock.close()
+
+negotiated = int(state["server_settings"] and state["client_settings_ack"])
+valid_end = int(state["valid_end"])
+print(status)
+print(sent_hex)
+print(negotiated)
+print(valid_end)
+print(",".join(state["goaway_errors"]))
+print(int(state["ping_ack"]))
+print(int(state["eof"]))
+sys.exit(0 if status == "DELIVERY_OK" else 1)
+PY
+)" || rc=$?
+
+    IDLE_STATUS="$(printf '%s\n' "$out" | sed -n '1p')"
+    IDLE_SENT_HEX="$(printf '%s\n' "$out" | sed -n '2p')"
+    IDLE_NEGOTIATED="$(printf '%s\n' "$out" | sed -n '3p')"
+    IDLE_VALID_END="$(printf '%s\n' "$out" | sed -n '4p')"
+    IDLE_GOAWAY_ERRORS="$(printf '%s\n' "$out" | sed -n '5p')"
+    IDLE_PING_ACK="$(printf '%s\n' "$out" | sed -n '6p')"
+    IDLE_EOF="$(printf '%s\n' "$out" | sed -n '7p')"
+
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$IDLE_STATUS" ] \
+            || IDLE_STATUS="DELIVERY_FAIL:python3 exited $rc with no output"
+        return 1
+    fi
 }
 
 # csv_contains CSV VALUE -- true if VALUE is one of CSV's comma-separated
@@ -469,6 +619,92 @@ run_attack_case() {
     TP=$((TP + 4))
 }
 
+# run_idle_rst_gap_case
+#
+# Five TAP points: exact ordered delivery, the visible RFC conformance point,
+# then the three worker-inside recovery oracles.  The conformance point is TODO
+# only for the one measured gap shape (no GOAWAY/EOF and a matching PING ACK);
+# any other unrecognised response remains a hard failure rather than being
+# laundered through the known-gap annotation.
+run_idle_rst_gap_case() {
+    local label="RST_STREAM(CANCEL) on idle stream 3"
+    local before_fds before_pool before_slab
+    local idle_after_fds idle_after_pool idle_after_slab
+    local delivered=1 expected_rst="00000403000000000300000008"
+
+    if ! wait_quiescent; then
+        echo "# $label: pre-attack snapshot never settled within 5s; attack skipped"
+        echo "not ok $((TP + 1)) - $label: delivery unavailable (no stable baseline)"
+        echo "not ok $((TP + 2)) - $label: conformance unavailable (no stable baseline)"
+        echo "not ok $((TP + 3)) - $label: fd neutrality unavailable (no stable baseline)"
+        echo "not ok $((TP + 4)) - $label: cycle-pool neutrality unavailable (no stable baseline)"
+        echo "not ok $((TP + 5)) - $label: slab-page neutrality unavailable (no stable baseline)"
+        FAILED=$((FAILED + 5))
+        TP=$((TP + 5))
+        return
+    fi
+    before_fds="$SNAP_FDS"; before_pool="$SNAP_POOL"; before_slab="$SNAP_SLAB"
+
+    if ! send_idle_rst; then
+        delivered=0
+    fi
+    echo "# $label: $IDLE_STATUS; sent=$IDLE_SENT_HEX; GOAWAY errors=${IDLE_GOAWAY_ERRORS:-<none>}; ping_ack=${IDLE_PING_ACK:-?}; eof=${IDLE_EOF:-?}"
+
+    if [ "$delivered" -eq 1 ] \
+       && [ "$IDLE_NEGOTIATED" = 1 ] \
+       && [ "$IDLE_VALID_END" = 1 ] \
+       && [ "$IDLE_SENT_HEX" = "$expected_rst" ]; then
+        echo "ok $((TP + 1)) - $label: negotiated stream 1 completed before exact idle-stream reset bytes"
+    else
+        echo "not ok $((TP + 1)) - $label: ordered delivery unproven (negotiated=${IDLE_NEGOTIATED:-?}; stream1_end=${IDLE_VALID_END:-?}; sent=${IDLE_SENT_HEX:-<none>})"
+        FAILED=$((FAILED + 1))
+    fi
+
+    if [ "$delivered" -eq 1 ] \
+       && [ "$IDLE_SENT_HEX" = "$expected_rst" ] \
+       && csv_contains "$IDLE_GOAWAY_ERRORS" 1; then
+        echo "ok $((TP + 2)) - $label: peer returned connection PROTOCOL_ERROR"
+    elif [ "$delivered" -eq 1 ] \
+         && [ "$IDLE_NEGOTIATED" = 1 ] \
+         && [ "$IDLE_VALID_END" = 1 ] \
+         && [ "$IDLE_SENT_HEX" = "$expected_rst" ] \
+         && [ "$IDLE_PING_ACK" = 1 ] \
+         && [ "$IDLE_EOF" = 0 ] \
+         && [ -z "$IDLE_GOAWAY_ERRORS" ]; then
+        echo "not ok $((TP + 2)) - $label: peer ignored the RFC 9113 SS5.1 connection error and ACKed the following PING # TODO known nginx/angie interoperability gap"
+    else
+        echo "not ok $((TP + 2)) - $label: unexpected response (GOAWAY errors=${IDLE_GOAWAY_ERRORS:-<none>}; ping_ack=${IDLE_PING_ACK:-?}; eof=${IDLE_EOF:-?})"
+        FAILED=$((FAILED + 1))
+    fi
+
+    if wait_quiescent; then
+        idle_after_fds="$SNAP_FDS"; idle_after_pool="$SNAP_POOL"; idle_after_slab="$SNAP_SLAB"
+    else
+        idle_after_fds="<unsettled>"; idle_after_pool="<unsettled>"; idle_after_slab="<unsettled>"
+    fi
+
+    if [ "$before_fds" = "$idle_after_fds" ]; then
+        echo "ok $((TP + 3)) - $label: fd count neutral ($before_fds)"
+    else
+        echo "not ok $((TP + 3)) - $label: fd count moved ($before_fds -> $idle_after_fds)"
+        FAILED=$((FAILED + 1))
+    fi
+    if [ "$before_pool" = "$idle_after_pool" ]; then
+        echo "ok $((TP + 4)) - $label: cycle-pool bytes neutral ($before_pool)"
+    else
+        echo "not ok $((TP + 4)) - $label: cycle-pool bytes moved ($before_pool -> $idle_after_pool)"
+        FAILED=$((FAILED + 1))
+    fi
+    if [ "$before_slab" = "$idle_after_slab" ]; then
+        echo "ok $((TP + 5)) - $label: slab pages neutral ($before_slab)"
+    else
+        echo "not ok $((TP + 5)) - $label: slab pages moved ($before_slab -> $idle_after_slab)"
+        FAILED=$((FAILED + 1))
+    fi
+
+    TP=$((TP + 5))
+}
+
 # A throwaway, entirely well-formed h2c connection (preface + client SETTINGS
 # + a valid GET on stream 1, END_HEADERS|END_STREAM) run ONCE before any
 # attack and never scored. MEASURED 2026-08-28: the first h2c connection this
@@ -485,7 +721,7 @@ send_attack "$WARMUP" || echo "# warm-up: delivery failed ($ATTACK_STATUS) -- ba
 wait_quiescent || echo "# warm-up: baseline never settled; racing a moving reading"
 
 TP=0
-echo "1..12"
+echo "1..17"
 
 # All three were MEASURED (2026-08-28, this same server/build) to make nginx
 # answer with a GOAWAY (response types "4,8,4,7" for both), which is what
@@ -493,14 +729,15 @@ echo "1..12"
 run_attack_case "HEADERS on an even (illegal) stream id" "$ATTACK_A"
 run_attack_case "WINDOW_UPDATE overflow at the connection level" "$ATTACK_B"
 run_attack_case "HPACK dynamic-table update above the 4096-byte limit" "$ATTACK_C" 9
+run_idle_rst_gap_case
 
 # --- the worker must still be the SAME worker, not a crash-and-respawn -----
 #
 # A crash the master immediately respawned would still read as "fds/pool/slab
 # neutral" on the NEW worker's fresh state, which is a false pass on exactly
 # the failure this file exists to catch. Fold in the pid check as a final
-# diagnostic against the error log rather than a 10th TAP point: a worker that
-# died by signal across both attacks logs it, and that is real corroborating
+# diagnostic against the error log rather than another TAP point: a worker that
+# died by signal across the attacks logs it, and that is real corroborating
 # evidence even though it is not this file's primary oracle (see the file
 # header on why "it didn't crash" alone would be the wrong oracle to lead
 # with).
