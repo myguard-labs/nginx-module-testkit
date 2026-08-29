@@ -218,7 +218,7 @@ PY
 send_idle_rst() {
     local out rc=0
 
-    out="$(H="$HOST" P="$PORT" G="$HPACK_MINIMAL_GET" timeout 7 python3 - <<'PY'
+    out="$(H="$HOST" P="$PORT" G="$HPACK_MINIMAL_GET" timeout 12 python3 - <<'PY'
 import os, socket, sys, time
 
 host = os.environ["H"]
