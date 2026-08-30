@@ -111,7 +111,7 @@ while IFS= read -r path; do
 	}
 	ok=$((ok + 1))
 	printf 'ok %d - scenario anchor exists: %s\n' "$((ok + not_ok))" "$path"
-done < <(grep -Eo 'ci/prober/scenarios/[A-Za-z0-9._-]+' "$TMP" | sort -u)
+done < <(LC_ALL=C grep -Eo 'ci/prober/scenarios/[A-Za-z0-9._-]+' "$TMP" | LC_ALL=C sort -u)
 
 check 'public docs no longer claim every scenario is HTTP/1.1 cleartext' \
 	no_http11_cleartext_claim
