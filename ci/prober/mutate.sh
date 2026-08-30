@@ -1511,6 +1511,13 @@ mutate "capability inventory: shipped HTTP/2 row cannot claim open" \
     "| open | protocol-h2 | ${bt}ci/prober/scenarios/h2-roundtrip${bt}, ${bt}ci/prober/scenarios/h2-hostile-framing${bt}, and ${bt}ci/prober/scenarios/h2-stream-cancel${bt} cover the current HTTP/2 transport, hostile-frame, and stream-cleanup claims. |" \
     capability_inventory_test.sh
 
+mutate "capability inventory: duplicate capability rows are rejected" \
+    ../../README.md \
+    "| open | protocol-h3 | blocker: no QUIC/HTTP/3 transport leg or scenario exists yet. |" \
+    "| open | protocol-h3 | blocker: no QUIC/HTTP/3 transport leg or scenario exists yet. |
+| open | protocol-h3 | blocker: duplicate row mutation. |" \
+    capability_inventory_test.sh
+
 # ---- idle-stream RST_STREAM known-gap evidence (H2-3b) ---------------------
 #
 # The peer's real non-conformance is itself the observed-red control for the

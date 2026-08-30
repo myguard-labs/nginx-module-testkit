@@ -44,6 +44,21 @@ require_row() {
 	grep -Eq "^[|] ${status} [|] ${capability} [|]" "$TMP"
 }
 
+capability_names_unique() {
+	awk -F'|' '
+		NR <= 2 { next }
+		{
+			cap = $3
+			gsub(/^ +| +$/, "", cap)
+			if (seen[cap]++) {
+				printf("duplicate capability: %s\n", cap)
+				duplicate = 1
+			}
+		}
+		END { exit duplicate ? 1 : 0 }
+	' "$TMP"
+}
+
 no_http11_cleartext_claim() {
 	! grep -q "Every scenario speaks HTTP/1.1 cleartext" \
 		docs/attack-hostile-input.md README.md
@@ -65,6 +80,7 @@ check 'allocation-count oracle is not still listed as open' \
 	require_row "alloc-counter" "shipped"
 check 'hostile input rows point at shipped generators' \
 	require_row "hostile-input" "shipped"
+check 'each capability appears exactly once' capability_names_unique
 
 if awk -F'|' '
     NR <= 2 { next }
