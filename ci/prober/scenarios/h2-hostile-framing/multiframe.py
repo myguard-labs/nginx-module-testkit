@@ -7,8 +7,6 @@ import socket
 import sys
 import time
 
-DEFAULT_MAX_FRAME_SIZE = 16384
-
 
 def frame(frame_type, flags, stream_id, payload=b""):
     """Return one HTTP/2 frame with its exact nine-byte wire header."""
@@ -73,10 +71,6 @@ def record_frame(state, sock, frame_type, flags, stream_id, payload):
             state["settings_acks"] += 1
         else:
             state["server_settings"] = True
-            for offset in range(0, len(payload), 6):
-                setting = payload[offset:offset + 6]
-                if len(setting) == 6 and int.from_bytes(setting[:2], "big") == 5:
-                    state["max_frame_size"] = int.from_bytes(setting[2:], "big")
             sock.sendall(frame(4, 1, 0))
     if frame_type == 7 and stream_id == 0 and len(payload) >= 8:
         state["goaway_errors"].append(str(int.from_bytes(payload[4:8], "big")))
@@ -101,7 +95,7 @@ def pump(sock, buf, state, deadline, stop):
             return
         try:
             chunk = sock.recv(65536)
-        except TimeoutError:
+        except (TimeoutError, socket.timeout):  # noqa: UP041
             continue
         except OSError:
             drain_frames(buf, consume)
@@ -181,7 +175,6 @@ def main():
         "goaway_errors": [],
         "ping_ack": False,
         "settings_acks": 0,
-        "max_frame_size": DEFAULT_MAX_FRAME_SIZE,
         "eof": False,
     }
     status = "DELIVERY_OK"
@@ -224,7 +217,6 @@ def main():
     print(",".join(state["goaway_errors"]))
     print(int(state["ping_ack"]))
     print(state["settings_acks"])
-    print(state["max_frame_size"])
     print(int(state["eof"]))
     return 0 if status == "DELIVERY_OK" else 1
 

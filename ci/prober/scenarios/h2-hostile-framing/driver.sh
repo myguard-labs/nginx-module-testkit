@@ -102,7 +102,6 @@ MULTI_SENT_MARKER=""
 MULTI_GOAWAY_ERRORS=""
 MULTI_PING_ACK=""
 MULTI_SETTINGS_ACKS=""
-MULTI_MAX_FRAME=""
 MULTI_EOF=""
 
 # --- raw h2 attack delivery --------------------------------------------------
@@ -376,8 +375,7 @@ send_multiframe() {
     MULTI_GOAWAY_ERRORS="$(printf '%s\n' "$out" | sed -n '5p')"
     MULTI_PING_ACK="$(printf '%s\n' "$out" | sed -n '6p')"
     MULTI_SETTINGS_ACKS="$(printf '%s\n' "$out" | sed -n '7p')"
-    MULTI_MAX_FRAME="$(printf '%s\n' "$out" | sed -n '8p')"
-    MULTI_EOF="$(printf '%s\n' "$out" | sed -n '9p')"
+    MULTI_EOF="$(printf '%s\n' "$out" | sed -n '8p')"
     if [ "$rc" -ne 0 ]; then
         [ -n "$MULTI_STATUS" ] \
             || MULTI_STATUS="DELIVERY_FAIL:python3 exited $rc with no output"
@@ -786,13 +784,13 @@ run_multiframe_case() {
     before_fds="$SNAP_FDS"; before_pool="$SNAP_POOL"; before_slab="$SNAP_SLAB"
 
     if ! send_multiframe "$kind"; then delivered=0; fi
-    echo "# $label: $MULTI_STATUS; marker=${MULTI_SENT_MARKER:-<none>}; GOAWAY=${MULTI_GOAWAY_ERRORS:-<none>}; ping_ack=${MULTI_PING_ACK:-?}; settings_acks=${MULTI_SETTINGS_ACKS:-?}; max_frame=${MULTI_MAX_FRAME:-?}; eof=${MULTI_EOF:-?}"
+    echo "# $label: $MULTI_STATUS; marker=${MULTI_SENT_MARKER:-<none>}; GOAWAY=${MULTI_GOAWAY_ERRORS:-<none>}; ping_ack=${MULTI_PING_ACK:-?}; settings_acks=${MULTI_SETTINGS_ACKS:-?}; eof=${MULTI_EOF:-?}"
     if [ "$delivered" -eq 1 ] && [ "$MULTI_NEGOTIATED" = 1 ] \
        && [ "$MULTI_INFLIGHT" = 1 ] \
        && [ "$MULTI_SENT_MARKER" = "$expected_marker" ]; then
         echo "ok $((TP + 1)) - $label: exact ordered attack followed negotiation with request stream 1 in flight"
     else
-        echo "not ok $((TP + 1)) - $label: ordered delivery unproven (negotiated=${MULTI_NEGOTIATED:-?}; inflight=${MULTI_INFLIGHT:-?}; max_frame=${MULTI_MAX_FRAME:-?}; marker=${MULTI_SENT_MARKER:-<none>})"
+        echo "not ok $((TP + 1)) - $label: ordered delivery unproven (negotiated=${MULTI_NEGOTIATED:-?}; inflight=${MULTI_INFLIGHT:-?}; marker=${MULTI_SENT_MARKER:-<none>})"
         FAILED=$((FAILED + 1))
     fi
 

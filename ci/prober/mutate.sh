@@ -1701,6 +1701,18 @@ mutate "h2-hostile: multi-frame response readback cannot be skipped" \
     '        goaway-6) csv_contains "$MULTI_GOAWAY_ERRORS" 1 && readback=1 ;;' \
     scenarios/h2-hostile-framing/mutate-suite.sh
 
+mutate "h2-hostile: multi-frame SETTINGS-flood ack count must be exact" \
+    scenarios/h2-hostile-framing/multiframe.py \
+    '    print(state["settings_acks"])' \
+    '    print(1)' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
+mutate "h2-hostile: multi-frame RST storm requires a PING ack" \
+    scenarios/h2-hostile-framing/multiframe.py \
+    '    print(int(state["ping_ack"]))' \
+    '    print(0)' \
+    scenarios/h2-hostile-framing/mutate-suite.sh
+
 # shellcheck disable=SC2016
 mutate "h2-hostile: multi-frame fd-neutrality readback never compares reality" \
     scenarios/h2-hostile-framing/driver.sh \
