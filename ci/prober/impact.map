@@ -60,6 +60,7 @@ PRIMARY	ci/prober/lib.sh	slope_check_test.sh	fast
 # slope-floor bug (#134) live in a function with zero fast-lane coverage.
 PRIMARY	ci/prober/lib.sh	stale_so_test.sh	fast
 PRIMARY	ci/prober/lib.sh	check_conf_test.sh	fast
+PRIMARY	ci/prober/lib.sh	heap_env_test.sh	fast
 
 # The suite is its own owner: editing a test must select that test, or the
 # selector fails closed on an unmapped executable change (which is exactly what
@@ -67,6 +68,7 @@ PRIMARY	ci/prober/lib.sh	check_conf_test.sh	fast
 PRIMARY	ci/prober/slope_check_test.sh	slope_check_test.sh	fast
 PRIMARY	ci/prober/stale_so_test.sh	stale_so_test.sh	fast
 PRIMARY	ci/prober/check_conf_test.sh	check_conf_test.sh	fast
+PRIMARY	ci/prober/heap_env_test.sh	heap_env_test.sh	fast
 PRIMARY	ci/prober/docs_directives_test.sh	docs_directives_test.sh	fast
 PRIMARY	ci/prober/schema_emitter_test.sh	schema_emitter_test.sh	fast
 PRIMARY	ci/prober/tls_test.sh	tls_test.sh	fast
