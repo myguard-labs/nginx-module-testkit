@@ -12,6 +12,7 @@
 #include "http.h"
 #include "h2.h"
 #include "json.h"
+#include "openssl_compat.h"
 #include "util.h"
 
 #include <arpa/inet.h>
@@ -33,7 +34,6 @@
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
-
 
 void
 http_response_free(http_response *resp)
