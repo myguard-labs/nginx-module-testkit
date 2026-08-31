@@ -179,6 +179,8 @@ SEMANTIC	ci/prober/scenarios	scenarios/*	fast
 # attack-side logic.  This focused self-test injects malformed frames and a
 # failed probe between matching snapshots without booting a server.
 SEMANTIC	ci/prober/scenarios/h2-hostile-framing/driver.sh	h2_hostile_framing_parser_test.sh	fast
+SEMANTIC	ci/prober/scenarios/h2-hostile-framing/multiframe.py	h2_hostile_framing_parser_test.sh	fast
+SEMANTIC	ci/prober/scenarios/h2-hostile-framing/multiframe.py	scenarios/h2-hostile-framing	fast
 
 # The TLS scenario's own files. The rule file and conf are covered by the
 # scenarios glob above; these two are called out because they are EXECUTABLE
