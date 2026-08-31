@@ -47,11 +47,11 @@ can be watched by more than the scenario's own oracles.
 |---|---|
 | [fault-injection-under-tooling.md](fault-injection-under-tooling.md) | You have a fault site and a scenario that arms it. What does running that scenario under memcheck, a sanitizer, or coverage actually tell you — and which leak classes does each one structurally miss? |
 
-The list of attacks we do **not** yet have — TLS, HTTP/2 and HTTP/3, `stream{}`,
-body-boundary hostility, allocation faults during a lifecycle event, syscall
-*budgets* — is [Ideas and opportunities](../README.md#ideas-and-opportunities--ways-to-break-a-module-we-do-not-yet-try)
-in the README. A row there graduates by becoming a scenario with a
-mutation-proven oracle, at which point it moves into one of the documents above.
+The current status table for shipped, partial, open and parked attack rows is
+[Ideas and opportunities](../README.md#ideas-and-opportunities--ways-to-break-a-module-we-do-not-yet-try)
+in the README. TLS, HTTP/2, body-boundary hostility and allocation-count
+oracles have graduated into scenario-backed claims; HTTP/3 remains open, and
+`stream{}` remains parked pending a stream-shaped consumer.
 
 ## The rule that governs all of them
 

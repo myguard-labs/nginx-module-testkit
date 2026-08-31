@@ -150,12 +150,12 @@ every failure diagnostic), and each request batch is separately saved as
 
 ## Not yet reachable
 
-Body-boundary hostility has no directive: nothing sends a body declared shorter
-than what follows, trickles a chunked body one byte per chunk, or sends an
-oversized `Content-Length` and stops. `backend-lying-length` does this to the
-*upstream*; nothing does it to the module's own request path. Every scenario also
-speaks HTTP/1.1 cleartext — TLS, HTTP/2 and HTTP/3 are the largest untouched
-surface here. Both are tracked in
+HTTP/3 is still not reachable from this harness: there is no QUIC/HTTP/3
+transport leg or scenario. Some hostile request-body rows that used to live in
+this section have graduated: `short-body.rule`, `huge-content-length.rule` and
+`chunked-trickle.rule` now cover the module request path, while
+`backend-lying-length` remains the upstream counterpart. TLS and HTTP/2 are no
+longer untouched protocol surfaces; their scenario-backed status is tracked in
 [Ideas and opportunities](../README.md#ideas-and-opportunities--ways-to-break-a-module-we-do-not-yet-try).
 
 ## See also

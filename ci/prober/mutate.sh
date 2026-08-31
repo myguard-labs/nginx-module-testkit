@@ -1502,6 +1502,94 @@ mutate "h2-hostile: failed settle snapshot cannot retain stale predecessor" \
             prev_slab="${SNAP_SLAB:-}"' \
     h2_hostile_framing_parser_test.sh
 
+# ---- public capability inventory ------------------------------------------
+
+bt='`'
+mutate "capability inventory: shipped HTTP/2 row cannot claim open" \
+    ../../README.md \
+    "| shipped | protocol-h2 | ${bt}ci/prober/scenarios/h2-roundtrip${bt}, ${bt}ci/prober/scenarios/h2-hostile-framing${bt}, and ${bt}ci/prober/scenarios/h2-stream-cancel${bt} cover the current HTTP/2 transport, hostile-frame, and stream-cleanup claims. |" \
+    "| open | protocol-h2 | ${bt}ci/prober/scenarios/h2-roundtrip${bt}, ${bt}ci/prober/scenarios/h2-hostile-framing${bt}, and ${bt}ci/prober/scenarios/h2-stream-cancel${bt} cover the current HTTP/2 transport, hostile-frame, and stream-cleanup claims. |" \
+    capability_inventory_test.sh
+
+mutate "capability inventory: duplicate capability rows are rejected" \
+    ../../README.md \
+    "| open | protocol-h3 | blocker: no QUIC/HTTP/3 transport leg or scenario exists yet. |" \
+    "| open | protocol-h3 | blocker: no QUIC/HTTP/3 transport leg or scenario exists yet. |
+| open | protocol-h3 | blocker: duplicate row mutation. |" \
+    capability_inventory_test.sh
+
+mutate "capability inventory: missing scenario evidence is rejected" \
+    ../../README.md \
+    "| shipped | hostile-input | ${bt}ci/prober/scenarios/property-fuzz${bt}, ${bt}ci/prober/scenarios/stateful-property-fuzz${bt}, and ${bt}ci/prober/scenarios/keepalive-bleed${bt} own the hostile request generators and reader negative control. |" \
+    "| shipped | hostile-input | ${bt}ci/prober/scenarios/property-fuzz-missing${bt}, ${bt}ci/prober/scenarios/stateful-property-fuzz${bt}, and ${bt}ci/prober/scenarios/keepalive-bleed${bt} own the hostile request generators and reader negative control. |" \
+    capability_inventory_test.sh
+
+mutate "capability inventory: malformed scenario evidence is rejected" \
+    ../../README.md \
+    "| shipped | hostile-input | ${bt}ci/prober/scenarios/property-fuzz${bt}, ${bt}ci/prober/scenarios/stateful-property-fuzz${bt}, and ${bt}ci/prober/scenarios/keepalive-bleed${bt} own the hostile request generators and reader negative control. |" \
+    "| shipped | hostile-input | ${bt}ci/prober/scenarios/${bt}, ${bt}ci/prober/scenarios/stateful-property-fuzz${bt}, and ${bt}ci/prober/scenarios/keepalive-bleed${bt} own the hostile request generators and reader negative control. |" \
+    capability_inventory_test.sh
+
+mutate "capability inventory: prefixed scenario evidence is rejected" \
+    ../../README.md \
+    "| shipped | hostile-input | ${bt}ci/prober/scenarios/property-fuzz${bt}, ${bt}ci/prober/scenarios/stateful-property-fuzz${bt}, and ${bt}ci/prober/scenarios/keepalive-bleed${bt} own the hostile request generators and reader negative control. |" \
+    "| shipped | hostile-input | ${bt}xci/prober/scenarios/property-fuzz${bt}, ${bt}ci/prober/scenarios/stateful-property-fuzz${bt}, and ${bt}ci/prober/scenarios/keepalive-bleed${bt} own the hostile request generators and reader negative control. |" \
+    capability_inventory_test.sh
+
+mutate "capability inventory: missing stock-rule evidence is rejected" \
+    ../../README.md \
+    "| shipped | request-body-boundary | ${bt}ci/prober/scenarios/property-fuzz${bt}, ${bt}rules/stock/short-body.rule${bt}, ${bt}rules/stock/huge-content-length.rule${bt}, and ${bt}rules/stock/chunked-trickle.rule${bt} cover the graduated request-body boundary attacks. |" \
+    "| shipped | request-body-boundary | ${bt}ci/prober/scenarios/property-fuzz${bt}, ${bt}rules/stock/short-body-missing.rule${bt}, ${bt}rules/stock/huge-content-length.rule${bt}, and ${bt}rules/stock/chunked-trickle.rule${bt} cover the graduated request-body boundary attacks. |" \
+    capability_inventory_test.sh
+
+mutate "capability inventory: malformed stock-rule evidence is rejected" \
+    ../../README.md \
+    "| shipped | request-body-boundary | ${bt}ci/prober/scenarios/property-fuzz${bt}, ${bt}rules/stock/short-body.rule${bt}, ${bt}rules/stock/huge-content-length.rule${bt}, and ${bt}rules/stock/chunked-trickle.rule${bt} cover the graduated request-body boundary attacks. |" \
+    "| shipped | request-body-boundary | ${bt}ci/prober/scenarios/property-fuzz${bt}, ${bt}rules/stock/${bt}, ${bt}rules/stock/huge-content-length.rule${bt}, and ${bt}rules/stock/chunked-trickle.rule${bt} cover the graduated request-body boundary attacks. |" \
+    capability_inventory_test.sh
+
+mutate "capability inventory: prefixed stock-rule evidence is rejected" \
+    ../../README.md \
+    "| shipped | request-body-boundary | ${bt}ci/prober/scenarios/property-fuzz${bt}, ${bt}rules/stock/short-body.rule${bt}, ${bt}rules/stock/huge-content-length.rule${bt}, and ${bt}rules/stock/chunked-trickle.rule${bt} cover the graduated request-body boundary attacks. |" \
+    "| shipped | request-body-boundary | ${bt}ci/prober/scenarios/property-fuzz${bt}, ${bt}xrules/stock/short-body.rule${bt}, ${bt}rules/stock/huge-content-length.rule${bt}, and ${bt}rules/stock/chunked-trickle.rule${bt} cover the graduated request-body boundary attacks. |" \
+    capability_inventory_test.sh
+
+mutate "capability inventory: unknown probe-field evidence is rejected" \
+    ../../README.md \
+    "| shipped | alloc-counter | ${bt}ci/prober/scenarios/alloc-per-request${bt}; probe field: ${bt}zone.slab_reqs${bt} and ${bt}zone.slab_used${bt}. |" \
+    "| shipped | alloc-counter | ${bt}ci/prober/scenarios/alloc-per-request${bt}; probe field: ${bt}zone.slab_missing${bt} and ${bt}zone.slab_used${bt}. |" \
+    capability_inventory_test.sh
+
+mutate "capability inventory: malformed probe-field evidence is rejected" \
+    ../../README.md \
+    "| shipped | alloc-counter | ${bt}ci/prober/scenarios/alloc-per-request${bt}; probe field: ${bt}zone.slab_reqs${bt} and ${bt}zone.slab_used${bt}. |" \
+    "| shipped | alloc-counter | ${bt}ci/prober/scenarios/alloc-per-request${bt}; probe field: ${bt}zone.slab@reqs${bt} and ${bt}zone.slab_used${bt}. |" \
+    capability_inventory_test.sh
+
+mutate "capability inventory: missing blocker marker is rejected" \
+    ../../README.md \
+    "| open | protocol-h3 | blocker: no QUIC/HTTP/3 transport leg or scenario exists yet. |" \
+    "| open | protocol-h3 | reason: no QUIC/HTTP/3 transport leg or scenario exists yet. |" \
+    capability_inventory_test.sh
+
+# shellcheck disable=SC2016
+mutate "capability inventory: anchor extractor failure is rejected" \
+    capability_inventory_test.sh \
+    'if extract_repository_anchors | LC_ALL=C sort -u >"$REPO_ANCHORS" \
+	&& [ -s "$REPO_ANCHORS" ]; then' \
+    'if extract_repository_anchors() { return 1; }; extract_repository_anchors | LC_ALL=C sort -u >"$REPO_ANCHORS" \
+	&& [ -s "$REPO_ANCHORS" ]; then' \
+    capability_inventory_test.sh
+
+# shellcheck disable=SC2016
+mutate "capability inventory: empty anchor extraction is rejected" \
+    capability_inventory_test.sh \
+    'if extract_repository_anchors | LC_ALL=C sort -u >"$REPO_ANCHORS" \
+	&& [ -s "$REPO_ANCHORS" ]; then' \
+    'if extract_repository_anchors() { return 0; }; extract_repository_anchors | LC_ALL=C sort -u >"$REPO_ANCHORS" \
+	&& [ -s "$REPO_ANCHORS" ]; then' \
+    capability_inventory_test.sh
+
 # ---- idle-stream RST_STREAM known-gap evidence (H2-3b) ---------------------
 #
 # The peer's real non-conformance is itself the observed-red control for the
