@@ -1662,6 +1662,18 @@ mutate "h2-hostile: multi-frame CONTINUATION must stay unfinished before PING" \
     '        return frame(1, 4, 3, b"\x82") + frame(9, 4, 3, b"\x84") + ping' \
     h2_hostile_framing_parser_test.sh
 
+mutate "h2-hostile: SETTINGS ACK payload cannot forge negotiation" \
+    scenarios/h2-hostile-framing/multiframe.py \
+    '            if payload:' \
+    '            if False:' \
+    h2_hostile_framing_parser_test.sh
+
+mutate "h2-hostile: malformed SETTINGS length cannot forge negotiation" \
+    scenarios/h2-hostile-framing/multiframe.py \
+    '            if len(payload) % 6 != 0:' \
+    '            if False:' \
+    h2_hostile_framing_parser_test.sh
+
 mutate "h2-hostile: multi-frame SETTINGS flood count cannot shrink" \
     scenarios/h2-hostile-framing/multiframe.py \
     '        return b"".join(frame(4, 0, 0) for _ in range(128)) + ping' \
@@ -1733,6 +1745,24 @@ mutate "h2-hostile: multi-frame slab-page-neutrality readback never compares rea
     '        multi_after_fds="$SNAP_FDS"; multi_after_pool="$SNAP_POOL"; multi_after_slab="$SNAP_SLAB"' \
     '        multi_after_fds="$SNAP_FDS"; multi_after_pool="$SNAP_POOL"; multi_after_slab="$((SNAP_SLAB + 1))"' \
     scenarios/h2-hostile-framing/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: worker signal death cannot remain warning-only" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '    echo "# ERROR: a worker died by signal during the hostile-framing run"
+    grep -nE '\''exited on signal|SIGSEGV|SIGABRT|SIGBUS'\'' "$ELOG" | sed '\''s/^/# /'\''
+    FAILED=$((FAILED + 1))' \
+    '    echo "# WARNING: a worker died by signal during the hostile-framing run"
+    grep -nE '\''exited on signal|SIGSEGV|SIGABRT|SIGBUS'\'' "$ELOG" | sed '\''s/^/# /'\''
+    : # failure counter dropped' \
+    h2_hostile_framing_parser_test.sh
+
+# shellcheck disable=SC2016
+mutate "h2-hostile: worker log inspection cannot fail open" \
+    scenarios/h2-hostile-framing/driver.sh \
+    '    if [ "$grep_rc" -eq 1 ]; then' \
+    '    if [ "$grep_rc" -ge 1 ]; then' \
+    h2_hostile_framing_parser_test.sh
 
 # ---- ordinary h2 stream cancellation cleanup (H2-5) -----------------------
 #

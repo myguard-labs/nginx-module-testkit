@@ -485,6 +485,34 @@ wait_quiescent() {
     return 1
 }
 
+# A crash followed by an immediate master respawn can leave fresh resource
+# counters that look neutral. Treat the worker-death log as a hard scenario
+# failure so those new-worker snapshots cannot hide the crash.
+check_worker_survival() {
+    local grep_rc
+
+    if grep -qE 'worker process .* exited on signal|SIGSEGV|SIGABRT|SIGBUS' "$ELOG"; then
+        grep_rc=0
+    else
+        grep_rc=$?
+    fi
+
+    if [ "$grep_rc" -eq 1 ]; then
+        return 0
+    fi
+
+    if [ "$grep_rc" -ne 0 ]; then
+        echo "# ERROR: could not inspect the worker error log: $ELOG"
+        FAILED=$((FAILED + 1))
+        return 1
+    fi
+
+    echo "# ERROR: a worker died by signal during the hostile-framing run"
+    grep -nE 'exited on signal|SIGSEGV|SIGABRT|SIGBUS' "$ELOG" | sed 's/^/# /'
+    FAILED=$((FAILED + 1))
+    return 1
+}
+
 # H2_HOSTILE_FRAMING_SELF_TEST=1 runs the attack-side parser and settling
 # controls without a server. H2_CAPTURE_HEX enters at send_attack's
 # response-decoder boundary, so the parser observations are the same fields
@@ -493,7 +521,7 @@ wait_quiescent() {
 # matching snapshot()'s ordinary failure behavior. A later matching success
 # must become the NEW predecessor, so settling is correct only on call four.
 if [ "${H2_HOSTILE_FRAMING_SELF_TEST:-0}" = 1 ]; then
-    echo "1..8"
+    echo "1..11"
 
     # Header declares an 8-byte GOAWAY payload but carries only its four-byte
     # last-stream-id field. It is not a complete frame and therefore must not
@@ -560,15 +588,43 @@ if [ "${H2_HOSTILE_FRAMING_SELF_TEST:-0}" = 1 ]; then
         exit 1
     fi
 
+    mkdir -p "$(dirname "$ELOG")"
+    printf '%s\n' 'worker process 999 exited on signal 11' >"$ELOG"
+    failed_before=$FAILED
+    if check_worker_survival; then
+        echo "not ok 5 - h2 worker survival: a signal death must fail the scenario"
+        exit 1
+    elif [ "$FAILED" -eq "$((failed_before + 1))" ]; then
+        echo "ok 5 - h2 worker survival: a signal death fails the scenario"
+    else
+        echo "not ok 5 - h2 worker survival: failure counter did not advance exactly once"
+        exit 1
+    fi
+    : >"$ELOG"
+
+    rm -f "$ELOG"
+    failed_before=$FAILED
+    if check_worker_survival; then
+        echo "not ok 6 - h2 worker survival: an unreadable error log must fail closed"
+        exit 1
+    elif [ "$FAILED" -eq "$((failed_before + 1))" ]; then
+        echo "ok 6 - h2 worker survival: an unreadable error log fails closed"
+    else
+        echo "not ok 6 - h2 worker survival: log-read failure counter did not advance exactly once"
+        exit 1
+    fi
+    : >"$ELOG"
+
     multi_self=""
     multi_rc=0
     multi_self="$(H2_MULTIFRAME_SELF_TEST=1 \
         python3 "$(dirname "$0")/multiframe.py")" || multi_rc=$?
     for self_point in \
-        "5:SELFTEST_BOUNDARIES_OK:zero DATA plus exact and one-over PING boundaries" \
-        "6:SELFTEST_SHAPES_OK:all four ordered attack shapes" \
-        "7:SELFTEST_MALFORMED_OK:truncated response frame retention" \
-        "8:SELFTEST_ERROR_OK:unknown attack kind fails closed"
+        "7:SELFTEST_BOUNDARIES_OK:zero DATA plus exact and one-over PING boundaries" \
+        "8:SELFTEST_SHAPES_OK:all four ordered attack shapes" \
+        "9:SELFTEST_MALFORMED_OK:truncated response frame retention" \
+        "10:SELFTEST_SETTINGS_OK:malformed SETTINGS frames fail closed" \
+        "11:SELFTEST_ERROR_OK:unknown attack kind fails closed"
     do
         self_n="${self_point%%:*}"
         self_rest="${self_point#*:}"
@@ -892,10 +948,7 @@ run_multiframe_case "33-stream RST_STREAM(CANCEL) storm" \
 # evidence even though it is not this file's primary oracle (see the file
 # header on why "it didn't crash" alone would be the wrong oracle to lead
 # with).
-if grep -qE 'worker process .* exited on signal|SIGSEGV|SIGABRT|SIGBUS' "$ELOG"; then
-    echo "# WARNING: a worker died by signal during the hostile-framing run"
-    grep -nE 'exited on signal|SIGSEGV|SIGABRT|SIGBUS' "$ELOG" | sed 's/^/# /'
-fi
+check_worker_survival || true
 
 if [ "$FAILED" -gt 0 ]; then
     exit 1

@@ -67,9 +67,13 @@ def record_frame(state, sock, frame_type, flags, stream_id, payload):
     """Record only response fields consumed by the scenario's TAP oracles."""
     if frame_type == 4 and stream_id == 0:
         if flags & 1:
+            if payload:
+                raise RuntimeError("SETTINGS ACK carried a payload")
             state["client_settings_ack"] = True
             state["settings_acks"] += 1
         else:
+            if len(payload) % 6 != 0:
+                raise RuntimeError("SETTINGS payload length is not a multiple of 6")
             state["server_settings"] = True
             sock.sendall(frame(4, 1, 0))
     if frame_type == 7 and stream_id == 0 and len(payload) >= 8:
@@ -109,6 +113,47 @@ def pump(sock, buf, state, deadline, stop):
         drain_frames(buf, consume)
 
 
+def self_test_settings():
+    """Prove malformed SETTINGS frames cannot advance negotiation state."""
+    state = {
+        "client_settings_ack": False,
+        "settings_acks": 0,
+        "server_settings": False,
+        "goaway_errors": [],
+        "ping_ack": False,
+    }
+
+    class FakeSocket:  # pylint: disable=too-few-public-methods
+        """Capture SETTINGS acknowledgements without touching the network."""
+
+        def __init__(self):
+            self.sent: list[bytes] = []
+
+        def sendall(self, data: bytes) -> None:
+            """Record an emitted SETTINGS acknowledgement."""
+            self.sent.append(data)
+
+    fake_sock = FakeSocket()
+    for flags, payload, message in (
+        (1, b"not-empty", "SETTINGS ACK carried a payload"),
+        (0, b"short", "SETTINGS payload length is not a multiple of 6"),
+    ):
+        try:
+            record_frame(state, fake_sock, 4, flags, 0, payload)
+        except RuntimeError as exc:
+            if str(exc) != message:
+                raise
+        else:
+            raise RuntimeError("malformed SETTINGS frame reached negotiation state")
+    if state["client_settings_ack"] or state["settings_acks"]:
+        raise RuntimeError("malformed SETTINGS ACK forged negotiation evidence")
+    if state["server_settings"]:
+        raise RuntimeError("malformed SETTINGS frame forged server evidence")
+    if fake_sock.sent:
+        raise RuntimeError("malformed SETTINGS frame triggered an ACK")
+    print("SELFTEST_SETTINGS_OK")
+
+
 def run_self_test():
     """Exercise the helper's boundary, malformed, and error branches offline."""
     minimal_get = bytes.fromhex("828486410670726f626572")
@@ -146,6 +191,8 @@ def run_self_test():
     if seen or len(truncated) != 13:
         raise RuntimeError("truncated response escaped the complete-frame guard")
     print("SELFTEST_MALFORMED_OK")
+
+    self_test_settings()
 
     try:
         build_attack("unknown", minimal_get)
