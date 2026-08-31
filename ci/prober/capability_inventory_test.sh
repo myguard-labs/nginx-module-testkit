@@ -10,7 +10,9 @@ cd "$(dirname "$0")/../.."
 
 README=README.md
 TMP="$(mktemp "${TMPDIR:-/tmp}/capability-inventory.XXXXXX")"
-trap 'rm -f "$TMP"' EXIT
+REPO_ANCHORS="$(mktemp "${TMPDIR:-/tmp}/capability-repo-anchors.XXXXXX")"
+PROBE_FIELDS="$(mktemp "${TMPDIR:-/tmp}/capability-probe-fields.XXXXXX")"
+trap 'rm -f "$TMP" "$REPO_ANCHORS" "$PROBE_FIELDS"' EXIT
 
 awk '
     /^<!-- capability-inventory:start -->$/ { in_table = 1; next }
@@ -69,6 +71,106 @@ no_protocol_untouched_claim() {
 		docs/README.md docs/attack-hostile-input.md README.md
 }
 
+extract_repository_anchors() {
+	awk '
+		function inspect(token) {
+			scenario_at = index(token, "ci/prober/scenarios/")
+			rule_at = index(token, "rules/stock/")
+			if (scenario_at) {
+				if (scenario_at != 1) {
+					printf("malformed scenario anchor: %s\n", token) > "/dev/stderr"
+					bad = 1
+					return
+				}
+				if (token !~ /^ci\/prober\/scenarios\/[A-Za-z0-9._-]+$/) {
+					printf("malformed scenario anchor: %s\n", token) > "/dev/stderr"
+					bad = 1
+				} else {
+					print token
+				}
+			} else if (rule_at) {
+				if (rule_at != 1) {
+					printf("malformed stock-rule anchor: %s\n", token) > "/dev/stderr"
+					bad = 1
+					return
+				}
+				if (token !~ /^rules\/stock\/[A-Za-z0-9._-]+\.rule$/) {
+					printf("malformed stock-rule anchor: %s\n", token) > "/dev/stderr"
+					bad = 1
+				} else {
+					print token
+				}
+			}
+		}
+		{
+			line = $0
+			outside = $0
+			while (match(line, /`[^`]*`/)) {
+				inspect(substr(line, RSTART + 1, RLENGTH - 2))
+				line = substr(line, RSTART + RLENGTH)
+			}
+			gsub(/`[^`]*`/, "", outside)
+			if (outside ~ /ci\/prober\/scenarios\/|rules\/stock\//) {
+				printf("repository anchor is not a complete backticked token: %s\n", outside) > "/dev/stderr"
+				bad = 1
+			}
+		}
+		END { exit bad ? 1 : 0 }
+	' "$TMP"
+}
+
+extract_probe_fields() {
+	awk '
+		/probe field:/ {
+			line = substr($0, index($0, "probe field:") + length("probe field:"))
+			outside = line
+			found = 0
+			while (match(line, /`[^`]*`/)) {
+				token = substr(line, RSTART + 1, RLENGTH - 2)
+				if (token !~ /^[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z0-9._-]+$/) {
+					printf("malformed probe field anchor: %s\n", token) > "/dev/stderr"
+					bad = 1
+				} else {
+					print token
+					found = 1
+				}
+				line = substr(line, RSTART + RLENGTH)
+			}
+			gsub(/`[^`]*`/, "", outside)
+			gsub(/[[:space:].|]/, "", outside)
+			gsub(/and/, "", outside)
+			if (outside != "") {
+				printf("malformed text after probe field marker: %s\n", outside) > "/dev/stderr"
+				bad = 1
+			}
+			if (!found) {
+				printf("probe field marker has no field anchor: %s\n", $0) > "/dev/stderr"
+				bad = 1
+			}
+		}
+		END { exit bad ? 1 : 0 }
+	' "$TMP"
+}
+
+repository_anchor_exists() {
+	case $1 in
+		ci/prober/scenarios/*) [ -d "$1" ] ;;
+		rules/stock/*.rule) [ -f "$1" ] ;;
+		*) return 1 ;;
+	esac
+}
+
+schema_has_probe_field() {
+	local field=$1
+
+	awk -v field="$field" '
+		/^  "fields": \{/ { in_fields = 1; next }
+		in_fields && /^  \}/ { in_fields = 0 }
+		in_fields && $1 == "\"" field "\":" { found = 1 }
+		END { exit found ? 0 : 1 }
+	' probe-schema.json
+}
+
 check 'README exposes a capability inventory table' table_nonempty
 check 'TLS is not still listed as an open protocol gap' \
 	require_row "protocol-tls" "shipped"
@@ -119,15 +221,26 @@ else
 	check 'each inventory row has an allowed status and concrete evidence' false
 fi
 
-while IFS= read -r path; do
-	[ -d "$path" ] || {
-		not_ok=$((not_ok + 1))
-		printf 'not ok %d - scenario anchor exists: %s\n' "$((ok + not_ok))" "$path"
-		continue
-	}
-	ok=$((ok + 1))
-	printf 'ok %d - scenario anchor exists: %s\n' "$((ok + not_ok))" "$path"
-done < <(LC_ALL=C grep -Eo 'ci/prober/scenarios/[A-Za-z0-9._-]+' "$TMP" | LC_ALL=C sort -u)
+if extract_repository_anchors | LC_ALL=C sort -u >"$REPO_ANCHORS" \
+	&& [ -s "$REPO_ANCHORS" ]; then
+	check 'repository evidence anchors were extracted' true
+	while IFS= read -r path; do
+		check "repository anchor exists with the expected type: $path" \
+			repository_anchor_exists "$path"
+	done <"$REPO_ANCHORS"
+else
+	check 'repository evidence anchors were extracted' false
+fi
+
+if extract_probe_fields | LC_ALL=C sort -u >"$PROBE_FIELDS"; then
+	check 'probe field evidence anchors were extracted' test -s "$PROBE_FIELDS"
+	while IFS= read -r field; do
+		check "probe field is declared by the schema: $field" \
+			schema_has_probe_field "$field"
+	done <"$PROBE_FIELDS"
+else
+	check 'probe field evidence anchors were extracted' false
+fi
 
 check 'public docs no longer claim every scenario is HTTP/1.1 cleartext' \
 	no_http11_cleartext_claim
