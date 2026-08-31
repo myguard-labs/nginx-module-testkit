@@ -1,10 +1,14 @@
 name: ci
 
-# PR-only. A push trigger would double every run and, on merge, re-run the exact
+# PRs run the delivery gate. The monthly/manual runs additionally execute the
+# exhaustive mutation sweeps, which are intentionally too expensive for every
+# change. A push trigger would double every run and, on merge, re-run the exact
 # commit that just passed as a PR -- see the merge-gate note in the README.
 on:
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '17 3 1 * *'
 
 permissions:
   contents: read
@@ -68,10 +72,11 @@ jobs:
   # real gap on every pass so far, including a directive whose entire effect was
   # untested behind assertions that looked thorough.
   #
-  # Blocking rather than scheduled: it rebuilds once per mutation, but the whole
-  # sweep is well under a minute, and a coverage gap is cheapest to fix in the PR
-  # that introduces it.
+  # Monthly/manual rather than PR-blocking: each mutation performs a clean
+  # build, and the complete sweep now takes about 90 minutes. PRs still validate
+  # every mutation anchor in the fast hygiene job, so row drift fails promptly.
   mutation:
+    if: github.event_name != 'pull_request'
     runs-on: [self-hosted, builder02, lxc]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
@@ -767,7 +772,7 @@ jobs:
       # differences, so running them once is enough. The scenario TREE still
       # runs on every flavor in the matrix.
       - name: the scenario mutation rows actually catch (mutation)
-        if: matrix.mutation_rows
+        if: matrix.mutation_rows && github.event_name != 'pull_request'
         env:
           PROBER_ROOT: ${{ github.workspace }}
           PROBER_MODULE: ngx_http_test_ref_module.so
