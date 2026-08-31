@@ -64,9 +64,9 @@ green run proving nothing:
   complexity, which is why a wall-clock `expect time<ms` directive was
   considered and **rejected** (load- and host-dependent, flaky by construction).
   Generalizing that ratio to a consumer's module is still open. The
-  per-request slab allocation counter has graduated: `zone.slab_reqs` and
-  `zone.slab_used` are rendered by the probe and `alloc-per-request` asserts a
-  ceiling on request-local churn.
+  per-request slab churn oracle has graduated: `zone.slab_reqs` is rendered by
+  the probe and `alloc-per-request` asserts a ceiling on request-local churn.
+  `zone.slab_used` is the companion live-occupancy oracle.
 - **[Memory corruption ASan cannot see](docs/attack-memory-corruption.md)** —
   `ngx_palloc_small()` is a bump allocator, so a pool holding two hundred small
   objects is ONE live allocation to AddressSanitizer and to valgrind. Their
@@ -2425,9 +2425,10 @@ into a generator of concrete adversarial scenarios instead of a number to chase.
 - The `delta` oracles pin fds, pool bytes, slab and timers. A module can still
   leak in places nothing snapshots — cleanup handlers, resolver state. Each is
   a probe field somebody has to add before an oracle can assert on it.
-- **Allocation-count oracles.** Shipped for slab churn. `zone.slab_reqs` and
-  `zone.slab_used` expose cumulative allocation counters, and
-  `scenarios/alloc-per-request` asserts ceilings against those probe fields.
+- **Allocation-count oracles.** Shipped for slab churn. `zone.slab_reqs`
+  exposes cumulative allocation traffic, while `zone.slab_used` exposes live
+  allocation occupancy. `scenarios/alloc-per-request` asserts ceilings against
+  those probe fields.
   That finds slab thrash and an allocation in a path that should reuse; it is
   still blind to anything CPU-bound at flat allocation.
 - **Cachegrind ratio, generalized to a consumer's module.** `perf/cachegrind-scale.sh`
