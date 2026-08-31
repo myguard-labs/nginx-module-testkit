@@ -6,7 +6,7 @@
  */
 #include <openssl/sslerr.h>
 
-/* Force the pre-3.2 header shape even when this test runs on a newer OpenSSL. */
+/* Force the pre-3.4 header shape even when this test runs on a newer OpenSSL. */
 #undef SSL_R_TLSV1_ALERT_NO_APPLICATION_PROTOCOL
 
 #include "openssl_compat.h"

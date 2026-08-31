@@ -98,6 +98,7 @@ PRIMARY	ci/prober/runner_summary_test.sh	runner_summary_test.sh	fast
 # above covered it and the gap stayed invisible.
 PRIMARY	ci/prober/http_test.c	http_test	fast
 PRIMARY	ci/prober/rules_test.c	rules_test	fast
+PRIMARY	ci/prober/openssl_compat_test.c	openssl_compat_test	fast
 
 # prober.c is the CLI driver: it links the LIB but no *_test.c links IT
 # (build.sh:58 excludes it), so no unit test can own it. The scenario suite is
