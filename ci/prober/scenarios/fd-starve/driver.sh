@@ -189,7 +189,11 @@ FDSTARVE_ARM_SED="${FDSTARVE_ARM_SED:-}"
 # own daemon-on branch uses.
 wait_port_free() {
     local _i _owners
-    for ((_i = 0; _i < 100; _i++)); do
+    # Scaled like SETTLE and RETRY_SLEEP below: on a valgrind or sanitizer leg
+    # the retired master holds the listen socket well past a fixed 5s, and an
+    # unscaled budget would bail 125 and land CONTROL 1 as BROKEN -- the
+    # control stops being evidence rather than going falsely red.
+    for ((_i = 0; _i < 100 * PROBER_TIMEOUT_SCALE; _i++)); do
         _owners="$(prober_port_owner_pids 127.0.0.1 "$PORT")" || return 0
         [ -z "$_owners" ] && return 0
         sleep 0.05
@@ -230,7 +234,7 @@ if [ -n "$FDSTARVE_ARM_SED" ]; then
     # exit 125. Scoped to the call and unset immediately after, so nothing later
     # in this driver silently inherits the soft-bail mode.
     if ! PROBER_BAIL_RETURN=1 prober_check_conf; then
-        echo "Bail out! the armed conf does not pass nginx -t -- the fixture could not be armed, so no verdict below is meaningful"
+        echo "Bail out! the armed conf fails prober_check_conf's directive gate (daemon/worker_processes/pid) -- the fixture could not be armed, so no verdict below is meaningful"
         exit 125
     fi
     # Armed BEFORE the boot: prober_boot can start the server and still fail
