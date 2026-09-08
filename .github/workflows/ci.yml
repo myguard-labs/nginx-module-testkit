@@ -895,6 +895,11 @@ jobs:
           # runs the prober), so leaving it out would be the same silent-hole
           # the explicit-list comment above warns about. --source-path=ci/prober
           # still resolves its `# shellcheck source=lib.sh` directive.
+          #
+          # scenarios/*/mutate-suite.sh is globbed for the same reason: a
+          # mutate-suite is real shell that gates a scenario's mutation
+          # verdicts, so an unlinted one can mis-score a mutant while the job
+          # stays green. All 13 of them were uncovered until this glob.
           # verify-impact and pr-impact carry no .sh extension (P2-A/P2-C spec
           # names them as bare entry points, matching ci/prober/build.sh's own
           # style of naming things by role) so the *.sh glob above does not
@@ -908,7 +913,7 @@ jobs:
           # error -- the job should go red for a bad script, not for an absent
           # one.
           shopt -s nullglob
-          shellcheck -x --source-path=ci/prober ci/prober/*.sh ci/prober/verify-impact ci/prober/pr-impact ci/prober/pr-memcheck ci/prober/scenarios/*/driver.sh tools/*.sh
+          shellcheck -x --source-path=ci/prober ci/prober/*.sh ci/prober/verify-impact ci/prober/pr-impact ci/prober/pr-memcheck ci/prober/scenarios/*/driver.sh ci/prober/scenarios/*/mutate-suite.sh tools/*.sh
 
       # The consumer-* scenarios listed in tools/gen-consumer-scenarios.sh are
       # GENERATED from a table in that script. Hand-editing one works locally
