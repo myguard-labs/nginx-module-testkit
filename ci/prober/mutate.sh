@@ -3281,3 +3281,32 @@ mutate "backend: RESP inline parser accepts an embedded NUL" backend.c \
     '        /*
          * Tokenise the caller'"'"'s buffer IN PLACE, exactly as the framed and' \
     backend_test
+
+# --- scenarios/fd-starve (G-2 process-fd exhaustion via worker_rlimit_nofile) -
+#
+# Two non-vacuity claims live in driver.sh's own NON-VACUITY header (CONTROL 1
+# and CONTROL 2). CONTROL 1 (raising/deleting worker_rlimit_nofile in
+# nginx.conf) is documented-only, same tier as fault-matrix's and
+# deploy-canary's own by-hand controls: the checked-in nginx.conf IS the
+# fixture here (there is no compiled-in default to flip, and patching the
+# checked-in conf from a suite script is the same "different shape than
+# patching the driver in place" boundary those two scenarios' headers already
+# draw), so it cannot be expressed as a driver.sh mutation this row's
+# machinery patches.
+#
+# CONTROL 2 (withholding the release before the recovery probe) mutates
+# driver.sh itself exactly like property-fuzz/fault-matrix/deploy-canary's own
+# driver.sh rows above, so it is wired here. Neutralising the `release_held`
+# call before the recovery probe (line 205, kept apart from the `trap -
+# EXIT`/`release_held` definition earlier in the file so the mutant's own shell
+# process still frees its fds on exit rather than leaking real descriptors
+# during the mutation run) must turn assertion 3 (recovery) red: the worker
+# stays pinned at its rlimit and the closing request cannot be accepted within
+# the driver's bounded 2s wait.
+mutate "fd-starve: recovery oracle vacuous (release withheld, suite must still red)" \
+    scenarios/fd-starve/driver.sh \
+    '# --- release: close every held descriptor --------------------------------
+release_held' \
+    '# --- release: close every held descriptor --------------------------------
+: release_held' \
+    scenarios/fd-starve/mutate-suite.sh

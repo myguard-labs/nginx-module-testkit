@@ -104,7 +104,7 @@ under:
 | `conn-delta` | The base case: one request, zero deltas. Everything else is this plus a stressor |
 | `soak-delta` | Many repetitions of the same request, so a drip crosses a `probe_baseline` bound |
 | `rss-slope` | The post-warmup slope, on `cycle_used` and `private_dirty` |
-| `fd-starve` | `worker_connections 10` — requests served while descriptors are scarce, asserting the constrained path is still allocation-neutral |
+| `fd-starve` | A low `worker_rlimit_nofile` plus real held descriptors, driving `accept()` to a witnessed EMFILE, then release and recovery/neutrality — process-fd exhaustion, distinct from `open-conns`'s connection-slot case |
 | `open-conns` | Bare parked connections that never send anything, against the connection accounting |
 | `backpressure` | A reader that will not drain, against the write path |
 | `alloc-per-request` | The direct claim: an ordinary request allocates nothing on the cycle pool |
