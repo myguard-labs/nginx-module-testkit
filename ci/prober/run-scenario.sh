@@ -102,10 +102,11 @@ trap prober_cleanup EXIT
 
 # The env file is sourced, not executed, so ulimit and export take effect in
 # THIS shell -- the one about to fork the server. That is the mechanism by
-# which a scenario arms LD_PRELOAD (mockeagain), lowers `ulimit -n`
-# (fd-starve), or sets PROBER_ALLOW_LOG for a fault it provokes on purpose.
-# It runs after prober_resolve so it may override the resolved port, and
-# before conf render so template substitution sees the final values.
+# which a scenario arms LD_PRELOAD (mockeagain), sets PROBER_ALLOW_LOG
+# (fd-starve) for a fault it provokes on purpose, or otherwise overrides
+# environment the server inherits. It runs after prober_resolve so it may
+# override the resolved port, and before conf render so template
+# substitution sees the final values.
 if [ -f "$SCENARIO/env" ]; then
     # shellcheck source=/dev/null
     . "$SCENARIO/env"

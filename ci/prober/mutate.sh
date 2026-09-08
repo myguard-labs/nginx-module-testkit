@@ -402,6 +402,17 @@ PY
     elif [ "$rc" -eq 124 ]; then
         echo "caught   $name ($suite timed out after ${MUT_SUITE_TIMEOUT}s)"
         pass=$((pass + 1))
+    elif [ "$rc" -eq 125 ]; then
+        # 125 is this tree's own convention (see
+        # scenarios/fd-starve/driver.sh and scenarios/log-oracle-fails-closed's
+        # run_prober helper) for "the fixture itself could not be armed or
+        # exercised" -- a scenario-side setup failure, not a red assertion. A
+        # bare nonzero exit here would read as `caught` and credit a mutation
+        # that was never actually applied to the code under test with proving
+        # anything, which is the same vacuous-gate failure mode this whole
+        # script exists to catch, one layer up.
+        echo "BROKEN  $name -- $suite could not arm its own fixture; the verdict is meaningless"
+        broken=$((broken + 1))
     else
         echo "caught   $name ($suite)"
         pass=$((pass + 1))
@@ -3285,24 +3296,36 @@ mutate "backend: RESP inline parser accepts an embedded NUL" backend.c \
 # --- scenarios/fd-starve (G-2 process-fd exhaustion via worker_rlimit_nofile) -
 #
 # Two non-vacuity claims live in driver.sh's own NON-VACUITY header (CONTROL 1
-# and CONTROL 2). CONTROL 1 (raising/deleting worker_rlimit_nofile in
-# nginx.conf) is documented-only, same tier as fault-matrix's and
-# deploy-canary's own by-hand controls: the checked-in nginx.conf IS the
-# fixture here (there is no compiled-in default to flip, and patching the
-# checked-in conf from a suite script is the same "different shape than
-# patching the driver in place" boundary those two scenarios' headers already
-# draw), so it cannot be expressed as a driver.sh mutation this row's
-# machinery patches.
+# and CONTROL 2). Both are wired here, the same way deploy-canary wires
+# O1/O2/O3: a driver.sh variable, empty by default, applied via sed to the
+# RENDERED conf, never the checked-in source.
 #
+# CONTROL 1 (raising/deleting worker_rlimit_nofile) arms FDSTARVE_ARM_SED,
+# which driver.sh applies to $PROBER_PREFIX/conf/nginx.conf strictly after
+# run-scenario.sh's first boot -- the driver stops that boot, applies the sed
+# to the rendered conf, and reboots before running any assertion. Patching the
+# checked-in nginx.conf directly would not work: this scenario has only one
+# boot in an unmutated run, so a source-file patch would arm the ONLY leg
+# there is and there would be nothing left to compare against -- the row
+# below instead proves the driver's OWN reboot path reproduces the fixture
+# faithfully (an unmutated FDSTARVE_ARM_SED reboot must still pass all four
+# assertions; a non-empty one raising the rlimit must red assertion 2 only).
+# shellcheck disable=SC2016
+mutate "fd-starve: CONTROL 1 (worker_rlimit_nofile raised, EMFILE witness must red)" \
+    scenarios/fd-starve/driver.sh \
+    'FDSTARVE_ARM_SED="${FDSTARVE_ARM_SED:-}"' \
+    'FDSTARVE_ARM_SED="${FDSTARVE_ARM_SED:-s/worker_rlimit_nofile 30;/worker_rlimit_nofile 4096;/}"' \
+    scenarios/fd-starve/mutate-suite.sh
+
 # CONTROL 2 (withholding the release before the recovery probe) mutates
 # driver.sh itself exactly like property-fuzz/fault-matrix/deploy-canary's own
-# driver.sh rows above, so it is wired here. The anchor is the commented
+# driver.sh rows above. The anchor is the commented
 # `release_held` CALL SITE only, so the definition and the EXIT trap earlier in
 # the file stay intact for unmutated runs. The mutant holds the descriptors
 # until its own shell exits, at which point the kernel closes them -- nothing
 # leaks past the mutant run. Neutralising that call must turn assertion 3
 # (recovery) red: the worker stays pinned at its rlimit and the closing request
-# cannot be accepted within the driver's bounded 2s wait.
+# cannot be accepted within the driver's bounded recovery window.
 mutate "fd-starve: recovery oracle vacuous (release withheld, suite must still red)" \
     scenarios/fd-starve/driver.sh \
     '# --- release: close every held descriptor --------------------------------
