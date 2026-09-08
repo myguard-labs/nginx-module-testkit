@@ -154,6 +154,13 @@ if [ -x "$SCENARIO/driver.sh" ]; then
     export PROBER_BACKEND_JOURNAL="${PROBER_BACKEND_JOURNAL:-}"
 
     "$SCENARIO/driver.sh" || STATUS=$?
+
+    # A driver may report a DISTINGUISHED status -- notably 125, this tree's
+    # "the fixture itself could not be armed or exercised" convention (see
+    # scenarios/fd-starve/driver.sh) that mutate.sh maps to BROKEN rather than
+    # `caught`. The three scrapes below therefore must not flatten it: each
+    # raises STATUS from 0 to 1 and otherwise leaves the driver's own status
+    # alone, so a fixture-failure 125 survives to this script's exit.
 else
     # A scenario without rules and without a driver can assert nothing; that
     # is a broken scenario, not an empty test plan, and reporting it as green
@@ -200,7 +207,7 @@ fi
 # report every backend scenario as failed. The errfile is complete by now
 # regardless: fakesrv writes it as it goes, and nothing more is asked of the
 # upstream once the driver or the rules have finished.
-prober_backend_scrape || STATUS=1
+prober_backend_scrape || prober_fail_status
 
 # Then teardown, backend before server, so the module under test sees its
 # upstream disappear only after it has stopped being asked for anything --
@@ -212,7 +219,7 @@ prober_stop
 # The error-log scrape runs after prober_stop, not before: the workers must
 # have exited for the log to be complete and for nothing to still be
 # appending to it.
-prober_scrape_log || STATUS=1
+prober_scrape_log || prober_fail_status
 
 # Same ordering requirement as the error-log scrape: a valgrinded worker only
 # finishes writing its --log-file once it has actually exited, which
@@ -220,7 +227,7 @@ prober_scrape_log || STATUS=1
 # (the normal case) -- see prober_scrape_valgrind. Runs for BOTH the
 # driver.sh path and the rules path above: the server-side valgrind logs are
 # what matter regardless of which one drove the requests.
-prober_scrape_valgrind || STATUS=1
+prober_scrape_valgrind || prober_fail_status
 
 # The prefix is freed by the EXIT trap, not here: both scrapes above read
 # files inside it, so releasing it early would delete the evidence on exactly

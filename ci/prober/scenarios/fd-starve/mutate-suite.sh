@@ -15,4 +15,13 @@ cd "$(dirname "$0")/../.."
 # shellcheck source=mutate-suite-lib.sh
 . ./mutate-suite-lib.sh
 
+# MUTATE_REQUIRE_MARKER (mutate-suite-lib.sh): both fd-starve rows are NEGATIVE
+# CONTROLS, so "the suite exited nonzero" is not enough to credit them -- a lost
+# port, a failed boot or a driver that never reached its assertions all exit
+# nonzero too. The regex names the two red-path markers driver.sh prints (see its
+# header): a failing run that emits neither is reported BROKEN, not caught. Both
+# are accepted by the one pattern because each row is separately anchored on the
+# assertion it mutates and mutate.sh already fails a row whose suite stays green.
+export MUTATE_REQUIRE_MARKER='FDSTARVE-RED-(EMFILE-WITNESS|NEUTRALITY)'
+
 run_mutate_suite scenarios/fd-starve nginx 1.29.0

@@ -74,13 +74,41 @@
 #      first boot, arms the sed, and reboots on the same rendered conf before
 #      running any assertion. See "fd-starve: CONTROL 1" in mutate.sh.
 #   2. Withholding the release (never closing the held fds before the final
-#      probe) makes assertion 3 (recovery) RED: the worker stays pinned at
-#      RLIMIT_NOFILE, the closing request cannot be accepted within the
-#      driver's bounded wait, and the case reports "not ok" rather than
-#      silently passing. WIRED (mutate.sh, MUT_KIND=scenario): see
-#      "fd-starve: recovery oracle vacuous" in mutate.sh, which neutralises
-#      this exact `release_held` call and requires
-#      scenarios/fd-starve/mutate-suite.sh to go red on it.
+#      probe) makes assertion 4 (fd/connection neutrality) RED: the descriptors
+#      and connection slots this driver took are never given back, so `free`
+#      cannot return to its pre-pressure baseline. WIRED (mutate.sh,
+#      MUT_KIND=scenario): see "fd-starve: release oracle" in mutate.sh, which
+#      neutralises this exact `release_held` call.
+#
+#      ASSERTION 4, NOT ASSERTION 3, and this was MEASURED rather than assumed.
+#      The obvious claim -- that withholding the release reds RECOVERY, because
+#      the worker stays pinned at its rlimit and cannot accept the closing
+#      request -- is FALSE here, and the run that proved it is why this file no
+#      longer makes it. With 20 held connections against worker_rlimit_nofile
+#      30 there is still descriptor headroom for one more accept() once
+#      ngx_disable_accept_events re-arms the listen socket, so the mutant run
+#      reports `ok 3` and reds `not ok 4 - ... free=977 vs base 997`. Crediting
+#      that run to a claim about assertion 3 would be the "wrong owner"
+#      vacuity: a control is only evidence for the assertion that actually went
+#      red, which is what the marker below pins down.
+#
+# HOW A CONTROL IS CREDITED -- the 125 convention, stated once for this whole
+# file. mutate.sh reads any plain nonzero, non-124 exit as `caught` (a red
+# assertion), so a driver that DIED before reaching its assertions would credit
+# a control that never ran. Every "the fixture itself could not be armed or
+# exercised" bail below therefore exits 125, a distinct status mutate.sh maps to
+# BROKEN; only a genuine `not ok` reaches the final `exit 1`. Later bails carry
+# no repeat of this rationale.
+#
+# Nonzero alone is still not enough for a CONTROL row, because a fixture can
+# also break in ways this driver never sees (a lost port, a crash in
+# run-scenario.sh's own boot). So each control's red path prints a marker line,
+# and the control's mutate.sh row requires it via MUTATE_REQUIRE_MARKER
+# (mutate-suite-lib.sh): a nonzero run WITHOUT the marker is reported BROKEN,
+# not caught.
+#
+#   FDSTARVE-RED-EMFILE-WITNESS   assertion 2 went red (CONTROL 1)
+#   FDSTARVE-RED-NEUTRALITY       assertion 4 went red (CONTROL 2)
 set -euo pipefail
 
 # shellcheck source=lib.sh
@@ -94,14 +122,12 @@ FAILED=0
 REBOOTED=0
 
 # HELD_FDS, release_held and on_exit are declared and armed BEFORE the
-# CONTROL 1 reboot below, not after: prober_boot can start the second server
-# and then fail its own listener wait (set -e kills this driver before
-# REBOOTED would otherwise be set), or anything else in between can exit, and
-# in either case a trap installed later never runs at all -- exactly the
-# orphaned-second-server outcome the reboot exists not to cause. REBOOTED
-# itself is still set immediately before prober_boot (not after it returns),
-# so the trap treats "we started a second boot" as true the instant that boot
-# is attempted, whether or not it succeeds.
+# CONTROL 1 reboot below, not after: the reboot can start a second server and
+# then fail, and a trap installed later would never run at all -- exactly the
+# orphaned-second-server outcome the reboot exists not to cause. REBOOTED is
+# likewise set immediately BEFORE that boot rather than after it returns, so the
+# trap treats "we started a second boot" as true the instant it is attempted,
+# whether or not it succeeds.
 declare -a HELD_FDS=()
 
 release_held() {
@@ -118,12 +144,10 @@ release_held() {
 # the kind of self-inflicted false positive this repo hunts), AND, when
 # CONTROL 1 rebooted this driver's OWN second server (REBOOTED=1), stop it.
 # That reboot's pid is local to THIS child process (run-scenario.sh runs
-# driver.sh as a plain child, never sources it -- see
-# deploy-canary/driver.sh's identical note on PROBER_SERVER_PID
-# reassignment), so the PARENT's own cleanup still remembers the FIRST boot's
-# (already-dead) pid and cannot reach this one; left alone, the second boot
-# orphans and holds the port for the rest of the CI job, the exact failure
-# deploy-canary/driver.sh's header documents diagnosing in reload-soak.
+# driver.sh as a plain child, never sources it), so the PARENT's own cleanup
+# still remembers the FIRST boot's (already-dead) pid and cannot reach this one;
+# left alone, the second boot orphans and holds the port for the rest of the CI
+# job.
 # shellcheck disable=SC2317  # called only via `trap on_exit EXIT` below
 on_exit() {
     release_held
@@ -144,22 +168,41 @@ trap on_exit EXIT
 # byte-identical to the first boot (the NULL case) and a mutate.sh row can
 # arm a real, isolated fault without editing the checked-in fixture.
 #
-# PROBER_TIMEOUT_SCALE is a plain (unexported) shell variable in
-# run-scenario.sh's own process -- it never reaches this driver, which runs
-# as a separate child (run-scenario.sh's own comment on PROBER_SERVER_PID
-# reassignment says the same about pid tracking). Normalized HERE,
-# unconditionally, not only inside the CONTROL 1 branch below: SETTLE and
-# RETRY_SLEEP further down are computed on EVERY run, armed or not, and their
-# `${PROBER_TIMEOUT_SCALE:-1}` fallback would otherwise silently pin every
-# ordinary (unarmed) CI run to scale 1 even under
-# PROBER_TIMEOUT_SCALE=40 -- no `set -u` crash to catch it, since the `:-1`
-# default swallows the unset variable without complaint.
+# PROBER_TIMEOUT_SCALE is unexported in run-scenario.sh, so it never reaches
+# this driver's separate process. Normalized here UNCONDITIONALLY, not inside
+# the arm branch: SETTLE and RETRY_SLEEP below are computed on every run, and
+# their `${PROBER_TIMEOUT_SCALE:-1}` fallback would otherwise silently pin an
+# ordinary CI run to scale 1 with no `set -u` crash to catch it.
 prober_normalize_timeout_scale
 
 # shellcheck disable=SC2016
 FDSTARVE_ARM_SED="${FDSTARVE_ARM_SED:-}"
+# Wait for a stopped server to be GONE, rather than trusting prober_stop's
+# `wait`. In daemon-off mode prober_stop reaps with `wait "$PROBER_SERVER_PID"`,
+# which only works for a CHILD of the calling shell -- and this driver's first
+# server is a child of run-scenario.sh, its PARENT. `wait` on a non-child
+# returns immediately without reaping, so prober_stop returns while the old
+# master and its worker still hold the listen socket, and the reboot below then
+# races them for the port: `bind() ... (98: Address already in use)`, a failed
+# boot, and (before the marker gate) a control credited `caught` for a fixture
+# that never armed. Poll for actual death instead, the same shape prober_stop's
+# own daemon-on branch uses.
+wait_port_free() {
+    local _i _owners
+    for ((_i = 0; _i < 100; _i++)); do
+        _owners="$(prober_port_owner_pids 127.0.0.1 "$PORT")" || return 0
+        [ -z "$_owners" ] && return 0
+        sleep 0.05
+    done
+    return 1
+}
+
 if [ -n "$FDSTARVE_ARM_SED" ]; then
     prober_stop
+    if ! wait_port_free; then
+        echo "Bail out! the first boot still holds port $PORT after prober_stop -- rebooting onto it would race its own predecessor"
+        exit 125
+    fi
     # sed exits 0 on ZERO substitutions -- its status proves nothing about
     # whether the arm actually took. An FDSTARVE_ARM_SED that matches
     # nothing (a reformatted nginx.conf, a changed rlimit value) would reboot
@@ -175,27 +218,25 @@ if [ -n "$FDSTARVE_ARM_SED" ]; then
     if cmp -s "$PREARM" "$PROBER_PREFIX/conf/nginx.conf"; then
         echo "Bail out! FDSTARVE_ARM_SED ('$FDSTARVE_ARM_SED') changed nothing in the rendered conf -- the mutation was NOT applied and any verdict below would be meaningless"
         rm -f "$PREARM"
-        # 125, not 1: mutate.sh reads any plain nonzero, non-124 exit as
-        # `caught` (a red assertion), so a failed arm exiting 1 would report
-        # this control row as green for a mutation that was never applied --
-        # the exact vacuous-gate failure this driver exists to prevent, one
-        # layer up. 125 is a distinct status mutate.sh maps to BROKEN. Every
-        # other "the fixture itself could not be armed or exercised" bail in
-        # this driver (below, and the two reboot-side checks that follow)
-        # uses the same status for the same reason -- a fixture failure is
-        # not a red assertion, and mixing the two exit codes lets a broken
-        # fixture masquerade as proof.
         exit 125
     fi
     rm -f "$PREARM"
-    if ! prober_check_conf; then
+
+    # PROBER_BAIL_RETURN=1 for exactly these two calls (see lib.sh's own
+    # "BAILING" note): prober_check_conf and prober_boot bail with `exit 1` by
+    # default, which would kill THIS driver outright and hand mutate.sh a plain
+    # 1 -- credited `caught` -- for a fixture that never came up. The opt-in
+    # makes them `return 1` instead so the guards below are reachable and can
+    # exit 125. Scoped to the call and unset immediately after, so nothing later
+    # in this driver silently inherits the soft-bail mode.
+    if ! PROBER_BAIL_RETURN=1 prober_check_conf; then
         echo "Bail out! the armed conf does not pass nginx -t -- the fixture could not be armed, so no verdict below is meaningful"
         exit 125
     fi
     # Armed BEFORE the boot: prober_boot can start the server and still fail
     # its own listener wait, and on_exit must stop it in that case too.
     REBOOTED=1
-    if ! prober_boot; then
+    if ! PROBER_BAIL_RETURN=1 prober_boot; then
         echo "Bail out! the armed reboot did not come up -- fixture failure, not a red assertion"
         exit 125
     fi
@@ -211,18 +252,21 @@ fi
 #   3 release -- with the held descriptors closed, a fresh request succeeds
 #     (the recovery half of the done criterion: not merely "the process is
 #     still alive" but "it serves a request again")
-#   4 fd/connection neutrality -- fds/free are observed CLIMBING toward the
-#     rlimit during the hold, then return to EXACTLY the pre-pressure
+#   4 fd/connection neutrality -- fds/free return to EXACTLY the pre-pressure
 #     baseline after release plus one clean request
-echo "1..4"
+#   5 pressure was actually APPLIED -- the worker's own fd count was observed
+#     STRICTLY ABOVE its pre-pressure baseline at some point during the hold.
+#     Its own assertion rather than a cosmetic branch of assertion 2: the climb
+#     is the direct evidence that this driver's held sockets reached the worker
+#     at all, and a number that can only select between two passing message
+#     strings cannot fail the run and therefore proves nothing.
+echo "1..5"
 
 # --- baseline -----------------------------------------------------------
 BASE_BODY="$(prober_probe_body "$HOST" "$PORT")" || {
     echo "not ok 1 - baseline request before pressure"
     echo "# probe unreachable before any fd pressure was applied"
     echo "Bail out! baseline probe unreadable -- refusing to apply fd pressure to a server already declared unhealthy"
-    # 125: a fixture failure (the probe endpoint itself is unreadable), not a
-    # red assertion -- see the CONTROL 1 arm's own exit-code comment above.
     exit 125
 }
 BASE_FDS="$(prober_probe_field "$BASE_BODY" fds)" || BASE_FDS=""
@@ -232,17 +276,14 @@ if [ -n "$BASE_FDS" ] && [ -n "$BASE_FREE" ]; then
 else
     echo "not ok 1 - baseline probe missing fds or connections.free"
     echo "Bail out! baseline probe returned no fds/free field -- cannot evaluate later assertions against an unknown baseline"
-    # 125: fixture failure, same reasoning as the unreadable-probe bail above.
     exit 125
 fi
 
 BASE_PID="$(prober_probe_field "$BASE_BODY" pid)" || BASE_PID=""
 if [ -z "$BASE_PID" ]; then
     echo "Bail out! baseline probe returned no pid field -- assertion 2 could not attribute an EMFILE witness to THIS boot's worker"
-    # 125: fixture failure, same reasoning as the fds/free bail above -- a
-    # missing pid silently disables the pid gate rather than failing loudly,
-    # which is exactly the "witness text alone" vacuity this driver added the
-    # gate to close.
+    # A missing pid would silently disable the pid gate rather than fail
+    # loudly, which is exactly the "witness text alone" vacuity it closes.
     exit 125
 fi
 
@@ -252,7 +293,6 @@ fi
 # driver held even a single descriptor.
 if grep -qE 'accept4?\(\) failed \(24: Too many open files\)' "$ELOG" 2>/dev/null; then
     echo "Bail out! EMFILE witness text already present in $ELOG before any pressure was applied -- stale log or reused prefix"
-    # 125: fixture failure (a stale/reused log), same reasoning as above.
     exit 125
 fi
 
@@ -288,12 +328,13 @@ for ((i = 0; i < MAX_HOLD; i++)); do
     # of inside the compiled prober.
     if ! exec {fd}<>"/dev/tcp/$HOST/$PORT" 2>/dev/null; then
         # The CLIENT's own connect() failing here (rather than the server's
-        # accept()) would mean this box's OWN fd table or backlog is the
-        # constraint, not the worker's -- not the condition under test, and
-        # not expected at 40 sockets on any CI runner. Treat it as a fixture
-        # break rather than silently interpreting it as the witness.
-        echo "# /dev/tcp connect failed while holding descriptor $i -- client-side fd pressure, not server-side"
-        break
+        # accept()) means this box's OWN fd table or backlog is the constraint,
+        # not the worker's -- not the condition under test, and not expected at
+        # 40 sockets on any CI runner. A `break` here would leave EMFILE_SEEN=0
+        # and red assertion 2, presenting a fixture break as the very red
+        # assertion the controls claim to cause; bail instead.
+        echo "Bail out! /dev/tcp connect failed while holding descriptor $i -- client-side fd pressure, not server-side"
+        exit 125
     fi
     HELD_FDS+=("$fd")
 
@@ -324,12 +365,9 @@ for ((i = 0; i < MAX_HOLD; i++)); do
     fi
 done
 
-# The witness alone decides this assertion. PEAK_FDS comes from the
-# best-effort in-pressure probe inside the hold loop above, which is LEAST
-# likely to answer at the
-# exact moment EMFILE fires (the worker is, by definition, refusing accept()
-# right then) -- so a missing sample is reported, never treated as a reason
-# to fail an assertion the log itself already proves.
+# The witness alone decides THIS assertion; whether the fd count was seen to
+# climb is assertion 5's job, so a missing in-pressure sample cannot red an
+# assertion the log itself already proves.
 if [ "$EMFILE_SEEN" -eq 1 ]; then
     WITNESS="$(grep -E 'accept4?\(\) failed \(24: Too many open files\)' "$ELOG" | tail -1)"
     # Extract the worker pid from the witness line and require it match THIS
@@ -354,32 +392,21 @@ if [ "$EMFILE_SEEN" -eq 1 ]; then
     elif [ "$WITNESS_PID" != "$BASE_PID" ]; then
         echo "not ok 2 - EMFILE witness pid $WITNESS_PID does not match this boot's worker pid $BASE_PID"
         FAILED=$((FAILED + 1))
-    elif [ "$PEAK_FDS" -gt "$BASE_FDS" ] 2>/dev/null; then
-        echo "ok 2 - accept() EMFILE witnessed under held fd pressure (fds climbed $BASE_FDS -> $PEAK_FDS)"
-        echo "# $WITNESS"
     else
-        echo "ok 2 - accept() EMFILE witnessed under held fd pressure (in-pressure fds sample unavailable, base $BASE_FDS)"
+        echo "ok 2 - accept() EMFILE witnessed under held fd pressure (peak fds $PEAK_FDS, base $BASE_FDS)"
         echo "# $WITNESS"
     fi
 else
-    if [ "$PEAK_FDS" -gt "$BASE_FDS" ] 2>/dev/null; then
-        echo "not ok 2 - no accept() EMFILE line appeared in $ELOG after holding ${#HELD_FDS[@]} descriptors (fds climbed $BASE_FDS -> $PEAK_FDS)"
-    else
-        echo "not ok 2 - no accept() EMFILE line appeared in $ELOG after holding ${#HELD_FDS[@]} descriptors (in-pressure fds sample unavailable, base $BASE_FDS)"
-    fi
-    echo "# CONTROL 1 (mutate.sh, FDSTARVE_ARM_SED): raising or deleting"
-    echo "# worker_rlimit_nofile in the rendered conf must make this assertion"
-    echo "# RED exactly like this, because the held connections no longer exceed"
-    echo "# any process ceiling."
+    echo "not ok 2 - no accept() EMFILE line appeared in $ELOG after holding ${#HELD_FDS[@]} descriptors (peak fds $PEAK_FDS, base $BASE_FDS)"
+    # The machine-checkable marker CONTROL 1's mutate.sh row requires (see this
+    # file's header): raising or deleting worker_rlimit_nofile must land HERE,
+    # not merely make the suite exit nonzero.
+    echo "# FDSTARVE-RED-EMFILE-WITNESS"
     FAILED=$((FAILED + 1))
 fi
 
-# The EXIT trap (on_exit) stays armed past this point rather than being
-# cleared: when CONTROL 1 rebooted this driver's own second server, that
-# reboot still needs stopping on every remaining exit path below (a failed
-# recovery probe included), and release_held is idempotent (HELD_FDS is
-# already emptied by the call below, so on_exit's own call at exit iterates
-# nothing).
+# on_exit stays armed past this point: a CONTROL 1 reboot still needs stopping
+# on every remaining exit path, and release_held is idempotent.
 # --- release: close every held descriptor --------------------------------
 release_held
 
@@ -407,10 +434,6 @@ if [ "$RECOVERED" -eq 1 ]; then
     echo "ok 3 - a fresh request succeeds after the held descriptors are released"
 else
     echo "not ok 3 - no successful request within the recovery window after releasing the held descriptors"
-    echo "# CONTROL 2 (wired in mutate.sh, MUT_KIND=scenario): neutralising the"
-    echo "# 'release_held' call above (i.e. withholding the release) makes this"
-    echo "# assertion RED exactly like this, because the worker stays pinned at"
-    echo "# its rlimit and never accepts the recovery probe within the bound."
     FAILED=$((FAILED + 1))
 fi
 
@@ -431,6 +454,12 @@ if [ "$RECOVERED" -eq 1 ] && [ -n "${BASE_FDS:-}" ] && [ -n "${BASE_FREE:-}" ]; 
     # window this re-sample loop exists to widen.
     NOW_FDS=""
     NOW_FREE=""
+    # Set when the re-sample fetch stops answering. Without it the loop breaks
+    # carrying NOW_FDS/NOW_FREE from the PREVIOUS iteration and the comparison
+    # below can print `ok 4` on that stale pair -- so a worker that answered
+    # once and then died would pass a neutrality assertion measured on a body
+    # fetched before it died.
+    STALE=0
     for ((i = 0; i < 20; i++)); do
         NOW_FDS="$(prober_probe_field "$RECOVER_BODY" fds)" || NOW_FDS=""
         NOW_FREE="$(prober_probe_field "$RECOVER_BODY" free)" || NOW_FREE=""
@@ -442,22 +471,51 @@ if [ "$RECOVERED" -eq 1 ] && [ -n "${BASE_FDS:-}" ] && [ -n "${BASE_FREE:-}" ]; 
         sleep "$RETRY_SLEEP"
         if ! RECOVER_BODY="$(prober_probe_body "$HOST" "$PORT")"; then
             echo "# re-sample probe stopped answering; the values below are the last readable sample"
+            STALE=1
             break
         fi
     done
 
-    if [ -n "$NOW_FDS" ] && [ -n "$NOW_FREE" ] \
+    if [ "$STALE" -eq 0 ] && [ -n "$NOW_FDS" ] && [ -n "$NOW_FREE" ] \
        && [ "$NOW_FDS" -eq "$BASE_FDS" ] && [ "$NOW_FREE" -eq "$BASE_FREE" ]; then
         echo "ok 4 - fds and connections.free are back at exactly baseline after release (fds=$NOW_FDS free=$NOW_FREE)"
     else
-        echo "not ok 4 - fds/connections.free did not return to exactly baseline (fds=${NOW_FDS:-?} vs base $BASE_FDS, free=${NOW_FREE:-?} vs base $BASE_FREE)"
-        echo "# either a leaked descriptor, or one that never returned (e.g. an"
-        echo "# error-log fd the worker itself dropped) would fail exactly this way"
+        if [ "$STALE" -eq 1 ]; then
+            echo "not ok 4 - the server stopped answering during the neutrality re-sample; the last readable values (fds=${NOW_FDS:-?} free=${NOW_FREE:-?}) predate that and cannot be asserted on"
+        else
+            echo "not ok 4 - fds/connections.free did not return to exactly baseline (fds=${NOW_FDS:-?} vs base $BASE_FDS, free=${NOW_FREE:-?} vs base $BASE_FREE)"
+            echo "# either a leaked descriptor, or one that never returned (e.g. an"
+            echo "# error-log fd the worker itself dropped) would fail exactly this way"
+            # CONTROL 2's required marker: withholding release_held must land
+            # HERE. Deliberately NOT on the STALE branch above -- that one means
+            # the server stopped answering, i.e. the fixture broke, which is
+            # exactly what the marker exists to distinguish from a red oracle.
+            echo "# FDSTARVE-RED-NEUTRALITY"
+        fi
         FAILED=$((FAILED + 1))
     fi
 else
     echo "not ok 4 - no recovered probe body to measure neutrality against"
     echo "# assertion 3 or the baseline already failed, so neutrality cannot be evaluated"
+    FAILED=$((FAILED + 1))
+fi
+
+# --- pressure actually reached the worker --------------------------------
+# PEAK_FDS is the highest `fds` any in-pressure probe reported during the hold
+# loop. Strictly above the pre-pressure baseline is the direct evidence that
+# this driver's held sockets landed in the WORKER's descriptor table, rather
+# than the run having witnessed an EMFILE line for some reason of its own.
+#
+# The probe during active pressure is best-effort -- the worker is, by
+# definition, refusing accept() around the moment EMFILE fires -- but "the
+# sample was unavailable" is reported as a FAILED assertion, not waved through:
+# a hold loop that reached EMFILE necessarily answered at least one earlier
+# in-pressure probe at a raised fd count, so no sample at all means the pressure
+# was not observed to be applied.
+if [ "$PEAK_FDS" -gt "$BASE_FDS" ] 2>/dev/null; then
+    echo "ok 5 - worker fds observed climbing under the hold ($BASE_FDS -> $PEAK_FDS)"
+else
+    echo "not ok 5 - worker fds were never observed above the pre-pressure baseline (peak $PEAK_FDS, base $BASE_FDS) -- the hold did not demonstrably reach the worker"
     FAILED=$((FAILED + 1))
 fi
 

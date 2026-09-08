@@ -443,6 +443,44 @@ prober_render_conf() {
 # `env`, never globally: a daemonized server tracked by a stale $! is the
 # orphaned-port failure this gate otherwise stops, and the scenario carries the
 # pidfile-teardown contract in exchange.
+# BAILING: `exit` by default, `return` under PROBER_BAIL_RETURN=1
+#
+# prober_check_conf and prober_boot below bail with `prober_bail_rc 1`, which
+# is `exit 1` unless the caller set PROBER_BAIL_RETURN=1, in which case it is
+# `return 1` from the helper.
+#
+# The `exit` default is the one run-scenario.sh and every scenario driver has
+# always relied on, and it is the right default: a gate that fails has nothing
+# left to assert, so aborting the run is the honest outcome and no caller has to
+# remember to check a status.
+#
+# The opt-in exists for the one caller that must SURVIVE the failure in order to
+# report it DIFFERENTLY: a driver arming its own negative control has to
+# distinguish "the fixture could not be brought up" from "the assertion went
+# red", and exit 125 rather than 1 (scenarios/fd-starve/driver.sh; mutate.sh
+# maps 125 to BROKEN and any other nonzero to `caught`). Without it,
+# `if ! prober_boot; then ...; fi` in such a driver is dead code -- the helper's
+# own `exit 1` kills the driver before the guard body can run, and a fixture
+# failure reaches mutate.sh indistinguishable from a red assertion.
+#
+# A shell variable and not a separate wrapper function, because there is no way
+# to call a bash function in a status-tested context (`f || ...`, `if ! f`)
+# without ALSO suppressing errexit for the whole of its body: a wrapper would
+# silently change the execution semantics these bodies were written under. The
+# helper still runs in the caller's own shell either way, so prober_boot's
+# PROBER_SERVER_PID assignment still reaches the teardown that kills it -- which
+# a subshell (`( prober_boot ) || ...`) would lose.
+#
+# Scoped, never global: the fd-starve driver sets it for exactly one call and
+# unsets it immediately after, so every other gate in the same driver keeps the
+# hard-bail default.
+prober_bail_rc() {
+    if [ "${PROBER_BAIL_RETURN:-0}" = "1" ]; then
+        return "${1:-1}"
+    fi
+    exit "${1:-1}"
+}
+
 prober_check_conf() {
     local workers
 
@@ -468,7 +506,7 @@ prober_check_conf() {
              "a different pid per request and every case fails (set" \
              "PROBER_ALLOW_MULTIWORKER=1 in the scenario env if every case uses" \
              "pid_may_change)"
-        exit 1
+        prober_bail_rc 1; return 1
     fi
 
     if [ "${PROBER_DAEMON_MODE:-off}" = "on" ]; then
@@ -482,14 +520,14 @@ prober_check_conf() {
             echo "Bail out! PROBER_DAEMON_MODE=on but the conf lacks" \
                  "\"daemon on;\" -- USR2 binary upgrade is ignored under daemon" \
                  "off (getppid()==ngx_parent for a foregrounded master)"
-            exit 1
+            prober_bail_rc 1; return 1
         fi
         if ! grep -qE "^[[:space:]]*pid[[:space:]]+$PROBER_PREFIX/nginx\.pid[[:space:]]*;" \
             "$PROBER_PREFIX/conf/nginx.conf"; then
             echo "Bail out! PROBER_DAEMON_MODE=on but the conf does not set" \
                  "\"pid $PROBER_PREFIX/nginx.pid;\" -- a daemonized master is not" \
                  "\$! and teardown reads the master pid from that file"
-            exit 1
+            prober_bail_rc 1; return 1
         fi
         return 0
     fi
@@ -498,7 +536,7 @@ prober_check_conf() {
         "$PROBER_PREFIX/conf/nginx.conf"; then
         echo "Bail out! conf lacks \"daemon off;\" -- the engine tracks the" \
              "master by \$! and a daemonized server orphans itself past teardown"
-        exit 1
+        prober_bail_rc 1; return 1
     fi
 }
 
@@ -1397,7 +1435,7 @@ prober_boot() {
             [ -z "$_op" ] && continue
             echo "#   pid $_op: $(readlink "/proc/$_op/exe" 2>/dev/null || echo "unknown (exe unreadable)")"
         done
-        exit 1
+        prober_bail_rc 1; return 1
     elif [ "$_pre_rc" -eq 2 ]; then
         echo "# pre-boot port-ownership check skipped: no ss and no" \
              "readable /proc/net/tcp on this host -- cannot confirm" \
@@ -1413,7 +1451,7 @@ prober_boot() {
         >"$PROBER_PREFIX/logs/conftest" 2>&1; then
         echo "Bail out! config test failed:"
         sed 's/^/# /' "$PROBER_PREFIX/logs/conftest"
-        exit 1
+        prober_bail_rc 1; return 1
     fi
 
     # Capture the launcher's stderr to a file. After config load nginx redirects
@@ -1481,7 +1519,7 @@ prober_boot() {
             if [ -f "$PROBER_PREFIX/logs/server.err" ]; then
                 sed 's/^/# /' "$PROBER_PREFIX/logs/server.err"
             fi
-            exit 1
+            prober_bail_rc 1; return 1
         fi
     fi
 
@@ -1521,7 +1559,7 @@ prober_boot() {
         if [ -f "$PROBER_PREFIX/logs/server.err" ]; then
             sed 's/^/# /' "$PROBER_PREFIX/logs/server.err"
         fi
-        exit 1
+        prober_bail_rc 1; return 1
     fi
 
     # Positive identity: confirm the listener the readiness loop just found is
@@ -1546,7 +1584,7 @@ prober_boot() {
              "children) -- a stale listener from another process is serving" \
              "this scenario:"
         sed 's/^/# /' "$PROBER_PREFIX/logs/.port-owner-check"
-        exit 1
+        prober_bail_rc 1; return 1
     elif [ "$_owner_rc" -eq 2 ]; then
         echo "# port-ownership check skipped: no ss and no readable" \
              "/proc/net/tcp on this host -- cannot confirm $PROBER_RESOLVED_PORT" \
@@ -1583,7 +1621,7 @@ prober_boot() {
                  "the server raced a listener already on port" \
                  "$PROBER_RESOLVED_PORT for this run:"
             sed 's/^/# /' "$PROBER_PREFIX/logs/error.log"
-            exit 1
+            prober_bail_rc 1; return 1
         fi
     fi
 
@@ -1611,7 +1649,7 @@ prober_boot() {
         if [ -f "$PROBER_PREFIX/logs/server.err" ]; then
             sed 's/^/# /' "$PROBER_PREFIX/logs/server.err"
         fi
-        exit 1
+        prober_bail_rc 1; return 1
     fi
 }
 
@@ -1666,6 +1704,27 @@ prober_stop() {
     for _pid in $_targets; do
         kill -9 "$_pid" 2>/dev/null || true
     done
+}
+
+# prober_fail_status
+#
+# Raise the caller's STATUS to 1 only when it is still 0, preserving any
+# DISTINGUISHED nonzero status a scenario driver already reported.
+# run-scenario.sh captures the driver's exit with `|| STATUS=$?` and then runs
+# three post-run scrapes; writing `scrape || STATUS=1` in those three places
+# destroyed the distinction, so a driver that exited 125 ("the fixture could not
+# be armed or exercised" -- scenarios/fd-starve/driver.sh) reached mutate.sh as a
+# plain 1 and was credited `caught` for a mutation that never ran. Ordinary
+# pass/fail is unchanged: STATUS 0 with a failing scrape still becomes 1, and a
+# driver that failed an assertion with 1 stays 1.
+#
+# ALWAYS returns 0. Its callers run under `set -euo pipefail` in a bare
+# statement position, so any nonzero return here would abort run-scenario.sh
+# before the remaining scrapes and the final `exit $STATUS` -- turning the guard
+# itself into the bug it was added to fix.
+prober_fail_status() {
+    [ "${STATUS:-0}" -eq 0 ] && STATUS=1
+    return 0
 }
 
 # prober_scrape_log
