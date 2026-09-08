@@ -148,7 +148,7 @@ release_held() {
 # still remembers the FIRST boot's (already-dead) pid and cannot reach this one;
 # left alone, the second boot orphans and holds the port for the rest of the CI
 # job.
-# shellcheck disable=SC2317  # called only via `trap on_exit EXIT` below
+# shellcheck disable=SC2317,SC2329 # invoked indirectly via `trap ... EXIT`, not a dead call
 on_exit() {
     release_held
     if [ "$REBOOTED" -eq 1 ]; then
