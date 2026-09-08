@@ -3317,7 +3317,7 @@ mutate "backend: RESP inline parser accepts an embedded NUL" backend.c \
 # boot in an unmutated run, so a source-file patch would arm the ONLY leg
 # there is and there would be nothing left to compare against -- the row
 # below instead proves the driver's OWN reboot path reproduces the fixture
-# faithfully (an unmutated FDSTARVE_ARM_SED reboot must still pass all four
+# faithfully (an unmutated FDSTARVE_ARM_SED reboot must still pass all five
 # assertions; a non-empty one raising the rlimit must red assertion 2 only).
 # shellcheck disable=SC2016
 mutate "fd-starve: CONTROL 1 (worker_rlimit_nofile raised, EMFILE witness must red)" \

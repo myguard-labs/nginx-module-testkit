@@ -122,5 +122,14 @@ run_mutate_suite() {
 
     echo "# mutate-suite: gave up after 3 lost-port retries -- this box is" \
          "saturated, not broken" >&2
-    return "$rc"
+    # 125 unconditionally, not "$rc": three lost ports means NO attempt ever
+    # reached the scenario's assertions, so there is no verdict to report. $rc
+    # here is the last attempt's bind failure, which mutate.sh would read as a
+    # plain nonzero and credit `caught` -- a control row credited for a
+    # mutation whose suite never ran, which is the exact failure this file's
+    # marker gate exists to close. A saturated box is BROKEN, not evidence.
+    # Not gated on MUTATE_REQUIRE_MARKER: a suite that lost the port three
+    # times has proven nothing regardless of whether its caller asked for a
+    # marker.
+    return 125
 }

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# The "suite" mutate.sh runs for the fd-starve mutation claim below (recovery
-# oracle: withholding release_held before the recovery probe). It is not a
-# unit-test binary -- it is the scenario, run exactly the way a human runs it
-# from ci/prober/ (see driver.sh's header, CONTROL 2, for the equivalent
-# by-hand recipe this wires into CI). mutate.sh always executes suites
+# The "suite" mutate.sh runs for BOTH fd-starve control rows: CONTROL 1
+# (worker_rlimit_nofile raised -- assertion 2, the EMFILE witness, must red) and
+# CONTROL 2 (release_held withheld -- assertion 4, fd/connection NEUTRALITY,
+# must red; NOT assertion 3, see driver.sh's header for the measurement that
+# settled it). It is not a unit-test binary -- it is the scenario, run exactly
+# the way a human runs it from ci/prober/. mutate.sh always executes suites
 # relative to ci/prober/, which is why this script assumes that cwd.
 #
 # Everything real is in the shared helper, including why the port is allocated

@@ -242,7 +242,7 @@ if [ -n "$FDSTARVE_ARM_SED" ]; then
     fi
 fi
 
-# TAP plan: four assertions.
+# TAP plan: five assertions.
 #   1 baseline request succeeds before any pressure is applied (anti-vacuity:
 #     proves the server is healthy and the probe readable before the fixture
 #     manipulates anything)
