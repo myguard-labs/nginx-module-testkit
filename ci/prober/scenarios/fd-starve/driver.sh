@@ -149,8 +149,7 @@ EMFILE_SEEN=0
 release_held() {
     local fd
     for fd in "${HELD_FDS[@]}"; do
-        eval "exec ${fd}<&-" 2>/dev/null || true
-        eval "exec ${fd}>&-" 2>/dev/null || true
+        exec {fd}<&- 2>/dev/null || true
     done
     HELD_FDS=()
 }
@@ -162,14 +161,14 @@ release_held() {
 trap release_held EXIT
 
 for ((i = 0; i < MAX_HOLD; i++)); do
-    # A fresh numbered fd per iteration (bash allocates the lowest free one
-    # starting at 10 by convention here to stay clear of 0/1/2 and the
-    # driver's own inherited descriptors); held OPEN, never read from and
-    # never written to -- the same bare-parked-connection shape
+    # {fd} lets bash itself pick a free descriptor (>= 10, avoiding 0/1/2 and
+    # any already-open one) rather than this loop guessing numbers by counting
+    # -- a fixed `10 + i` scheme could silently collide with and clobber an
+    # inherited descriptor the shell already holds. Held OPEN, never read from
+    # and never written to -- the same bare-parked-connection shape
     # scenarios/open-conns uses, just opened one at a time from shell instead
     # of inside the compiled prober.
-    fd=$((10 + i))
-    if ! eval "exec ${fd}<>\"/dev/tcp/$HOST/$PORT\"" 2>/dev/null; then
+    if ! exec {fd}<>"/dev/tcp/$HOST/$PORT" 2>/dev/null; then
         # The CLIENT's own connect() failing here (rather than the server's
         # accept()) would mean this box's OWN fd table or backlog is the
         # constraint, not the worker's -- not the condition under test, and
@@ -251,7 +250,8 @@ if [ "$RECOVERED" -eq 1 ] && [ -n "${BASE_FDS:-}" ] && [ -n "${BASE_FREE:-}" ]; 
         FAILED=$((FAILED + 1))
     fi
 else
-    echo "not ok 4 - skipped: no recovered probe body to measure neutrality against"
+    echo "not ok 4 - no recovered probe body to measure neutrality against"
+    echo "# assertion 3 or the baseline already failed, so neutrality cannot be evaluated"
     FAILED=$((FAILED + 1))
 fi
 

@@ -3296,13 +3296,13 @@ mutate "backend: RESP inline parser accepts an embedded NUL" backend.c \
 #
 # CONTROL 2 (withholding the release before the recovery probe) mutates
 # driver.sh itself exactly like property-fuzz/fault-matrix/deploy-canary's own
-# driver.sh rows above, so it is wired here. Neutralising the `release_held`
-# call before the recovery probe (line 205, kept apart from the `trap -
-# EXIT`/`release_held` definition earlier in the file so the mutant's own shell
-# process still frees its fds on exit rather than leaking real descriptors
-# during the mutation run) must turn assertion 3 (recovery) red: the worker
-# stays pinned at its rlimit and the closing request cannot be accepted within
-# the driver's bounded 2s wait.
+# driver.sh rows above, so it is wired here. The anchor is the commented
+# `release_held` CALL SITE only, so the definition and the EXIT trap earlier in
+# the file stay intact for unmutated runs. The mutant holds the descriptors
+# until its own shell exits, at which point the kernel closes them -- nothing
+# leaks past the mutant run. Neutralising that call must turn assertion 3
+# (recovery) red: the worker stays pinned at its rlimit and the closing request
+# cannot be accepted within the driver's bounded 2s wait.
 mutate "fd-starve: recovery oracle vacuous (release withheld, suite must still red)" \
     scenarios/fd-starve/driver.sh \
     '# --- release: close every held descriptor --------------------------------
