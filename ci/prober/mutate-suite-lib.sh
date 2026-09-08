@@ -27,6 +27,21 @@
 # it. So the race is made RECOVERABLE instead: lose the port, take a fresh one
 # and try again, bounded.
 #
+# REQUIRING A MARKER, NOT MERELY A NONZERO EXIT. A mutation row is credited
+# `caught` when its suite exits nonzero -- but "nonzero" covers a red assertion,
+# a crashed fixture, a lost port and a driver that never reached its assertions
+# at all. For a NEGATIVE CONTROL row that is not good enough: the whole claim
+# being made is "mutating X turns assertion N red", and a suite that died before
+# assertion N proves nothing while reporting exactly the same status. So a
+# control row's suite may set MUTATE_REQUIRE_MARKER to an extended regex that
+# must appear in the run's own output for a nonzero exit to count. If the run
+# fails WITHOUT the marker, the suite exits 125 -- this tree's "the fixture could
+# not be armed or exercised" status, which mutate.sh maps to BROKEN rather than
+# `caught`. The marker is emitted by the driver on the specific red-assertion
+# path the row claims (see scenarios/fd-starve/driver.sh's FDSTARVE-RED-*
+# lines), so "caught" means "the named assertion went red", not "the suite
+# exited nonzero".
+#
 # The retry is gated on the bind failure naming THIS port. A blanket
 # retry-on-nonzero would convert a genuinely red suite into three runs of the
 # same red suite and report the last one, which would hide real breakage --
@@ -69,6 +84,9 @@ run_mutate_suite() {
         set -e
 
         if [ "$rc" -eq 0 ]; then
+            # A marker requirement never turns a GREEN run red: an unmutated run
+            # passes all its assertions and emits no red-path marker at all,
+            # which is exactly the baseline mutate.sh checks before any row.
             return 0
         fi
 
@@ -85,10 +103,33 @@ run_mutate_suite() {
 
         # A real failure. Report it on the first occurrence rather than burning
         # two more attempts to arrive at the same answer.
+        #
+        # 125 rather than $rc when a required marker is absent: the run failed,
+        # but not demonstrably at the assertion the caller's control row claims,
+        # so it must reach mutate.sh as BROKEN and not as `caught`. Checked here,
+        # after the EADDRINUSE branch, so a lost port is still retried rather
+        # than reported as an unarmed fixture on the first attempt.
+        if [ -n "${MUTATE_REQUIRE_MARKER:-}" ] \
+           && ! grep -qE "$MUTATE_REQUIRE_MARKER" "$out"; then
+            echo "# mutate-suite: the run failed (exit $rc) but never emitted" \
+                 "the required marker /$MUTATE_REQUIRE_MARKER/ -- the fixture" \
+                 "did not reach the assertion this control claims to red;" \
+                 "reporting 125 (BROKEN), not a caught mutation" >&2
+            return 125
+        fi
         return "$rc"
     done
 
     echo "# mutate-suite: gave up after 3 lost-port retries -- this box is" \
          "saturated, not broken" >&2
-    return "$rc"
+    # 125 unconditionally, not "$rc": three lost ports means NO attempt ever
+    # reached the scenario's assertions, so there is no verdict to report. $rc
+    # here is the last attempt's bind failure, which mutate.sh would read as a
+    # plain nonzero and credit `caught` -- a control row credited for a
+    # mutation whose suite never ran, which is the exact failure this file's
+    # marker gate exists to close. A saturated box is BROKEN, not evidence.
+    # Not gated on MUTATE_REQUIRE_MARKER: a suite that lost the port three
+    # times has proven nothing regardless of whether its caller asked for a
+    # marker.
+    return 125
 }

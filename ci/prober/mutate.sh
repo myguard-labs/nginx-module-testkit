@@ -394,14 +394,41 @@ PY
     # reads it at RUN time, so it must be on the suite invocation and not only
     # the build. It is empty for a plain mutant, so env is a no-op there.
     local rc=0
+    # MUT_ROW carries the row's NAME into the suite. A suite that gates on a
+    # red-path marker (MUTATE_REQUIRE_MARKER, see mutate-suite-lib.sh) needs to
+    # know WHICH row is running so it can require the marker for the assertion
+    # THAT row claims to red, rather than accepting any of the scenario's
+    # markers -- the difference between proving "some assertion reddened" and
+    # proving the claimed one did. Empty for the baseline run and ignored by
+    # every suite that does not gate on a marker.
     # shellcheck disable=SC2086  # $buildenv is VAR=value words for env; see above.
-    env $buildenv timeout "$MUT_SUITE_TIMEOUT" ./"$suite" >/dev/null 2>&1 || rc=$?
+    env MUT_ROW="$name" $buildenv timeout "$MUT_SUITE_TIMEOUT" ./"$suite" >/dev/null 2>&1 || rc=$?
     if [ "$rc" -eq 0 ]; then
         echo "SURVIVED $name -- $suite still passes; the behaviour is untested"
         fail=$((fail + 1))
     elif [ "$rc" -eq 124 ]; then
         echo "caught   $name ($suite timed out after ${MUT_SUITE_TIMEOUT}s)"
         pass=$((pass + 1))
+    elif [ "$rc" -eq 125 ]; then
+        # 125 is this tree's own convention (see
+        # scenarios/fd-starve/driver.sh and scenarios/log-oracle-fails-closed's
+        # run_prober helper) for "the fixture itself could not be armed or
+        # exercised" -- a scenario-side setup failure, not a red assertion. A
+        # bare nonzero exit here would read as `caught` and credit a mutation
+        # that was never actually applied to the code under test with proving
+        # anything, which is the same vacuous-gate failure mode this whole
+        # script exists to catch, one layer up.
+        #
+        # The mapping is only as good as what reaches it. It covers a fixture
+        # failure a DRIVER detected and reported as 125, and (via
+        # MUTATE_REQUIRE_MARKER, mutate-suite-lib.sh) a failing run that never
+        # emitted the red-path marker its control row claims. It is not a total
+        # account of every way a fixture can break: a suite with no marker
+        # requirement whose run dies for a reason its driver never sees still
+        # arrives here as a plain nonzero and is credited `caught`. A control row
+        # that needs better than that sets MUTATE_REQUIRE_MARKER in its suite.
+        echo "BROKEN  $name -- $suite could not arm its own fixture; the verdict is meaningless"
+        broken=$((broken + 1))
     else
         echo "caught   $name ($suite)"
         pass=$((pass + 1))
@@ -3281,3 +3308,48 @@ mutate "backend: RESP inline parser accepts an embedded NUL" backend.c \
     '        /*
          * Tokenise the caller'"'"'s buffer IN PLACE, exactly as the framed and' \
     backend_test
+
+# --- scenarios/fd-starve (G-2 process-fd exhaustion via worker_rlimit_nofile) -
+#
+# Two non-vacuity claims live in driver.sh's own NON-VACUITY header (CONTROL 1
+# and CONTROL 2). Both are wired here, the same way deploy-canary wires
+# O1/O2/O3: a driver.sh variable, empty by default, applied via sed to the
+# RENDERED conf, never the checked-in source.
+#
+# CONTROL 1 (raising/deleting worker_rlimit_nofile) arms FDSTARVE_ARM_SED,
+# which driver.sh applies to $PROBER_PREFIX/conf/nginx.conf strictly after
+# run-scenario.sh's first boot -- the driver stops that boot, applies the sed
+# to the rendered conf, and reboots before running any assertion. Patching the
+# checked-in nginx.conf directly would not work: this scenario has only one
+# boot in an unmutated run, so a source-file patch would arm the ONLY leg
+# there is and there would be nothing left to compare against -- the row
+# below instead proves the driver's OWN reboot path reproduces the fixture
+# faithfully (an unmutated FDSTARVE_ARM_SED reboot must still pass all five
+# assertions; a non-empty one raising the rlimit must red assertion 2 only).
+# shellcheck disable=SC2016
+mutate "fd-starve: CONTROL 1 (worker_rlimit_nofile raised, EMFILE witness must red)" \
+    scenarios/fd-starve/driver.sh \
+    'FDSTARVE_ARM_SED="${FDSTARVE_ARM_SED:-}"' \
+    'FDSTARVE_ARM_SED="${FDSTARVE_ARM_SED:-s/worker_rlimit_nofile 30;/worker_rlimit_nofile 4096;/}"' \
+    scenarios/fd-starve/mutate-suite.sh
+
+# CONTROL 2 (withholding the release) mutates driver.sh itself exactly like
+# property-fuzz/fault-matrix/deploy-canary's own driver.sh rows above. The
+# anchor is the commented `release_held` CALL SITE only, so the definition and
+# the EXIT trap earlier in the file stay intact for unmutated runs. The mutant
+# holds the descriptors until its own shell exits, at which point the kernel
+# closes them -- nothing leaks past the mutant run.
+#
+# Neutralising that call must turn assertion 4 (fd/connection NEUTRALITY) red --
+# not assertion 3 (recovery), which this row claimed until a marker-gated run
+# showed the mutant reporting `ok 3` and failing `not ok 4` instead. driver.sh's
+# NON-VACUITY header carries the measurement and the reason. MUTATE_REQUIRE_MARKER
+# in scenarios/fd-starve/mutate-suite.sh now pins the row to the assertion that
+# actually reds, so the row cannot silently drift back onto the wrong one.
+mutate "fd-starve: release oracle (release withheld, neutrality must red)" \
+    scenarios/fd-starve/driver.sh \
+    '# --- release: close every held descriptor --------------------------------
+release_held' \
+    '# --- release: close every held descriptor --------------------------------
+: release_held' \
+    scenarios/fd-starve/mutate-suite.sh

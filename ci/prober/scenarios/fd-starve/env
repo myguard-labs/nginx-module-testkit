@@ -1,0 +1,22 @@
+# This scenario drives the worker's process-wide file-descriptor table to
+# EMFILE on purpose (see nginx.conf's worker_rlimit_nofile and driver.sh),
+# which nginx logs as
+#   [crit] <pid>#0: accept4() failed (24: Too many open files)
+# -- ngx_event_accept.c's own EMFILE/ENFILE branch logs at NGX_LOG_CRIT, since
+# the condition is a real resource exhaustion, not a benign client event.
+# "accept4()" not "accept()": this repo's CI legs build with NGX_HAVE_ACCEPT4
+# (Linux), which prefers accept4() and names it in the log line; a build
+# without it would say "accept()" instead (see ngx_event_accept.c's own
+# NGX_HAVE_ACCEPT4 branching), so the pattern matches either spelling, same as
+# driver.sh's own witness grep. That witness is the EXACT text driver.sh polls
+# for, so this is the expected outcome the scenario exists to provoke, not a
+# finding; without this exemption prober_scrape_log's [alert|crit|emerg] gate
+# would fail the run on the very line the scenario is built to assert.
+#
+# Scoped to that one message, not the whole crit level: a segfault, a
+# double-free or an unrelated crit anywhere else in the same run still fails
+# the scrape, which is the entire point of PROBER_ALLOW_LOG being a pattern
+# and not a blanket switch. driver.sh's own witness grep asserts this same
+# text POSITIVELY, so the two cannot silently drift apart -- exempting a line
+# the scenario no longer produces would fail that grep first.
+PROBER_ALLOW_LOG='accept4?\(\) failed \(24: Too many open files\)'
