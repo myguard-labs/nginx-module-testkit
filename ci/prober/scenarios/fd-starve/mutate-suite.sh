@@ -19,10 +19,31 @@ cd "$(dirname "$0")/../.."
 # MUTATE_REQUIRE_MARKER (mutate-suite-lib.sh): both fd-starve rows are NEGATIVE
 # CONTROLS, so "the suite exited nonzero" is not enough to credit them -- a lost
 # port, a failed boot or a driver that never reached its assertions all exit
-# nonzero too. The regex names the two red-path markers driver.sh prints (see its
-# header): a failing run that emits neither is reported BROKEN, not caught. Both
-# are accepted by the one pattern because each row is separately anchored on the
-# assertion it mutates and mutate.sh already fails a row whose suite stays green.
-export MUTATE_REQUIRE_MARKER='FDSTARVE-RED-(EMFILE-WITNESS|NEUTRALITY)'
+# nonzero too. driver.sh prints a marker on each red path; a failing run that
+# emits none is reported BROKEN, not caught.
+#
+# The marker is pinned PER ROW, keyed on MUT_ROW (exported by mutate.sh). One
+# alternation shared by both rows would only prove that SOME fd-starve
+# assertion reddened, and this scenario has already been bitten by that gap:
+# CONTROL 2 named assertion 3 until a marker-gated run showed it leaving 3
+# green and reddening 4 instead. An anchor constrains what is MUTATED, not
+# which assertion REDS -- so each row states the assertion it claims.
+#
+# A by-hand run (no MUT_ROW) accepts either marker: there is no row making a
+# claim to hold it to.
+case "${MUT_ROW:-}" in
+    *"CONTROL 1"*)      EXPECT='FDSTARVE-RED-EMFILE-WITNESS' ;;
+    *"release oracle"*) EXPECT='FDSTARVE-RED-NEUTRALITY' ;;
+    "")                 EXPECT='FDSTARVE-RED-(EMFILE-WITNESS|NEUTRALITY)' ;;
+    *)
+        # A new row nobody taught this suite about. Failing closed keeps an
+        # unrecognised row from being credited by whichever marker happens to
+        # appear -- exactly the wrong-owner vacuity this gate exists to close.
+        echo "Bail out! scenarios/fd-starve/mutate-suite.sh does not know which" \
+             "assertion row '$MUT_ROW' claims to red; add it to the case above"
+        exit 125
+        ;;
+esac
+export MUTATE_REQUIRE_MARKER="$EXPECT"
 
 run_mutate_suite scenarios/fd-starve nginx 1.29.0

@@ -394,8 +394,15 @@ PY
     # reads it at RUN time, so it must be on the suite invocation and not only
     # the build. It is empty for a plain mutant, so env is a no-op there.
     local rc=0
+    # MUT_ROW carries the row's NAME into the suite. A suite that gates on a
+    # red-path marker (MUTATE_REQUIRE_MARKER, see mutate-suite-lib.sh) needs to
+    # know WHICH row is running so it can require the marker for the assertion
+    # THAT row claims to red, rather than accepting any of the scenario's
+    # markers -- the difference between proving "some assertion reddened" and
+    # proving the claimed one did. Empty for the baseline run and ignored by
+    # every suite that does not gate on a marker.
     # shellcheck disable=SC2086  # $buildenv is VAR=value words for env; see above.
-    env $buildenv timeout "$MUT_SUITE_TIMEOUT" ./"$suite" >/dev/null 2>&1 || rc=$?
+    env MUT_ROW="$name" $buildenv timeout "$MUT_SUITE_TIMEOUT" ./"$suite" >/dev/null 2>&1 || rc=$?
     if [ "$rc" -eq 0 ]; then
         echo "SURVIVED $name -- $suite still passes; the behaviour is untested"
         fail=$((fail + 1))
