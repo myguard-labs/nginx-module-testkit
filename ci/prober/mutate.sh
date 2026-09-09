@@ -3353,3 +3353,76 @@ release_held' \
     '# --- release: close every held descriptor --------------------------------
 : release_held' \
     scenarios/fd-starve/mutate-suite.sh
+
+# --- scenarios/lifecycle-journal (L-1a out-of-process termination journal) --
+#
+# Four rows, one per claim in driver.sh's own header: QUIT and TERM each get
+# a driver-side mutation that disarms the signal actually sent (kill -0
+# instead of the real signal), so the terminal journal record that claim's
+# assertion checks for never has a cause -- proving each assertion is a live
+# check of a signal that landed, not something the journal or the driver
+# would print regardless. The SIGKILL non-vacuity row instead mutates the
+# JOURNAL ENGINE (lib.sh) to fabricate a false terminal record from the
+# "exited on signal" alert line the master logs after a real SIGKILL -- the
+# exact failure mode claim 3 exists to catch, planted directly rather than
+# argued about. The sequence row corrupts the per-event counter so two
+# events land with the same seq, breaking claim 4's monotonicity check.
+#
+# shellcheck disable=SC2016
+mutate "lifecycle-journal: QUIT terminal event (signal disarmed, must red)" \
+    scenarios/lifecycle-journal/driver.sh \
+    'kill -QUIT "$MASTER1" 2>/dev/null || true' \
+    'kill -0 "$MASTER1" 2>/dev/null || true' \
+    scenarios/lifecycle-journal/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-journal: TERM terminal event (signal disarmed, must red)" \
+    scenarios/lifecycle-journal/driver.sh \
+    'kill -TERM "$MASTER2" 2>/dev/null || true' \
+    'kill -0 "$MASTER2" 2>/dev/null || true' \
+    scenarios/lifecycle-journal/mutate-suite.sh
+
+# The journal engine lives in lib.sh, shared by every scenario -- the anchor
+# below is the worker-exit case arm's OWN pattern text, unique in the file,
+# extended to also translate the SIGKILL alert line into a fabricated
+# "exiting" record carrying the KILLED WORKER's own pid (not the master's,
+# which appears first on that log line -- the extraction pattern is widened
+# to prefer the "worker process N exited" pid). Reverted after the row runs,
+# same as every other lib.sh-anchored row in this file.
+# shellcheck disable=SC2016
+mutate "lifecycle-journal: SIGKILL non-vacuity (fabricated exiting record must red)" \
+    lib.sh \
+    '                *'\''exiting'\''|*'\''gracefully shutting down'\'')
+                    wpid="$(printf '\''%s\n'\'' "$line" | sed -n \
+                        '\''s/^.* \([0-9][0-9]*\)#[0-9][0-9]*: \(exiting\|gracefully shutting down\)$/\1/p'\'')"
+                    [ -n "$wpid" ] || continue
+                    case "$line" in
+                        *'\''exiting'\'') ev=exiting ;;
+                        *)          ev=shutting_down ;;
+                    esac' \
+    '                *'\''exiting'\''|*'\''gracefully shutting down'\''|*'\''exited on signal'\''*)
+                    wpid="$(printf '\''%s\n'\'' "$line" | sed -nE \
+                        '\''s/^.*worker process ([0-9]+) exited on signal [0-9]+$/\1/p; t; s/^.* ([0-9]+)#[0-9]+: (exiting|gracefully shutting down)$/\1/p'\'')"
+                    [ -n "$wpid" ] || continue
+                    case "$line" in
+                        *'\''exited on signal'\''*) ev=exiting ;;
+                        *'\''exiting'\'') ev=exiting ;;
+                        *)          ev=shutting_down ;;
+                    esac' \
+    scenarios/lifecycle-journal/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-journal: sequence monotonicity (duplicate seq must red)" \
+    lib.sh \
+    '                    [ -n "$mpid" ] || mpid="0"
+                    seq=$((seq + 1))
+                    {
+                        flock -x 200
+                        printf '\''{"role":"master","pid":%s,"gen":%s,"ev":"exit","seq":%s}\n'\'' \
+                            "$mpid" "$gen" "$seq" >&200' \
+    '                    [ -n "$mpid" ] || mpid="0"
+                    {
+                        flock -x 200
+                        printf '\''{"role":"master","pid":%s,"gen":%s,"ev":"exit","seq":%s}\n'\'' \
+                            "$mpid" "$gen" "$seq" >&200' \
+    scenarios/lifecycle-journal/mutate-suite.sh

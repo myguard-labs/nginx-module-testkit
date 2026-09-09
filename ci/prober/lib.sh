@@ -2147,6 +2147,175 @@ prober_served_by() {
     [ "$got" = "$want" ]
 }
 
+# prober_journal_start LOG JOURNAL [PIDFILE]
+#
+# Sets: PROBER_JOURNAL_PID
+#
+# Starts a background watcher that turns nginx's OWN lifecycle log lines --
+# "gracefully shutting down" and "exiting" for a worker, bare "exit" for the
+# master, all logged at NGX_LOG_NOTICE by ngx_process_cycle.c -- into an
+# append-only JSONL journal, one record per event:
+#   {"role":"worker"|"master","pid":N,"gen":N,"ev":NAME,"seq":N}
+#
+# WHY THIS IS THE ONLY POSSIBLE ORACLE. This tree has NO exit_process /
+# init_process / exit_master module hooks anywhere (confirmed by grep over
+# the whole tree), and the probe (ngx_test_probe.c / PROBE_HTTP_TEMPLATE.c) is
+# a request-time renderer -- once a worker has exited there is nothing left
+# inside the process to ask. nginx's own NOTICE line is the only externally
+# observable record of a CLEAN exit, so the reader of it must survive the
+# process it describes: it runs as an independent background loop tailing the
+# error log by name, never as a request made to the server, and it keeps
+# running after every worker and the master are gone.
+#
+# WHY THIS IS ALSO THE NEGATIVE CONTROL, BY CONSTRUCTION. nginx installs no
+# handler for SIGKILL, so none of ngx_worker_process_cycle's exit-logging
+# branches ever run for a killed process -- there is no line for this watcher
+# to translate. A SIGKILLed process therefore leaves no terminal journal
+# record for its pid, not because the watcher was told to ignore one, but
+# because nginx itself never wrote one. worker-death (a sibling scenario)
+# SIGKILLs a worker and asserts the exit-on-signal-9 log line as its own
+# non-vacuity control for the SAME underlying reason.
+#
+# ROLE / GEN. A worker line already carries its own pid ("<pid>#<tid>: ...").
+# A master line is bare "exit" with no pid in the text, so it is attributed to
+# whichever pid currently owns PIDFILE (default $PROBER_PREFIX/nginx.pid) at
+# the moment the line is read -- fetched FRESH per line, never cached, because
+# a USR2 upgrade hands the pidfile to a new master while the retiring one is
+# still writing its own final "exit" line (see usr2-state-machine). GEN starts
+# at 0 and increments once, right after each master "exit" record is
+# emitted -- so the retiring master's own exit is tagged with the generation
+# it belonged to, and only the NEXT master's eventual exit is tagged higher.
+#
+# A master's own exit-log line is written by ngx_master_process_exit AFTER it
+# has already called ngx_delete_pidfile (see ngx_process_cycle.c) -- so a
+# clean exit's own "exit" record legitimately carries pid 0: the pidfile is
+# already gone at the exact moment this watcher reads that line, and there is
+# no live document anywhere naming the master this record describes. That is
+# not a bug in this attribution scheme, it is what the retiring master's own
+# exit sequence guarantees; a caller wanting the master's pid for that record
+# already has it from whatever discovered the generation in the first place
+# (a USR2 handoff, a probe snapshot before the signal was sent).
+#
+# tail -F (capital F): follows the log BY NAME, not by the currently-open
+# inode, so a log path that is replaced out from under the watcher (this repo
+# never rotates error_log mid-run, but -F costs nothing and is the safe
+# default used elsewhere in this file) is still tracked.
+#
+# DURABILITY. JOURNAL is created via tmp+fsync+rename the FIRST time this is
+# called for a given path, mirroring prober_backend_start's documented reason
+# for fakesrv's portfile: a reader must never observe a torn write. Every
+# record append happens under `flock -x` on the journal path itself so a
+# reader polling with `wc -l`/`tail` never observes a half-written JSON line,
+# and the journal's fd is fsync'd after each append so a record a caller has
+# just counted is durable on disk, not sitting in a buffer that a hard kill of
+# the watcher would lose.
+#
+# SPANS RESTARTS. A caller that stops this watcher (prober_journal_stop) and
+# starts a fresh one against the SAME journal path -- lifecycle-journal's
+# driver does this once per phase, across three independent master/worker
+# generations -- gets ONE continuous journal, not three separate ones each
+# overwriting the last: an existing file at JOURNAL is left alone (never
+# truncated), and SEQ/GEN are seeded from its own last recorded values rather
+# than restarting at 0/0, or every restart would silently reset both counters
+# and manufacture a false "seq went backwards" or "gen never advanced" defect
+# that has nothing to do with the process this journal is watching.
+prober_journal_start() {
+    local log="$1" journal="$2" pidfile="${3:-$PROBER_PREFIX/nginx.pid}"
+
+    if [ ! -e "$journal" ]; then
+        : > "$journal.tmp"
+        # fsync the empty placeholder before the rename, same discipline as
+        # write_portfile() in fakesrv.c: a reader must never see a torn file.
+        exec 8<>"$journal.tmp"
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c 'import os,sys; os.fsync(int(sys.argv[1]))' 8 2>/dev/null || true
+        fi
+        exec 8<&-
+        mv -f "$journal.tmp" "$journal"
+    fi
+
+    # Seed SEQ/GEN from the journal's own last line rather than 0/0, so a
+    # restart against an existing journal continues its sequence instead of
+    # silently resetting it. `tail -n1` on an empty or not-yet-existing file
+    # prints nothing, and the sed/arithmetic below default cleanly to 0.
+    local _last _seed_seq _seed_gen
+    _last="$(tail -n1 "$journal" 2>/dev/null || true)"
+    _seed_seq="$(printf '%s' "$_last" | sed -n 's/.*"seq":\([0-9]\{1,\}\).*/\1/p')"
+    _seed_gen="$(printf '%s' "$_last" | sed -n 's/.*"gen":\([0-9]\{1,\}\).*/\1/p')"
+    [ -n "$_seed_seq" ] || _seed_seq=0
+    [ -n "$_seed_gen" ] || _seed_gen=0
+
+    (
+        seq="$_seed_seq"
+        # A restart's first NEW master "exit" record, if this is a resumed
+        # journal, must land in the NEXT generation after the one the last
+        # line already recorded -- the increment-after-emit at the bottom of
+        # the master branch below only fires on a FRESH master exit seen from
+        # here on, so seed gen to (last recorded gen) and let that same
+        # increment carry it forward exactly as it would have in one
+        # continuous run.
+        gen="$_seed_gen"
+        while IFS= read -r line; do
+            case "$line" in
+                *' exit')
+                    mpid=""
+                    [ -s "$pidfile" ] && mpid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null)"
+                    [ -n "$mpid" ] || mpid="0"
+                    seq=$((seq + 1))
+                    {
+                        flock -x 200
+                        printf '{"role":"master","pid":%s,"gen":%s,"ev":"exit","seq":%s}\n' \
+                            "$mpid" "$gen" "$seq" >&200
+                    } 200>>"$journal"
+                    if command -v python3 >/dev/null 2>&1; then
+                        exec 201<>"$journal"
+                        python3 -c 'import os,sys; os.fsync(int(sys.argv[1]))' 201 2>/dev/null || true
+                        exec 201<&-
+                    fi
+                    gen=$((gen + 1))
+                    ;;
+                *'exiting'|*'gracefully shutting down')
+                    wpid="$(printf '%s\n' "$line" | sed -n \
+                        's/^.* \([0-9][0-9]*\)#[0-9][0-9]*: \(exiting\|gracefully shutting down\)$/\1/p')"
+                    [ -n "$wpid" ] || continue
+                    case "$line" in
+                        *'exiting') ev=exiting ;;
+                        *)          ev=shutting_down ;;
+                    esac
+                    seq=$((seq + 1))
+                    {
+                        flock -x 200
+                        printf '{"role":"worker","pid":%s,"gen":%s,"ev":"%s","seq":%s}\n' \
+                            "$wpid" "$gen" "$ev" "$seq" >&200
+                    } 200>>"$journal"
+                    if command -v python3 >/dev/null 2>&1; then
+                        exec 201<>"$journal"
+                        python3 -c 'import os,sys; os.fsync(int(sys.argv[1]))' 201 2>/dev/null || true
+                        exec 201<&-
+                    fi
+                    ;;
+            esac
+        done < <(tail -F -n0 "$log" 2>/dev/null)
+    ) &
+    PROBER_JOURNAL_PID=$!
+}
+
+# prober_journal_stop
+#
+# Stops the background watcher started by prober_journal_start. Signals the
+# whole process group (the subshell plus its `tail -F` child): killing only
+# the subshell's own pid leaves `tail -F` running and holding the log file
+# open past teardown, the same leak prober_backend_stop's wait-for-exit
+# discipline exists to avoid for fakesrv.
+prober_journal_stop() {
+    [ -n "${PROBER_JOURNAL_PID:-}" ] || return 0
+    kill -TERM -- "-$PROBER_JOURNAL_PID" 2>/dev/null || true
+    kill -TERM "$PROBER_JOURNAL_PID" 2>/dev/null || true
+    wait "$PROBER_JOURNAL_PID" 2>/dev/null || true
+    PROBER_JOURNAL_PID=""
+}
+
+
 # prober_cleanup
 #
 # Idempotent teardown of everything a scenario allocated: fake upstream,
