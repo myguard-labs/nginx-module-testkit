@@ -16,7 +16,7 @@
 # exit lines into an append-only JSONL journal that keeps running after every
 # worker and the master it watches are gone.
 #
-# THE FOUR CLAIMS, and why each is the shape it is:
+# THE FIVE CLAIMS, and why each is the shape it is:
 #
 #   1. QUIT emits the terminal event for the worker(s) it retired. QUIT is the
 #      graceful shutdown signal: the worker logs "gracefully shutting down"
@@ -37,13 +37,36 @@
 #      logs "exiting", ever runs. So a killed worker leaves NO record in the
 #      journal for its pid: not because the watcher was told to ignore one,
 #      but because nginx itself never wrote the line the watcher translates.
-#      This is the NON-VACUITY control: it is what tells apart a real
-#      out-of-process oracle from one that would print something on its own
-#      teardown regardless of how the process actually died.
+#      This is the NON-VACUITY control.
+#
+#      IT IS ALSO THE CLAIM MOST EASILY FAKED, because its pass condition is
+#      an ABSENCE, and an absence is produced just as readily by a reader that
+#      never attached, died, or was never started as by the truth being
+#      asserted. Two things stop that, and only together: prober_journal_start
+#      does not return until its attach handshake proves the watcher is
+#      reading the log, and this phase requires a LIVENESS WITNESS at its end
+#      -- the phase-3 master's own correctly attributed exit record, on the
+#      same watcher, in the same phase -- before it will conclude anything
+#      from the killed worker's silence. Without the witness this printed
+#      `ok 3` with the phase-3 watcher SIGKILLed, and assertion 4 passed too,
+#      because phases 1 and 2 had already made the journal non-empty. The
+#      "dead phase-3 reader" mutation row exists to keep it that way.
 #
 #   4. Sequence numbers strictly increase, one per emitted event, with none
 #      lost or duplicated -- checked across all the events the three phases
-#      above produced, read back from the one journal file spanning them.
+#      above produced, read back from the one journal file spanning them. A
+#      record with no seq field at all is reported as MALFORMED, not as
+#      non-monotonic: scoring it 0 would report a fabricated sequence defect
+#      of the server for what is a defect of the record shape.
+#
+#   5. The records carry the schema this journal documents: every line matches
+#      the declared shape, no pid this driver read out of the probe as a
+#      WORKER is recorded with role master, and gen advances exactly once per
+#      master exit. Nothing else here reads role or gen, which is precisely
+#      how the journal first shipped producing a schema it did not document --
+#      both roles log an identical bare "exit", and a classifier keying on the
+#      absence of a pid in the text labelled every worker exit "master" while
+#      claims 1-4 stayed green. Claim 5 is the one that reds.
 #
 # Why a driver and not a .rule file: this proof spans three separate signals
 # delivered to three separate master/worker generations with the journal
@@ -81,7 +104,11 @@ ELOG="$PROBER_PREFIX/logs/error.log"
 JOURNAL="$PROBER_PREFIX/lifecycle.jsonl"
 PIDFILE="$PROBER_PREFIX/nginx.pid"
 
-export PROBER_ERROR_LOG="$ELOG"
+# Every `Bail out!` below leaves this phase's journal watcher running, and
+# with it a `tail -F` on a log the harness is about to remove. run-scenario.sh
+# installs prober_cleanup in ITS shell, not in this driver process, so nothing
+# else reaps it. One trap, installed before the first watcher exists.
+trap 'prober_journal_stop || true' EXIT
 
 FAILED=0
 
@@ -153,21 +180,36 @@ start_phase() {
         prober_normalize_timeout_scale
         prober_boot
     fi
-    prober_journal_start "$ELOG" "$JOURNAL" "$PIDFILE"
+    prober_journal_start "$ELOG" "$JOURNAL"
 }
 
-# Stops the journal watcher FIRST, then the server: the watcher's own exit
-# must not race the last line it is meant to translate, so its "$1" argument
-# below is only ever called after wait_journal_lines has already confirmed
-# the terminal record landed (or the timeout has already been charged to the
-# calling phase's own failure).
+# Stops the SERVER first, then the watcher -- the opposite of the original
+# order, which stopped the watcher first and lost every master's own "exit"
+# line to the gap.
+#
+# Stopping the watcher first is only safe if nothing more will be logged, and
+# that is false here: prober_stop is what retires the generation, so the
+# master's ngx_master_process_exit "exit" line -- the very line assertion 5's
+# gen accounting counts, and the line assertion 3's liveness witness needs --
+# is written AFTER the point the watcher used to be killed. With -n0 the next
+# phase's watcher cannot recover it either. So the server is retired first,
+# the master's terminal record is waited for, and only then is the watcher
+# stopped.
+#
+# The wait is bounded and advisory: a phase whose own assertion already failed
+# must not additionally hang here, and the assertion that cares about the
+# record (5) reports its absence itself.
 stop_phase() {
-    prober_journal_stop
+    local m="${1:-}"
     prober_stop
+    if [ -n "$m" ]; then
+        wait_journal_lines "\"role\":\"master\",\"pid\":$m,\"gen\":[0-9]+,\"ev\":\"exit\"" 60 || true
+    fi
+    prober_journal_stop
     wait_port_free || true
 }
 
-echo "1..4"
+echo "1..5"
 
 # --- 1: QUIT emits the terminal event for the worker(s) it retired --------
 start_phase 0
@@ -198,7 +240,7 @@ else
     [ -s "$JOURNAL" ] && sed 's/^/# /' "$JOURNAL" || echo "# journal is empty"
     FAILED=$((FAILED + 1))
 fi
-stop_phase
+stop_phase "$MASTER1"
 
 # --- 2: TERM emits the terminal event ---------------------------------------
 start_phase 1
@@ -226,7 +268,7 @@ else
     [ -s "$JOURNAL" ] && sed 's/^/# /' "$JOURNAL" || echo "# journal is empty"
     FAILED=$((FAILED + 1))
 fi
-stop_phase
+stop_phase "$MASTER2"
 
 # --- 3: SIGKILL does NOT emit a terminal event (the non-vacuity control) --
 start_phase 1
@@ -255,19 +297,49 @@ kill -KILL "$WPID3" 2>/dev/null || true
 # positive legs did not also have to win.
 sleep 2
 
+KILLED_RECORD=0
 if wait_journal_lines "\"role\":\"worker\",\"pid\":$WPID3,\"gen\":[0-9]+,\"ev\":\"exiting\"" 1; then
+    KILLED_RECORD=1
+fi
+
+# THE LIVENESS WITNESS, and why claim 3 is worthless without one.
+#
+# Claim 3's pass condition is an ABSENCE, and an absence is satisfied just as
+# well by a watcher that never attached, died, or was never started at all as
+# by the truth being asserted -- nginx genuinely never writing a line for a
+# SIGKILLed process. prober_journal_start's handshake proves the watcher was
+# attached when the phase BEGAN; this proves it was still alive and still
+# translating lines at the END of the phase, after the kill, on the SAME
+# watcher and in the SAME phase whose absence is being read.
+#
+# The witness is the phase-3 master's own clean retirement, which this driver
+# has to perform for teardown anyway: QUIT it and require its correctly
+# attributed terminal record (role master, its own pid) to appear. Only then
+# does "no record for $WPID3" mean anything. The replacement worker the master
+# respawned after the kill also retires here, which is why the QUIT happens
+# before the verdict rather than after it.
+kill -QUIT "$MASTER3" 2>/dev/null || true
+wait_master_gone "$MASTER3" 100 || true
+
+if wait_journal_lines "\"role\":\"master\",\"pid\":$MASTER3,\"gen\":[0-9]+,\"ev\":\"exit\"" 60; then
+    WITNESS=1
+else
+    WITNESS=0
+fi
+
+if [ "$WITNESS" != "1" ]; then
+    echo "not ok 3 - phase-3 journal watcher never produced the master $MASTER3 exit record that witnesses it was live; the absence of a record for worker $WPID3 proves nothing"
+    echo "# LIFECYCLE-RED-SIGKILL-NONVACUITY"
+    [ -s "$JOURNAL" ] && sed 's/^/# /' "$JOURNAL" || echo "# journal is empty"
+    FAILED=$((FAILED + 1))
+elif [ "$KILLED_RECORD" = "1" ]; then
     echo "not ok 3 - SIGKILL produced a terminal journal record for worker $WPID3 (should be none)"
     echo "# LIFECYCLE-RED-SIGKILL-NONVACUITY"
     FAILED=$((FAILED + 1))
 else
-    echo "ok 3 - SIGKILL produced NO terminal journal record for worker $WPID3"
+    echo "ok 3 - SIGKILL produced NO terminal journal record for worker $WPID3, on a watcher witnessed live by master $MASTER3's own exit record"
 fi
-# The master this phase booted is a fresh generation kill -QUIT can retire
-# cleanly for teardown's own sake; its own exit record (if any) does not
-# affect claim 3, which is scoped to the WORKER pid only.
-kill -QUIT "$MASTER3" 2>/dev/null || true
-wait_master_gone "$MASTER3" 100 || true
-stop_phase
+stop_phase "$MASTER3"
 
 # --- 4: sequence numbers strictly increase, none lost or duplicated -------
 if [ ! -s "$JOURNAL" ]; then
@@ -275,7 +347,17 @@ if [ ! -s "$JOURNAL" ]; then
     echo "# LIFECYCLE-RED-SEQUENCE"
     FAILED=$((FAILED + 1))
 else
-    SEQ_CHECK="$(awk -F'"seq":' '{n=$2+0; if (n<=prev) bad=1; prev=n; seen[n]++}
+    # A line with no "seq": field at all is MALFORMED, not non-monotonic:
+    # awk's $2+0 scores it 0, which then reads as "the sequence went
+    # backwards" and reports a fabricated defect of the server for what is a
+    # defect of the record shape. The two are separated so the diagnostic
+    # names the real fault.
+    SEQ_CHECK="$(awk '{
+            if ($0 !~ /"seq":[0-9]+/) { print "malformed:line" NR; exit }
+            split($0, a, /"seq":/); n = a[2] + 0
+            if (n <= prev) bad = 1
+            prev = n; seen[n]++
+        }
         END{
             for (s in seen) if (seen[s] > 1) { print "dup:" s; exit }
             if (bad) { print "nonmonotonic"; exit }
@@ -290,6 +372,103 @@ else
         sed 's/^/# /' "$JOURNAL"
         FAILED=$((FAILED + 1))
     fi
+fi
+
+# --- 5: role and gen are what the schema says they are --------------------
+#
+# WHY THIS EXISTS. Nothing above reads role or gen, which is exactly how the
+# journal shipped producing a schema it did not document: ngx_process_cycle.c
+# logs the SAME bare "exit" NOTICE for both roles (:662 master, :994 worker),
+# so a classifier keying on "the text has no pid" -- rather than on WHOSE pid
+# the line carries -- labels every worker's own exit "master" and, because gen
+# advances after each master exit, advances gen about twice per real
+# generation. Every assertion above stayed green through all of it. This row
+# is the one that reds.
+#
+# Three things are checked, all derivable from what this driver already knows:
+#
+#   a. Every record matches the documented shape exactly. A watcher record of
+#      ev "unparsed" is a shape violation on purpose: it is what lib.sh writes
+#      when a line matched a lifecycle keyword but failed the anchored
+#      "<pid>#<tid>: <word>" extraction, so a silent parser drift across the
+#      pinned matrix reds here instead of quietly degrading the oracle to
+#      "emits nothing" -- which claim 3 would score as a pass.
+#
+#   b. No master record carries a pid this driver knows to be a WORKER's. The
+#      three worker pids were read out of the probe endpoint, so a
+#      misclassification is directly observable rather than argued about.
+#
+#   c. gen advanced exactly once per master record and never went backwards,
+#      and the final gen equals the number of master exits recorded. Three
+#      generations were booted and retired here, so a classifier double-
+#      counting worker exits as master exits lands well above that.
+BAD5=""
+
+# The alternation admits exactly two record families: a lifecycle event for a
+# worker or master, and the watcher's own attach acknowledgement. It does NOT
+# admit ev "unparsed" -- see (a) above, that record exists to red here.
+RECORD_RE='^\{"role":"(worker|master)","pid":[0-9]+,"gen":[0-9]+,"ev":"(exit|exiting|shutting_down)","seq":[0-9]+\}$|^\{"role":"watcher","pid":0,"gen":[0-9]+,"ev":"ready","seq":[0-9]+\}$'
+while IFS= read -r rec; do
+    if ! printf '%s\n' "$rec" | grep -qE "$RECORD_RE"; then
+        BAD5="record does not match the documented shape: $rec"
+        break
+    fi
+done < "$JOURNAL"
+
+if [ -z "$BAD5" ]; then
+    for wp in "$WPID1" "$WPID2" "$WPID3"; do
+        [ -n "$wp" ] || continue
+        if grep -qE "\"role\":\"master\",\"pid\":$wp," "$JOURNAL"; then
+            BAD5="worker pid $wp (read from the probe endpoint) is recorded with role master"
+            break
+        fi
+    done
+fi
+
+if [ -z "$BAD5" ]; then
+    NMASTER="$(grep -cE '"role":"master",.*"ev":"exit"' "$JOURNAL" || true)"
+    GEN_CHECK="$(awk '{
+            split($0, r, /"role":"/); split(r[2], r2, /"/); role = r2[1]
+            split($0, g, /"gen":/); n = g[2] + 0
+            if (NR > 1 && n < prev) { print "gen went backwards at line " NR; exit }
+            if (NR > 1 && n > prev + 1) { print "gen jumped by " (n - prev) " at line " NR; exit }
+            # gen may advance by exactly one, and only immediately AFTER a
+            # master exit record -- the increment fires once that record is
+            # emitted, so it is the FOLLOWING record that first shows the new
+            # value, whatever role that record happens to carry.
+            if (NR > 1 && n == prev + 1 && prevrole != "master") {
+                print "gen advanced after a " prevrole " record at line " NR; exit
+            }
+            prev = n; prevrole = role; last = n
+        }
+        END{ print "final:" last }' "$JOURNAL")"
+    case "$GEN_CHECK" in
+        final:*)
+            FINAL_GEN="${GEN_CHECK#final:}"
+            # gen starts at 0 and increments AFTER each master exit record is
+            # emitted, so the LAST master exit is tagged N-1 and its own
+            # increment is never observable -- the watcher is stopped before
+            # anything else is written. The last record in the journal is
+            # always that final master exit (stop_phase waits for it), so the
+            # final recorded gen is one less than the master-exit count. This
+            # is the assertion that reds when a classifier miscounts worker
+            # exits as master exits: doing so inflates NMASTER without a
+            # matching generation, and the two stop tracking.
+            if [ "$FINAL_GEN" != "$((NMASTER - 1))" ]; then
+                BAD5="final gen $FINAL_GEN is not one less than the $NMASTER master exit records; gen is not advancing exactly once per master generation"
+            fi
+            ;;
+        *) BAD5="$GEN_CHECK" ;;
+    esac
+fi
+
+if [ -z "$BAD5" ]; then
+    echo "ok 5 - every record matches the documented schema; no worker pid is recorded as master; gen advanced once per master exit ($NMASTER)"
+else
+    echo "not ok 5 - role/gen schema violation ($BAD5)"
+    echo "# LIFECYCLE-RED-ROLEGEN"
+    sed 's/^/# /' "$JOURNAL"
+    FAILED=$((FAILED + 1))
 fi
 
 [ "$FAILED" -eq 0 ] || exit 1

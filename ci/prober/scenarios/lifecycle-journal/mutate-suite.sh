@@ -31,9 +31,11 @@ case "${MUT_ROW:-}" in
     *"QUIT terminal event"*)     EXPECT='LIFECYCLE-RED-QUIT' ;;
     *"TERM terminal event"*)     EXPECT='LIFECYCLE-RED-TERM' ;;
     *"SIGKILL non-vacuity"*)     EXPECT='LIFECYCLE-RED-SIGKILL-NONVACUITY' ;;
+    *"dead phase-3 reader"*)     EXPECT='LIFECYCLE-RED-SIGKILL-NONVACUITY' ;;
     *"sequence"*)                EXPECT='LIFECYCLE-RED-SEQUENCE' ;;
+    *"role/gen"*)                EXPECT='LIFECYCLE-RED-ROLEGEN' ;;
     "")
-        EXPECT='LIFECYCLE-RED-(QUIT|TERM|SIGKILL-NONVACUITY|SEQUENCE)' ;;
+        EXPECT='LIFECYCLE-RED-(QUIT|TERM|SIGKILL-NONVACUITY|SEQUENCE|ROLEGEN)' ;;
     *)
         # A new row nobody taught this suite about. Failing closed keeps an
         # unrecognised row from being credited by whichever marker happens to
