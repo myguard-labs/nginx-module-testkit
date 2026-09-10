@@ -342,11 +342,15 @@ fi
 wait "$UPLOAD_PID" 2>/dev/null || true
 
 UPLOAD_READER_RC="$( { tr -d '[:space:]' <"$UPLOAD_RC"; } 2>/dev/null )" || UPLOAD_READER_RC=""
+# Same framing check as the QUIT leg: the grep matches a body one byte short
+# of its declared Content-Length, so "completed cleanly" needs the length
+# measured, not a substring found.
+UPLOAD_FRAMING="$(prober_http_body_complete "$UPLOAD_OUT")" && UPLOAD_FRAMING=""
 if grep -q '^HTTP/1\.1 200' "$UPLOAD_OUT" 2>/dev/null && grep -q 'UPLOADED' "$UPLOAD_OUT" 2>/dev/null \
-   && [ "$UPLOAD_READER_RC" = 0 ]; then
-    echo "ok 3 - the in-flight upload completed cleanly across the reopen (not cut, not stalled; response read ended at EOF, reader rc=0)"
+   && [ "$UPLOAD_READER_RC" = 0 ] && [ -z "$UPLOAD_FRAMING" ]; then
+    echo "ok 3 - the in-flight upload completed cleanly across the reopen (not cut, not stalled; the whole declared body arrived and the response read ended at EOF, reader rc=0)"
 else
-    echo "not ok 3 - the in-flight upload did not complete cleanly across USR1 (reader rc=${UPLOAD_READER_RC:-unrecorded}; rc 124 means the response bytes arrived but the read then stalled to the 30s bound)"
+    echo "not ok 3 - the in-flight upload did not complete cleanly across USR1 (reader rc=${UPLOAD_READER_RC:-unrecorded}; rc 124 means the response bytes arrived but the read then stalled to the 30s bound${UPLOAD_FRAMING:+; $UPLOAD_FRAMING})"
     echo "# LIFECYCLE-USR1-RED-DISTURBED"
     sed 's/^/# /' "$UPLOAD_OUT" 2>/dev/null || true
     FAILED=$((FAILED + 1))

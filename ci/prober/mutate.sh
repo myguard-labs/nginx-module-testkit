@@ -3605,6 +3605,17 @@ mutate "lifecycle-quit-vs-term-drain: TERM cutoff is not merely a non-200 (synth
     'printf '"'"'HTTP/1.1 502 Bad Gateway\r\n\r\n'"'"' >"$UPLOAD_T_OUT"; TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
+# The DRAIN assertion's FRAMING requirement (assertion 2). Truncating the
+# response by one byte leaves both greps matching and the reader exiting 0 at
+# the orderly close, so only the Content-Length measurement can red. This is
+# the exact case measured in prober_http_body_complete's comment.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT drain requires a complete body (response truncated one byte, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'QUIT_FRAMING="$(prober_http_body_complete' \
+    'truncate -s -1 "$UPLOAD_Q_OUT"; QUIT_FRAMING="$(prober_http_body_complete' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
 # The DRAIN assertion's completed-read requirement (assertion 2). QUIT is
 # supposed to finish the request and close it, and the reader observes that as
 # an orderly EOF. Suppressing the QUIT leg's status sidecar leaves both greps
@@ -3697,6 +3708,16 @@ mutate "lifecycle-usr1-reopen: upload survives needs a completed read (reader ti
     scenarios/lifecycle-usr1-reopen/driver.sh \
     '"$reader_rc" >"$rcfile.tmp"' \
     '124 >"$rcfile.tmp"' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# Assertion 3's FRAMING requirement. Same one-byte truncation as the QUIT leg:
+# the greps still match and the read still ends at EOF, so the declared-length
+# measurement is the only thing that can red.
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: upload survives requires a complete body (response truncated one byte, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'UPLOAD_FRAMING="$(prober_http_body_complete' \
+    'truncate -s -1 "$UPLOAD_OUT"; UPLOAD_FRAMING="$(prober_http_body_complete' \
     scenarios/lifecycle-usr1-reopen/mutate-suite.sh
 
 # The SERVER-SIDE half of the in-flight precondition (assertion 1). Freezing

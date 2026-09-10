@@ -13,6 +13,7 @@ cd "$(dirname "$0")/../.."
 
 case "${MUT_ROW:-}" in
     *"QUIT in-flight gate"*)      EXPECT='LIFECYCLE-DRAIN-RED-QUIT-NOT-INFLIGHT' ;;
+    *"QUIT drain requires a complete body"*) EXPECT='LIFECYCLE-DRAIN-RED-QUIT-NOT-DRAINED' ;;
     *"QUIT drains upload"*)       EXPECT='LIFECYCLE-DRAIN-RED-QUIT-NOT-DRAINED' ;;
     *"QUIT terminal record"*)     EXPECT='LIFECYCLE-DRAIN-RED-QUIT-NO-TERMINAL' ;;
     *"QUIT ordering"*)            EXPECT='LIFECYCLE-DRAIN-RED-QUIT-ORDER' ;;

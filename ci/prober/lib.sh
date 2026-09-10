@@ -2625,3 +2625,50 @@ prober_cleanup() {
 
     return "$rc"
 }
+
+# Is $1 a COMPLETE HTTP/1.1 response -- headers, then exactly as many body
+# bytes as its own Content-Length declares?
+#
+# Two greps for a status line and a body string do not establish this. The
+# fixtures in the lifecycle scenarios declare `Content-Length: 9` for a body
+# of "UPLOADED\n", so a response truncated to "UPLOADED" -- eight of the nine
+# declared bytes -- still matches a `grep -q UPLOADED`, and if the peer then
+# closes cleanly the reader exits 0 as well. Measured directly: both greps
+# match and the file is 65 bytes. Every drain and completion assertion built
+# on those greps therefore accepted a truncated response, which is precisely
+# the failure a draining shutdown is supposed to be unable to produce.
+#
+# Returns 0 when the response is complete, 1 otherwise, and prints a short
+# reason to stdout when it is not. Chunked responses are rejected explicitly
+# rather than silently passed: this helper only knows how to measure a
+# Content-Length body, and reporting "complete" for a framing it did not check
+# would reintroduce the same defect one layer up.
+prober_http_body_complete() {
+    local f=$1 hdr_len body_len declared total
+
+    [ -s "$f" ] || { echo "the response file is empty"; return 1; }
+
+    # Header/body split at the first CRLFCRLF. Byte offsets, because the body
+    # is binary as far as this check is concerned.
+    hdr_len="$(LC_ALL=C awk 'BEGIN{RS="\r\n\r\n"} NR==1{print length($0)+4; exit}' "$f" 2>/dev/null || echo 0)"
+    case "$hdr_len" in ''|*[!0-9]*) hdr_len=0 ;; esac
+    [ "$hdr_len" -gt 0 ] || { echo "no header terminator (CRLFCRLF) was received, so the response is incomplete"; return 1; }
+
+    if LC_ALL=C head -c "$hdr_len" "$f" | grep -qi '^Transfer-Encoding:.*chunked'; then
+        echo "the response is chunked, which this check cannot measure"
+        return 1
+    fi
+
+    declared="$(LC_ALL=C head -c "$hdr_len" "$f" | grep -i '^Content-Length:' | head -1 | tr -dc '0-9')"
+    case "$declared" in ''|*[!0-9]*) echo "the response declared no usable Content-Length, so its body length cannot be checked"; return 1 ;; esac
+
+    total="$(stat -c '%s' "$f" 2>/dev/null || echo 0)"
+    case "$total" in ''|*[!0-9]*) total=0 ;; esac
+    body_len=$((total - hdr_len))
+
+    if [ "$body_len" -ne "$declared" ]; then
+        echo "the body is $body_len bytes against a declared Content-Length of $declared"
+        return 1
+    fi
+    return 0
+}

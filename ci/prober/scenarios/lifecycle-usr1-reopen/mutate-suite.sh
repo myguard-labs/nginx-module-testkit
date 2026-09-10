@@ -15,6 +15,7 @@ cd "$(dirname "$0")/../.."
 case "${MUT_ROW:-}" in
     *"in-flight gate needs"*)    EXPECT='LIFECYCLE-USR1-RED-NOT-INFLIGHT' ;;
     *"inode changes"*)          EXPECT='LIFECYCLE-USR1-RED-NO-REOPEN' ;;
+    *"upload survives requires a complete body"*) EXPECT='LIFECYCLE-USR1-RED-DISTURBED' ;;
     *"upload survives"*)        EXPECT='LIFECYCLE-USR1-RED-DISTURBED' ;;
     *"worker set unchanged"*)   EXPECT='LIFECYCLE-USR1-RED-WORKER-CHANGED' ;;
     *"fd count unchanged"*)     EXPECT='LIFECYCLE-USR1-RED-FD-LEAK' ;;

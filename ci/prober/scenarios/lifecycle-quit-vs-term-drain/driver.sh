@@ -422,11 +422,17 @@ UPLOAD_TERM_SEEN_Q="$( { tr -d '[:space:]' <"$UPLOAD_Q_STAMP"; } 2>/dev/null )" 
 # then resets or stalls leaves both greps satisfied, so only the recorded
 # status separates a completed drain from a truncated one.
 QUIT_READER_RC="$( { tr -d '[:space:]' <"$UPLOAD_Q_RC"; } 2>/dev/null )" || QUIT_READER_RC=""
+# FRAMING, not just a substring. The fixture declares Content-Length: 9 for a
+# body of "UPLOADED\n", so a response truncated to "UPLOADED" satisfies the
+# grep and, on an orderly close, exits the reader 0 as well -- a truncated
+# response would have passed as a clean drain. The body length is measured
+# against the response's own declared length.
+QUIT_FRAMING="$(prober_http_body_complete "$UPLOAD_Q_OUT")" && QUIT_FRAMING=""
 if grep -q '^HTTP/1\.1 200' "$UPLOAD_Q_OUT" 2>/dev/null && grep -q 'UPLOADED' "$UPLOAD_Q_OUT" 2>/dev/null \
-   && [ "$QUIT_READER_RC" = 0 ]; then
-    echo "ok 2 - QUIT leg: the in-flight upload completed with a clean 200 (drained, not dropped; response read ended at EOF, reader rc=0)"
+   && [ "$QUIT_READER_RC" = 0 ] && [ -z "$QUIT_FRAMING" ]; then
+    echo "ok 2 - QUIT leg: the in-flight upload completed with a clean 200 (drained, not dropped; the whole declared body arrived and the response read ended at EOF, reader rc=0)"
 else
-    echo "not ok 2 - QUIT leg: the in-flight upload did not complete cleanly after QUIT (reader rc=${QUIT_READER_RC:-unrecorded}; a non-zero status means the response bytes were not followed by an orderly close)"
+    echo "not ok 2 - QUIT leg: the in-flight upload did not complete cleanly after QUIT (reader rc=${QUIT_READER_RC:-unrecorded}${QUIT_FRAMING:+; $QUIT_FRAMING})"
     echo "# LIFECYCLE-DRAIN-RED-QUIT-NOT-DRAINED"
     sed 's/^/# /' "$UPLOAD_Q_OUT" 2>/dev/null || true
     FAILED=$((FAILED + 1))
