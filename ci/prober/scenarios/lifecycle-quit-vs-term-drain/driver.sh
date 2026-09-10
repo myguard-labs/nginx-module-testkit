@@ -234,11 +234,28 @@ start_upload() {
             # request instead -- the failure this exists to catch -- has
             # already dropped the connection and logged its exit, so this
             # still reads "seen".
+            #
+            # Three-valued, not two. `grep` returns 2 -- not 1 -- when the
+            # file is missing or unreadable, and `2>/dev/null` hides the
+            # message that would say so. Collapsing that into the `else` would
+            # stamp "absent", which is assertion 4's ONLY green path: a
+            # mis-pathed error_log, a log rotated away mid-window, or a
+            # prefix permission change would print assertion 4 green on every
+            # run, proving nothing about the drain. No other assertion covers
+            # it -- assertion 3 reads $JOURNAL, not $ELOG. Separate rc>=2 out
+            # and stamp it as its own no-evidence value, exactly as the
+            # missing-stamp case is kept separate from the verdict below.
             if [ -n "$stamp" ] && [ "$((off + len))" -ge "$BODY_LEN" ]; then
-                if [ -n "$termre" ] && grep -qE "$termre" "$ELOG" 2>/dev/null; then
-                    printf 'seen\n' >"$stamp" 2>/dev/null || true
-                else
+                if [ -z "$termre" ]; then
                     printf 'absent\n' >"$stamp" 2>/dev/null || true
+                else
+                    grep_rc=0
+                    grep -qE "$termre" "$ELOG" 2>/dev/null || grep_rc=$?
+                    case "$grep_rc" in
+                        0) printf 'seen\n' >"$stamp" 2>/dev/null || true ;;
+                        1) printf 'absent\n' >"$stamp" 2>/dev/null || true ;;
+                        *) printf 'unreadable\n' >"$stamp" 2>/dev/null || true ;;
+                    esac
                 fi
             fi
 
@@ -492,6 +509,15 @@ if [ -n "$TERM_LINE_Q" ]; then
         echo "not ok 4 - QUIT leg: the upload never recorded a mid-body stamp, so the ordering claim has no evidence"
         echo "# LIFECYCLE-DRAIN-RED-QUIT-NO-STAMP"
         FAILED=$((FAILED + 1))
+    elif [ "$UPLOAD_TERM_SEEN_Q" = "unreadable" ]; then
+        # The error log could not be read at the sampling moment, so the
+        # question was asked but got no answer. Kept separate from both
+        # verdicts for the same reason the missing-stamp arm above is: an
+        # unreadable log must never be able to spell "absent", which is this
+        # assertion's only green.
+        echo "not ok 4 - QUIT leg: the error log could not be read at the mid-body sampling moment, so the ordering claim has no evidence"
+        echo "# LIFECYCLE-DRAIN-RED-QUIT-NO-STAMP"
+        FAILED=$((FAILED + 1))
     elif [ "$UPLOAD_TERM_SEEN_Q" = "absent" ]; then
         # SCOPE OF THIS CLAIM, stated exactly. The stamp is taken while the
         # client still owes body bytes, so what is proved is that the worker
@@ -539,6 +565,11 @@ fi
 
 UPLOAD_T_OUT="$PROBER_PREFIX/upload-term.out"
 UPLOAD_T_RC="$PROBER_PREFIX/upload-term.readerrc"
+# Cleared like every other sidecar (see the QUIT leg above): the rc file is
+# written only if the reader subshell reaches its final line, so without this
+# a reader killed mid-run leaves the PREVIOUS run's status in place and
+# assertion 6 reads it as this run's.
+rm -f "$UPLOAD_T_RC"
 TFDS="$(prober_probe_field "$(prober_probe_body "$HOST" "$PORT" 2>/dev/null || true)" fds 2>/dev/null || true)"
 case "$TFDS" in ''|*[!0-9]*) TFDS=-1 ;; esac
 UPLOAD_T_PROGRESS="$PROBER_PREFIX/upload-term.progress"
