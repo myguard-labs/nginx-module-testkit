@@ -3615,8 +3615,8 @@ mutate "lifecycle-usr1-reopen: fd count unchanged (comparison inverted, must red
 # shellcheck disable=SC2016
 mutate "lifecycle-usr1-reopen: no spurious exit (grep sense negated, must red)" \
     scenarios/lifecycle-usr1-reopen/driver.sh \
-    'if grep -qE "\"role\":\"worker\",\"pid\":$WPID_BEFORE,\"gen\":[0-9]+,\"ev\":\"exiting\"" "$JOURNAL" 2>/dev/null; then' \
-    'if ! grep -qE "\"role\":\"worker\",\"pid\":$WPID_BEFORE,\"gen\":[0-9]+,\"ev\":\"exiting\"" "$JOURNAL" 2>/dev/null; then' \
+    'if grep -qE "$WPID_BEFORE#[0-9]+: exiting$" "$ELOG" "$ELOG.rotated" 2>/dev/null; then' \
+    'if ! grep -qE "$WPID_BEFORE#[0-9]+: exiting$" "$ELOG" "$ELOG.rotated" 2>/dev/null; then' \
     scenarios/lifecycle-usr1-reopen/mutate-suite.sh
 
 # The scenario's sharpest claim: USR1 is forwarded to the WORKER, not merely

@@ -283,19 +283,36 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-# --- non-vacuity: USR1 must NOT emit the terminal ("exiting") journal
-# record lifecycle-journal and lifecycle-quit-vs-term-drain key their own
-# claims on -- a reopen is not a shutdown, and a watcher or classifier bug
-# that conflated the two would corrupt every assertion above by making the
-# worker look terminated when it is not. Checked directly off the SAME
-# journal this driver already trusts (rotation-safe attach, see above), for
-# the pid this run has been tracking throughout.
-if grep -qE "\"role\":\"worker\",\"pid\":$WPID_BEFORE,\"gen\":[0-9]+,\"ev\":\"exiting\"" "$JOURNAL" 2>/dev/null; then
-    echo "not ok 6 - a terminal journal record was emitted for worker $WPID_BEFORE after USR1 -- USR1 is a reopen, not a shutdown"
+# --- non-vacuity: USR1 must NOT emit the terminal ("exiting") record that
+# lifecycle-journal and lifecycle-quit-vs-term-drain key their own claims on
+# -- a reopen is not a shutdown, and a watcher or classifier bug that
+# conflated the two would corrupt every assertion above by making the worker
+# look terminated when it is not.
+#
+# Read the ERROR LOG rather than $JOURNAL, for the pid this run has tracked
+# throughout. This is a NEGATIVE assertion, and the journal is transcribed
+# from the log by an asynchronous `tail -F` watcher subshell (lib.sh,
+# prober_journal_start) whose own comment notes it is routinely still behind.
+# Absence from the journal therefore conflates "no such record was written"
+# (the claim) with "the watcher has not transcribed it yet" (an artefact) --
+# and for a negative assertion the artefact direction makes it falsely GREEN,
+# which is exactly the failure mode this assertion exists to rule out. Worse,
+# the window straddles a rotation, so the watcher may be reattaching to the
+# new inode precisely when a spurious record would land.
+#
+# nginx writes the log itself, synchronously and in order, so by the time the
+# assertions above have observed the post-USR1 state any record nginx emitted
+# is already in the file. Both surfaces name one event -- lib.sh keys on the
+# anchored shape "<pid>#<slot>: exiting" -- so this asks the same question
+# against the surface that can actually answer it. Both the rotated file and
+# the reopened one are read: a spurious exit logged before the rename would
+# otherwise be rotated out of view and silently pass.
+if grep -qE "$WPID_BEFORE#[0-9]+: exiting$" "$ELOG" "$ELOG.rotated" 2>/dev/null; then
+    echo "not ok 6 - a terminal log record was emitted for worker $WPID_BEFORE after USR1 -- USR1 is a reopen, not a shutdown"
     echo "# LIFECYCLE-USR1-RED-SPURIOUS-EXIT"
     FAILED=$((FAILED + 1))
 else
-    echo "ok 6 - no terminal journal record for worker $WPID_BEFORE after USR1 (reopen, not a shutdown)"
+    echo "ok 6 - no terminal log record for worker $WPID_BEFORE after USR1 (reopen, not a shutdown)"
 fi
 
 # --- the rotated-away file itself is undisturbed content-wise: it still
