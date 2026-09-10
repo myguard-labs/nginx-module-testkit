@@ -1,0 +1,41 @@
+# The QUIT leg's oracle needs a real `HTTP/1.1 200` + `UPLOADED` on the wire,
+# which means something has to sit behind nginx's proxy_pass and answer like
+# an HTTP server -- see nginx.conf's header for why proxy_pass to this fake
+# upstream (a separate OS process, outside nginx's cycle->listening) is what
+# survives QUIT where a same-server proxy_pass and mirror/return both fail.
+#
+# fakesrv speaks memcached/RESP, not HTTP, so a plain `seed`/`get` reply is
+# not an option here: nginx's proxy module does not send `get <key>\r\n`, it
+# sends a real `POST /upload HTTP/1.1` request line followed by headers and
+# the dripped body. `action=raw` is the documented escape hatch (backend.h)
+# for exactly this -- it replaces the normal reply with literal bytes,
+# regardless of what the client actually sent.
+#
+# WHY THIS WORKS MECHANICALLY. backend_parse_memcached tokenises on spaces
+# and does not require a real memcached verb; `POST /upload HTTP/1.1` parses
+# cleanly as a one-line "command" named "post" (folded to lower case) with
+# args ["/upload", "HTTP/1.1"]. That is the FIRST complete line fakesrv's
+# parser sees, so `on=post:1` fires on it and the raw reply goes out.
+#
+# THE HEADER LINES AFTER IT ARE THE HAZARD, and drain_commands's loop
+# condition (`while (c->in_len > 0 && c->out_len == 0)`) is NOT what saves
+# us: it only stops the parser while a reply is still queued, so once the
+# raw bytes flush the loop runs again and happily reads `Host:`,
+# `Connection:` and `Content-Length:` as three more "commands" before
+# hitting the blank CRLF line, which is a parse error. That was observed,
+# not theorised -- it showed up as `fakesrv: protocol error on conn 2` in
+# backend.err, which prober_backend_scrape reports as a scenario failure.
+# What actually saves us is that `action=raw` hangs the connection up once
+# its bytes are flushed (fakesrv.c's RAW arm sets close_after_write), so the
+# buffered headers never get a second pass. See fakesrv_test.sh's
+# "raw closes after writing" assertions and mutate.sh's
+# "backend: a raw reply leaves the connection open" row, which exist to keep
+# that property from regressing underneath this scenario.
+#
+# The reply below is a minimal, self-contained HTTP/1.1 response. It carries
+# an explicit Content-Length matching "UPLOADED\n" (9 bytes), which is what
+# gives nginx's upstream parser an unambiguous end for the response body;
+# Connection: close states the same intent in-band and matches what fakesrv
+# then does on the socket.
+proto   memcached
+fault   on=post:1    action=raw    data=HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nUPLOADED\n

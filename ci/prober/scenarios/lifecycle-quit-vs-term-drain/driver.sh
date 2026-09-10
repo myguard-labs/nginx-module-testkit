@@ -37,9 +37,13 @@
 #      handshake record already establishes the watcher is live and reading);
 #   2. records the seq of the upload's OWN completion (success for QUIT,
 #      failure/cutoff for TERM) by taking a fresh read of the journal
-#      immediately after the foreground `wait` on the upload subshell
-#      returns -- i.e. "how many journal lines exist at the instant the
-#      upload subshell exited";
+#      from INSIDE the upload client, the instant it has the whole response
+#      in hand -- i.e. "how many journal lines existed when the client
+#      observed its request complete". Sampling after the foreground `wait`
+#      instead would be racy: `wait` returns only once the subshell has
+#      exited, and the worker's terminal record is emitted as a consequence
+#      of this same drain, so it can land inside that window and red a
+#      correctly-draining QUIT;
 #   3. polls for the worker's terminal record and reads ITS seq.
 # QUIT's claim is `upload_seq < terminal_seq` (the upload's own finish
 # happened-before the journal saw the worker's terminal event). TERM's claim
@@ -106,16 +110,6 @@ wait_journal_lines() {   # $1 = pattern (grep -E), $2 = timeout steps of 50ms
     return 1
 }
 
-# journal_line_count -- how many complete lines the journal currently holds.
-# `grep -c` semantics do not apply (it is not a search here), but the same
-# style of guard matters: an empty/missing file must read as 0, not abort
-# under `set -e`.
-journal_line_count() {
-    local n
-    n="$(wc -l < "$JOURNAL" 2>/dev/null)" || n=0
-    printf '%s\n' "${n:-0}"
-}
-
 # seq_of_line N -- the "seq" field of the Nth journal line, or empty.
 seq_of_line() {
     local n="$1"
@@ -161,8 +155,21 @@ BODY="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX0123456789abcd
 BODY_LEN=${#BODY}
 CHUNK=4
 
+# $4 (optional) -- a "done stamp" path, and $5 the terminal-record regex to
+# look for. The INSTANT the response bytes are in hand, and before the
+# subshell tears down, the client records whether the worker's terminal
+# record was ALREADY in the journal: "seen" or "absent".
+#
+# Deliberately a boolean about that one event, not a line count. A count is
+# not race-free no matter how early it is sampled -- between `cat` returning
+# and the sampling command being scheduled, the terminal record can land, and
+# a count that absorbs it reds a correctly-draining QUIT. The question the
+# oracle actually asks is only "had the worker already terminated when the
+# upload completed?", so recording the answer to THAT question is immune:
+# a terminal record written after the grep is exactly the ordering the test
+# wants to pass, and it can no longer perturb the recorded value.
 start_upload() {
-    local step_sleep=$1 out=$2 pidvar=$3
+    local step_sleep=$1 out=$2 pidvar=$3 stamp=${4:-} termre=${5:-}
     (
         exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
         printf 'POST /upload HTTP/1.1\r\nHost: prober\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' \
@@ -181,6 +188,13 @@ start_upload() {
         done
 
         cat <&3 2>/dev/null || true
+        if [ -n "$stamp" ]; then
+            if [ -n "$termre" ] && grep -qE "$termre" "$JOURNAL" 2>/dev/null; then
+                printf 'seen\n' >"$stamp" 2>/dev/null || true
+            else
+                printf 'absent\n' >"$stamp" 2>/dev/null || true
+            fi
+        fi
     ) >"$out" 2>/dev/null &
     printf -v "$pidvar" '%s' "$!"
 }
@@ -215,7 +229,15 @@ if [ -z "$WPID_Q" ] || [ -z "$MASTER_Q" ]; then
 fi
 
 UPLOAD_Q_OUT="$PROBER_PREFIX/upload-quit.out"
-start_upload "$STEP_SLEEP" "$UPLOAD_Q_OUT" UPLOAD_Q_PID
+UPLOAD_Q_STAMP="$PROBER_PREFIX/upload-quit.stamp"
+rm -f "$UPLOAD_Q_STAMP"
+# The QUIT worker's terminal record, pinned to the pid resolved above. Defined
+# ONCE and reused by both readers -- the client's completion stamp below and
+# the ordering oracle's own lookup. The two must ask about the SAME record or
+# the ordering claim compares a stamp about one event against a line number
+# from another, which no assertion here would notice.
+TERM_RE_Q="\"role\":\"worker\",\"pid\":$WPID_Q,\"gen\":[0-9]+,\"ev\":\"exiting\""
+start_upload "$STEP_SLEEP" "$UPLOAD_Q_OUT" UPLOAD_Q_PID "$UPLOAD_Q_STAMP" "$TERM_RE_Q"
 
 # In-flight liveness gate (reload-mid-upload's own idiom): the ordering claim
 # below is vacuous unless the upload was genuinely still open when QUIT was
@@ -240,7 +262,7 @@ kill -QUIT "$MASTER_Q" 2>/dev/null || true
 # draining worker keeps reading the stalled body rather than abandoning it.
 # Bounded by the master's own eventual exit plus slack, never unbounded.
 wait "$UPLOAD_Q_PID" 2>/dev/null || true
-UPLOAD_DONE_LINES_Q="$(journal_line_count)"
+UPLOAD_TERM_SEEN_Q="$( { tr -d '[:space:]' <"$UPLOAD_Q_STAMP"; } 2>/dev/null )" || UPLOAD_TERM_SEEN_Q=""
 
 if grep -q '^HTTP/1\.1 200' "$UPLOAD_Q_OUT" 2>/dev/null && grep -q 'UPLOADED' "$UPLOAD_Q_OUT" 2>/dev/null; then
     echo "ok 2 - QUIT leg: the in-flight upload completed with a clean 200 (drained, not dropped)"
@@ -253,8 +275,8 @@ fi
 
 wait_master_gone "$MASTER_Q" 200 || true
 
-if wait_journal_lines "\"role\":\"worker\",\"pid\":$WPID_Q,\"gen\":[0-9]+,\"ev\":\"exiting\"" 100; then
-    TERM_LINE_Q="$(grep -nE "\"role\":\"worker\",\"pid\":$WPID_Q,\"gen\":[0-9]+,\"ev\":\"exiting\"" "$JOURNAL" | tail -1 | cut -d: -f1)"
+if wait_journal_lines "$TERM_RE_Q" 100; then
+    TERM_LINE_Q="$(grep -nE "$TERM_RE_Q" "$JOURNAL" | tail -1 | cut -d: -f1)"
     TERM_SEQ_Q="$(seq_of_line "$TERM_LINE_Q")"
     echo "ok 3 - QUIT leg: the worker's terminal journal event was emitted (seq $TERM_SEQ_Q)"
 else
@@ -264,18 +286,32 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-# THE ORDERING ORACLE for QUIT: the upload's own completion (bounded by
-# UPLOAD_DONE_LINES_Q, the journal's line count sampled the instant `wait`
-# returned) must have happened at or before the terminal record's own
-# position in the journal -- i.e. every line the terminal record needed to
-# wait behind is already accounted for by the time the client-side join
-# returned. This is a same-journal, same-clock comparison (both counts come
-# from reads of $JOURNAL), so no cross-process clock skew enters it.
+# THE ORDERING ORACLE for QUIT: when the client had the complete 200 in hand,
+# the worker's terminal record must NOT yet have been in the journal. That is
+# the drain claim stated directly -- a draining QUIT finishes the request
+# first and only then lets the worker exit.
+#
+# Recorded by the client itself at the moment of completion (start_upload's
+# stamp), as a boolean about that one record rather than a line count. A count
+# sampled here in the foreground, or even inside the client, can absorb a
+# terminal record that lands during the gap before the sample runs, and would
+# red a QUIT that drained correctly. Asking only "was it already there?"
+# removes that window: a record written after the client's grep is precisely
+# the passing ordering, and cannot change the answer.
 if [ -n "$TERM_LINE_Q" ]; then
-    if [ "$UPLOAD_DONE_LINES_Q" -le "$TERM_LINE_Q" ]; then
-        echo "ok 4 - QUIT leg: the upload finished (by journal line $UPLOAD_DONE_LINES_Q) before or at the worker's terminal record (line $TERM_LINE_Q) -- QUIT drained first"
+    if [ -z "$UPLOAD_TERM_SEEN_Q" ]; then
+        # No stamp at all: the client never reached the end of the response, so
+        # it never evaluated the question. Checked FIRST and separately from
+        # the verdict below, so that "no evidence" can never be confused with
+        # either answer -- and so a mutation of the verdict lands on the
+        # verdict's own red marker rather than being absorbed by this arm.
+        echo "not ok 4 - QUIT leg: the upload never recorded a completion stamp, so the ordering claim has no evidence"
+        echo "# LIFECYCLE-DRAIN-RED-QUIT-NO-STAMP"
+        FAILED=$((FAILED + 1))
+    elif [ "$UPLOAD_TERM_SEEN_Q" = "absent" ]; then
+        echo "ok 4 - QUIT leg: the upload completed while the worker's terminal record was still absent (it landed later, at line $TERM_LINE_Q) -- QUIT drained first"
     else
-        echo "not ok 4 - QUIT leg: the worker's terminal record (line $TERM_LINE_Q) appeared BEFORE the upload finished (line $UPLOAD_DONE_LINES_Q) -- QUIT did not drain"
+        echo "not ok 4 - QUIT leg: the worker's terminal record (line $TERM_LINE_Q) was ALREADY in the journal when the upload completed -- QUIT did not drain"
         echo "# LIFECYCLE-DRAIN-RED-QUIT-ORDER"
         FAILED=$((FAILED + 1))
     fi

@@ -2781,6 +2781,27 @@ mutate "backend: replies are never written" fakesrv.c \
     '                n = (ssize_t) want;' \
     fakesrv_test.sh
 
+# A raw reply is bytes outside the configured proto, so whatever the peer sends
+# next is unparseable by construction. Leaving the connection open feeds those
+# bytes to the parser, which reports a protocol error -- and
+# prober_backend_scrape turns that into a scenario failure, so every scenario
+# reaching an HTTP upstream through raw would be permanently red. Dropping the
+# close must red fakesrv_test.sh's two follow-on-bytes assertions.
+# `ms=` is not a raw parameter -- the close is unconditional, so a deadline
+# cannot express anything raw can do. Dropping the refusal lets a script
+# specifying it boot and silently ignore it, which is the false-green shape the
+# tree refuses parameters to avoid. Must red fakesrv_test.sh's refusal
+# assertion.
+mutate "backend: action=raw silently ignores ms= instead of refusing it" backend.c \
+    '        if (have_after || have_delta || have_bytes || have_ms) {' \
+    '        if (0) {' \
+    fakesrv_test.sh
+
+mutate "backend: a raw reply leaves the connection open" fakesrv.c \
+    '        c->close_after_write = 1;' \
+    '        c->close_after_write = 0;' \
+    fakesrv_test.sh
+
 # The journal's accept count is the one observable that proves keepalive reuse.
 # Stuck at a constant it reports reuse for every run, including the runs that
 # opened a fresh connection every time.
@@ -3487,10 +3508,16 @@ mutate "lifecycle-quit-vs-term-drain: QUIT terminal record (signal disarmed, mus
     'kill -0 "$MASTER_Q" 2>/dev/null || true' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
-# QUIT ordering row (the scenario's own central claim): inverts the
-# comparison direction (-le becomes -gt), so the oracle now demands the
-# terminal record land STRICTLY BEFORE the upload finishes -- the opposite of
-# what a genuinely draining QUIT produces. A stub-to-always-true version of
+# QUIT ordering row (the scenario's own central claim): makes the PASSING
+# branch unreachable, so a genuinely draining QUIT (which stamps "absent")
+# falls through to the "did not drain" arm and reds with the real QUIT-ORDER
+# marker. Written as an unsatisfiable compare rather than a negation: `!=
+# "absent"` would instead make the run take the passing branch on a
+# non-draining QUIT, which is the wrong claim to test. The missing-stamp case
+# is deliberately checked FIRST and separately in the driver so that this
+# mutation cannot be absorbed by it -- an earlier arrangement let both the
+# mutant and the no-evidence case emit NO-STAMP, which MUTATE_REQUIRE_MARKER
+# correctly reported as BROKEN rather than crediting as caught. A stub-to-always-true version of
 # this row was tried first and SURVIVED: assertion 4 always printing "ok"
 # regardless of the underlying data is indistinguishable, from the suite's
 # own perspective, from assertion 4 correctly evaluating true, so nothing
@@ -3500,8 +3527,8 @@ mutate "lifecycle-quit-vs-term-drain: QUIT terminal record (signal disarmed, mus
 # shellcheck disable=SC2016
 mutate "lifecycle-quit-vs-term-drain: QUIT ordering oracle (comparison inverted, must red)" \
     scenarios/lifecycle-quit-vs-term-drain/driver.sh \
-    'if [ "$UPLOAD_DONE_LINES_Q" -le "$TERM_LINE_Q" ]; then' \
-    'if [ "$UPLOAD_DONE_LINES_Q" -gt "$TERM_LINE_Q" ]; then' \
+    'elif [ "$UPLOAD_TERM_SEEN_Q" = "absent" ]; then' \
+    'elif [ "$UPLOAD_TERM_SEEN_Q" = "no-such-value" ]; then' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
 # TERM terminal-record row: same disarm idiom, targeting phase B's own
