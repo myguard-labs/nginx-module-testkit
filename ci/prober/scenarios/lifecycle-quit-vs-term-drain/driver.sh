@@ -180,6 +180,45 @@ start_upload() {
             len=$CHUNK
             remaining=$((BODY_LEN - off))
             [ "$len" -gt "$remaining" ] && len=$remaining
+
+            # THE ORDERING SAMPLE, taken immediately before the FINAL body
+            # chunk -- the last moment at which the worker is provably still
+            # mid-request.
+            #
+            # Read the ERROR LOG, never $JOURNAL. The journal is transcribed
+            # from this same log by an asynchronous `tail -F` watcher subshell
+            # (lib.sh, prober_journal_start), so a record can be absent from
+            # the journal purely because the watcher has not been scheduled
+            # yet, while nginx has already written it. That artefact would
+            # make this assertion falsely GREEN. nginx writes the log itself,
+            # synchronously and in order.
+            #
+            # The POSITION is what makes the ordering sound, and both later
+            # positions are races. Sampling after `cat` returns races the
+            # worker's shutdown path directly -- measured landing in the same
+            # second as the grep. Sampling after the final write but before
+            # the read is also a race: the response here is 9 bytes, so nginx
+            # can push it entirely into the socket buffer, finish the request
+            # and drop its connection count to zero without the client ever
+            # reading, and exit before the sample runs.
+            #
+            # Here, $CHUNK bytes of the declared Content-Length are still
+            # unsent. The worker cannot have finished the request, because it
+            # is still waiting on body bytes that have not been written; with
+            # a connection outstanding it cannot reach its exit path at all.
+            # The absence is therefore forced by the property under test
+            # rather than sampled against a race. A worker that abandoned the
+            # request instead -- the failure this exists to catch -- has
+            # already dropped the connection and logged its exit, so this
+            # still reads "seen".
+            if [ -n "$stamp" ] && [ "$((off + len))" -ge "$BODY_LEN" ]; then
+                if [ -n "$termre" ] && grep -qE "$termre" "$ELOG" 2>/dev/null; then
+                    printf 'seen\n' >"$stamp" 2>/dev/null || true
+                else
+                    printf 'absent\n' >"$stamp" 2>/dev/null || true
+                fi
+            fi
+
             printf '%s' "${BODY:$off:$len}" >&3
             off=$((off + len))
             if [ "$off" -lt "$BODY_LEN" ] && [ "$step_sleep" != 0 ]; then
@@ -187,45 +226,6 @@ start_upload() {
             fi
         done
 
-        # Sample the terminal record BEFORE draining the response, not after.
-        #
-        # Read the ERROR LOG, never $JOURNAL. The journal is transcribed from
-        # this same log by an asynchronous `tail -F` watcher subshell (lib.sh,
-        # prober_journal_start), so a record can be absent from the journal
-        # purely because the watcher has not been scheduled yet -- while nginx
-        # has already written it. Ordering against the journal would conflate
-        # "the worker had not exited" (the claim) with "the watcher had not
-        # caught up" (an artefact), and that artefact makes the assertion
-        # falsely GREEN. nginx writes the log itself, synchronously and in
-        # order, so it is the only surface here with a real happens-before
-        # against the response bytes.
-        #
-        # The POSITION of this sample is what makes the ordering sound. Taken
-        # after `cat` returns, it races the very event it orders against: the
-        # last body byte and the worker's exit are separated only by the
-        # worker finishing the request and running its shutdown path, which is
-        # sub-millisecond -- measured landing inside the SAME second as the
-        # sampling grep. A draining worker that exits promptly would then be
-        # recorded "seen" and red this assertion, which is a false failure.
-        #
-        # Taken HERE, the full body has been written but the response has not
-        # been read, so the connection is still open and the request is still
-        # in flight from the worker's point of view. A worker that is draining
-        # correctly CANNOT have logged "exiting" yet: nginx only runs the
-        # worker's exit path once its connection count reaches zero, and this
-        # connection is still counted. The absence is therefore forced by the
-        # property under test rather than sampled against a race, and there is
-        # no scheduling window in which a correctly draining worker can make
-        # this read say "seen". A worker that abandoned the request instead --
-        # the failure this assertion exists to catch -- has already dropped
-        # the connection and logged its exit, so it still reads "seen".
-        if [ -n "$stamp" ]; then
-            if [ -n "$termre" ] && grep -qE "$termre" "$ELOG" 2>/dev/null; then
-                printf 'seen\n' >"$stamp" 2>/dev/null || true
-            else
-                printf 'absent\n' >"$stamp" 2>/dev/null || true
-            fi
-        fi
         cat <&3 2>/dev/null || true
     ) >"$out" 2>/dev/null &
     printf -v "$pidvar" '%s' "$!"
@@ -326,11 +326,12 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-# THE ORDERING ORACLE for QUIT: while the client's request was still in
-# flight -- whole body sent, response not yet read, connection still open --
-# the worker's terminal record must NOT yet have been written. That is the
-# drain claim stated directly: a draining QUIT keeps serving the outstanding
-# request and only exits once it has no connections left.
+# THE ORDERING ORACLE for QUIT: while the client's request was still
+# unfinished -- the final body chunk not yet written, so the worker was still
+# waiting on body bytes -- the worker's terminal record must NOT yet have been
+# written. That is the drain claim stated directly: a draining QUIT keeps
+# serving the outstanding request and only exits once it has no connections
+# left.
 #
 # Recorded by the client itself (start_upload's stamp), as a boolean about
 # that one record rather than a line count. A count sampled here in the
@@ -338,21 +339,21 @@ fi
 # sample runs. The boolean, taken at a moment when the property under test
 # forces the record's absence, has no such gap -- see the sampling comment in
 # start_upload for why its position, not merely its shape, is what closes the
-# race.
+# race, and why the two later positions do not.
 if [ -n "$TERM_LINE_Q" ]; then
     if [ -z "$UPLOAD_TERM_SEEN_Q" ]; then
-        # No stamp at all: the client never finished sending the body, so
+        # No stamp at all: the client never reached its final body chunk, so
         # it never evaluated the question. Checked FIRST and separately from
         # the verdict below, so that "no evidence" can never be confused with
         # either answer -- and so a mutation of the verdict lands on the
         # verdict's own red marker rather than being absorbed by this arm.
-        echo "not ok 4 - QUIT leg: the upload never recorded an in-flight stamp, so the ordering claim has no evidence"
+        echo "not ok 4 - QUIT leg: the upload never recorded a mid-body stamp, so the ordering claim has no evidence"
         echo "# LIFECYCLE-DRAIN-RED-QUIT-NO-STAMP"
         FAILED=$((FAILED + 1))
     elif [ "$UPLOAD_TERM_SEEN_Q" = "absent" ]; then
-        echo "ok 4 - QUIT leg: the worker had not logged its exit while the request was still in flight (the record landed later, at line $TERM_LINE_Q) -- QUIT drained first"
+        echo "ok 4 - QUIT leg: the worker had not logged its exit while it was still awaiting body bytes (the record landed later, at line $TERM_LINE_Q) -- QUIT drained first"
     else
-        echo "not ok 4 - QUIT leg: the worker had ALREADY logged its exit (record at line $TERM_LINE_Q) while the request was still in flight -- QUIT did not drain"
+        echo "not ok 4 - QUIT leg: the worker had ALREADY logged its exit (record at line $TERM_LINE_Q) while it was still awaiting body bytes -- QUIT did not drain"
         echo "# LIFECYCLE-DRAIN-RED-QUIT-ORDER"
         FAILED=$((FAILED + 1))
     fi
