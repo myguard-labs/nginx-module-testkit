@@ -172,8 +172,31 @@ start_upload() {
     local step_sleep=$1 out=$2 pidvar=$3 stamp=${4:-} termre=${5:-}
     (
         exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
+
+        # The reader runs CONCURRENTLY with the writes, not after them.
+        # Sequencing it after the drip loop makes the response file's
+        # emptiness ambiguous: if the server answers early and closes -- a
+        # 502, say -- while the body is still being dripped, the next
+        # `printf >&3` takes SIGPIPE and kills this subshell before any read
+        # happens, leaving the file empty. Assertion 6 reads empty as "the
+        # connection was torn down", so a server that ANSWERED would be
+        # recorded as a cutoff: the exact false pass that assertion exists to
+        # exclude. Measured: against a server replying 502 mid-upload, the
+        # sequential form exits 141 (SIGPIPE) with a 0-byte file, identical
+        # to a genuine cutoff. Reading in parallel makes the file hold
+        # whatever the server actually sent, whenever it sent it, so
+        # emptiness means only one thing.
+        timeout 45 cat <&3 >&1 2>/dev/null &
+        reader=$!
+
+        # SIGPIPE must not kill this subshell before the reader is joined:
+        # the write failing is expected in the TERM leg and is not itself the
+        # observation. Ignoring it lets the failed write fall through to the
+        # wait below, which is what preserves the response.
+        trap '' PIPE
+
         printf 'POST /upload HTTP/1.1\r\nHost: prober\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' \
-            "$BODY_LEN" >&3
+            "$BODY_LEN" >&3 2>/dev/null || true
 
         off=0
         while [ "$off" -lt "$BODY_LEN" ]; do
@@ -219,23 +242,22 @@ start_upload() {
                 fi
             fi
 
-            printf '%s' "${BODY:$off:$len}" >&3
+            printf '%s' "${BODY:$off:$len}" >&3 2>/dev/null || break
             off=$((off + len))
             if [ "$off" -lt "$BODY_LEN" ] && [ "$step_sleep" != 0 ]; then
                 sleep "$step_sleep"
             fi
         done
 
-        # Bounded. The failure this driver exists to detect is a worker that
-        # does NOT complete the drain, and an unbounded read turns exactly
-        # that failure into a hang: run-scenario.sh invokes the driver with
-        # no timeout of its own, and the foreground `wait` below would never
-        # return, so the assertions that would have reported the regression
-        # are never reached. The ceiling is worker_shutdown_timeout (30s)
-        # plus slack, so a legitimate drain -- which finishes in ~7.5s of
-        # drip -- is never cut short, while a stalled one reds instead of
-        # hanging.
-        timeout 45 cat <&3 2>/dev/null || true
+        # Half-close the write side so a drained server sees the body end
+        # and can finish its response, then join the reader. The reader
+        # carries the 45s bound (worker_shutdown_timeout is 30s and a
+        # legitimate drain finishes in ~7.5s of drip), so a worker that never
+        # completes reds here instead of hanging: run-scenario.sh imposes no
+        # timeout of its own, and an unbounded read would make the very
+        # regression this driver detects unreachable.
+        exec 3>&-
+        wait "$reader" 2>/dev/null || true
     ) >"$out" 2>/dev/null &
     printf -v "$pidvar" '%s' "$!"
 }
