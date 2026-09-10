@@ -326,6 +326,8 @@ TERM_RE_Q="\"role\":\"worker\",\"pid\":$WPID_Q,\"gen\":[0-9]+,\"ev\":\"exiting\"
 # therefore the delivery guarantee differ. The client stamp uses THIS one
 # because only the log is written synchronously by nginx -- see start_upload.
 TERM_LOG_RE_Q="$WPID_Q#[0-9]+: exiting$"
+QFDS="$(prober_probe_field "$(prober_probe_body "$HOST" "$PORT" 2>/dev/null || true)" fds 2>/dev/null || true)"
+case "$QFDS" in ''|*[!0-9]*) QFDS=-1 ;; esac
 UPLOAD_Q_PROGRESS="$PROBER_PREFIX/upload-quit.progress"
 rm -f "$UPLOAD_Q_PROGRESS"
 start_upload "$STEP_SLEEP" "$UPLOAD_Q_OUT" UPLOAD_Q_PID "$UPLOAD_Q_STAMP" "$TERM_LOG_RE_Q" "" "$UPLOAD_Q_PROGRESS"
@@ -348,11 +350,36 @@ for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
 done
 
 case "${QOFF}" in ''|*[!0-9]*) QOFF=0 ;; esac
+
+# SERVER-SIDE acceptance. A successful client write proves only that the
+# kernel buffered the bytes into the socket; the worker may not have accepted
+# the connection yet, and a signal sent in that window would act on an idle
+# listener rather than on an in-flight request. The probe reports the worker's
+# open-fd count, and an accepted connection is an extra descriptor it holds,
+# so a count strictly above the pre-upload baseline is evidence FROM THE
+# SERVER that the request is being handled. The baseline was taken through the
+# same probe request, so the probe's own transient descriptor cancels out.
+QFDS_NOW=""
+for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
+    kill -0 "${UPLOAD_Q_PID}" 2>/dev/null || break
+    pbody="$(prober_probe_body "$HOST" "$PORT" 2>/dev/null || true)"
+    QFDS_NOW="$(prober_probe_field "$pbody" fds 2>/dev/null || true)"
+    case "${QFDS}${QFDS_NOW}" in
+        *[!0-9]*) ;;
+        '') ;;
+        *) [ "${QFDS_NOW}" -gt "${QFDS}" ] && break ;;
+    esac
+    QFDS_NOW=""
+    sleep 0.05
+done
+case "${QFDS_NOW}" in ''|*[!0-9]*) QFDS_NOW=-1 ;; esac
+
 if [ "${QOFF}" -gt 0 ] && [ "${QOFF}" -lt "$BODY_LEN" ] \
+   && [ "${QFDS}" -ge 0 ] && [ "${QFDS_NOW}" -gt "${QFDS}" ] \
    && kill -0 "${UPLOAD_Q_PID}" 2>/dev/null; then
-    echo "ok 1 - QUIT leg: the upload was still in flight immediately before the signal (${QOFF} of $BODY_LEN body bytes written, connection open)"
+    echo "ok 1 - QUIT leg: the upload was still in flight immediately before the signal (${QOFF} of $BODY_LEN body bytes written; worker fds ${QFDS} -> ${QFDS_NOW}, so the worker has accepted it)"
 else
-    echo "not ok 1 - QUIT leg: the upload was not in flight before the signal (${QOFF} of $BODY_LEN body bytes written); the ordering claim below would be vacuous"
+    echo "not ok 1 - QUIT leg: the upload was not in flight before the signal (${QOFF} of $BODY_LEN body bytes written; worker fds ${QFDS} -> ${QFDS_NOW}); the ordering claim below would be vacuous"
     echo "# LIFECYCLE-DRAIN-RED-QUIT-NOT-INFLIGHT"
     FAILED=$((FAILED + 1))
 fi
@@ -445,6 +472,8 @@ fi
 
 UPLOAD_T_OUT="$PROBER_PREFIX/upload-term.out"
 UPLOAD_T_RC="$PROBER_PREFIX/upload-term.readerrc"
+TFDS="$(prober_probe_field "$(prober_probe_body "$HOST" "$PORT" 2>/dev/null || true)" fds 2>/dev/null || true)"
+case "$TFDS" in ''|*[!0-9]*) TFDS=-1 ;; esac
 UPLOAD_T_PROGRESS="$PROBER_PREFIX/upload-term.progress"
 rm -f "$UPLOAD_T_PROGRESS"
 start_upload "$STEP_SLEEP" "$UPLOAD_T_OUT" UPLOAD_T_PID "" "" "$UPLOAD_T_RC" "$UPLOAD_T_PROGRESS"
@@ -467,11 +496,36 @@ for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
 done
 
 case "${TOFF}" in ''|*[!0-9]*) TOFF=0 ;; esac
+
+# SERVER-SIDE acceptance. A successful client write proves only that the
+# kernel buffered the bytes into the socket; the worker may not have accepted
+# the connection yet, and a signal sent in that window would act on an idle
+# listener rather than on an in-flight request. The probe reports the worker's
+# open-fd count, and an accepted connection is an extra descriptor it holds,
+# so a count strictly above the pre-upload baseline is evidence FROM THE
+# SERVER that the request is being handled. The baseline was taken through the
+# same probe request, so the probe's own transient descriptor cancels out.
+TFDS_NOW=""
+for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
+    kill -0 "${UPLOAD_T_PID}" 2>/dev/null || break
+    pbody="$(prober_probe_body "$HOST" "$PORT" 2>/dev/null || true)"
+    TFDS_NOW="$(prober_probe_field "$pbody" fds 2>/dev/null || true)"
+    case "${TFDS}${TFDS_NOW}" in
+        *[!0-9]*) ;;
+        '') ;;
+        *) [ "${TFDS_NOW}" -gt "${TFDS}" ] && break ;;
+    esac
+    TFDS_NOW=""
+    sleep 0.05
+done
+case "${TFDS_NOW}" in ''|*[!0-9]*) TFDS_NOW=-1 ;; esac
+
 if [ "${TOFF}" -gt 0 ] && [ "${TOFF}" -lt "$BODY_LEN" ] \
+   && [ "${TFDS}" -ge 0 ] && [ "${TFDS_NOW}" -gt "${TFDS}" ] \
    && kill -0 "${UPLOAD_T_PID}" 2>/dev/null; then
-    echo "ok 5 - TERM leg: the upload was still in flight immediately before the signal (${TOFF} of $BODY_LEN body bytes written, connection open)"
+    echo "ok 5 - TERM leg: the upload was still in flight immediately before the signal (${TOFF} of $BODY_LEN body bytes written; worker fds ${TFDS} -> ${TFDS_NOW}, so the worker has accepted it)"
 else
-    echo "not ok 5 - TERM leg: the upload was not in flight before the signal (${TOFF} of $BODY_LEN body bytes written); the cutoff claim below would be vacuous"
+    echo "not ok 5 - TERM leg: the upload was not in flight before the signal (${TOFF} of $BODY_LEN body bytes written; worker fds ${TFDS} -> ${TFDS_NOW}); the cutoff claim below would be vacuous"
     echo "# LIFECYCLE-DRAIN-RED-TERM-NOT-INFLIGHT"
     FAILED=$((FAILED + 1))
 fi

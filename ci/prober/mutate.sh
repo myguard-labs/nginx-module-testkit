@@ -3501,6 +3501,18 @@ mutate "lifecycle-journal: sequence monotonicity (duplicate seq must red)" \
 # lifecycle-journal's QUIT/TERM rows -- kill -0 is a harmless liveness probe,
 # not termination, so the worker never exits and assertion 3 (terminal
 # record must appear) has nothing to observe.
+# The SERVER-SIDE half of the in-flight precondition (assertions 1 and 5).
+# Freezing the observed fd count at the baseline removes the only evidence
+# that the WORKER accepted the connection -- written client bytes prove only
+# that the kernel buffered them. QUIT runs first, so this reds on
+# QUIT-NOT-INFLIGHT.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT in-flight gate needs server-side accept (fd delta erased, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    '    QFDS_NOW="$(prober_probe_field "$pbody" fds 2>/dev/null || true)"' \
+    '    QFDS_NOW="$QFDS"' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
 # The in-flight PRECONDITION shared by both legs (assertions 1 and 5).
 # Suppressing the progress stamp leaves both gates with no written-byte
 # evidence: the upload subshell still EXISTS, so the old `kill -0` form
@@ -3602,8 +3614,8 @@ mutate "lifecycle-quit-vs-term-drain: TERM cutoff is not merely a non-200 (synth
 # shellcheck disable=SC2016
 mutate "lifecycle-quit-vs-term-drain: TERM cutoff is not a stalled read (reader timeout forced, must red)" \
     scenarios/lifecycle-quit-vs-term-drain/driver.sh \
-    '        reader_rc=0' \
-    '        reader_rc=124' \
+    '"$reader_rc" >"$rcfile"' \
+    '124 >"$rcfile"' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
 # The cutoff assertion's UNRECORDED-STATUS arm (assertion 6). Deleting the
