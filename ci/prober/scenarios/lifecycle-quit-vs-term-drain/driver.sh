@@ -169,7 +169,7 @@ CHUNK=4
 # a terminal record written after the grep is exactly the ordering the test
 # wants to pass, and it can no longer perturb the recorded value.
 start_upload() {
-    local step_sleep=$1 out=$2 pidvar=$3 stamp=${4:-} termre=${5:-}
+    local step_sleep=$1 out=$2 pidvar=$3 stamp=${4:-} termre=${5:-} rcfile=${6:-}
     (
         exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
 
@@ -257,7 +257,20 @@ start_upload() {
         # timeout of its own, and an unbounded read would make the very
         # regression this driver detects unreachable.
         exec 3>&-
-        wait "$reader" 2>/dev/null || true
+
+        # The reader's exit status is RECORDED, not discarded. `timeout 45
+        # cat` exits 124 when the socket stayed open without ever returning
+        # data, and that produces the same empty file as a connection torn
+        # down at EOF. Assertion 6 reads emptiness as teardown, so without
+        # this a regression that leaves the connection OPEN -- the opposite
+        # of a cutoff -- would pass the cutoff assertion. Writing the status
+        # out lets that assertion tell "closed with nothing" from "never
+        # answered and never closed".
+        reader_rc=0
+        wait "$reader" 2>/dev/null || reader_rc=$?
+        if [ -n "$rcfile" ]; then
+            printf '%s\n' "$reader_rc" >"$rcfile" 2>/dev/null || true
+        fi
     ) >"$out" 2>/dev/null &
     printf -v "$pidvar" '%s' "$!"
 }
@@ -413,7 +426,8 @@ if [ -z "$WPID_T" ] || [ -z "$MASTER_T" ]; then
 fi
 
 UPLOAD_T_OUT="$PROBER_PREFIX/upload-term.out"
-start_upload "$STEP_SLEEP" "$UPLOAD_T_OUT" UPLOAD_T_PID
+UPLOAD_T_RC="$PROBER_PREFIX/upload-term.readerrc"
+start_upload "$STEP_SLEEP" "$UPLOAD_T_OUT" UPLOAD_T_PID "" "" "$UPLOAD_T_RC"
 
 alive=0
 for ((i = 0; i < 20; i++)); do
@@ -451,6 +465,7 @@ wait "$UPLOAD_T_PID" 2>/dev/null || true
 # no response status line was ever received, which a 502 or any other
 # server-generated reply would falsify.
 TERM_BYTES="$(stat -c '%s' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"
+TERM_READER_RC="$( { tr -d '[:space:]' <"$UPLOAD_T_RC"; } 2>/dev/null )" || TERM_READER_RC=""
 if grep -q '^HTTP/1\.1 200' "$UPLOAD_T_OUT" 2>/dev/null && grep -q 'UPLOADED' "$UPLOAD_T_OUT" 2>/dev/null; then
     echo "not ok 6 - TERM leg: the in-flight upload completed with a clean 200 (TERM waited for it, contrary to claim)"
     echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
@@ -459,8 +474,17 @@ elif grep -q '^HTTP/1\.[01] [0-9][0-9][0-9]' "$UPLOAD_T_OUT" 2>/dev/null; then
     echo "not ok 6 - TERM leg: the client received a complete response status line ($(grep -m1 -o '^HTTP/1\.[01] [0-9][0-9][0-9]' "$UPLOAD_T_OUT" 2>/dev/null)) rather than a torn-down connection -- the worker answered the request instead of being cut off"
     echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
     FAILED=$((FAILED + 1))
+elif [ "$TERM_READER_RC" = 124 ]; then
+    # The read timed out rather than ending at EOF. The file is empty either
+    # way, but these are opposite outcomes: EOF means the connection WAS torn
+    # down (the claim), while a timeout means it stayed OPEN for the full 45s
+    # without answering -- a worker that neither drained nor died, which is a
+    # regression this assertion must not report as a successful cutoff.
+    echo "not ok 6 - TERM leg: the response read timed out after 45s with the connection still open and no data -- the request was neither answered nor cut off"
+    echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
+    FAILED=$((FAILED + 1))
 else
-    echo "ok 6 - TERM leg: the in-flight upload was cut off, not drained (no response status line reached the client; $TERM_BYTES bytes received)"
+    echo "ok 6 - TERM leg: the in-flight upload was cut off, not drained (connection closed at EOF, reader rc=${TERM_READER_RC:-0}, no response status line reached the client; $TERM_BYTES bytes received)"
 fi
 
 wait_master_gone "$MASTER_T" 200 || true

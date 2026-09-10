@@ -3581,6 +3581,19 @@ mutate "lifecycle-quit-vs-term-drain: TERM cutoff is not merely a non-200 (synth
     'printf '"'"'HTTP/1.1 502 Bad Gateway\r\n\r\n'"'"' >"$UPLOAD_T_OUT"; TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
+# The cutoff assertion's TIMEOUT arm (assertion 6). Forcing the recorded
+# reader status to 124 simulates a read that expired with the connection
+# still open and no data -- a worker that neither drained nor died. That
+# produces the same EMPTY response file as a genuine teardown, so before the
+# timeout arm existed this outcome passed as a successful cutoff. Must red on
+# DID-NOT-CUT via the timeout arm.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM cutoff is not a stalled read (reader timeout forced, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    '        reader_rc=0' \
+    '        reader_rc=124' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
 # Contrast row (assertion 8): inverts the required T_DRAINED value, so the
 # oracle now demands TERM drain its upload too -- the opposite of what this
 # scenario actually produces. (A stub-to-always-true version was tried first
