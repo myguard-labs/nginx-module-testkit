@@ -3501,6 +3501,18 @@ mutate "lifecycle-journal: sequence monotonicity (duplicate seq must red)" \
 # lifecycle-journal's QUIT/TERM rows -- kill -0 is a harmless liveness probe,
 # not termination, so the worker never exits and assertion 3 (terminal
 # record must appear) has nothing to observe.
+# The in-flight PRECONDITION shared by both legs (assertions 1 and 5).
+# Suppressing the progress stamp leaves both gates with no written-byte
+# evidence: the upload subshell still EXISTS, so the old `kill -0` form
+# passed, but nothing proves the request ever reached the wire. QUIT runs
+# first, so this reds on QUIT-NOT-INFLIGHT.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT in-flight gate needs written bytes (progress stamp suppressed, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    '[ -n "$progress" ] && printf' \
+    'false && printf' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
 # shellcheck disable=SC2016
 mutate "lifecycle-quit-vs-term-drain: QUIT terminal record (signal disarmed, must red)" \
     scenarios/lifecycle-quit-vs-term-drain/driver.sh \

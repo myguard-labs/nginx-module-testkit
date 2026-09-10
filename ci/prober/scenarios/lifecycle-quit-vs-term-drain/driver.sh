@@ -169,7 +169,7 @@ CHUNK=4
 # a terminal record written after the grep is exactly the ordering the test
 # wants to pass, and it can no longer perturb the recorded value.
 start_upload() {
-    local step_sleep=$1 out=$2 pidvar=$3 stamp=${4:-} termre=${5:-} rcfile=${6:-}
+    local step_sleep=$1 out=$2 pidvar=$3 stamp=${4:-} termre=${5:-} rcfile=${6:-} progress=${7:-}
     (
         exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
 
@@ -244,6 +244,11 @@ start_upload() {
 
             printf '%s' "${BODY:$off:$len}" >&3 2>/dev/null || break
             off=$((off + len))
+            # Written-byte progress, so the in-flight gates below can require
+            # evidence that the request actually reached the wire instead of
+            # inferring it from the subshell existing. See the gates for why
+            # `kill -0` alone is not that evidence.
+            [ -n "$progress" ] && printf '%s\n' "$off" >"$progress" 2>/dev/null
             if [ "$off" -lt "$BODY_LEN" ] && [ "$step_sleep" != 0 ]; then
                 sleep "$step_sleep"
             fi
@@ -321,20 +326,33 @@ TERM_RE_Q="\"role\":\"worker\",\"pid\":$WPID_Q,\"gen\":[0-9]+,\"ev\":\"exiting\"
 # therefore the delivery guarantee differ. The client stamp uses THIS one
 # because only the log is written synchronously by nginx -- see start_upload.
 TERM_LOG_RE_Q="$WPID_Q#[0-9]+: exiting$"
-start_upload "$STEP_SLEEP" "$UPLOAD_Q_OUT" UPLOAD_Q_PID "$UPLOAD_Q_STAMP" "$TERM_LOG_RE_Q"
+UPLOAD_Q_PROGRESS="$PROBER_PREFIX/upload-quit.progress"
+rm -f "$UPLOAD_Q_PROGRESS"
+start_upload "$STEP_SLEEP" "$UPLOAD_Q_OUT" UPLOAD_Q_PID "$UPLOAD_Q_STAMP" "$TERM_LOG_RE_Q" "" "$UPLOAD_Q_PROGRESS"
 
-# In-flight liveness gate (reload-mid-upload's own idiom): the ordering claim
-# below is vacuous unless the upload was genuinely still open when QUIT was
-# sent.
-alive=0
-for ((i = 0; i < 20; i++)); do   # 20 * 50ms = 1s settle, well under the ~7.5s drip
-    if kill -0 "$UPLOAD_Q_PID" 2>/dev/null; then alive=1; else alive=0; break; fi
+# In-flight gate: the ordering claim below is vacuous unless the upload was
+# genuinely open AND still incomplete when the signal was sent. `kill -0`
+# alone does not show that -- it is true from the instant the subshell is
+# forked, before /dev/tcp has connected and before a header byte has left the
+# process -- so this requires written body bytes, and fewer than all of them.
+QOFF=""
+for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
+    kill -0 "${UPLOAD_Q_PID}" 2>/dev/null || break
+    QOFF="$( { tr -d '[:space:]' <"${UPLOAD_Q_PROGRESS}"; } 2>/dev/null )" || QOFF=""
+    case "${QOFF}" in
+        ''|*[!0-9]*) ;;
+        *) [ "${QOFF}" -gt 0 ] && break ;;
+    esac
+    QOFF=""
     sleep 0.05
 done
-if [ "$alive" -eq 1 ] && kill -0 "$UPLOAD_Q_PID" 2>/dev/null; then
-    echo "ok 1 - QUIT leg: the upload was still in flight immediately before the signal"
+
+case "${QOFF}" in ''|*[!0-9]*) QOFF=0 ;; esac
+if [ "${QOFF}" -gt 0 ] && [ "${QOFF}" -lt "$BODY_LEN" ] \
+   && kill -0 "${UPLOAD_Q_PID}" 2>/dev/null; then
+    echo "ok 1 - QUIT leg: the upload was still in flight immediately before the signal (${QOFF} of $BODY_LEN body bytes written, connection open)"
 else
-    echo "not ok 1 - QUIT leg: the upload was not in flight before the signal; the ordering claim below would be vacuous"
+    echo "not ok 1 - QUIT leg: the upload was not in flight before the signal (${QOFF} of $BODY_LEN body bytes written); the ordering claim below would be vacuous"
     echo "# LIFECYCLE-DRAIN-RED-QUIT-NOT-INFLIGHT"
     FAILED=$((FAILED + 1))
 fi
@@ -427,17 +445,33 @@ fi
 
 UPLOAD_T_OUT="$PROBER_PREFIX/upload-term.out"
 UPLOAD_T_RC="$PROBER_PREFIX/upload-term.readerrc"
-start_upload "$STEP_SLEEP" "$UPLOAD_T_OUT" UPLOAD_T_PID "" "" "$UPLOAD_T_RC"
+UPLOAD_T_PROGRESS="$PROBER_PREFIX/upload-term.progress"
+rm -f "$UPLOAD_T_PROGRESS"
+start_upload "$STEP_SLEEP" "$UPLOAD_T_OUT" UPLOAD_T_PID "" "" "$UPLOAD_T_RC" "$UPLOAD_T_PROGRESS"
 
-alive=0
-for ((i = 0; i < 20; i++)); do
-    if kill -0 "$UPLOAD_T_PID" 2>/dev/null; then alive=1; else alive=0; break; fi
+# In-flight gate: the cutoff claim below is vacuous unless the upload was
+# genuinely open AND still incomplete when the signal was sent. `kill -0`
+# alone does not show that -- it is true from the instant the subshell is
+# forked, before /dev/tcp has connected and before a header byte has left the
+# process -- so this requires written body bytes, and fewer than all of them.
+TOFF=""
+for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
+    kill -0 "${UPLOAD_T_PID}" 2>/dev/null || break
+    TOFF="$( { tr -d '[:space:]' <"${UPLOAD_T_PROGRESS}"; } 2>/dev/null )" || TOFF=""
+    case "${TOFF}" in
+        ''|*[!0-9]*) ;;
+        *) [ "${TOFF}" -gt 0 ] && break ;;
+    esac
+    TOFF=""
     sleep 0.05
 done
-if [ "$alive" -eq 1 ] && kill -0 "$UPLOAD_T_PID" 2>/dev/null; then
-    echo "ok 5 - TERM leg: the upload was still in flight immediately before the signal"
+
+case "${TOFF}" in ''|*[!0-9]*) TOFF=0 ;; esac
+if [ "${TOFF}" -gt 0 ] && [ "${TOFF}" -lt "$BODY_LEN" ] \
+   && kill -0 "${UPLOAD_T_PID}" 2>/dev/null; then
+    echo "ok 5 - TERM leg: the upload was still in flight immediately before the signal (${TOFF} of $BODY_LEN body bytes written, connection open)"
 else
-    echo "not ok 5 - TERM leg: the upload was not in flight before the signal; the cutoff claim below would be vacuous"
+    echo "not ok 5 - TERM leg: the upload was not in flight before the signal (${TOFF} of $BODY_LEN body bytes written); the cutoff claim below would be vacuous"
     echo "# LIFECYCLE-DRAIN-RED-TERM-NOT-INFLIGHT"
     FAILED=$((FAILED + 1))
 fi
@@ -474,12 +508,22 @@ elif grep -q '^HTTP/1\.[01] [0-9][0-9][0-9]' "$UPLOAD_T_OUT" 2>/dev/null; then
     echo "not ok 6 - TERM leg: the client received a complete response status line ($(grep -m1 -o '^HTTP/1\.[01] [0-9][0-9][0-9]' "$UPLOAD_T_OUT" 2>/dev/null)) rather than a torn-down connection -- the worker answered the request instead of being cut off"
     echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
     FAILED=$((FAILED + 1))
-elif [ "$TERM_READER_RC" != 0 ]; then
+elif [ "$TERM_READER_RC" != 0 ] && [ "$TERM_READER_RC" != 1 ]; then
     # An empty response file only means "the connection was torn down" when
-    # the reader actually ran to EOF, and that is what rc=0 records. Every
-    # other outcome produces the same empty file for an entirely different
-    # reason, so the cutoff arm must ACCEPT the one status it claims rather
-    # than reject one status it happens to have thought of:
+    # the reader actually observed that teardown, and exactly two statuses
+    # record one:
+    #
+    #   0    the read ended at an orderly EOF (FIN).
+    #   1    `cat` hit a read error on the socket -- ECONNRESET. TERM closes
+    #        the worker's connection while unread request bytes are still in
+    #        its receive queue, and the kernel answers that with an RST rather
+    #        than a FIN, so a reset IS the cutoff this assertion claims.
+    #        Measured directly against a stub that closes with SO_LINGER 0
+    #        mid-body: the reader exits 1 with a 0-byte file.
+    #
+    # Every other outcome produces the same empty file for an entirely
+    # different reason, so the cutoff arm accepts only the two statuses that
+    # constitute evidence and names what each of the rest actually means:
     #
     #   124  `timeout` expired -- the socket stayed OPEN for the full 45s
     #        without answering; the worker neither drained nor died.
@@ -501,7 +545,11 @@ elif [ "$TERM_READER_RC" != 0 ]; then
     echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
     FAILED=$((FAILED + 1))
 else
-    echo "ok 6 - TERM leg: the in-flight upload was cut off, not drained (connection closed at EOF, reader rc=0 recorded, no response status line reached the client; $TERM_BYTES bytes received)"
+    case "$TERM_READER_RC" in
+        0) how="closed at EOF" ;;
+        *) how="reset by the peer (reader rc=1)" ;;
+    esac
+    echo "ok 6 - TERM leg: the in-flight upload was cut off, not drained (connection $how, status recorded, no response status line reached the client; $TERM_BYTES bytes received)"
 fi
 
 wait_master_gone "$MASTER_T" 200 || true
