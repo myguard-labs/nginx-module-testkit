@@ -2648,13 +2648,44 @@ prober_http_body_complete() {
 
     [ -s "$f" ] || { echo "the response file is empty"; return 1; }
 
-    # Header/body split at the first CRLFCRLF. Byte offsets, because the body
-    # is binary as far as this check is concerned.
-    hdr_len="$(LC_ALL=C awk 'BEGIN{RS="\r\n\r\n"} NR==1{print length($0)+4; exit}' "$f" 2>/dev/null || echo 0)"
-    case "$hdr_len" in ''|*[!0-9]*) hdr_len=0 ;; esac
+    # Header/body split at the first CRLFCRLF, as a byte offset -- the body is
+    # binary as far as this check is concerned.
+    #
+    # The terminator is located as the CR-only line that ends the header block,
+    # and both of the more obvious spellings were tried and measured wrong.
+    #
+    #   awk 'BEGIN{RS="\r\n\r\n"} {print length($0)+4}'
+    #     Wrong twice over. POSIX awk uses only the FIRST character of RS and
+    #     leaves a multi-character value unspecified, so the split depends on
+    #     whichever awk the runner supplies and no CI workflow pins one. Worse,
+    #     length($0)+4 is positive even when the terminator is ABSENT: fed a
+    #     header-only file with no CRLFCRLF it returned 40, so the guard below
+    #     that claims to reject a response with no header terminator could
+    #     never fire -- the vacuous-assertion defect this helper exists to
+    #     catch, reproduced inside the helper itself.
+    #
+    #   grep -abo -F "$(printf '\r\n\r\n')"
+    #     Returns rc=1 even on a known-good response, measured. GNU grep is
+    #     line-oriented: it splits input on LF before matching, so a pattern
+    #     CONTAINING newlines can never match, and every response would have
+    #     been reported header-less.
+    #
+    # `^\r$` matches the empty header line and is line-oriented, so grep can
+    # actually match it; -a keeps the binary body from suppressing output and
+    # -b reports the line's byte offset. The header runs to the end of that
+    # line, which is that offset plus its own two bytes (CR, LF). An absent
+    # terminator produces no match and no output, which the sentinel below
+    # turns into a non-positive length -- absence reported as absence.
+    hdr_len="$(LC_ALL=C grep -abm1 "$(printf '^\r$')" "$f" 2>/dev/null | head -1 | cut -d: -f1)"
+    case "$hdr_len" in ''|*[!0-9]*) hdr_len=-2 ;; esac
+    hdr_len=$((hdr_len + 2))
     [ "$hdr_len" -gt 0 ] || { echo "no header terminator (CRLFCRLF) was received, so the response is incomplete"; return 1; }
 
-    if LC_ALL=C head -c "$hdr_len" "$f" | grep -qi '^Transfer-Encoding:.*chunked'; then
+    # `grep -q` exits at its first match, which can SIGPIPE the feeding `head`
+    # on a large header; under `pipefail` that turns a positive chunked
+    # detection into a failed pipeline and skips the rejection below. Reading
+    # to EOF and discarding the output keeps the exit status meaningful.
+    if LC_ALL=C head -c "$hdr_len" "$f" | grep -i '^Transfer-Encoding:.*chunked' >/dev/null; then
         echo "the response is chunked, which this check cannot measure"
         return 1
     fi

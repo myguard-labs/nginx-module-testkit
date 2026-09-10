@@ -376,11 +376,28 @@ for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
     kill -0 "${UPLOAD_Q_PID}" 2>/dev/null || break
     pbody="$(prober_probe_body "$HOST" "$PORT" 2>/dev/null || true)"
     QFDS_NOW="$(prober_probe_field "$pbody" fds 2>/dev/null || true)"
-    case "${QFDS}${QFDS_NOW}" in
-        *[!0-9]*) ;;
-        '') ;;
-        *) [ "${QFDS_NOW}" -gt "${QFDS}" ] && break ;;
-    esac
+    # Each value is validated on its own, into a separate variable.
+    #
+    # Concatenating the two first was wrong: prober_probe_field prints nothing
+    # when `fds` is absent, and against a numeric baseline the concatenation
+    # "10" is still all-digits, so the empty value reached the numeric arm and
+    # ran [ "" -gt 10 ]. Measured: bash prints "integer expression expected"
+    # and returns 2, and because the test sat on the left of &&, the loop
+    # swallowed the error and kept polling until it ran out of iterations and
+    # reported NOT-INFLIGHT -- a probe outage reported as an upload that never
+    # started.
+    #
+    # The normalised values go into QFDS_OK/QFDS_NOW_OK rather than back over
+    # QFDS itself, because the assertion after this loop reads the baseline:
+    # it is normalised to -1 where it is first taken, and tested with
+    # [ "$QFDS" -ge 0 ]. Blanking it here would make THAT test error on an
+    # empty string -- the same defect, reintroduced one scope up.
+    QFDS_OK=""; QFDS_NOW_OK=""
+    case "${QFDS}" in ''|*[!0-9]*) ;; *) QFDS_OK="${QFDS}" ;; esac
+    case "${QFDS_NOW}" in ''|*[!0-9]*) ;; *) QFDS_NOW_OK="${QFDS_NOW}" ;; esac
+    if [ -n "${QFDS_OK}" ] && [ -n "${QFDS_NOW_OK}" ] && [ "${QFDS_NOW_OK}" -gt "${QFDS_OK}" ]; then
+        break
+    fi
     QFDS_NOW=""
     sleep 0.05
 done
@@ -560,11 +577,28 @@ for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
     kill -0 "${UPLOAD_T_PID}" 2>/dev/null || break
     pbody="$(prober_probe_body "$HOST" "$PORT" 2>/dev/null || true)"
     TFDS_NOW="$(prober_probe_field "$pbody" fds 2>/dev/null || true)"
-    case "${TFDS}${TFDS_NOW}" in
-        *[!0-9]*) ;;
-        '') ;;
-        *) [ "${TFDS_NOW}" -gt "${TFDS}" ] && break ;;
-    esac
+    # Each value is validated on its own, into a separate variable.
+    #
+    # Concatenating the two first was wrong: prober_probe_field prints nothing
+    # when `fds` is absent, and against a numeric baseline the concatenation
+    # "10" is still all-digits, so the empty value reached the numeric arm and
+    # ran [ "" -gt 10 ]. Measured: bash prints "integer expression expected"
+    # and returns 2, and because the test sat on the left of &&, the loop
+    # swallowed the error and kept polling until it ran out of iterations and
+    # reported NOT-INFLIGHT -- a probe outage reported as an upload that never
+    # started.
+    #
+    # The normalised values go into TFDS_OK/TFDS_NOW_OK rather than back over
+    # TFDS itself, because the assertion after this loop reads the baseline:
+    # it is normalised to -1 where it is first taken, and tested with
+    # [ "$TFDS" -ge 0 ]. Blanking it here would make THAT test error on an
+    # empty string -- the same defect, reintroduced one scope up.
+    TFDS_OK=""; TFDS_NOW_OK=""
+    case "${TFDS}" in ''|*[!0-9]*) ;; *) TFDS_OK="${TFDS}" ;; esac
+    case "${TFDS_NOW}" in ''|*[!0-9]*) ;; *) TFDS_NOW_OK="${TFDS_NOW}" ;; esac
+    if [ -n "${TFDS_OK}" ] && [ -n "${TFDS_NOW_OK}" ] && [ "${TFDS_NOW_OK}" -gt "${TFDS_OK}" ]; then
+        break
+    fi
     TFDS_NOW=""
     sleep 0.05
 done
