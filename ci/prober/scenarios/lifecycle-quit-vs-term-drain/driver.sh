@@ -408,6 +408,17 @@ fi
 
 kill -QUIT "$MASTER_Q" 2>/dev/null || true
 
+# A SECOND ordering bound, for the window the mid-body stamp cannot see. The
+# stamp is taken while the client still owes body bytes, so it proves only
+# that the worker had not exited during THAT window. A worker that logs
+# `exiting` after the final chunk but before it finishes the response would
+# leave the stamp "absent" and still deliver a complete 200 at EOF, so
+# assertions 2 and 4 would both pass while the drain claim was false. Record
+# where the journal stood before the response was joined; the terminal record
+# must land at or after that point, never behind it.
+JOURNAL_LINES_PRE_Q="$(wc -l <"$JOURNAL" 2>/dev/null || echo 0)"
+case "$JOURNAL_LINES_PRE_Q" in ''|*[!0-9]*) JOURNAL_LINES_PRE_Q=-1 ;; esac
+
 # Join the upload: for QUIT this MUST return with a clean 200, because the
 # draining worker keeps reading the stalled body rather than abandoning it.
 # The subshell bounds its own read (see start_upload), so this `wait` cannot
@@ -468,8 +479,13 @@ if [ -n "$TERM_LINE_Q" ]; then
         echo "not ok 4 - QUIT leg: the upload never recorded a mid-body stamp, so the ordering claim has no evidence"
         echo "# LIFECYCLE-DRAIN-RED-QUIT-NO-STAMP"
         FAILED=$((FAILED + 1))
+    elif [ "$UPLOAD_TERM_SEEN_Q" = "absent" ] && [ "$JOURNAL_LINES_PRE_Q" -ge 0 ] \
+         && [ "$TERM_LINE_Q" -gt "$JOURNAL_LINES_PRE_Q" ]; then
+        echo "ok 4 - QUIT leg: the worker had not logged its exit while it was still awaiting body bytes, and its terminal record (line $TERM_LINE_Q) landed after the response was joined (journal was $JOURNAL_LINES_PRE_Q lines) -- QUIT drained first"
     elif [ "$UPLOAD_TERM_SEEN_Q" = "absent" ]; then
-        echo "ok 4 - QUIT leg: the worker had not logged its exit while it was still awaiting body bytes (the record landed later, at line $TERM_LINE_Q) -- QUIT drained first"
+        echo "not ok 4 - QUIT leg: the worker logged its exit at line $TERM_LINE_Q, at or before the point the response was joined (journal was $JOURNAL_LINES_PRE_Q lines) -- the mid-body window was clean but the worker still exited before it finished answering"
+        echo "# LIFECYCLE-DRAIN-RED-QUIT-ORDER"
+        FAILED=$((FAILED + 1))
     else
         echo "not ok 4 - QUIT leg: the worker had ALREADY logged its exit (record at line $TERM_LINE_Q) while it was still awaiting body bytes -- QUIT did not drain"
         echo "# LIFECYCLE-DRAIN-RED-QUIT-ORDER"
