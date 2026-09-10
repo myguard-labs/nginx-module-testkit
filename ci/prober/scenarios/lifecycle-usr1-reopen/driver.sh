@@ -489,16 +489,28 @@ for fd in /proc/"$WPID_BEFORE"/fd/*; do
     WORKER_LOG_INOS="$WORKER_LOG_INOS $ino"
 done
 
-case " $WORKER_LOG_INOS " in
-    *" $INODE_AFTER "*)
-        echo "ok 8 - the worker itself holds a descriptor on the reopened log (inode $INODE_AFTER), not the rotated-away one"
-        ;;
-    *)
-        echo "not ok 8 - no descriptor of worker $WPID_BEFORE points at the reopened log (inode $INODE_AFTER); it is still writing to the rotated file"
-        echo "# LIFECYCLE-USR1-RED-WORKER-STALE-FD"
-        FAILED=$((FAILED + 1))
-        ;;
-esac
+# INODE_AFTER is empty when the reopened log never appeared at $ELOG (see
+# assertion 2, which already reds this without exiting). WORKER_LOG_INOS
+# always carries a leading space, so an empty INODE_AFTER turns the case
+# pattern below into *"  "* (two spaces), which the padded subject
+# " $WORKER_LOG_INOS " always contains -- printing a green assertion 8
+# unconditionally, even on a failed reopen. Guard the empty case explicitly.
+if [ -z "$INODE_AFTER" ]; then
+    echo "not ok 8 - no post-reopen inode was ever observed (see assertion 2), so the worker's descriptor has nothing to match against"
+    echo "# LIFECYCLE-USR1-RED-WORKER-STALE-FD"
+    FAILED=$((FAILED + 1))
+else
+    case " $WORKER_LOG_INOS " in
+        *" $INODE_AFTER "*)
+            echo "ok 8 - the worker itself holds a descriptor on the reopened log (inode $INODE_AFTER), not the rotated-away one"
+            ;;
+        *)
+            echo "not ok 8 - no descriptor of worker $WPID_BEFORE points at the reopened log (inode $INODE_AFTER); it is still writing to the rotated file"
+            echo "# LIFECYCLE-USR1-RED-WORKER-STALE-FD"
+            FAILED=$((FAILED + 1))
+            ;;
+    esac
+fi
 
 [ "$FAILED" -eq 0 ] || exit 1
 exit 0
