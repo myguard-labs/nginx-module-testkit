@@ -309,10 +309,9 @@ kill -KILL "$WPID3" 2>/dev/null || true
 # strictly more time than any positive leg needed to confirm presence.
 sleep 2
 
-KILLED_RECORD=0
-if wait_journal_lines "\"role\":\"worker\",\"pid\":$WPID3,\"gen\":[0-9]+,\"ev\":\"exiting\"" 1; then
-    KILLED_RECORD=1
-fi
+# The forbidden-record check itself happens AFTER the witness below, not
+# here -- see the witness note for why a check taken this early cannot be
+# trusted as the verdict.
 
 # THE LIVENESS WITNESS, and why claim 3 is worthless without one.
 #
@@ -330,6 +329,15 @@ fi
 # does "no record for $WPID3" mean anything. The replacement worker the master
 # respawned after the kill also retires here, which is why the QUIT happens
 # before the verdict rather than after it.
+#
+# ORDER MATTERS: the forbidden-record check that this row verdicts on is
+# sampled AFTER the witness is confirmed present, not before. A watcher that
+# is merely lagging (attached, alive, but slow to translate) can append the
+# forbidden worker-exit line into the journal at any point between an early
+# sample and the witness arriving; sampling early would let that late-arriving
+# line escape detection entirely. Re-reading the forbidden record here closes
+# that window: by construction, if it is absent now, it was never written
+# during a period this driver has just proven the watcher was alive for.
 kill -QUIT "$MASTER3" 2>/dev/null || true
 wait_master_gone "$MASTER3" 100 || true
 
@@ -337,6 +345,11 @@ if wait_journal_lines "\"role\":\"master\",\"pid\":$MASTER3,\"gen\":[0-9]+,\"ev\
     WITNESS=1
 else
     WITNESS=0
+fi
+
+KILLED_RECORD=0
+if wait_journal_lines "\"role\":\"worker\",\"pid\":$WPID3,\"gen\":[0-9]+,\"ev\":\"exiting\"" 1; then
+    KILLED_RECORD=1
 fi
 
 if [ "$WITNESS" != "1" ]; then
@@ -364,21 +377,33 @@ else
     # backwards" and reports a fabricated defect of the server for what is a
     # defect of the record shape. The two are separated so the diagnostic
     # names the real fault.
+    #
+    # seq is a CONTIGUOUS per-journal counter, not merely increasing:
+    # lib.sh's emit() (inside prober_journal_start) increments it by exactly
+    # 1 on every single emit call, and on a restart against an existing
+    # journal it seeds from the journal's own last recorded seq rather than
+    # resetting -- so the counter never legitimately skips a value, not even
+    # across a phase restart. A strict-increase check alone (e.g. 1, 3, 4)
+    # would pass a dropped numbered record through undetected, which defeats
+    # the reason a monotonic counter exists here. This check therefore
+    # requires the first seq to be 1 and every following seq to equal
+    # prev+1, with a dedicated diagnostic per fault so the message still
+    # names the real defect.
     SEQ_CHECK="$(awk '{
             if ($0 !~ /"seq":[0-9]+/) { print "malformed:line" NR; err=1; exit }
             split($0, a, /"seq":/); n = a[2] + 0
-            if (n <= prev) bad = 1
+            if (NR == 1 && n != 1) { print "start:" n; err=1; exit }
+            if (NR > 1 && n != prev + 1) { print "gap:" prev "->" n; err=1; exit }
             prev = n; seen[n]++
         }
         END{
             if (err) exit
             for (s in seen) if (seen[s] > 1) { print "dup:" s; exit }
-            if (bad) { print "nonmonotonic"; exit }
             print "ok"
         }' "$JOURNAL")"
     if [ "$SEQ_CHECK" = "ok" ]; then
         N="$(wc -l < "$JOURNAL")"
-        echo "ok 4 - sequence numbers strictly increase across $N events, none lost or duplicated"
+        echo "ok 4 - sequence numbers are contiguous (1..$N) across $N events, none lost or duplicated"
     else
         echo "not ok 4 - sequence check failed ($SEQ_CHECK)"
         echo "# LIFECYCLE-RED-SEQUENCE"
