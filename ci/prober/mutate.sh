@@ -3630,6 +3630,18 @@ mutate "lifecycle-quit-vs-term-drain: QUIT drains upload needs a completed read 
     'QUIT_READER_RC=""; : "$( { tr -d' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
+# The cutoff assertion's ABANDONED-UPLOAD arm (assertion 6). Forcing the
+# recorded offset to the full body length is the case where the worker
+# consumed the entire upload and then closed without answering: the response
+# file is still empty, the reader still exits 0, and the terminal record still
+# appears, so every other arm passes and only this one can red.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM cutoff requires an abandoned upload (full offset forced, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'case "$TOFF_FINAL" in' \
+    'TOFF_FINAL=$BODY_LEN; case "$TOFF_FINAL" in' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
 # The cutoff assertion's NON-EMPTY-RESPONSE arm (assertion 6). Injecting a
 # PARTIAL status line is the counterexample the two grep arms cannot see: it
 # matches neither the complete-200 nor the complete-status-line pattern, and

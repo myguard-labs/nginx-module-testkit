@@ -611,6 +611,16 @@ wait "$UPLOAD_T_PID" 2>/dev/null || true
 # "HTTP/1.1 200 ... UPLOADED" for the QUIT leg. The claim is therefore that
 # no response status line was ever received, which a 502 or any other
 # server-generated reply would falsify.
+# The upload must have been ABANDONED mid-body, not merely unanswered. A
+# worker that consumed the whole 200-byte body and then closed without
+# replying produces the same empty response file and the same reader rc 0 as
+# a genuine cutoff, and the terminal record still appears -- so every other
+# arm of this assertion would pass while TERM had in fact waited for the
+# upload, the opposite of what the contrast claims. The client's own progress
+# sidecar records how far it got: on a real cutoff the write loop dies when
+# the socket goes away. Measured over three runs, stable at 8 of 200 bytes.
+TOFF_FINAL="$( { tr -d '[:space:]' <"${UPLOAD_T_PROGRESS}"; } 2>/dev/null )" || TOFF_FINAL=""
+case "$TOFF_FINAL" in ''|*[!0-9]*) TOFF_FINAL=-1 ;; esac
 TERM_BYTES="$(stat -c '%s' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"
 TERM_READER_RC="$( { tr -d '[:space:]' <"$UPLOAD_T_RC"; } 2>/dev/null )" || TERM_READER_RC=""
 if grep -q '^HTTP/1\.1 200' "$UPLOAD_T_OUT" 2>/dev/null && grep -q 'UPLOADED' "$UPLOAD_T_OUT" 2>/dev/null; then
@@ -619,6 +629,15 @@ if grep -q '^HTTP/1\.1 200' "$UPLOAD_T_OUT" 2>/dev/null && grep -q 'UPLOADED' "$
     FAILED=$((FAILED + 1))
 elif grep -q '^HTTP/1\.[01] [0-9][0-9][0-9]' "$UPLOAD_T_OUT" 2>/dev/null; then
     echo "not ok 6 - TERM leg: the client received a complete response status line ($(grep -m1 -o '^HTTP/1\.[01] [0-9][0-9][0-9]' "$UPLOAD_T_OUT" 2>/dev/null)) rather than a torn-down connection -- the worker answered the request instead of being cut off"
+    echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
+    FAILED=$((FAILED + 1))
+elif [ "$TOFF_FINAL" -lt 0 ] || [ "$TOFF_FINAL" -ge "$BODY_LEN" ]; then
+    if [ "$TOFF_FINAL" -lt 0 ]; then
+        why_off="no upload progress was recorded, so there is no evidence the body was abandoned"
+    else
+        why_off="the client wrote all $TOFF_FINAL of $BODY_LEN body bytes, so the worker consumed the whole upload before closing -- TERM waited for it rather than cutting it off"
+    fi
+    echo "not ok 6 - TERM leg: $why_off"
     echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
     FAILED=$((FAILED + 1))
 elif [ "$TERM_BYTES" != 0 ]; then
@@ -674,7 +693,7 @@ else
         0) how="closed at EOF" ;;
         *) how="reset by the peer (reader rc=1)" ;;
     esac
-    echo "ok 6 - TERM leg: the in-flight upload was cut off, not drained (connection $how, status recorded, the response file is empty so nothing at all reached the client)"
+    echo "ok 6 - TERM leg: the in-flight upload was cut off, not drained (connection $how, status recorded, the upload was abandoned at $TOFF_FINAL of $BODY_LEN body bytes, and the response file is empty so nothing at all reached the client)"
 fi
 
 wait_master_gone "$MASTER_T" 200 || true
