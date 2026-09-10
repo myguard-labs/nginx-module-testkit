@@ -226,7 +226,16 @@ start_upload() {
             fi
         done
 
-        cat <&3 2>/dev/null || true
+        # Bounded. The failure this driver exists to detect is a worker that
+        # does NOT complete the drain, and an unbounded read turns exactly
+        # that failure into a hang: run-scenario.sh invokes the driver with
+        # no timeout of its own, and the foreground `wait` below would never
+        # return, so the assertions that would have reported the regression
+        # are never reached. The ceiling is worker_shutdown_timeout (30s)
+        # plus slack, so a legitimate drain -- which finishes in ~7.5s of
+        # drip -- is never cut short, while a stalled one reds instead of
+        # hanging.
+        timeout 45 cat <&3 2>/dev/null || true
     ) >"$out" 2>/dev/null &
     printf -v "$pidvar" '%s' "$!"
 }
@@ -300,7 +309,8 @@ kill -QUIT "$MASTER_Q" 2>/dev/null || true
 
 # Join the upload: for QUIT this MUST return with a clean 200, because the
 # draining worker keeps reading the stalled body rather than abandoning it.
-# Bounded by the master's own eventual exit plus slack, never unbounded.
+# The subshell bounds its own read (see start_upload), so this `wait` cannot
+# outlast that ceiling even if the worker never completes the response.
 wait "$UPLOAD_Q_PID" 2>/dev/null || true
 UPLOAD_TERM_SEEN_Q="$( { tr -d '[:space:]' <"$UPLOAD_Q_STAMP"; } 2>/dev/null )" || UPLOAD_TERM_SEEN_Q=""
 
