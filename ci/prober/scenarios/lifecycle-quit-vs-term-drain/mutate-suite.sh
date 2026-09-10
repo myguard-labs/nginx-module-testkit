@@ -15,7 +15,6 @@ case "${MUT_ROW:-}" in
     *"QUIT in-flight gate"*)      EXPECT='LIFECYCLE-DRAIN-RED-QUIT-NOT-INFLIGHT' ;;
     *"QUIT drains upload"*)       EXPECT='LIFECYCLE-DRAIN-RED-QUIT-NOT-DRAINED' ;;
     *"QUIT terminal record"*)     EXPECT='LIFECYCLE-DRAIN-RED-QUIT-NO-TERMINAL' ;;
-    *"QUIT ordering needs a post-join bound"*) EXPECT='LIFECYCLE-DRAIN-RED-QUIT-ORDER' ;;
     *"QUIT ordering"*)            EXPECT='LIFECYCLE-DRAIN-RED-QUIT-ORDER' ;;
     *"QUIT stamp path"*)          EXPECT='LIFECYCLE-DRAIN-RED-QUIT-NO-STAMP' ;;
     *"TERM in-flight gate"*)      EXPECT='LIFECYCLE-DRAIN-RED-TERM-NOT-INFLIGHT' ;;

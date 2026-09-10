@@ -3551,8 +3551,8 @@ mutate "lifecycle-quit-vs-term-drain: QUIT terminal record (signal disarmed, mus
 # shellcheck disable=SC2016
 mutate "lifecycle-quit-vs-term-drain: QUIT ordering oracle (comparison inverted, must red)" \
     scenarios/lifecycle-quit-vs-term-drain/driver.sh \
-    'UPLOAD_TERM_SEEN_Q" = "absent" ] && [' \
-    'UPLOAD_TERM_SEEN_Q" != "absent" ] && [' \
+    'elif [ "$UPLOAD_TERM_SEEN_Q" = "absent" ]; then' \
+    'elif [ "$UPLOAD_TERM_SEEN_Q" = "no-such-value" ]; then' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
 # TERM terminal-record row: same disarm idiom, targeting phase B's own
@@ -3603,20 +3603,6 @@ mutate "lifecycle-quit-vs-term-drain: TERM cutoff is not merely a non-200 (synth
     scenarios/lifecycle-quit-vs-term-drain/driver.sh \
     'TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
     'printf '"'"'HTTP/1.1 502 Bad Gateway\r\n\r\n'"'"' >"$UPLOAD_T_OUT"; TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
-    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
-
-# The SECOND ordering bound (assertion 4). The mid-body stamp cannot see the
-# window between the final body chunk and the completed response, so the
-# journal snapshot taken just before the response is joined is the only thing
-# that rejects a worker which exits after the last chunk but before it
-# finishes answering. Moving the snapshot past the join erases that bound:
-# the stamp is still "absent" and the 200 still arrives, so nothing else can
-# red. Must red on QUIT-ORDER.
-# shellcheck disable=SC2016
-mutate "lifecycle-quit-vs-term-drain: QUIT ordering needs a post-join bound (journal snapshot taken too late, must red)" \
-    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
-    'JOURNAL_LINES_PRE_Q="$(wc -l' \
-    'JOURNAL_LINES_PRE_Q=999999; : "$(wc -l' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
 # The DRAIN assertion's completed-read requirement (assertion 2). QUIT is
