@@ -348,7 +348,17 @@ else
 fi
 
 KILLED_RECORD=0
-if wait_journal_lines "\"role\":\"worker\",\"pid\":$WPID3,\"gen\":[0-9]+,\"ev\":\"exiting\"" 1; then
+# Both terminal worker event names, not just "exiting": lib.sh's emitter
+# writes "exiting" for a QUIT/TERM worker that ran ngx_worker_process_cycle's
+# `if (ngx_terminate)` branch, but also "exit" for a worker (or master) whose
+# bare NOTICE exit line the classifier attributed to role worker (see the
+# "*' exit')" arm, worker sub-case). A fabricated worker "exit" record for
+# $WPID3 satisfied this probe when it only matched "exiting": it passed the
+# schema check (role/ev both documented values), the sequence check
+# (well-formed seq) and the generation check (no master-exit side effect),
+# so this was the only assertion whose entire job was to reject it and it let
+# it straight through.
+if wait_journal_lines "\"role\":\"worker\",\"pid\":$WPID3,\"gen\":[0-9]+,\"ev\":\"(exiting|exit)\"" 1; then
     KILLED_RECORD=1
 fi
 

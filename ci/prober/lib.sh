@@ -2354,6 +2354,23 @@ prober_journal_start() {
     _ready_base="$(grep -c '"ev":"ready"' "$journal" 2>/dev/null)" || _ready_base=0
     _ready_base="${_ready_base:-0}"
 
+    # SEED/ATTACH SEAM. `workers` is seeded by scanning $log's existing
+    # content, and the tail below must start reading EXACTLY where that scan
+    # stopped -- not "the current end of file" as read a moment later. Taking
+    # the mark here, once, before either operation runs, is what makes the
+    # two continuous: the seed covers every line up to and including
+    # $_mark, the stream covers every line from $_mark on, and there is no
+    # line position that belongs to neither (a worker whose "start worker
+    # process" line lands between a `sed` seed and a `tail -F -n0` attach
+    # falls in exactly that gap: the seed already read past it, `-n0`
+    # attaches at a later end-of-file and skips it, so it is announced
+    # nowhere and its later bare "exit" gets classified as a MASTER exit by
+    # the case-arm below, corrupting gen). $log may not exist yet on a fresh
+    # boot, hence the `|| _mark=0`.
+    local _mark
+    _mark="$(wc -l < "$log" 2>/dev/null)" || _mark=0
+    _mark="${_mark:-0}"
+
     # The handshake sentinel. Unique per start so a resumed journal's earlier
     # ready records cannot be mistaken for this one's.
     local token
@@ -2366,10 +2383,13 @@ prober_journal_start() {
         seq="$_seed_seq"
         gen="$_seed_gen"
         # Space-delimited set of every worker pid this stream has announced.
-        # Seeded from the log's existing content on a restart (see below) so a
-        # phase-2/3 watcher still classifies a worker forked by the generation
-        # before it -- those exits legitimately land after the restart.
-        workers=" $(sed -nE 's/^.* [0-9]+#[0-9]+: start worker process ([0-9]+)$/\1/p' "$log" 2>/dev/null | tr '\n' ' ') "
+        # Seeded from the log's content UP TO AND INCLUDING $_mark (never the
+        # whole file) so it covers exactly the lines the tail below will NOT
+        # re-deliver -- see the seam comment above. This still spans restarts:
+        # a phase-2/3 watcher gets a fresh $_mark taken from the log's CURRENT
+        # length, which already includes every earlier phase's lines, so a
+        # worker forked by the generation before it is still in this set.
+        workers=" $(head -n "$_mark" "$log" 2>/dev/null | sed -nE 's/^.* [0-9]+#[0-9]+: start worker process ([0-9]+)$/\1/p' | tr '\n' ' ') "
 
         emit() {   # role pid ev
             seq=$((seq + 1))
@@ -2390,7 +2410,15 @@ prober_journal_start() {
         # neither of which holds for a driver run non-interactively. Without
         # this file the tail outlives teardown and spins forever on a path
         # prober_cleanup has already rm -rf'd.
-        tail -F -n0 "$log" >"$fifo" 2>/dev/null &
+        #
+        # `-n +N` starts at line N (1-based), not "N lines from the current
+        # end" like `-n0` -- so this resumes at exactly $_mark + 1, the first
+        # line the seed above did NOT consume, rather than wherever the file
+        # happens to end by the time tail's open()+seek runs. A line present
+        # at both $_mark (seed) and $_mark+1 (stream) cannot occur: the ranges
+        # are disjoint by construction, so no announcement or emitted record
+        # is ever double-counted or double-emitted across the seam.
+        tail -F -n "+$((_mark + 1))" "$log" >"$fifo" 2>/dev/null &
         printf '%s\n' "$!" > "$tailpidfile"
         exec 202<"$fifo"
 
