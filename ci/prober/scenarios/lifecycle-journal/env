@@ -6,8 +6,9 @@
 # re-target THIS generation's own master a second later (QUIT/TERM) or
 # distinguish "the master we just booted" from "nothing ever booted"
 # (SIGKILL). PROBER_DAEMON_MODE=on's pidfile-based tracking, which this
-# driver re-exports before calling prober_boot itself, is what makes a
-# second, third and fourth boot inside one driver process reliable.
+# driver re-exports before calling prober_boot itself, is what makes the
+# second and third boot of a run -- both issued from inside one driver
+# process -- reliable.
 PROBER_DAEMON_MODE=on
 
 # Phase 3 (the non-vacuity SIGKILL control) deliberately kills a worker, so

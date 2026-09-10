@@ -2346,6 +2346,14 @@ prober_journal_start() {
 
     PROBER_JOURNAL_PATH="$journal"
 
+    # Baseline for THIS start, read off THIS journal: only a ready record
+    # beyond the count already present proves the watcher below attached,
+    # rather than a previous watcher's leftover. Local, so it cannot go
+    # stale against a different journal path the way a global would.
+    local _ready_base
+    _ready_base="$(grep -c '"ev":"ready"' "$journal" 2>/dev/null)" || _ready_base=0
+    _ready_base="${_ready_base:-0}"
+
     # The handshake sentinel. Unique per start so a resumed journal's earlier
     # ready records cannot be mistaken for this one's.
     local token
@@ -2482,7 +2490,7 @@ prober_journal_start() {
             "$(date '+%Y/%m/%d %H:%M:%S')" "$token" >> "$log" 2>/dev/null || true
         if grep -q '"ev":"ready"' "$journal" 2>/dev/null &&
            [ "$(grep -c '"ev":"ready"' "$journal" 2>/dev/null)" -gt \
-             "${PROBER_JOURNAL_READY_BASE:-0}" ]; then
+             "$_ready_base" ]; then
             _ok=1
             break
         fi
@@ -2502,11 +2510,6 @@ prober_journal_start() {
              "assertion over $journal means anything"
         exit 1
     fi
-
-    # Baseline for the NEXT start against this same journal: only a ready
-    # record beyond this count proves the next watcher attached, rather than
-    # this one's leftover.
-    PROBER_JOURNAL_READY_BASE="$(grep -c '"ev":"ready"' "$journal" 2>/dev/null || echo 0)"
 }
 
 # prober_journal_stop

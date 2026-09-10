@@ -3356,7 +3356,7 @@ release_held' \
 
 # --- scenarios/lifecycle-journal (L-1a out-of-process termination journal) --
 #
-# Four rows, one per claim in driver.sh's own header: QUIT and TERM each get
+# Six rows against driver.sh's five claims: QUIT and TERM each get
 # a driver-side mutation that disarms the signal actually sent (kill -0
 # instead of the real signal), so the terminal journal record that claim's
 # assertion checks for never has a cause -- proving each assertion is a live

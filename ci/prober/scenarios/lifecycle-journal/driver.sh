@@ -365,12 +365,13 @@ else
     # defect of the record shape. The two are separated so the diagnostic
     # names the real fault.
     SEQ_CHECK="$(awk '{
-            if ($0 !~ /"seq":[0-9]+/) { print "malformed:line" NR; exit }
+            if ($0 !~ /"seq":[0-9]+/) { print "malformed:line" NR; err=1; exit }
             split($0, a, /"seq":/); n = a[2] + 0
             if (n <= prev) bad = 1
             prev = n; seen[n]++
         }
         END{
+            if (err) exit
             for (s in seen) if (seen[s] > 1) { print "dup:" s; exit }
             if (bad) { print "nonmonotonic"; exit }
             print "ok"
