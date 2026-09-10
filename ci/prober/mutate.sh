@@ -3618,3 +3618,16 @@ mutate "lifecycle-usr1-reopen: no spurious exit (grep sense negated, must red)" 
     'if grep -qE "\"role\":\"worker\",\"pid\":$WPID_BEFORE,\"gen\":[0-9]+,\"ev\":\"exiting\"" "$JOURNAL" 2>/dev/null; then' \
     'if ! grep -qE "\"role\":\"worker\",\"pid\":$WPID_BEFORE,\"gen\":[0-9]+,\"ev\":\"exiting\"" "$JOURNAL" 2>/dev/null; then' \
     scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# The scenario's sharpest claim: USR1 is forwarded to the WORKER, not merely
+# handled by the master. Making the match unsatisfiable simulates exactly the
+# regression the assertion exists to catch -- a worker still holding the
+# rotated-away descriptor while the master's reopen made the path's inode
+# change anyway. Must red assertion 8 specifically; assertions 2, 4, 5 and 7
+# all stay green under it, which is the whole reason the row is here.
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: worker fd on new inode (match made unsatisfiable, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    '    *" $INODE_AFTER "*)' \
+    '    *" no-such-inode "*)' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh

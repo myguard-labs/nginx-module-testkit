@@ -156,7 +156,7 @@ start_upload() {
     printf -v "$pidvar" '%s' "$!"
 }
 
-echo "1..7"
+echo "1..8"
 
 # run-scenario.sh has already called prober_boot ONCE, before driver.sh ever
 # runs (same contract as lifecycle-journal's phase 1 and
@@ -312,6 +312,45 @@ else
     echo "# LIFECYCLE-USR1-RED-OLD-FILE-CORRUPTED"
     FAILED=$((FAILED + 1))
 fi
+
+# --- the WORKER, not just the master, is writing to the new inode.
+# Assertions 2 and 7 prove the FILE was rotated and reopened, but both stat
+# the path (or the renamed old path) -- neither observes which object the
+# worker's own descriptor points at. That gap is not hypothetical: nginx
+# reopens files in the master (ngx_reopen_files) and FORWARDS USR1 to each
+# worker via ngx_signal_worker_processes. If that forwarding, or the worker's
+# handling of it, regressed, the master would still create the new file --
+# so inode-before != inode-after still holds -- while the worker kept its old
+# descriptor and went on appending to the ROTATED inode. The pid (4), fd
+# COUNT (5) and no-exit (6) assertions would all still pass, because none of
+# them looks at what an fd points to. Every log line would silently land in
+# the rotated-away file, which is precisely the bug a reopen test exists to
+# catch.
+#
+# Read straight out of /proc/$WPID_BEFORE/fd: the worker runs as this same
+# uid (no privilege separation in the testkit's prefix), so its descriptors
+# are resolvable. Matched by INODE, not by path string -- a readlink target
+# still reads "$ELOG" for a stale fd only until the rename, after which it
+# shows "$ELOG.rotated"; comparing st_ino against INODE_AFTER states the
+# claim directly and cannot be satisfied by a coincidental path spelling.
+WORKER_LOG_INOS=""
+for fd in /proc/"$WPID_BEFORE"/fd/*; do
+    [ -e "$fd" ] || continue
+    ino="$(stat -L -c '%i' "$fd" 2>/dev/null || true)"
+    [ -n "$ino" ] || continue
+    WORKER_LOG_INOS="$WORKER_LOG_INOS $ino"
+done
+
+case " $WORKER_LOG_INOS " in
+    *" $INODE_AFTER "*)
+        echo "ok 8 - the worker itself holds a descriptor on the reopened log (inode $INODE_AFTER), not the rotated-away one"
+        ;;
+    *)
+        echo "not ok 8 - no descriptor of worker $WPID_BEFORE points at the reopened log (inode $INODE_AFTER); it is still writing to the rotated file"
+        echo "# LIFECYCLE-USR1-RED-WORKER-STALE-FD"
+        FAILED=$((FAILED + 1))
+        ;;
+esac
 
 [ "$FAILED" -eq 0 ] || exit 1
 exit 0

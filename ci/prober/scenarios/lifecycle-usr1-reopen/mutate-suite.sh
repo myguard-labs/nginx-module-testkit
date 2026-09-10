@@ -18,8 +18,9 @@ case "${MUT_ROW:-}" in
     *"worker set unchanged"*)   EXPECT='LIFECYCLE-USR1-RED-WORKER-CHANGED' ;;
     *"fd count unchanged"*)     EXPECT='LIFECYCLE-USR1-RED-FD-LEAK' ;;
     *"no spurious exit"*)       EXPECT='LIFECYCLE-USR1-RED-SPURIOUS-EXIT' ;;
+    *"worker fd on new inode"*) EXPECT='LIFECYCLE-USR1-RED-WORKER-STALE-FD' ;;
     "")
-        EXPECT='LIFECYCLE-USR1-RED-(NOT-INFLIGHT|NO-REOPEN|DISTURBED|WORKER-CHANGED|FD-LEAK|SPURIOUS-EXIT|OLD-FILE-CORRUPTED)' ;;
+        EXPECT='LIFECYCLE-USR1-RED-(NOT-INFLIGHT|NO-REOPEN|DISTURBED|WORKER-CHANGED|FD-LEAK|SPURIOUS-EXIT|OLD-FILE-CORRUPTED|WORKER-STALE-FD)' ;;
     *)
         echo "Bail out! scenarios/lifecycle-usr1-reopen/mutate-suite.sh does not" \
              "know which assertion row '$MUT_ROW' claims to red; add it to" \

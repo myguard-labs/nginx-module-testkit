@@ -189,7 +189,19 @@ start_upload() {
 
         cat <&3 2>/dev/null || true
         if [ -n "$stamp" ]; then
-            if [ -n "$termre" ] && grep -qE "$termre" "$JOURNAL" 2>/dev/null; then
+            # Read the ERROR LOG, never $JOURNAL. The journal is transcribed
+            # from this same log by an asynchronous `tail -F` watcher
+            # subshell (lib.sh, prober_journal_start), so a record can be
+            # absent from the journal purely because the watcher has not been
+            # scheduled yet -- while nginx has already written it. Ordering
+            # against the journal would therefore conflate "the worker had
+            # not exited" (the claim) with "the watcher had not caught up"
+            # (an artefact), and the artefact direction makes this assertion
+            # falsely GREEN: a non-draining QUIT whose record is merely
+            # delayed reads exactly like a draining one. nginx writes the log
+            # itself, synchronously and in order, so it is the only surface
+            # here with a real happens-before against the response bytes.
+            if [ -n "$termre" ] && grep -qE "$termre" "$ELOG" 2>/dev/null; then
                 printf 'seen\n' >"$stamp" 2>/dev/null || true
             else
                 printf 'absent\n' >"$stamp" 2>/dev/null || true
@@ -237,7 +249,15 @@ rm -f "$UPLOAD_Q_STAMP"
 # the ordering claim compares a stamp about one event against a line number
 # from another, which no assertion here would notice.
 TERM_RE_Q="\"role\":\"worker\",\"pid\":$WPID_Q,\"gen\":[0-9]+,\"ev\":\"exiting\""
-start_upload "$STEP_SLEEP" "$UPLOAD_Q_OUT" UPLOAD_Q_PID "$UPLOAD_Q_STAMP" "$TERM_RE_Q"
+
+# The SAME terminal event as TERM_RE_Q, matched in nginx's own error_log
+# rather than in the transcribed journal. The log line is what the watcher
+# parses into that journal record (lib.sh keys on the anchored shape
+# "<pid>#<slot>: exiting"), so the two name one event; only the surface and
+# therefore the delivery guarantee differ. The client stamp uses THIS one
+# because only the log is written synchronously by nginx -- see start_upload.
+TERM_LOG_RE_Q="$WPID_Q#[0-9]+: exiting$"
+start_upload "$STEP_SLEEP" "$UPLOAD_Q_OUT" UPLOAD_Q_PID "$UPLOAD_Q_STAMP" "$TERM_LOG_RE_Q"
 
 # In-flight liveness gate (reload-mid-upload's own idiom): the ordering claim
 # below is vacuous unless the upload was genuinely still open when QUIT was
