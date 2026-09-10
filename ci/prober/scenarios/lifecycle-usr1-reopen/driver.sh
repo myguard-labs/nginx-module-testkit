@@ -133,7 +133,7 @@ CHUNK=4
 STEP_SLEEP=0.15   # ~7.5s total drip -- see lifecycle-quit-vs-term-drain's sizing note
 
 start_upload() {
-    local step_sleep=$1 out=$2 pidvar=$3 progress=${4:-}
+    local step_sleep=$1 out=$2 pidvar=$3 progress=${4:-} rcfile=${5:-}
     (
         exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
         printf 'POST /upload HTTP/1.1\r\nHost: prober\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' \
@@ -161,7 +161,17 @@ start_upload() {
             # buffers the whole body before any upstream signal exists. The
             # gate claims exactly what it can see: the request is on the wire
             # and incomplete.
-            [ -n "$progress" ] && printf '%s\n' "$off" >"$progress" 2>/dev/null
+            # Published atomically: a plain truncating redirect would leave the
+            # file momentarily empty, and the foreground gate reads it once
+            # without retrying, so it would read that window as "no bytes
+            # written" and fail a perfectly healthy upload. A rename within
+            # the same directory swaps the value in one step, so a reader sees
+            # either the old offset or the new one, never nothing.
+            if [ -n "$progress" ]; then
+                if printf '%s\n' "$off" >"$progress.tmp" 2>/dev/null; then
+                    mv -f "$progress.tmp" "$progress" 2>/dev/null || true
+                fi
+            fi
             if [ "$off" -lt "$BODY_LEN" ] && [ "$step_sleep" != 0 ]; then
                 sleep "$step_sleep"
             fi
@@ -173,7 +183,19 @@ start_upload() {
         # test-scenarios.sh waits on scenario workers without a timeout, so
         # nothing upstream would cut it off and the "not ok" below would
         # never be reached. A timeout turns that hang into the failure it is.
-        timeout 30 cat <&3 2>/dev/null || true
+        # The reader's exit status is RECORDED, not discarded. The assertion
+        # below claims the upload completed "not cut, not stalled", and a
+        # timeout (124) is exactly the stall it names: the server can emit the
+        # 200 and UPLOADED bytes and then hang without finishing the response
+        # or closing, and a grep over the captured bytes cannot tell that from
+        # a clean completion. Only the read's own outcome can.
+        reader_rc=0
+        timeout 30 cat <&3 2>/dev/null || reader_rc=$?
+        if [ -n "$rcfile" ]; then
+            if printf '%s\n' "$reader_rc" >"$rcfile.tmp" 2>/dev/null; then
+                mv -f "$rcfile.tmp" "$rcfile" 2>/dev/null || true
+            fi
+        fi
     ) >"$out" 2>/dev/null &
     printf -v "$pidvar" '%s' "$!"
 }
@@ -221,7 +243,9 @@ rm -f "$UPLOAD_PROGRESS"
 # assertion 5 and must keep its own sampling point.
 ACC_FDS="$(prober_probe_field "$(prober_probe_body "$HOST" "$PORT" 2>/dev/null || true)" fds 2>/dev/null || true)"
 case "$ACC_FDS" in ''|*[!0-9]*) ACC_FDS=-1 ;; esac
-start_upload "$STEP_SLEEP" "$UPLOAD_OUT" UPLOAD_PID "$UPLOAD_PROGRESS"
+UPLOAD_RC="$PROBER_PREFIX/upload-usr1.readerrc"
+rm -f "$UPLOAD_RC"
+start_upload "$STEP_SLEEP" "$UPLOAD_OUT" UPLOAD_PID "$UPLOAD_PROGRESS" "$UPLOAD_RC"
 
 # Wait for the upload to be DEMONSTRABLY on the wire and still incomplete:
 # some body bytes written, but fewer than all of them. Both halves matter --
@@ -317,10 +341,12 @@ fi
 # --- join the upload: USR1 must not disturb it -----------------------------
 wait "$UPLOAD_PID" 2>/dev/null || true
 
-if grep -q '^HTTP/1\.1 200' "$UPLOAD_OUT" 2>/dev/null && grep -q 'UPLOADED' "$UPLOAD_OUT" 2>/dev/null; then
-    echo "ok 3 - the in-flight upload completed cleanly across the reopen (not cut, not stalled)"
+UPLOAD_READER_RC="$( { tr -d '[:space:]' <"$UPLOAD_RC"; } 2>/dev/null )" || UPLOAD_READER_RC=""
+if grep -q '^HTTP/1\.1 200' "$UPLOAD_OUT" 2>/dev/null && grep -q 'UPLOADED' "$UPLOAD_OUT" 2>/dev/null \
+   && [ "$UPLOAD_READER_RC" = 0 ]; then
+    echo "ok 3 - the in-flight upload completed cleanly across the reopen (not cut, not stalled; response read ended at EOF, reader rc=0)"
 else
-    echo "not ok 3 - the in-flight upload did not complete cleanly across USR1"
+    echo "not ok 3 - the in-flight upload did not complete cleanly across USR1 (reader rc=${UPLOAD_READER_RC:-unrecorded}; rc 124 means the response bytes arrived but the read then stalled to the 30s bound)"
     echo "# LIFECYCLE-USR1-RED-DISTURBED"
     sed 's/^/# /' "$UPLOAD_OUT" 2>/dev/null || true
     FAILED=$((FAILED + 1))

@@ -248,7 +248,17 @@ start_upload() {
             # evidence that the request actually reached the wire instead of
             # inferring it from the subshell existing. See the gates for why
             # `kill -0` alone is not that evidence.
-            [ -n "$progress" ] && printf '%s\n' "$off" >"$progress" 2>/dev/null
+            # Published atomically: a plain truncating redirect would leave the
+            # file momentarily empty, and the foreground gate reads it once
+            # without retrying, so it would read that window as "no bytes
+            # written" and fail a perfectly healthy upload. A rename within
+            # the same directory swaps the value in one step, so a reader sees
+            # either the old offset or the new one, never nothing.
+            if [ -n "$progress" ]; then
+                if printf '%s\n' "$off" >"$progress.tmp" 2>/dev/null; then
+                    mv -f "$progress.tmp" "$progress" 2>/dev/null || true
+                fi
+            fi
             if [ "$off" -lt "$BODY_LEN" ] && [ "$step_sleep" != 0 ]; then
                 sleep "$step_sleep"
             fi

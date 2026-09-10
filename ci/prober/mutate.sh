@@ -3521,8 +3521,8 @@ mutate "lifecycle-quit-vs-term-drain: QUIT in-flight gate needs server-side acce
 # shellcheck disable=SC2016
 mutate "lifecycle-quit-vs-term-drain: QUIT in-flight gate needs written bytes (progress stamp suppressed, must red)" \
     scenarios/lifecycle-quit-vs-term-drain/driver.sh \
-    '[ -n "$progress" ] && printf' \
-    'false && printf' \
+    '            if [ -n "$progress" ]; then' \
+    '            if false; then' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
 # shellcheck disable=SC2016
@@ -3660,6 +3660,18 @@ mutate "lifecycle-quit-vs-term-drain: contrast holds (divergence requirement inv
 # exact mistake, fixed there before shipping). Pinned via
 # MUTATE_REQUIRE_MARKER in this scenario's own mutate-suite.sh.
 
+# Assertion 3 claims the upload completed "not cut, not stalled". Forcing the
+# RECORDED reader status to a timeout -- at the write site, so no later
+# assignment can undo it -- reproduces exactly the stall the wording denies:
+# the response bytes are all present, so the greps still match, and only the
+# status distinguishes a completed read from one that hung to the 30s bound.
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: upload survives needs a completed read (reader timeout forced, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    '"$reader_rc" >"$rcfile.tmp"' \
+    '124 >"$rcfile.tmp"' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
 # The SERVER-SIDE half of the in-flight precondition (assertion 1). Freezing
 # the observed fd count at the baseline removes the only evidence that the
 # WORKER accepted the connection before USR1 was sent.
@@ -3678,8 +3690,8 @@ mutate "lifecycle-usr1-reopen: in-flight gate needs server-side accept (fd delta
 # shellcheck disable=SC2016
 mutate "lifecycle-usr1-reopen: in-flight gate needs written bytes (progress stamp suppressed, must red)" \
     scenarios/lifecycle-usr1-reopen/driver.sh \
-    '[ -n "$progress" ] && printf' \
-    'false && printf' \
+    '            if [ -n "$progress" ]; then' \
+    '            if false; then' \
     scenarios/lifecycle-usr1-reopen/mutate-suite.sh
 
 # shellcheck disable=SC2016
@@ -3692,8 +3704,8 @@ mutate "lifecycle-usr1-reopen: inode changes (comparison inverted, must red)" \
 # shellcheck disable=SC2016
 mutate "lifecycle-usr1-reopen: upload survives (grep sense negated, must red)" \
     scenarios/lifecycle-usr1-reopen/driver.sh \
-    'if grep -q '"'"'^HTTP/1\.1 200'"'"' "$UPLOAD_OUT" 2>/dev/null && grep -q '"'"'UPLOADED'"'"' "$UPLOAD_OUT" 2>/dev/null; then' \
-    'if ! grep -q '"'"'^HTTP/1\.1 200'"'"' "$UPLOAD_OUT" 2>/dev/null || ! grep -q '"'"'UPLOADED'"'"' "$UPLOAD_OUT" 2>/dev/null; then' \
+    'if grep -q ' \
+    'if ! grep -q ' \
     scenarios/lifecycle-usr1-reopen/mutate-suite.sh
 
 # shellcheck disable=SC2016
