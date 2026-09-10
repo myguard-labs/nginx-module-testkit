@@ -3605,6 +3605,20 @@ mutate "lifecycle-quit-vs-term-drain: TERM cutoff is not merely a non-200 (synth
     'printf '"'"'HTTP/1.1 502 Bad Gateway\r\n\r\n'"'"' >"$UPLOAD_T_OUT"; TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
+# The DRAIN assertion's completed-read requirement (assertion 2). QUIT is
+# supposed to finish the request and close it, and the reader observes that as
+# an orderly EOF. Suppressing the QUIT leg's status sidecar leaves both greps
+# satisfied -- the 200 and the whole 9-byte UPLOADED body are still on the
+# wire -- so only the recorded-status half of the condition can red. This also
+# closes a three-set gap: the QUIT-NOT-DRAINED marker and its mutate-suite arm
+# both existed with no row behind them.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT drains upload needs a completed read (status sidecar removed, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'QUIT_READER_RC="$( { tr -d' \
+    'QUIT_READER_RC=""; : "$( { tr -d' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
 # The cutoff assertion's TIMEOUT arm (assertion 6). Forcing the recorded
 # reader status to 124 simulates a read that expired with the connection
 # still open and no data -- a worker that neither drained nor died. That

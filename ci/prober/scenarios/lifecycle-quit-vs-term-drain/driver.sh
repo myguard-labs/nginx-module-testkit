@@ -340,7 +340,9 @@ QFDS="$(prober_probe_field "$(prober_probe_body "$HOST" "$PORT" 2>/dev/null || t
 case "$QFDS" in ''|*[!0-9]*) QFDS=-1 ;; esac
 UPLOAD_Q_PROGRESS="$PROBER_PREFIX/upload-quit.progress"
 rm -f "$UPLOAD_Q_PROGRESS"
-start_upload "$STEP_SLEEP" "$UPLOAD_Q_OUT" UPLOAD_Q_PID "$UPLOAD_Q_STAMP" "$TERM_LOG_RE_Q" "" "$UPLOAD_Q_PROGRESS"
+UPLOAD_Q_RC="$PROBER_PREFIX/upload-quit.readerrc"
+rm -f "$UPLOAD_Q_RC"
+start_upload "$STEP_SLEEP" "$UPLOAD_Q_OUT" UPLOAD_Q_PID "$UPLOAD_Q_STAMP" "$TERM_LOG_RE_Q" "$UPLOAD_Q_RC" "$UPLOAD_Q_PROGRESS"
 
 # In-flight gate: the ordering claim below is vacuous unless the upload was
 # genuinely open AND still incomplete when the signal was sent. `kill -0`
@@ -413,10 +415,17 @@ kill -QUIT "$MASTER_Q" 2>/dev/null || true
 wait "$UPLOAD_Q_PID" 2>/dev/null || true
 UPLOAD_TERM_SEEN_Q="$( { tr -d '[:space:]' <"$UPLOAD_Q_STAMP"; } 2>/dev/null )" || UPLOAD_TERM_SEEN_Q=""
 
-if grep -q '^HTTP/1\.1 200' "$UPLOAD_Q_OUT" 2>/dev/null && grep -q 'UPLOADED' "$UPLOAD_Q_OUT" 2>/dev/null; then
-    echo "ok 2 - QUIT leg: the in-flight upload completed with a clean 200 (drained, not dropped)"
+# The reader's own outcome is part of the drain claim. QUIT is supposed to let
+# the request finish and then close, which the reader observes as an orderly
+# EOF (rc 0). A shutdown regression that emits the 200 and UPLOADED bytes and
+# then resets or stalls leaves both greps satisfied, so only the recorded
+# status separates a completed drain from a truncated one.
+QUIT_READER_RC="$( { tr -d '[:space:]' <"$UPLOAD_Q_RC"; } 2>/dev/null )" || QUIT_READER_RC=""
+if grep -q '^HTTP/1\.1 200' "$UPLOAD_Q_OUT" 2>/dev/null && grep -q 'UPLOADED' "$UPLOAD_Q_OUT" 2>/dev/null \
+   && [ "$QUIT_READER_RC" = 0 ]; then
+    echo "ok 2 - QUIT leg: the in-flight upload completed with a clean 200 (drained, not dropped; response read ended at EOF, reader rc=0)"
 else
-    echo "not ok 2 - QUIT leg: the in-flight upload did not complete cleanly after QUIT"
+    echo "not ok 2 - QUIT leg: the in-flight upload did not complete cleanly after QUIT (reader rc=${QUIT_READER_RC:-unrecorded}; a non-zero status means the response bytes were not followed by an orderly close)"
     echo "# LIFECYCLE-DRAIN-RED-QUIT-NOT-DRAINED"
     sed 's/^/# /' "$UPLOAD_Q_OUT" 2>/dev/null || true
     FAILED=$((FAILED + 1))
