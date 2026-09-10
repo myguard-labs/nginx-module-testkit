@@ -117,6 +117,7 @@ read_pidfile() {   # echoes a live pid, or nothing
     local p
     p="$( { tr -d '[:space:]' <"$PIDFILE"; } 2>/dev/null )"
     [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "$p"
+    # explicit: the && chain's falsity must not become the function's status
     return 0
 }
 
@@ -209,6 +210,14 @@ stop_phase() {
     wait_port_free || true
 }
 
+# The driver's own phase structure: phase 1 (QUIT) reuses run-scenario.sh's
+# initial prober_boot, and phases 2 (TERM) and 3 (SIGKILL) each call
+# start_phase with REBOOT=1 -- one boot-and-retire per phase, three phases,
+# three generations. This is the out-of-band count assertion 5(c) verifies
+# NMASTER against; it comes from the driver's structure, not from anything
+# the journal or its classifier produced.
+EXPECTED_GENS=3
+
 echo "1..5"
 
 # --- 1: QUIT emits the terminal event for the worker(s) it retired --------
@@ -292,9 +301,12 @@ fi
 # apply to for an untracked master death.
 kill -KILL "$WPID3" 2>/dev/null || true
 # The master respawns a replacement almost immediately; give the log/journal
-# a fair window before concluding no terminal record exists, same 40-step
-# (2 s) budget as the two positive legs above, so this is not a race the
-# positive legs did not also have to win.
+# a fair window before concluding no terminal record exists. The wall-clock
+# ceiling matches the two positive legs' 40-step (2 s) budget, but the
+# semantics are stronger, not merely equal: the positive legs POLL and return
+# as soon as their record appears, so they typically wait far less than 2 s,
+# while this leg always burns the FULL 2 s. Absence is concluded only after
+# strictly more time than any positive leg needed to confirm presence.
 sleep 2
 
 KILLED_RECORD=0
@@ -398,11 +410,18 @@ fi
 #      three worker pids were read out of the probe endpoint, so a
 #      misclassification is directly observable rather than argued about.
 #
-#   c. gen advanced exactly once per master record and never went backwards,
-#      and the final gen equals the number of master exits recorded. Three
-#      generations were booted and retired here, so a classifier double-
-#      counting worker exits as master exits lands well above that.
+#   c. gen advanced exactly once per master record and never went backwards.
+#      This is checked two ways: first against EXPECTED_GENS, the number of
+#      generations THIS DRIVER actually booted and retired (an out-of-band
+#      count the classifier cannot influence), and second as a cheap
+#      self-consistency guard that the emitter's own gen/master-exit identity
+#      still holds. The self-consistency guard is NOT the generation oracle --
+#      it is a structural identity of the emitter (see the comment below,
+#      where it is checked) and holds for every journal the emitter can
+#      produce, correct or not, so it alone would not catch a classifier
+#      double-counting worker exits as master exits.
 BAD5=""
+BAD5_MARKER=""
 
 # The alternation admits exactly two record families: a lifecycle event for a
 # worker or master, and the watcher's own attach acknowledgement. It does NOT
@@ -427,35 +446,48 @@ fi
 
 if [ -z "$BAD5" ]; then
     NMASTER="$(grep -cE '"role":"master",.*"ev":"exit"' "$JOURNAL" || true)"
+    # awk's `exit` inside a main rule transfers control to END rather than
+    # skipping it, so every early-exit error path would ALSO print "final:<n>"
+    # from END -- a second, unwanted line that gives BAD5 an embedded newline.
+    # `err` suppresses that: END prints only when no main rule already did.
     GEN_CHECK="$(awk '{
             split($0, r, /"role":"/); split(r[2], r2, /"/); role = r2[1]
             split($0, g, /"gen":/); n = g[2] + 0
-            if (NR > 1 && n < prev) { print "gen went backwards at line " NR; exit }
-            if (NR > 1 && n > prev + 1) { print "gen jumped by " (n - prev) " at line " NR; exit }
+            if (NR > 1 && n < prev) { print "gen went backwards at line " NR; err=1; exit }
+            if (NR > 1 && n > prev + 1) { print "gen jumped by " (n - prev) " at line " NR; err=1; exit }
             # gen may advance by exactly one, and only immediately AFTER a
             # master exit record -- the increment fires once that record is
             # emitted, so it is the FOLLOWING record that first shows the new
             # value, whatever role that record happens to carry.
             if (NR > 1 && n == prev + 1 && prevrole != "master") {
-                print "gen advanced after a " prevrole " record at line " NR; exit
+                print "gen advanced after a " prevrole " record at line " NR; err=1; exit
             }
             prev = n; prevrole = role; last = n
         }
-        END{ print "final:" last }' "$JOURNAL")"
+        END{ if (!err) print "final:" last }' "$JOURNAL")"
     case "$GEN_CHECK" in
         final:*)
             FINAL_GEN="${GEN_CHECK#final:}"
-            # gen starts at 0 and increments AFTER each master exit record is
-            # emitted, so the LAST master exit is tagged N-1 and its own
-            # increment is never observable -- the watcher is stopped before
-            # anything else is written. The last record in the journal is
-            # always that final master exit (stop_phase waits for it), so the
-            # final recorded gen is one less than the master-exit count. This
-            # is the assertion that reds when a classifier miscounts worker
-            # exits as master exits: doing so inflates NMASTER without a
-            # matching generation, and the two stop tracking.
-            if [ "$FINAL_GEN" != "$((NMASTER - 1))" ]; then
-                BAD5="final gen $FINAL_GEN is not one less than the $NMASTER master exit records; gen is not advancing exactly once per master generation"
+            # THE GENERATION ORACLE: NMASTER (how many master-exit records the
+            # journal holds) against EXPECTED_GENS (how many generations this
+            # driver actually booted and retired -- out-of-band, independent
+            # of anything the classifier produced). A classifier crediting
+            # worker exits to the master inflates NMASTER past EXPECTED_GENS;
+            # this is the comparison that catches it.
+            if [ "$NMASTER" != "$EXPECTED_GENS" ]; then
+                BAD5="recorded $NMASTER master exit records, but this driver booted and retired $EXPECTED_GENS generations"
+                BAD5_MARKER="LIFECYCLE-RED-GENCOUNT"
+            # Cheap emitter self-consistency guard ONLY, not the generation
+            # oracle above: gen starts at 0 and increments AFTER each master
+            # exit record is emitted, so the Kth master-exit record always
+            # carries gen == K-1 and the final recorded gen is one less than
+            # NMASTER, for EVERY journal the emitter can produce -- correct or
+            # miscounted, since the restart path reseeds gen by recomputing
+            # NMASTER the same way. It cannot distinguish a correct classifier
+            # from a miscounting one; it only catches the emitter's internal
+            # bookkeeping going out of step with its own master-exit count.
+            elif [ "$FINAL_GEN" != "$((NMASTER - 1))" ]; then
+                BAD5="internal: gen/master-exit identity violated (final gen $FINAL_GEN, $NMASTER master exits)"
             fi
             ;;
         *) BAD5="$GEN_CHECK" ;;
@@ -466,7 +498,7 @@ if [ -z "$BAD5" ]; then
     echo "ok 5 - every record matches the documented schema; no worker pid is recorded as master; gen advanced once per master exit ($NMASTER)"
 else
     echo "not ok 5 - role/gen schema violation ($BAD5)"
-    echo "# LIFECYCLE-RED-ROLEGEN"
+    echo "# ${BAD5_MARKER:-LIFECYCLE-RED-ROLEGEN}"
     sed 's/^/# /' "$JOURNAL"
     FAILED=$((FAILED + 1))
 fi

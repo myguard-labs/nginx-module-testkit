@@ -3437,7 +3437,12 @@ kill -KILL "$PROBER_JOURNAL_PID" 2>/dev/null || true' \
 # identical bare "exit" (ngx_process_cycle.c :662 master, :994 worker), so the
 # mutated arm credits every worker's own exit to the master and advances gen
 # roughly twice per real generation. Every assertion except 5 stays green
-# through it -- which is exactly why assertion 5 exists.
+# through it. Within assertion 5 it is check (b) -- no worker pid may be
+# recorded with role master -- that catches this row: every tracked worker
+# pid now shows up misclassified as master, which (b)'s grep is built to
+# observe directly. Check (c)'s NMASTER/EXPECTED_GENS comparison also reds on
+# this mutant (NMASTER is inflated), but (b) is what makes this a targeted,
+# specific row rather than an incidental hit.
 # shellcheck disable=SC2016
 mutate "lifecycle-journal: role/gen classification (worker exits credited to master must red)" \
     lib.sh \

@@ -35,7 +35,7 @@ case "${MUT_ROW:-}" in
     *"sequence"*)                EXPECT='LIFECYCLE-RED-SEQUENCE' ;;
     *"role/gen"*)                EXPECT='LIFECYCLE-RED-ROLEGEN' ;;
     "")
-        EXPECT='LIFECYCLE-RED-(QUIT|TERM|SIGKILL-NONVACUITY|SEQUENCE|ROLEGEN)' ;;
+        EXPECT='LIFECYCLE-RED-(QUIT|TERM|SIGKILL-NONVACUITY|SEQUENCE|ROLEGEN|GENCOUNT)' ;;
     *)
         # A new row nobody taught this suite about. Failing closed keeps an
         # unrecognised row from being credited by whichever marker happens to
