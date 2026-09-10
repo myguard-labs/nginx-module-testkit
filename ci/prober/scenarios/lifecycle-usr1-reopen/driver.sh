@@ -416,12 +416,27 @@ fi
 # against the surface that can actually answer it. Both the rotated file and
 # the reopened one are read: a spurious exit logged before the rename would
 # otherwise be rotated out of view and silently pass.
-if grep -qE "$WPID_BEFORE#[0-9]+: exiting$" "$ELOG" "$ELOG.rotated" 2>/dev/null; then
+#
+# The status is captured rather than branched on directly, because this is a
+# NEGATIVE assertion: its green is the "did not find" branch, so a `grep` that
+# could not read what it was asked to read must not land there. `grep` returns
+# 2, not 1, for a missing or unreadable operand, and `2>/dev/null` hides the
+# diagnostic. Measured with GNU grep 3.11: with two operands, rc is 2 whenever
+# EITHER is unreadable and the other does not match -- so a rotation that
+# never produced `$ELOG.rotated` would have printed assertion 6 green without
+# either file having been searched. Only status 1 establishes absence.
+grep_rc=0
+grep -qE "$WPID_BEFORE#[0-9]+: exiting$" "$ELOG" "$ELOG.rotated" 2>/dev/null || grep_rc=$?
+if [ "$grep_rc" -eq 0 ]; then
     echo "not ok 6 - a terminal log record was emitted for worker $WPID_BEFORE after USR1 -- USR1 is a reopen, not a shutdown"
     echo "# LIFECYCLE-USR1-RED-SPURIOUS-EXIT"
     FAILED=$((FAILED + 1))
-else
+elif [ "$grep_rc" -eq 1 ]; then
     echo "ok 6 - no terminal log record for worker $WPID_BEFORE after USR1 (reopen, not a shutdown)"
+else
+    echo "not ok 6 - the error log and its rotated counterpart could not both be read, so the absence of a terminal record for worker $WPID_BEFORE was never established"
+    echo "# LIFECYCLE-USR1-RED-SPURIOUS-EXIT"
+    FAILED=$((FAILED + 1))
 fi
 
 # --- the rotated-away file itself is undisturbed content-wise: it still
