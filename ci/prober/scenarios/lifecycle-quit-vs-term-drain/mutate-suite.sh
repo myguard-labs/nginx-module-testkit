@@ -19,6 +19,7 @@ case "${MUT_ROW:-}" in
     *"QUIT stamp path"*)          EXPECT='LIFECYCLE-DRAIN-RED-QUIT-NO-STAMP' ;;
     *"TERM in-flight gate"*)      EXPECT='LIFECYCLE-DRAIN-RED-TERM-NOT-INFLIGHT' ;;
     *"TERM cuts upload"*)         EXPECT='LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT' ;;
+    *"TERM cutoff is not merely"*) EXPECT='LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT' ;;
     *"TERM terminal record"*)     EXPECT='LIFECYCLE-DRAIN-RED-TERM-NO-TERMINAL' ;;
     *"contrast holds"*)           EXPECT='LIFECYCLE-DRAIN-RED-CONTRAST' ;;
     "")

@@ -417,12 +417,28 @@ wait "$UPLOAD_T_PID" 2>/dev/null || true
 # slow client before dying, so a seq race alone would not distinguish "did
 # not wait" from "got lucky"), but "the client-visible outcome is a cutoff,
 # never a completed upload".
+# Asserted POSITIVELY, on the shape a cutoff actually has, rather than as
+# the negation of the happy path. "No clean 200" is satisfied by far more
+# than a cutoff: a complete HTTP 502, a truncated header, or an empty file
+# produced by a driver bug all pass it, so the negation admits outcomes in
+# which the worker kept serving the request and never tore the connection
+# down -- the very thing the contrast claims to have observed. Measured: a
+# real TERM cutoff on this scenario leaves the response file EMPTY (the
+# connection dies before any status line), against 125 bytes and a
+# "HTTP/1.1 200 ... UPLOADED" for the QUIT leg. The claim is therefore that
+# no response status line was ever received, which a 502 or any other
+# server-generated reply would falsify.
+TERM_BYTES="$(stat -c '%s' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"
 if grep -q '^HTTP/1\.1 200' "$UPLOAD_T_OUT" 2>/dev/null && grep -q 'UPLOADED' "$UPLOAD_T_OUT" 2>/dev/null; then
     echo "not ok 6 - TERM leg: the in-flight upload completed with a clean 200 (TERM waited for it, contrary to claim)"
     echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
     FAILED=$((FAILED + 1))
+elif grep -q '^HTTP/1\.[01] [0-9][0-9][0-9]' "$UPLOAD_T_OUT" 2>/dev/null; then
+    echo "not ok 6 - TERM leg: the client received a complete response status line ($(grep -m1 -o '^HTTP/1\.[01] [0-9][0-9][0-9]' "$UPLOAD_T_OUT" 2>/dev/null)) rather than a torn-down connection -- the worker answered the request instead of being cut off"
+    echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
+    FAILED=$((FAILED + 1))
 else
-    echo "ok 6 - TERM leg: the in-flight upload was cut off, not drained (no clean 200/UPLOADED)"
+    echo "ok 6 - TERM leg: the in-flight upload was cut off, not drained (no response status line reached the client; $TERM_BYTES bytes received)"
 fi
 
 wait_master_gone "$MASTER_T" 200 || true

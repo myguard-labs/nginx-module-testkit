@@ -3568,6 +3568,19 @@ mutate "lifecycle-quit-vs-term-drain: TERM cuts upload (grep sense negated, must
     'if ! grep -q '"'"'^HTTP/1\.1 200'"'"' "$UPLOAD_T_OUT" 2>/dev/null || ! grep -q '"'"'UPLOADED'"'"' "$UPLOAD_T_OUT" 2>/dev/null; then' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
+# The cutoff assertion's NON-CUTOFF arm (assertion 6). Injecting a synthetic
+# response status line into the TERM leg's output file simulates a worker
+# that answered the request -- with a 502, say -- instead of having its
+# connection torn down. Before this arm existed, that outcome satisfied the
+# assertion, because "no clean 200" is not the same claim as "cut off".
+# Must red on DID-NOT-CUT via the status-line arm specifically.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM cutoff is not merely a non-200 (synthetic 502 injected, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
+    'printf '"'"'HTTP/1.1 502 Bad Gateway\r\n\r\n'"'"' >"$UPLOAD_T_OUT"; TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
 # Contrast row (assertion 8): inverts the required T_DRAINED value, so the
 # oracle now demands TERM drain its upload too -- the opposite of what this
 # scenario actually produces. (A stub-to-always-true version was tried first
