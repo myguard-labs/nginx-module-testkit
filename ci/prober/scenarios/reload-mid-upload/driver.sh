@@ -16,7 +16,7 @@
 # in the rewrite phase before the body is read at all -- see nginx.conf's
 # comment), which is why this scenario proxies to a same-server sink instead.
 # Because the 200 is gated on the LAST body byte, assertion 3 below is a
-# genuinely strong proof, not a weak one: the ~4.5s drip cannot finish before
+# genuinely strong proof, not a weak one: the ~15s drip cannot finish before
 # the sub-second reload lands, so a clean 200 is direct evidence the response
 # was produced only after the full slow body -- spanning the reload -- was
 # read.
@@ -51,11 +51,16 @@
 # alive immediately before prober_signal_wait is called (a hard gate, not a
 # soft assertion: if it already exited, the run aborts assertion 2 as a
 # mistimed `not ok` rather than certifying a false span), and the total body
-# (60 bytes @ 4 bytes/300ms ~= 4.5s) is many times longer than a reload takes
-# to absorb, so on any host where the pre-signal liveness gate passes, the
-# upload is still sending when the HUP lands. This mirrors the timing-margin
-# argument backend-reload-inflight uses for its drip, just without a journal
-# to make it a hard per-byte proof.
+# (200 bytes @ 4 bytes/300ms ~= 15s, widened from an original 60 B/~4.5s after
+# assertion 2 lost the race under loaded CI on run 34424914645, angie 1.12.0
+# leg -- the settle window's own fixed-count `kill -0` polling loop stretches
+# in wall time under CPU contention just like every other counted-step wait in
+# this harness, so a drip sized for an idle box's reload-absorb time left too
+# thin a margin) is many times longer than a reload takes to absorb, so on any
+# host where the pre-signal liveness gate passes, the upload is still sending
+# when the HUP lands. This mirrors the timing-margin argument
+# backend-reload-inflight uses for its drip, just without a journal to make it
+# a hard per-byte proof.
 set -euo pipefail
 
 # shellcheck source=lib.sh
@@ -105,7 +110,10 @@ echo "1..6"
 # this shell") and could leave the upload running past the intended cleanup
 # boundary. Backgrounding in the driver's own shell (out-param via `printf -v`)
 # keeps the job a true child, so wait/kill/kill -0 all address it correctly.
-BODY="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX"   # 60 bytes
+BODY="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX0123456789abcdefghij"   # 200 bytes (60-byte pattern repeated), widened from 60 B after
+                 # the settle-window liveness gate (assertion 2) lost the race
+                 # under loaded CI on run 34424914645, angie 1.12.0 leg -- see
+                 # the STEP_SLEEP comment below for the timing budget.
 BODY_LEN=${#BODY}
 CHUNK=4          # bytes per write
 
@@ -172,8 +180,10 @@ else
 fi
 
 # --- fire the slow upload ---------------------------------------------------
-STEP_SLEEP=0.3   # seconds between writes -> ~(60/4)*0.3 = 4.5s total drip,
-                 # many times a reload's absorb time.
+STEP_SLEEP=0.3   # seconds between writes -> ~(200/4)*0.3 = 15s total drip,
+                 # many times a reload's absorb time. Widened from a 60-byte
+                 # (~4.5s) body after the settle gate lost the race under
+                 # loaded CI (run 34424914645, angie 1.12.0 leg).
 
 UPLOAD_OUT="$PROBER_PREFIX/upload.out"
 start_upload "$STEP_SLEEP" "$UPLOAD_OUT" UPLOAD_PID
@@ -187,7 +197,7 @@ start_upload "$STEP_SLEEP" "$UPLOAD_OUT" UPLOAD_PID
 # and for where the real span-proof actually lives (the pre-signal liveness
 # gate below).
 ALIVE_SEEN=0
-for ((i = 0; i < 20; i++)); do   # 20 * 50 ms = 1 s settle, well under the 4.5s drip
+for ((i = 0; i < 20; i++)); do   # 20 * 50 ms = 1 s settle, well under the ~15s drip
     if kill -0 "$UPLOAD_PID" 2>/dev/null; then
         ALIVE_SEEN=1
     else
@@ -223,8 +233,10 @@ fi
 # bounded failure. Poll for the background shell to exit within a deadline; if
 # it overruns, KILL it and fall through -- the truncated/empty $UPLOAD_OUT then
 # fails the assertion below, which is the correct verdict for an upload that
-# never completed.
-join_deadline=$(( SECONDS + 15 ))
+# never completed. Widened from 15 s to 60 s alongside the body-size increase
+# above so the join deadline keeps the same multiple of headroom over the
+# nominal drip time that the original 15 s had over the old ~4.5 s drip.
+join_deadline=$(( SECONDS + 60 ))
 while kill -0 "$UPLOAD_PID" 2>/dev/null; do
     if [ "$SECONDS" -ge "$join_deadline" ]; then
         # Kill the whole subtree, not just the subshell. The background job is

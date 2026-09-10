@@ -12,19 +12,27 @@
 # -- that would reintroduce exactly the host-timing flakiness the counted-step
 # discipline removes. Instead the drip is sized with generous headroom over the
 # storm's realistic cost. Each HUP is absorbed in well under a second on any
-# non-pathological box (a reload's new worker answers within a few probe polls),
-# so ten HUPs cost on the order of a few seconds; the 172-byte value @ 2 B/300 ms
-# drips for ~26 s, several times that, and still finishes safely inside the
-# driver's 40 s bounded, subtree-killing join deadline. If a genuinely
-# pathological host ever absorbed the storm slower than the drip, oracle 3 would
-# red (held request finished before the last HUP) rather than pass falsely --
-# the conservative direction: a false RED that flags "re-tune the drip on this
-# host", never a false GREEN.
+# IDLE box (a reload's new worker answers within a few probe polls), so ten
+# HUPs cost on the order of a few seconds there -- but each `prober_probe_pid`
+# round trip inside `prober_signal_wait`'s counted loop is a real HTTP
+# request/response against nginx, and under CI CPU contention that round trip
+# (worker fork/exec, TCP accept, scheduler latency) itself stretches in WALL
+# time even though the step COUNT stays fixed; ten such round trips can then
+# take tens of seconds instead of a few. Observed directly on run 34424914645:
+# the 172-byte value @ 2 B/300 ms (~26 s drip) lost the race under loaded CI on
+# both the nginx and Angie legs (assertion 3 red -- the held request finished
+# before the last HUP landed). The 600-byte value @ 2 B/300 ms below drips for
+# ~90 s, several times the loaded-CI storm cost actually observed, and still
+# finishes safely inside the driver's join deadline (widened alongside this).
+# If a genuinely pathological host ever absorbed the storm slower than the
+# drip, oracle 3 would red (held request finished before the last HUP) rather
+# than pass falsely -- the conservative direction: a false RED that flags
+# "re-tune the drip on this host", never a false GREEN.
 #
 # Gated by backend-smoke: an adversarially-timed reply proves nothing unless
 # the same fake is first proven correct when told to behave normally.
 proto   memcached
-seed    slow    AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMMNNNNOOOOPPPPQQQQRRRRSSSSTTTTUUUUVVVVWWWWXXXXYYYYZZZZ0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffffgggg
+seed    slow    AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMMNNNNOOOOPPPPQQQQRRRRSSSSTTTTUUUUVVVVWWWWXXXXYYYYZZZZ0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffffgggghhhhiiiijjjjkkkkllllmmmmnnnnooooppppqqqqrrrrssssttttuuuuvvvvwwwwxxxxyyyyzzzzhhhhiiiijjjjkkkkllllmmmmnnnnooooppppqqqqrrrrssssttttuuuuvvvvwwwwxxxxyyyyzzzzhhhhiiiijjjjkkkkllllmmmmnnnnooooppppqqqqrrrrssssttttuuuuvvvvwwwwxxxxyyyyzzzzhhhhiiiijjjjkkkkllllmmmmnnnnooooppppqqqqrrrrssssttttuuuuvvvvwwwwxxxxyyyyzzzzhhhhiiiijjjjkkkkllllmmmmnnnnooooppppqqqqrrrrssssttttuuuuvvvvwwwwxxxxyyyyzzzzhhhhiiiijjjjkkkkllllmmmmnnnnooooppppqqqqrrrrssss
 
 # on=get:1 so ONLY the in-flight held request drips; the pre-storm baseline
 # ordering check and the post-storm coherence leg (get:2, get:3, ...) are
