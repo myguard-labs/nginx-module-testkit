@@ -303,11 +303,13 @@ DRC=0
 # truncated/empty $INFLIGHT then fails the assertion below, the correct
 # verdict for a request that never completed.
 # A longer ceiling than backend-reload-inflight's 10 s: the drip here is sized
-# to outlast the WHOLE storm (~26 s at 172 B @ 2 B/300 ms, see ./backend), so
-# on a fast box the join may still need to wait out most of that after the
-# last HUP lands. 40 s is comfortably above the drip's own ceiling while still
-# being a bounded, killed deadline rather than an unbounded wait.
-join_deadline=$(( SECONDS + 40 ))
+# to outlast the WHOLE storm (~90 s at 600 B @ 2 B/300 ms, see ./backend, widened
+# from an original 172 B/~26 s after that margin lost the race under loaded CI
+# on run 34424914645 -- both the nginx and Angie legs), so on a fast box the
+# join may still need to wait out most of that after the last HUP lands. 150 s
+# is comfortably above the drip's own ceiling while still being a bounded,
+# killed deadline rather than an unbounded wait.
+join_deadline=$(( SECONDS + 150 ))
 while kill -0 "$INFLIGHT_PID" 2>/dev/null; do
     if [ "$SECONDS" -ge "$join_deadline" ]; then
         # Kill the whole subtree, not just the subshell. The background job is

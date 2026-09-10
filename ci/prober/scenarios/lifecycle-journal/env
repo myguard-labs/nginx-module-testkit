@@ -1,0 +1,22 @@
+# daemon on -- see usr2-state-machine's env for the identical contract this
+# scenario borrows: each of the three phases in driver.sh stops the current
+# generation and calls prober_boot again for a fresh one, and the daemon-off
+# alternative tracks the master by $! (the launcher's own pid) -- reaped the
+# instant the master forks away, and useless for a driver that needs to
+# re-target THIS generation's own master a second later (QUIT/TERM) or
+# distinguish "the master we just booted" from "nothing ever booted"
+# (SIGKILL). PROBER_DAEMON_MODE=on's pidfile-based tracking, which this
+# driver re-exports before calling prober_boot itself, is what makes the
+# second and third boot of a run -- both issued from inside one driver
+# process -- reliable.
+PROBER_DAEMON_MODE=on
+
+# Phase 3 (the non-vacuity SIGKILL control) deliberately kills a worker, so
+# the master legitimately logs [alert] "worker process <pid> exited on
+# signal 9" -- exactly worker-death's own PROBER_ALLOW_LOG, exempting the
+# same line for the same reason: this is the fault the scenario provokes on
+# purpose, not a server-side failure prober_scrape_log should red on. Pinned
+# to "exited on signal 9" specifically, never a blanket allow -- a FAULT
+# signal (SIGSEGV=11, SIGABRT=6, SIGBUS=7) carries an [alert] this pattern
+# does not match and stays fatal.
+PROBER_ALLOW_LOG='worker process [0-9]+ exited on signal 9'

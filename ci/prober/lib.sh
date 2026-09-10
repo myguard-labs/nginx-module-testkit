@@ -2147,6 +2147,433 @@ prober_served_by() {
     [ "$got" = "$want" ]
 }
 
+# _journal_fsync FD_TARGET_PATH
+#
+# fsyncs a path so a record a caller has just counted is on disk rather than
+# in a buffer a hard kill of the watcher would lose. python3 is a HARD
+# REQUIREMENT of the journal, not a nicety: the durability claim above is the
+# only reason a reader may treat "the record is not in the file" as "the
+# server never emitted it", and a silently-skipped fsync on a runner without
+# python3 would make that claim false while every assertion still read green.
+# prober_journal_start bails if python3 is missing, so by the time this runs
+# the interpreter is known to exist and a failure here is a real I/O failure
+# worth surfacing rather than swallowing.
+_journal_fsync() {
+    local path="$1"
+    exec 201<>"$path"
+    python3 -c 'import os,sys; os.fsync(int(sys.argv[1]))' 201
+    exec 201<&-
+}
+
+# prober_journal_start LOG JOURNAL
+#
+# Sets: PROBER_JOURNAL_PID, PROBER_JOURNAL_PATH
+#
+# Starts a background watcher that turns nginx's OWN lifecycle log lines --
+# "gracefully shutting down" and "exiting" for a worker, bare "exit" for
+# either -- into an append-only JSONL journal, one record per event:
+#   {"role":"worker"|"master","pid":N,"gen":N,"ev":NAME,"seq":N}
+# plus two records the watcher writes about ITSELF (ev "ready" and
+# ev "unparsed"), described under HANDSHAKE and LOUD DISCARD below.
+#
+# WHY THIS IS THE ONLY POSSIBLE ORACLE. This tree has NO exit_process /
+# init_process / exit_master module hooks anywhere (confirmed by grep over
+# the whole tree), and the probe (ngx_test_probe.c / PROBE_HTTP_TEMPLATE.c) is
+# a request-time renderer -- once a worker has exited there is nothing left
+# inside the process to ask. nginx's own NOTICE line is the only externally
+# observable record of a CLEAN exit, so the reader of it must survive the
+# process it describes: it runs as an independent background loop tailing the
+# error log by name, never as a request made to the server, and it keeps
+# running after every worker and the master are gone.
+#
+# WHY THIS IS ALSO THE NEGATIVE CONTROL, BY CONSTRUCTION. nginx installs no
+# handler for SIGKILL, so none of ngx_worker_process_cycle's exit-logging
+# branches ever run for a killed process -- there is no line for this watcher
+# to translate. A SIGKILLed process therefore leaves no terminal journal
+# record for its pid, not because the watcher was told to ignore one, but
+# because nginx itself never wrote one.
+#
+# ...WHICH IS EXACTLY WHY ABSENCE MUST NEVER BE FREE. An oracle whose PASS
+# condition is "no record appeared" scores a dead reader, an unattached
+# reader and a never-created journal identically to the truth it means to
+# assert. That is the same fail-open prober_scrape_log was fixed for (an
+# absent log used to return 0 and report every run clean), and it is closed
+# here the same way -- with positive evidence -- by the HANDSHAKE below and by
+# the ev:"ready" record it leaves behind, which a caller asserting an absence
+# is expected to require for the phase it is asserting over.
+#
+# HANDSHAKE. This function does NOT return when the watcher subshell has been
+# spawned; it returns when the watcher has PROVABLY attached to the log and is
+# translating lines from it. `tail -F -n0` starts reading at the current end of
+# file and there is a real window -- measured at 10 misses in 10 attempts with
+# no delay -- between `&` returning a pid and tail's own open()+seek. Anything
+# nginx logged inside that window is lost. So after spawning, this appends a
+# unique sentinel line to the LOG, and polls the journal for the ev:"ready"
+# record the watcher emits on seeing it; each retry appends a fresh sentinel,
+# because the first ones are what land in the unattached window. It bails
+# loudly if the watcher dies or never acknowledges, exactly as
+# prober_backend_start bails when fakesrv exits before publishing its port.
+# A sleep would not be a fix: it trades a certain race for a probabilistic
+# one and still reports the loss as a pass.
+#
+# The sentinel is a plain nginx-shaped notice line appended to the error log.
+# It carries no pid#tid: contract text, so neither case arm below can match it
+# and it can never be mistaken for a lifecycle event.
+#
+# ROLE, FROM THE STREAM'S OWN WORKER SET. ngx_process_cycle.c logs the SAME
+# bare "exit" for both roles -- ngx_master_process_exit() at :662 and
+# ngx_worker_process_exit() at :994 -- and both lines carry only the logging
+# process's own pid in the standard "<pid>#<tid>: " prefix. There is no
+# textual difference to key on, so "the text has no pid, therefore master"
+# credits every worker's own exit to the master and, with the increment below,
+# advances gen roughly twice per real generation.
+#
+# Role is decided instead against the set of worker pids THIS SAME LOG STREAM
+# announced: the master logs "start worker process <pid>" for every worker it
+# forks, strictly before that worker can log anything of its own. A bare
+# "exit" from a pid in that set is a worker; any other is the master.
+#
+# The pidfile cannot serve for this, which is why this helper no longer takes
+# one -- a third argument would be a parameter nothing reads. This watcher
+# reads the log
+# ASYNCHRONOUSLY and is routinely still translating a worker's exit line after
+# the master has already exited and called ngx_delete_pidfile -- at that
+# moment a live pidfile read returns nothing, and every such worker exit is
+# attributed to the master. Observed, not theorised: it is what the role
+# assertion in scenarios/lifecycle-journal reds on. Keying on the stream makes
+# the classification depend only on log ORDER, which nginx guarantees,
+# rather than on when this loop happens to be scheduled.
+#
+# The set is seeded on start from the log's existing "start worker process"
+# lines, so a watcher restarted mid-run still classifies a worker forked by
+# the generation before it -- those exits legitimately arrive after a restart.
+#
+# GEN increments once, right after each MASTER exit record is emitted, so the
+# retiring master's own exit is tagged with the generation it belonged to and
+# only the next master's exit is tagged higher. A worker exit never touches
+# gen. On a restart gen is recomputed as the COUNT of master exits already in
+# the journal, not read off the last line's gen field: that field holds the
+# pre-increment value for a master record, so seeding from it would replay the
+# same generation and gen would never advance across the restarts this helper
+# exists to span.
+#
+# LOUD DISCARD. Both case arms are anchored on the full
+# "<pid>#<tid>: <word>" line shape, so a line that merely CONTAINS a keyword
+# -- "signal 15 (SIGTERM) received from N, exiting", or any message ending in
+# the word "exit" -- does not reach the extraction. A line that matches the
+# arm's glob but fails the anchored extraction is not silently dropped: it is
+# written as an ev:"unparsed" record. Silence there is the worst available
+# behaviour, because per the fail-open note above a journal that emits nothing
+# is scored as a pass; format drift across the pinned matrix would degrade
+# this oracle to "asserts nothing" while staying green. An ev:"unparsed"
+# record makes the drift red on the caller's own record-shape assertion.
+#
+# tail -F (capital F): follows the log BY NAME, not by the currently-open
+# inode, so a log path replaced out from under the watcher is still tracked.
+#
+# DURABILITY. JOURNAL is created via tmp+fsync+rename the FIRST time this is
+# called for a given path, mirroring prober_backend_start's documented reason
+# for fakesrv's portfile: a reader must never observe a torn write. Every
+# record append happens under `flock -x` on the journal path itself so a
+# reader polling with `wc -l`/`tail` never observes a half-written JSON line,
+# and the journal is fsync'd after each append (see _journal_fsync, and the
+# python3 requirement enforced below).
+#
+# SPANS RESTARTS. A caller that stops this watcher (prober_journal_stop) and
+# starts a fresh one against the SAME journal path -- lifecycle-journal's
+# driver does this once per phase -- gets ONE continuous journal: an existing
+# file at JOURNAL is left alone (never truncated), and SEQ/GEN are seeded from
+# its own last recorded values rather than restarting at 0/0.
+#
+# The seed is taken only from a last line matching the FULL record shape. A
+# torn or partial last line does not silently reseed to 0/0: that would
+# manufacture a duplicate or backwards seq and report it as a defect of the
+# server being watched, when it is a defect of this reader. It bails instead.
+prober_journal_start() {
+    local log="$1" journal="$2"
+
+    # python3 backs the fsync that the durability claim above rests on. Without
+    # it every append would be buffered and "the record is absent" would stop
+    # meaning "the server never emitted it" -- the exact fail-open this whole
+    # helper is shaped to avoid. Fail here, loudly, rather than run an oracle
+    # whose documented guarantee is silently false.
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Bail out! prober_journal_start needs python3 for the per-append" \
+             "fsync its durability contract rests on; without it an absent" \
+             "record cannot be distinguished from an unflushed one"
+        exit 1
+    fi
+
+    if [ ! -e "$journal" ]; then
+        : > "$journal.tmp"
+        # fsync the empty placeholder before the rename, same discipline as
+        # write_portfile() in fakesrv.c: a reader must never see a torn file.
+        _journal_fsync "$journal.tmp"
+        mv -f "$journal.tmp" "$journal"
+    fi
+
+    # Seed SEQ/GEN from the journal's own last line rather than 0/0, so a
+    # restart against an existing journal continues its sequence. Only a line
+    # matching the full record shape may seed: see the header on why a partial
+    # line must not quietly reset the counters.
+    local _last _seed_seq _seed_gen
+    _last="$(tail -n1 "$journal" 2>/dev/null || true)"
+    if [ -z "$_last" ]; then
+        _seed_seq=0
+        _seed_gen=0
+    else
+        _seed_seq="$(printf '%s\n' "$_last" | sed -nE \
+            's/^\{"role":"(worker|master|watcher)","pid":[0-9]+,"gen":[0-9]+,"ev":"[a-z_]+","seq":([0-9]+)\}$/\2/p')"
+        # GEN is NOT read off the last line's own "gen" field. That field
+        # carries the PRE-increment value for a master record (the retiring
+        # master is tagged with the generation it belonged to), so seeding
+        # from it replays the same generation and gen never advances across a
+        # restart -- which is the whole point of spanning them. gen is instead
+        # recomputed as the count of master exits already recorded, which is
+        # exactly the invariant the counter maintains: after N master exits,
+        # gen reads N.
+        _seed_gen="$(grep -cE '^\{"role":"master",.*"ev":"exit",' "$journal" 2>/dev/null || true)"
+        [ -n "$_seed_gen" ] || _seed_gen=0
+        if [ -z "$_seed_seq" ]; then
+            echo "Bail out! prober_journal_start cannot seed from the last" \
+                 "line of $journal -- it does not match the record shape," \
+                 "so continuing would reset seq/gen to 0 and report the" \
+                 "reset as a sequence defect of the server. Last line was:"
+            printf '# %s\n' "$_last"
+            exit 1
+        fi
+    fi
+
+    PROBER_JOURNAL_PATH="$journal"
+
+    # Baseline for THIS start, read off THIS journal: only a ready record
+    # beyond the count already present proves the watcher below attached,
+    # rather than a previous watcher's leftover. Local, so it cannot go
+    # stale against a different journal path the way a global would.
+    local _ready_base
+    _ready_base="$(grep -c '"ev":"ready"' "$journal" 2>/dev/null)" || _ready_base=0
+    _ready_base="${_ready_base:-0}"
+
+    # SEED/ATTACH SEAM. `workers` is seeded by scanning $log's existing
+    # content, and the tail below must start reading EXACTLY where that scan
+    # stopped -- not "the current end of file" as read a moment later. Taking
+    # the mark here, once, before either operation runs, is what makes the
+    # two continuous: the seed covers every line up to and including
+    # $_mark, the stream covers every line from $_mark on, and there is no
+    # line position that belongs to neither (a worker whose "start worker
+    # process" line lands between a `sed` seed and a `tail -F -n0` attach
+    # falls in exactly that gap: the seed already read past it, `-n0`
+    # attaches at a later end-of-file and skips it, so it is announced
+    # nowhere and its later bare "exit" gets classified as a MASTER exit by
+    # the case-arm below, corrupting gen). $log may not exist yet on a fresh
+    # boot, hence the `|| _mark=0`.
+    local _mark
+    _mark="$(wc -l < "$log" 2>/dev/null)" || _mark=0
+    _mark="${_mark:-0}"
+
+    # The handshake sentinel. Unique per start so a resumed journal's earlier
+    # ready records cannot be mistaken for this one's.
+    local token
+    token="jrnl-$$-${RANDOM}-$(date +%s%N 2>/dev/null || echo 0)"
+    local tailpidfile="$journal.tailpid" fifo="$journal.fifo"
+    rm -f "$tailpidfile" "$fifo"
+    mkfifo "$fifo"
+
+    (
+        seq="$_seed_seq"
+        gen="$_seed_gen"
+        # Space-delimited set of every worker pid this stream has announced.
+        # Seeded from the log's content UP TO AND INCLUDING $_mark (never the
+        # whole file) so it covers exactly the lines the tail below will NOT
+        # re-deliver -- see the seam comment above. This still spans restarts:
+        # a phase-2/3 watcher gets a fresh $_mark taken from the log's CURRENT
+        # length, which already includes every earlier phase's lines, so a
+        # worker forked by the generation before it is still in this set.
+        workers=" $(head -n "$_mark" "$log" 2>/dev/null | sed -nE 's/^.* [0-9]+#[0-9]+: start worker process ([0-9]+)$/\1/p' | tr '\n' ' ') "
+
+        emit() {   # role pid ev
+            seq=$((seq + 1))
+            {
+                flock -x 200
+                printf '{"role":"%s","pid":%s,"gen":%s,"ev":"%s","seq":%s}\n' \
+                    "$1" "$2" "$gen" "$3" "$seq" >&200
+            } 200>>"$journal"
+            _journal_fsync "$journal"
+        }
+
+        # `tail`'s own pid, recorded from INSIDE the subshell where $! names
+        # it, and its output carried over an explicit FIFO rather than a
+        # process substitution. prober_journal_stop cannot discover that pid
+        # any other way: the subshell's pid is all the parent's $! yields, and
+        # a pgroup-wide kill does not reach the tail because bash creates a
+        # per-job process group only when interactive or under `set -m`,
+        # neither of which holds for a driver run non-interactively. Without
+        # this file the tail outlives teardown and spins forever on a path
+        # prober_cleanup has already rm -rf'd.
+        #
+        # `-n +N` starts at line N (1-based), not "N lines from the current
+        # end" like `-n0` -- so this resumes at exactly $_mark + 1, the first
+        # line the seed above did NOT consume, rather than wherever the file
+        # happens to end by the time tail's open()+seek runs. A line present
+        # at both $_mark (seed) and $_mark+1 (stream) cannot occur: the ranges
+        # are disjoint by construction, so no announcement or emitted record
+        # is ever double-counted or double-emitted across the seam.
+        tail -F -n "+$((_mark + 1))" "$log" >"$fifo" 2>/dev/null &
+        printf '%s\n' "$!" > "$tailpidfile"
+        exec 202<"$fifo"
+
+        while IFS= read -r line; do
+            case "$line" in
+                *"$token"*)
+                    emit watcher 0 ready
+                    continue
+                    ;;
+            esac
+            case "$line" in
+                *' exit')
+                    # Bare "exit" is logged by BOTH roles (ngx_process_cycle.c
+                    # :662 master, :994 worker) and both carry only the
+                    # logging pid. Role comes from the WORKER SET this same
+                    # log stream announced (see the "start worker process"
+                    # arm below), never from the text shape and never from a
+                    # live read of the pidfile.
+                    lpid="$(printf '%s\n' "$line" | sed -nE \
+                        's/^.* ([0-9]+)#[0-9]+: exit$/\1/p')"
+                    if [ -z "$lpid" ]; then
+                        emit watcher 0 unparsed
+                        continue
+                    fi
+                    case " $workers " in
+                        *" $lpid "*)
+                            emit worker "$lpid" exit
+                            ;;
+                        *)
+                            emit master "$lpid" exit
+                            gen=$((gen + 1))
+                            ;;
+                    esac
+                    ;;
+                *'start worker process '*)
+                    # The master announces every worker it forks, on this same
+                    # stream, strictly BEFORE that worker can log its own exit.
+                    # This is the only race-free discriminator available: the
+                    # pidfile cannot serve, because this watcher reads the log
+                    # asynchronously and is routinely still translating a
+                    # worker's exit line after the master has already exited
+                    # and called ngx_delete_pidfile -- at which point a live
+                    # pidfile read returns nothing and every such worker exit
+                    # gets attributed to the master. Learning the worker set
+                    # from the stream itself makes the classification depend
+                    # only on log ORDER, which nginx guarantees, rather than
+                    # on when this loop happens to get scheduled.
+                    npid="$(printf '%s\n' "$line" | sed -nE \
+                        's/^.* [0-9]+#[0-9]+: start worker process ([0-9]+)$/\1/p')"
+                    if [ -z "$npid" ]; then
+                        emit watcher 0 unparsed
+                        continue
+                    fi
+                    workers="$workers $npid"
+                    ;;
+                *'signal '*' received from '*)
+                    # "signal 15 (SIGTERM) received from N, exiting" and
+                    # "signal 3 (SIGQUIT) received from N, shutting down" are
+                    # the master ACKNOWLEDGING a signal, not a process
+                    # terminating. They contain the same keywords the two arms
+                    # below key on, so they are consumed HERE, explicitly and
+                    # by their own distinctive shape, rather than falling into
+                    # an arm that cannot parse them. Matching them by name is
+                    # what lets the unparsed record below stay meaningful: it
+                    # then fires only for a line this watcher genuinely does
+                    # not understand.
+                    :
+                    ;;
+                *'exiting'|*'gracefully shutting down')
+                    wpid="$(printf '%s\n' "$line" | sed -nE \
+                        's/^.* ([0-9]+)#[0-9]+: (exiting|gracefully shutting down)$/\1/p')"
+                    if [ -z "$wpid" ]; then
+                        # Matched the glob, failed the anchored shape: a
+                        # "signal 15 (SIGTERM) received from N, exiting"
+                        # line today, format drift tomorrow. Recorded, never
+                        # dropped -- see LOUD DISCARD in the header.
+                        emit watcher 0 unparsed
+                        continue
+                    fi
+                    case "$line" in
+                        *'exiting') ev=exiting ;;
+                        *)          ev=shutting_down ;;
+                    esac
+                    emit worker "$wpid" "$ev"
+                    ;;
+            esac
+        done <&202
+    ) &
+    PROBER_JOURNAL_PID=$!
+
+    # Poll for the watcher's own ev:"ready" record, re-arming the sentinel each
+    # step: the earliest sentinels are precisely the ones that land in the
+    # not-yet-attached window -n0 discards.
+    local _i _ok=0
+    for ((_i = 0; _i < 200; _i++)); do
+        printf '%s [notice] 0#0: %s\n' \
+            "$(date '+%Y/%m/%d %H:%M:%S')" "$token" >> "$log" 2>/dev/null || true
+        if grep -q '"ev":"ready"' "$journal" 2>/dev/null &&
+           [ "$(grep -c '"ev":"ready"' "$journal" 2>/dev/null)" -gt \
+             "$_ready_base" ]; then
+            _ok=1
+            break
+        fi
+        if ! kill -0 "$PROBER_JOURNAL_PID" 2>/dev/null; then
+            echo "Bail out! the lifecycle journal watcher exited before it" \
+                 "acknowledged its attach sentinel; nothing would be reading" \
+                 "$log, and an oracle asserting the ABSENCE of a record" \
+                 "would then pass for the wrong reason"
+            exit 1
+        fi
+        sleep 0.05
+    done
+
+    if [ "$_ok" != "1" ]; then
+        echo "Bail out! the lifecycle journal watcher never acknowledged its" \
+             "attach sentinel within 10s -- it is not reading $log, so no" \
+             "assertion over $journal means anything"
+        exit 1
+    fi
+}
+
+# prober_journal_stop
+#
+# Stops the background watcher started by prober_journal_start.
+#
+# BOTH pids, explicitly. The `tail -F` child is not reachable through the
+# subshell's pid, and it is not reachable through a process-group kill either:
+# `kill -TERM -- -$PID` needs $PID to BE a process-group leader, and bash puts
+# a background job in its own group only when job control is on (interactive,
+# or `set -m`). A non-interactive driver has neither, so the subshell shares
+# the driver's pgid and that kill returns 1 while the tail survives -- then
+# spins forever on a path prober_cleanup has already rm -rf'd. So the tail's
+# own pid is recorded from inside the subshell (see prober_journal_start) and
+# signalled here by name.
+prober_journal_stop() {
+    [ -n "${PROBER_JOURNAL_PID:-}" ] || return 0
+
+    local _tailpidfile="${PROBER_JOURNAL_PATH:-}.tailpid" _tpid=""
+    if [ -n "${PROBER_JOURNAL_PATH:-}" ] && [ -s "$_tailpidfile" ]; then
+        _tpid="$(tr -d '[:space:]' < "$_tailpidfile" 2>/dev/null || true)"
+    fi
+
+    kill -TERM "$PROBER_JOURNAL_PID" 2>/dev/null || true
+    if [ -n "$_tpid" ]; then
+        kill -TERM "$_tpid" 2>/dev/null || true
+    fi
+    wait "$PROBER_JOURNAL_PID" 2>/dev/null || true
+
+    [ -n "$_tpid" ] && rm -f "$_tailpidfile"
+    [ -n "${PROBER_JOURNAL_PATH:-}" ] && rm -f "${PROBER_JOURNAL_PATH}.fifo"
+    PROBER_JOURNAL_PID=""
+    return 0
+}
+
+
 # prober_cleanup
 #
 # Idempotent teardown of everything a scenario allocated: fake upstream,
@@ -2168,6 +2595,12 @@ prober_served_by() {
 prober_cleanup() {
     local rc=$?
 
+    # The lifecycle-journal watcher first: it holds a `tail -F` on a log
+    # inside the prefix this function is about to rm -rf, and an orphaned
+    # tail then spins on the deleted path for the rest of the run. Guarded
+    # and cleared like every other handle here, so a second call is a no-op.
+    prober_journal_stop || true
+
     prober_backend_stop || true
 
     if [ -n "${PROBER_SERVER_PID:-}" ]; then
@@ -2185,6 +2618,8 @@ prober_cleanup() {
     # EXIT. Clearing the handles is what makes the guards above hold.
     PROBER_BACKEND_PID=""
     PROBER_SERVER_PID=""
+    PROBER_JOURNAL_PID=""
+    PROBER_JOURNAL_PATH=""
     PROBER_PREFIX=""
     PROBER_PREFIX_OWNED=""
 

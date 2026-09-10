@@ -23,7 +23,7 @@
 # WHY PARALLEL IS SAFE, AND ITS ONE PRECONDITION
 # ----------------------------------------------
 # Scenarios are wait-dominated, not CPU-dominated: a single one drips a body
-# for ~26s, storms a worker with ten HUPs, or waits out a ~90s negative-control
+# for ~90s, storms a worker with ten HUPs, or waits out a ~90s negative-control
 # settle window. Run serially the stage costs the SUM of every scenario's
 # waits; run concurrently it costs the slowest single chain, and the idle waits
 # overlap. The only shared resource two scenarios contend for is the nginx

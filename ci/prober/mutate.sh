@@ -3353,3 +3353,117 @@ release_held' \
     '# --- release: close every held descriptor --------------------------------
 : release_held' \
     scenarios/fd-starve/mutate-suite.sh
+
+# --- scenarios/lifecycle-journal (L-1a out-of-process termination journal) --
+#
+# Six rows against driver.sh's five claims: QUIT and TERM each get
+# a driver-side mutation that disarms the signal actually sent (kill -0
+# instead of the real signal), so the terminal journal record that claim's
+# assertion checks for never has a cause -- proving each assertion is a live
+# check of a signal that landed, not something the journal or the driver
+# would print regardless. The SIGKILL non-vacuity row instead mutates the
+# JOURNAL ENGINE (lib.sh) to fabricate a false terminal record from the
+# "exited on signal" alert line the master logs after a real SIGKILL -- the
+# exact failure mode claim 3 exists to catch, planted directly rather than
+# argued about. The sequence row corrupts the per-event counter so two
+# events land with the same seq, breaking claim 4's monotonicity check.
+#
+# shellcheck disable=SC2016
+mutate "lifecycle-journal: QUIT terminal event (signal disarmed, must red)" \
+    scenarios/lifecycle-journal/driver.sh \
+    'kill -QUIT "$MASTER1" 2>/dev/null || true' \
+    'kill -0 "$MASTER1" 2>/dev/null || true' \
+    scenarios/lifecycle-journal/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-journal: TERM terminal event (signal disarmed, must red)" \
+    scenarios/lifecycle-journal/driver.sh \
+    'kill -TERM "$MASTER2" 2>/dev/null || true' \
+    'kill -0 "$MASTER2" 2>/dev/null || true' \
+    scenarios/lifecycle-journal/mutate-suite.sh
+
+# The journal engine lives in lib.sh, shared by every scenario -- the anchor
+# below is the worker-exit case arm's OWN pattern text, unique in the file,
+# extended to also translate the SIGKILL alert line into a fabricated
+# "exiting" record carrying the KILLED WORKER's own pid (not the master's,
+# which appears first on that log line -- the extraction pattern is widened
+# to prefer the "worker process N exited" pid). Reverted after the row runs,
+# same as every other lib.sh-anchored row in this file.
+# shellcheck disable=SC2016
+mutate "lifecycle-journal: SIGKILL non-vacuity (fabricated exiting record must red)" \
+    lib.sh \
+    '                *'"'"'exiting'"'"'|*'"'"'gracefully shutting down'"'"')
+                    wpid="$(printf '"'"'%s\n'"'"' "$line" | sed -nE \
+                        '"'"'s/^.* ([0-9]+)#[0-9]+: (exiting|gracefully shutting down)$/\1/p'"'"')"
+                    if [ -z "$wpid" ]; then' \
+    '                *'"'"'exiting'"'"'|*'"'"'gracefully shutting down'"'"'|*'"'"'exited on signal'"'"'*)
+                    wpid="$(printf '"'"'%s\n'"'"' "$line" | sed -nE \
+                        '"'"'s/^.*worker process ([0-9]+) exited on signal [0-9]+$/\1/p; t; s/^.* ([0-9]+)#[0-9]+: (exiting|gracefully shutting down)$/\1/p'"'"')"
+                    case "$line" in *'"'"'exited on signal'"'"'*) emit worker "$wpid" exiting; continue ;; esac
+                    if [ -z "$wpid" ]; then' \
+    scenarios/lifecycle-journal/mutate-suite.sh
+
+# THE DEAD-READER ROW -- the one this scenario most needed and did not have.
+#
+# Claim 3 passes on an ABSENCE, and until the liveness witness landed in
+# driver.sh every way of producing that absence scored identically: a journal
+# that was empty, a file that never existed, a watcher that never attached and
+# a watcher that died all printed `ok 3`. The pre-existing "SIGKILL
+# non-vacuity" row above plants WRONG CONTENT, so it only proves the grep
+# fires on a bad record -- it says nothing at all about the reader being
+# alive, and both rows are needed. Assertion 4's `[ ! -s "$JOURNAL" ]` guard
+# does not cover it either: phases 1 and 2 write records of their own, so a
+# phase-3-only reader failure leaves the journal non-empty and 4 passes.
+#
+# This row kills the phase-3 watcher immediately after start_phase returns --
+# after its attach handshake has already succeeded, so this is specifically
+# "the reader died mid-phase", not "the reader never started". Assertion 3
+# must then red on its OWN marker because the liveness witness (the phase-3
+# master's own correctly attributed exit record) never appears. The anchor
+# carries the phase-3 comment banner because `start_phase 1` alone appears
+# twice in the driver.
+# shellcheck disable=SC2016
+mutate "lifecycle-journal: dead phase-3 reader (killed watcher must red, not pass)" \
+    scenarios/lifecycle-journal/driver.sh \
+    '# --- 3: SIGKILL does NOT emit a terminal event (the non-vacuity control) --
+start_phase 1' \
+    '# --- 3: SIGKILL does NOT emit a terminal event (the non-vacuity control) --
+start_phase 1
+kill -KILL "$PROBER_JOURNAL_PID" 2>/dev/null || true' \
+    scenarios/lifecycle-journal/mutate-suite.sh
+
+# The role/gen row plants the ORIGINAL classifier bug: keying role on "the log
+# text carries no pid" rather than on WHOSE pid it carries. Both roles log an
+# identical bare "exit" (ngx_process_cycle.c :662 master, :994 worker), so the
+# mutated arm credits every worker's own exit to the master and advances gen
+# roughly twice per real generation. Every assertion except 5 stays green
+# through it. Within assertion 5 it is check (b) -- no worker pid may be
+# recorded with role master -- that catches this row: every tracked worker
+# pid now shows up misclassified as master, which (b)'s grep is built to
+# observe directly. Check (c)'s NMASTER/EXPECTED_GENS comparison also reds on
+# this mutant (NMASTER is inflated), but (b) is what makes this a targeted,
+# specific row rather than an incidental hit.
+# shellcheck disable=SC2016
+mutate "lifecycle-journal: role/gen classification (worker exits credited to master must red)" \
+    lib.sh \
+    '                    case " $workers " in
+                        *" $lpid "*)
+                            emit worker "$lpid" exit
+                            ;;
+                        *)
+                            emit master "$lpid" exit
+                            gen=$((gen + 1))
+                            ;;
+                    esac' \
+    '                    emit master "$lpid" exit
+                    gen=$((gen + 1))' \
+    scenarios/lifecycle-journal/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-journal: sequence monotonicity (duplicate seq must red)" \
+    lib.sh \
+    '        emit() {   # role pid ev
+            seq=$((seq + 1))' \
+    '        emit() {   # role pid ev
+            :' \
+    scenarios/lifecycle-journal/mutate-suite.sh
