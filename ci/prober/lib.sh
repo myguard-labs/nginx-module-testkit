@@ -2644,7 +2644,7 @@ prober_cleanup() {
 # Content-Length body, and reporting "complete" for a framing it did not check
 # would reintroduce the same defect one layer up.
 prober_http_body_complete() {
-    local f=$1 hdr_len body_len declared total
+    local f=$1 hdr_len body_len declared total cl_values cl_count cl_first
 
     [ -s "$f" ] || { echo "the response file is empty"; return 1; }
 
@@ -2690,7 +2690,34 @@ prober_http_body_complete() {
         return 1
     fi
 
-    declared="$(LC_ALL=C head -c "$hdr_len" "$f" | grep -i '^Content-Length:' | head -1 | tr -dc '0-9')"
+    # Every Content-Length in the header block, field name and surrounding
+    # whitespace (including the trailing CR) stripped, one per line.
+    #
+    # The previous spelling ended in `tr -dc '0-9'`, which DELETES non-digits
+    # instead of rejecting them and so laundered a malformed value into a
+    # valid-looking one: measured, `Content-Length: 1x0` became `10`, and a
+    # response with ten body bytes then passed as correctly framed by the very
+    # helper that exists to detect bad framing. It also made the all-digits
+    # guard that followed it unfirable, since `tr` had already guaranteed the
+    # only characters that could reach it -- a vacuous guard of the same class
+    # this file keeps catching elsewhere. The value is now validated whole.
+    #
+    # `head -1` was wrong for a second reason: conflicting Content-Length
+    # headers are invalid framing, not something to resolve by taking the
+    # first. They are collected and compared instead.
+    cl_values="$(LC_ALL=C head -c "$hdr_len" "$f" | grep -i '^Content-Length:' | sed 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*$//')" || cl_values=""
+    cl_count="$(printf '%s' "$cl_values" | grep -c '')" || cl_count=0
+    [ -n "$cl_values" ] || cl_count=0
+
+    if [ "${cl_count:-0}" -gt 1 ]; then
+        cl_first="$(printf '%s\n' "$cl_values" | head -1)"
+        if printf '%s\n' "$cl_values" | grep -qvxF -- "$cl_first"; then
+            echo "the response declared conflicting Content-Length values ($(printf '%s' "$cl_values" | tr '\n' '/')), which is invalid framing"
+            return 1
+        fi
+    fi
+
+    declared="$(printf '%s\n' "$cl_values" | head -1)"
     case "$declared" in ''|*[!0-9]*) echo "the response declared no usable Content-Length, so its body length cannot be checked"; return 1 ;; esac
 
     total="$(stat -c '%s' "$f" 2>/dev/null || echo 0)"
