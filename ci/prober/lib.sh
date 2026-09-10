@@ -2699,12 +2699,19 @@ prober_http_body_complete() {
         fi
     fi
 
+    # ANY Transfer-Encoding, not only `chunked`: RFC 9112 s6.1 says a message
+    # carrying Transfer-Encoding must have its Content-Length ignored, so the
+    # length comparison below is meaningless for every value. Matching only
+    # `chunked` let `Transfer-Encoding: gzip` plus `Content-Length: 1` reach
+    # that comparison and be reported COMPLETE (measured), crediting framing
+    # this helper cannot actually measure.
+    #
     # `grep -q` exits at its first match, which can SIGPIPE the feeding `head`
-    # on a large header; under `pipefail` that turns a positive chunked
-    # detection into a failed pipeline and skips the rejection below. Reading
-    # to EOF and discarding the output keeps the exit status meaningful.
-    if LC_ALL=C head -c "$hdr_len" "$f" | grep -i '^Transfer-Encoding:.*chunked' >/dev/null; then
-        echo "the response is chunked, which this check cannot measure"
+    # on a large header; under `pipefail` that turns a positive detection into
+    # a failed pipeline and skips the rejection below. Reading to EOF and
+    # discarding the output keeps the exit status meaningful.
+    if LC_ALL=C head -c "$hdr_len" "$f" | grep -i '^Transfer-Encoding:' >/dev/null; then
+        echo "the response carries a Transfer-Encoding, so its Content-Length must be ignored and this check cannot measure the body"
         return 1
     fi
 
