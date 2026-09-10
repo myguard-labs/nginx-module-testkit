@@ -2644,7 +2644,7 @@ prober_cleanup() {
 # Content-Length body, and reporting "complete" for a framing it did not check
 # would reintroduce the same defect one layer up.
 prober_http_body_complete() {
-    local f=$1 hdr_len body_len declared total cl_values cl_count cl_first
+    local f=$1 hdr_len body_len declared total cl_values cl_count cl_first prev_byte
 
     [ -s "$f" ] || { echo "the response file is empty"; return 1; }
 
@@ -2680,6 +2680,24 @@ prober_http_body_complete() {
     case "$hdr_len" in ''|*[!0-9]*) hdr_len=-2 ;; esac
     hdr_len=$((hdr_len + 2))
     [ "$hdr_len" -gt 0 ] || { echo "no header terminator (CRLFCRLF) was received, so the response is incomplete"; return 1; }
+
+    # A CR-only line proves its OWN two bytes, not that the line before it
+    # ended in CRLF -- and the separator this function claims to find is
+    # CRLFCRLF, all four bytes. Measured: `...200 OK\r\nContent-Length: 1\n\r\nX`
+    # matched at offset 35 and was accepted, though the file contains no
+    # CRLFCRLF anywhere. Require the CR of the preceding line's terminator,
+    # unless the CR-only line is the very first thing in the response (offset
+    # 0), where there is no preceding line to have terminated.
+    # Compared as a hex byte, not as a string: command substitution strips
+    # trailing newlines, and a bare CR is one of them, so `"$(dd ...)"` would
+    # collapse to the empty string and match nothing.
+    if [ "$hdr_len" -gt 2 ]; then
+        prev_byte="$(LC_ALL=C dd if="$f" bs=1 skip=$((hdr_len - 4)) count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+        if [ "$prev_byte" != "0d" ]; then
+            echo "no header terminator (CRLFCRLF) was received, so the response is incomplete"
+            return 1
+        fi
+    fi
 
     # `grep -q` exits at its first match, which can SIGPIPE the feeding `head`
     # on a large header; under `pipefail` that turns a positive chunked
@@ -2717,8 +2735,17 @@ prober_http_body_complete() {
 
     if [ "${cl_count:-0}" -gt 1 ]; then
         cl_first="$(printf '%s\n' "$cl_values" | head -1)"
-        if printf '%s\n' "$cl_values" | grep -qvxF -- "$cl_first"; then
-            echo "the response declared conflicting Content-Length values ($(printf '%s' "$cl_values" | tr '\n' '/')), which is invalid framing"
+        # `grep -q` again: it exits at its first match, which SIGPIPEs the
+        # feeding `printf` once the collected headers exceed pipe capacity,
+        # and under `pipefail` the condition then reads FALSE -- letting a
+        # response with conflicting lengths pass on the strength of the first
+        # one. Measured rc=141 on 20000 collected values. Read to EOF and
+        # discard, exactly as the Transfer-Encoding check above does.
+        if printf '%s\n' "$cl_values" | grep -vxF -- "$cl_first" >/dev/null; then
+            # Bounded: a hostile response can carry thousands of these, and
+            # the whole list would land in the driver's log. Four is enough to
+            # show the disagreement; the count says how many there were.
+            echo "the response declared $cl_count conflicting Content-Length values ($(printf '%s\n' "$cl_values" | head -4 | tr '\n' '/')...), which is invalid framing"
             return 1
         fi
     fi
