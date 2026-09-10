@@ -3660,6 +3660,16 @@ mutate "lifecycle-quit-vs-term-drain: contrast holds (divergence requirement inv
 # exact mistake, fixed there before shipping). Pinned via
 # MUTATE_REQUIRE_MARKER in this scenario's own mutate-suite.sh.
 
+# The SERVER-SIDE half of the in-flight precondition (assertion 1). Freezing
+# the observed fd count at the baseline removes the only evidence that the
+# WORKER accepted the connection before USR1 was sent.
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: in-flight gate needs server-side accept (fd delta erased, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    '    ACC_FDS_NOW="$(prober_probe_field' \
+    '    ACC_FDS_NOW="$ACC_FDS" #' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
 # The in-flight PRECONDITION (assertion 1). Suppressing the progress stamp
 # leaves the gate with no written-byte evidence: the upload subshell still
 # EXISTS, so the old `kill -0` form passed, but nothing proves the request

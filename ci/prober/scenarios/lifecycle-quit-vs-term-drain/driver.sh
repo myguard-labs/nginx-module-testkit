@@ -374,6 +374,15 @@ for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
 done
 case "${QFDS_NOW}" in ''|*[!0-9]*) QFDS_NOW=-1 ;; esac
 
+# RE-SAMPLE the offset. The value read above is now up to two seconds old --
+# the probe loop above ran in between -- and the upload keeps writing the
+# whole time, so the earlier sample may describe an upload that has since
+# finished sending its body and is merely waiting for a response. The gate
+# must assert "still incomplete" about the moment the signal is sent, not
+# about a moment that has passed.
+QOFF="$( { tr -d '[:space:]' <"${UPLOAD_Q_PROGRESS}"; } 2>/dev/null )" || QOFF=""
+case "${QOFF}" in ''|*[!0-9]*) QOFF=0 ;; esac
+
 if [ "${QOFF}" -gt 0 ] && [ "${QOFF}" -lt "$BODY_LEN" ] \
    && [ "${QFDS}" -ge 0 ] && [ "${QFDS_NOW}" -gt "${QFDS}" ] \
    && kill -0 "${UPLOAD_Q_PID}" 2>/dev/null; then
@@ -519,6 +528,15 @@ for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
     sleep 0.05
 done
 case "${TFDS_NOW}" in ''|*[!0-9]*) TFDS_NOW=-1 ;; esac
+
+# RE-SAMPLE the offset. The value read above is now up to two seconds old --
+# the probe loop above ran in between -- and the upload keeps writing the
+# whole time, so the earlier sample may describe an upload that has since
+# finished sending its body and is merely waiting for a response. The gate
+# must assert "still incomplete" about the moment the signal is sent, not
+# about a moment that has passed.
+TOFF="$( { tr -d '[:space:]' <"${UPLOAD_T_PROGRESS}"; } 2>/dev/null )" || TOFF=""
+case "${TOFF}" in ''|*[!0-9]*) TOFF=0 ;; esac
 
 if [ "${TOFF}" -gt 0 ] && [ "${TOFF}" -lt "$BODY_LEN" ] \
    && [ "${TFDS}" -ge 0 ] && [ "${TFDS_NOW}" -gt "${TFDS}" ] \

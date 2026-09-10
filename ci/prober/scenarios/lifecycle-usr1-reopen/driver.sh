@@ -216,6 +216,11 @@ fi
 UPLOAD_OUT="$PROBER_PREFIX/upload-usr1.out"
 UPLOAD_PROGRESS="$PROBER_PREFIX/upload-usr1.progress"
 rm -f "$UPLOAD_PROGRESS"
+# Accept baseline for the server-side half of the gate below. Deliberately a
+# separate sample from FDS_BEFORE, which is the fd-NEUTRALITY baseline for
+# assertion 5 and must keep its own sampling point.
+ACC_FDS="$(prober_probe_field "$(prober_probe_body "$HOST" "$PORT" 2>/dev/null || true)" fds 2>/dev/null || true)"
+case "$ACC_FDS" in ''|*[!0-9]*) ACC_FDS=-1 ;; esac
 start_upload "$STEP_SLEEP" "$UPLOAD_OUT" UPLOAD_PID "$UPLOAD_PROGRESS"
 
 # Wait for the upload to be DEMONSTRABLY on the wire and still incomplete:
@@ -235,11 +240,41 @@ for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
 done
 
 case "$UPLOAD_OFF" in ''|*[!0-9]*) UPLOAD_OFF=0 ;; esac
+
+# SERVER-SIDE acceptance, the same evidence the QUIT/TERM driver requires. A
+# successful client write proves only that the kernel buffered the bytes; if
+# the worker has not yet accepted the queued connection when USR1 arrives it
+# can reopen its logs first and handle the upload afterwards, and the
+# undisturbed-traffic claim would never have crossed the reopen at all. An
+# accepted connection is an extra descriptor the worker holds, so a count
+# above the baseline is evidence from the server that it is handling this
+# request. The baseline came through the same probe request, so the probe's
+# own transient descriptor cancels out.
+ACC_FDS_NOW=""
+for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
+    kill -0 "$UPLOAD_PID" 2>/dev/null || break
+    ACC_FDS_NOW="$(prober_probe_field "$(prober_probe_body "$HOST" "$PORT" 2>/dev/null || true)" fds 2>/dev/null || true)"
+    case "$ACC_FDS_NOW" in
+        ''|*[!0-9]*) ;;
+        *) [ "$ACC_FDS_NOW" -gt "$ACC_FDS" ] && break ;;
+    esac
+    ACC_FDS_NOW=""
+    sleep 0.05
+done
+case "$ACC_FDS_NOW" in ''|*[!0-9]*) ACC_FDS_NOW=-1 ;; esac
+
+# Re-sample the offset: the probe loop above ran for up to two seconds while
+# the upload kept writing, so the earlier value may describe an upload that
+# has since finished its body. The gate must be about the moment USR1 is sent.
+UPLOAD_OFF="$( { tr -d '[:space:]' <"$UPLOAD_PROGRESS"; } 2>/dev/null )" || UPLOAD_OFF=""
+case "$UPLOAD_OFF" in ''|*[!0-9]*) UPLOAD_OFF=0 ;; esac
+
 if [ "$UPLOAD_OFF" -gt 0 ] && [ "$UPLOAD_OFF" -lt "$BODY_LEN" ] \
+   && [ "$ACC_FDS" -ge 0 ] && [ "$ACC_FDS_NOW" -gt "$ACC_FDS" ] \
    && kill -0 "$UPLOAD_PID" 2>/dev/null; then
-    echo "ok 1 - the upload was still in flight immediately before USR1 ($UPLOAD_OFF of $BODY_LEN body bytes written, connection open)"
+    echo "ok 1 - the upload was still in flight immediately before USR1 ($UPLOAD_OFF of $BODY_LEN body bytes written; worker fds $ACC_FDS -> $ACC_FDS_NOW, so the worker has accepted it)"
 else
-    echo "not ok 1 - the upload was not in flight before USR1 ($UPLOAD_OFF of $BODY_LEN body bytes written); the undisturbed-traffic claim below would be vacuous"
+    echo "not ok 1 - the upload was not in flight before USR1 ($UPLOAD_OFF of $BODY_LEN body bytes written; worker fds $ACC_FDS -> $ACC_FDS_NOW); the undisturbed-traffic claim below would be vacuous"
     echo "# LIFECYCLE-USR1-RED-NOT-INFLIGHT"
     FAILED=$((FAILED + 1))
 fi
