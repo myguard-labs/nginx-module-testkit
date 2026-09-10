@@ -3467,3 +3467,127 @@ mutate "lifecycle-journal: sequence monotonicity (duplicate seq must red)" \
     '        emit() {   # role pid ev
             :' \
     scenarios/lifecycle-journal/mutate-suite.sh
+
+# --- scenarios/lifecycle-quit-vs-term-drain (L-1 remainder (b): QUIT drains, TERM does not) --
+#
+# Same discipline as lifecycle-journal's own rows above: each mutation
+# disarms or falsifies exactly the mechanism its assertion depends on, pinned
+# via MUTATE_REQUIRE_MARKER in this scenario's own mutate-suite.sh so
+# "the suite exited nonzero" is credited only when the SPECIFIC claimed
+# assertion actually reddened.
+
+# QUIT terminal-record row: same "disarm the signal" idiom as
+# lifecycle-journal's QUIT/TERM rows -- kill -0 is a harmless liveness probe,
+# not termination, so the worker never exits and assertion 3 (terminal
+# record must appear) has nothing to observe.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT terminal record (signal disarmed, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'kill -QUIT "$MASTER_Q" 2>/dev/null || true' \
+    'kill -0 "$MASTER_Q" 2>/dev/null || true' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# QUIT ordering row (the scenario's own central claim): inverts the
+# comparison direction (-le becomes -gt), so the oracle now demands the
+# terminal record land STRICTLY BEFORE the upload finishes -- the opposite of
+# what a genuinely draining QUIT produces. A stub-to-always-true version of
+# this row was tried first and SURVIVED: assertion 4 always printing "ok"
+# regardless of the underlying data is indistinguishable, from the suite's
+# own perspective, from assertion 4 correctly evaluating true, so nothing
+# catches it -- the inverted comparison below is a real, falsifiable claim
+# instead, and the correctly-ordered records this scenario actually produces
+# make it red.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT ordering oracle (comparison inverted, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'if [ "$UPLOAD_DONE_LINES_Q" -le "$TERM_LINE_Q" ]; then' \
+    'if [ "$UPLOAD_DONE_LINES_Q" -gt "$TERM_LINE_Q" ]; then' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# TERM terminal-record row: same disarm idiom, targeting phase B's own
+# signal.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM terminal record (signal disarmed, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'kill -TERM "$MASTER_T" 2>/dev/null || true' \
+    'kill -0 "$MASTER_T" 2>/dev/null || true' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# TERM cutoff row: negates the grep condition itself (not just the branch
+# text -- a text-only flip was tried first and SURVIVED, because the real
+# run always takes the ELSE branch regardless of which text sits in which
+# arm, so nothing downstream could tell the arms had been swapped). Negating
+# the condition makes the ELSE branch -- the one a genuinely cut-off upload
+# actually takes -- print "not ok 6" instead, so the row now depends on the
+# real client-visible outcome (the upload IS cut off) rather than on which
+# arm happens to run.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM cuts upload (grep sense negated, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'if grep -q '"'"'^HTTP/1\.1 200'"'"' "$UPLOAD_T_OUT" 2>/dev/null && grep -q '"'"'UPLOADED'"'"' "$UPLOAD_T_OUT" 2>/dev/null; then' \
+    'if ! grep -q '"'"'^HTTP/1\.1 200'"'"' "$UPLOAD_T_OUT" 2>/dev/null || ! grep -q '"'"'UPLOADED'"'"' "$UPLOAD_T_OUT" 2>/dev/null; then' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# Contrast row (assertion 8): inverts the required T_DRAINED value, so the
+# oracle now demands TERM drain its upload too -- the opposite of what this
+# scenario actually produces. (A stub-to-always-true version was tried first
+# and SURVIVED for the same reason as the ordering row above: "always ok"
+# cannot be distinguished from "correctly ok" by anything downstream, so
+# nothing catches it.) With the requirement inverted, the genuinely-divergent
+# legs this scenario produces (Q_DRAINED=1, T_DRAINED=0) now fail the
+# mutated check, closing the one gap the QUIT/TERM-specific rows above do
+# not cover -- a driver bug that made both legs behave identically would
+# still pass assertions 2..7 individually in the degenerate case where both
+# drained or both cut off.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: contrast holds (divergence requirement inverted, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'if [ "$Q_DRAINED" = "1" ] && [ "$T_DRAINED" = "0" ]; then' \
+    'if [ "$Q_DRAINED" = "1" ] && [ "$T_DRAINED" = "1" ]; then' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# --- scenarios/lifecycle-usr1-reopen (L-1 remainder (a): USR1 log-reopen
+# inode/fd neutrality under traffic) --
+#
+# Same discipline as the two blocks above: each row inverts the actual
+# comparison or negates the actual boolean condition an assertion depends on
+# -- never a stub-to-always-true and never a branch-text-only swap, both of
+# which are indistinguishable from a correctly-passing run and reliably
+# SURVIVE (see the lifecycle-quit-vs-term-drain block's own history of this
+# exact mistake, fixed there before shipping). Pinned via
+# MUTATE_REQUIRE_MARKER in this scenario's own mutate-suite.sh.
+
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: inode changes (comparison inverted, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'if [ -n "$INODE_AFTER" ] && [ "$INODE_AFTER" != "$INODE_BEFORE" ]; then' \
+    'if [ -n "$INODE_AFTER" ] && [ "$INODE_AFTER" = "$INODE_BEFORE" ]; then' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: upload survives (grep sense negated, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'if grep -q '"'"'^HTTP/1\.1 200'"'"' "$UPLOAD_OUT" 2>/dev/null && grep -q '"'"'UPLOADED'"'"' "$UPLOAD_OUT" 2>/dev/null; then' \
+    'if ! grep -q '"'"'^HTTP/1\.1 200'"'"' "$UPLOAD_OUT" 2>/dev/null || ! grep -q '"'"'UPLOADED'"'"' "$UPLOAD_OUT" 2>/dev/null; then' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: worker set unchanged (comparison inverted, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'if [ -n "$WPID_AFTER" ] && [ "$WPID_AFTER" = "$WPID_BEFORE" ]; then' \
+    'if [ -n "$WPID_AFTER" ] && [ "$WPID_AFTER" != "$WPID_BEFORE" ]; then' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: fd count unchanged (comparison inverted, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'if [ -n "$FDS_AFTER" ] && [ "$FDS_AFTER" = "$FDS_BEFORE" ]; then' \
+    'if [ -n "$FDS_AFTER" ] && [ "$FDS_AFTER" != "$FDS_BEFORE" ]; then' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: no spurious exit (grep sense negated, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'if grep -qE "\"role\":\"worker\",\"pid\":$WPID_BEFORE,\"gen\":[0-9]+,\"ev\":\"exiting\"" "$JOURNAL" 2>/dev/null; then' \
+    'if ! grep -qE "\"role\":\"worker\",\"pid\":$WPID_BEFORE,\"gen\":[0-9]+,\"ev\":\"exiting\"" "$JOURNAL" 2>/dev/null; then' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh

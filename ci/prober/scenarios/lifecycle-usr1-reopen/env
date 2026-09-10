@@ -1,0 +1,6 @@
+# daemon on -- same contract as lifecycle-journal's and
+# lifecycle-quit-vs-term-drain's own env: this driver sends USR1 to a running
+# master it must retarget by pid after boot, and needs the pidfile-based
+# tracking prober_boot's daemon-on branch gives ($PROBER_PREFIX/nginx.pid),
+# not $! (reaped the instant the master forks away under daemon off).
+PROBER_DAEMON_MODE=on
