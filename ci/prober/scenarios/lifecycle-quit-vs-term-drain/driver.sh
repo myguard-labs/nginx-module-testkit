@@ -599,6 +599,18 @@ elif grep -q '^HTTP/1\.[01] [0-9][0-9][0-9]' "$UPLOAD_T_OUT" 2>/dev/null; then
     echo "not ok 6 - TERM leg: the client received a complete response status line ($(grep -m1 -o '^HTTP/1\.[01] [0-9][0-9][0-9]' "$UPLOAD_T_OUT" 2>/dev/null)) rather than a torn-down connection -- the worker answered the request instead of being cut off"
     echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
     FAILED=$((FAILED + 1))
+elif [ "$TERM_BYTES" != 0 ]; then
+    # ACCEPT the state, do not merely reject the counterexamples that came to
+    # mind. The two arms above match a COMPLETE status line; a partial one --
+    # "HTTP/1.1 2" cut mid-write -- matches neither, and its reader still
+    # exits 0 at EOF, so before this arm existed it reached the success branch
+    # and printed "no response status line reached the client" over a file
+    # that plainly held response bytes. TERM_BYTES was already computed for
+    # the message and never constrained the verdict. The claim is that NOTHING
+    # came back, so the only response file consistent with it is an empty one.
+    echo "not ok 6 - TERM leg: the client received $TERM_BYTES bytes of response ($(head -c 40 "$UPLOAD_T_OUT" 2>/dev/null | tr -d '\r\n')), so the connection was not cut off before the worker answered"
+    echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
+    FAILED=$((FAILED + 1))
 elif [ "$TERM_READER_RC" != 0 ] && [ "$TERM_READER_RC" != 1 ]; then
     # An empty response file only means "the connection was torn down" when
     # the reader actually observed that teardown, and exactly two statuses
@@ -640,7 +652,7 @@ else
         0) how="closed at EOF" ;;
         *) how="reset by the peer (reader rc=1)" ;;
     esac
-    echo "ok 6 - TERM leg: the in-flight upload was cut off, not drained (connection $how, status recorded, no response status line reached the client; $TERM_BYTES bytes received)"
+    echo "ok 6 - TERM leg: the in-flight upload was cut off, not drained (connection $how, status recorded, the response file is empty so nothing at all reached the client)"
 fi
 
 wait_master_gone "$MASTER_T" 200 || true

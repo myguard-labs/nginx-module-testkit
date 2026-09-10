@@ -3619,6 +3619,19 @@ mutate "lifecycle-quit-vs-term-drain: QUIT drains upload needs a completed read 
     'QUIT_READER_RC=""; : "$( { tr -d' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
+# The cutoff assertion's NON-EMPTY-RESPONSE arm (assertion 6). Injecting a
+# PARTIAL status line is the counterexample the two grep arms cannot see: it
+# matches neither the complete-200 nor the complete-status-line pattern, and
+# its reader still exits 0 at EOF, so before the byte-count arm existed it
+# reached the success branch and reported "nothing reached the client" over a
+# file holding response bytes. Must red on DID-NOT-CUT.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM cutoff requires an empty response (partial status line injected, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'TERM_BYTES="$(stat -c' \
+    'printf "HTTP/1.1 2" >"$UPLOAD_T_OUT"; TERM_BYTES="$(stat -c' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
 # The cutoff assertion's TIMEOUT arm (assertion 6). Forcing the recorded
 # reader status to 124 simulates a read that expired with the connection
 # still open and no data -- a worker that neither drained nor died. That
