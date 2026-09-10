@@ -21,6 +21,7 @@ case "${MUT_ROW:-}" in
     *"TERM cuts upload"*)         EXPECT='LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT' ;;
     *"TERM cutoff is not merely"*) EXPECT='LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT' ;;
     *"TERM cutoff is not a stalled read"*) EXPECT='LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT' ;;
+    *"TERM cutoff requires a recorded status"*) EXPECT='LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT' ;;
     *"TERM terminal record"*)     EXPECT='LIFECYCLE-DRAIN-RED-TERM-NO-TERMINAL' ;;
     *"contrast holds"*)           EXPECT='LIFECYCLE-DRAIN-RED-CONTRAST' ;;
     "")

@@ -474,17 +474,34 @@ elif grep -q '^HTTP/1\.[01] [0-9][0-9][0-9]' "$UPLOAD_T_OUT" 2>/dev/null; then
     echo "not ok 6 - TERM leg: the client received a complete response status line ($(grep -m1 -o '^HTTP/1\.[01] [0-9][0-9][0-9]' "$UPLOAD_T_OUT" 2>/dev/null)) rather than a torn-down connection -- the worker answered the request instead of being cut off"
     echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
     FAILED=$((FAILED + 1))
-elif [ "$TERM_READER_RC" = 124 ]; then
-    # The read timed out rather than ending at EOF. The file is empty either
-    # way, but these are opposite outcomes: EOF means the connection WAS torn
-    # down (the claim), while a timeout means it stayed OPEN for the full 45s
-    # without answering -- a worker that neither drained nor died, which is a
-    # regression this assertion must not report as a successful cutoff.
-    echo "not ok 6 - TERM leg: the response read timed out after 45s with the connection still open and no data -- the request was neither answered nor cut off"
+elif [ "$TERM_READER_RC" != 0 ]; then
+    # An empty response file only means "the connection was torn down" when
+    # the reader actually ran to EOF, and that is what rc=0 records. Every
+    # other outcome produces the same empty file for an entirely different
+    # reason, so the cutoff arm must ACCEPT the one status it claims rather
+    # than reject one status it happens to have thought of:
+    #
+    #   124  `timeout` expired -- the socket stayed OPEN for the full 45s
+    #        without answering; the worker neither drained nor died.
+    #   127  `timeout` could not exec `cat`; 126, it could not run it. The
+    #        socket was never read at all.
+    #   ''   the status file is missing or empty -- the reader subshell died
+    #        before recording, or the sidecar was never written. Nothing was
+    #        observed, so nothing can be concluded.
+    #   else the reader was killed by a signal, or `cat` itself failed.
+    #
+    # Reporting any of these as a successful cutoff would be the same defect
+    # this arm was added to fix, one value further out.
+    case "$TERM_READER_RC" in
+        124) why="the response read timed out after 45s with the connection still open and no data -- the request was neither answered nor cut off" ;;
+        '')  why="no reader exit status was recorded, so the empty response is unexplained -- it may be a teardown, a stalled read, or a driver fault" ;;
+        *)   why="the response reader exited abnormally (rc=$TERM_READER_RC), so the empty response is evidence about the driver, not about the connection" ;;
+    esac
+    echo "not ok 6 - TERM leg: $why"
     echo "# LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT"
     FAILED=$((FAILED + 1))
 else
-    echo "ok 6 - TERM leg: the in-flight upload was cut off, not drained (connection closed at EOF, reader rc=${TERM_READER_RC:-0}, no response status line reached the client; $TERM_BYTES bytes received)"
+    echo "ok 6 - TERM leg: the in-flight upload was cut off, not drained (connection closed at EOF, reader rc=0 recorded, no response status line reached the client; $TERM_BYTES bytes received)"
 fi
 
 wait_master_gone "$MASTER_T" 200 || true

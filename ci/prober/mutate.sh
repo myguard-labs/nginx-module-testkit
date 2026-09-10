@@ -3594,6 +3594,19 @@ mutate "lifecycle-quit-vs-term-drain: TERM cutoff is not a stalled read (reader 
     '        reader_rc=124' \
     scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
 
+# The cutoff assertion's UNRECORDED-STATUS arm (assertion 6). Deleting the
+# sidecar before it is read leaves TERM_READER_RC empty -- the reader's
+# outcome was never observed. The response file is empty exactly as it is on a
+# genuine teardown, so an assertion that only rejects the ONE bad status it
+# thought of (124) reports this as a successful cutoff. Must red on
+# DID-NOT-CUT via the accept-only-rc=0 arm.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM cutoff requires a recorded status (sidecar removed, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
+    'rm -f "$UPLOAD_T_RC"; TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
 # Contrast row (assertion 8): inverts the required T_DRAINED value, so the
 # oracle now demands TERM drain its upload too -- the opposite of what this
 # scenario actually produces. (A stub-to-always-true version was tried first
@@ -3622,6 +3635,18 @@ mutate "lifecycle-quit-vs-term-drain: contrast holds (divergence requirement inv
 # SURVIVE (see the lifecycle-quit-vs-term-drain block's own history of this
 # exact mistake, fixed there before shipping). Pinned via
 # MUTATE_REQUIRE_MARKER in this scenario's own mutate-suite.sh.
+
+# The in-flight PRECONDITION (assertion 1). Suppressing the progress stamp
+# leaves the gate with no written-byte evidence: the upload subshell still
+# EXISTS, so the old `kill -0` form passed, but nothing proves the request
+# ever reached the wire. Every "undisturbed traffic" claim downstream rests on
+# this precondition, so it must red rather than silently gate on liveness.
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: in-flight gate needs written bytes (progress stamp suppressed, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    '[ -n "$progress" ] && printf' \
+    'false && printf' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
 
 # shellcheck disable=SC2016
 mutate "lifecycle-usr1-reopen: inode changes (comparison inverted, must red)" \

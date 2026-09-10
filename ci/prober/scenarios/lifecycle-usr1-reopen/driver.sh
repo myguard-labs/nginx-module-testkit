@@ -133,7 +133,7 @@ CHUNK=4
 STEP_SLEEP=0.15   # ~7.5s total drip -- see lifecycle-quit-vs-term-drain's sizing note
 
 start_upload() {
-    local step_sleep=$1 out=$2 pidvar=$3
+    local step_sleep=$1 out=$2 pidvar=$3 progress=${4:-}
     (
         exec 3<>"/dev/tcp/$HOST/$PORT" || exit 1
         printf 'POST /upload HTTP/1.1\r\nHost: prober\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' \
@@ -146,6 +146,22 @@ start_upload() {
             [ "$len" -gt "$remaining" ] && len=$remaining
             printf '%s' "${BODY:$off:$len}" >&3
             off=$((off + len))
+            # Record how far the request has actually got, so the caller can
+            # gate on WRITTEN BYTES rather than on this subshell merely
+            # existing. `kill -0` is true from the instant the subshell is
+            # forked, before /dev/tcp has connected and before a single header
+            # byte has left the process; gating on it alone would let a
+            # delayed connect pass while the upload had not started, making
+            # the undisturbed-traffic claim vacuous. A non-zero offset here
+            # proves the connection was established, the request line and
+            # headers were accepted by nginx, and body bytes are flowing.
+            #
+            # It does NOT prove nginx has parsed those bytes -- that is not
+            # observable client-side under proxy_request_buffering on, which
+            # buffers the whole body before any upstream signal exists. The
+            # gate claims exactly what it can see: the request is on the wire
+            # and incomplete.
+            [ -n "$progress" ] && printf '%s\n' "$off" >"$progress" 2>/dev/null
             if [ "$off" -lt "$BODY_LEN" ] && [ "$step_sleep" != 0 ]; then
                 sleep "$step_sleep"
             fi
@@ -198,17 +214,32 @@ fi
 
 # --- start the in-flight upload, gate on it genuinely being open ----------
 UPLOAD_OUT="$PROBER_PREFIX/upload-usr1.out"
-start_upload "$STEP_SLEEP" "$UPLOAD_OUT" UPLOAD_PID
+UPLOAD_PROGRESS="$PROBER_PREFIX/upload-usr1.progress"
+rm -f "$UPLOAD_PROGRESS"
+start_upload "$STEP_SLEEP" "$UPLOAD_OUT" UPLOAD_PID "$UPLOAD_PROGRESS"
 
-alive=0
-for ((i = 0; i < 20; i++)); do   # 1s settle, well under the ~7.5s drip
-    if kill -0 "$UPLOAD_PID" 2>/dev/null; then alive=1; else alive=0; break; fi
+# Wait for the upload to be DEMONSTRABLY on the wire and still incomplete:
+# some body bytes written, but fewer than all of them. Both halves matter --
+# zero bytes means it has not started, and BODY_LEN bytes means it has already
+# finished, and in either case USR1 would not land mid-request.
+UPLOAD_OFF=""
+for ((i = 0; i < 40; i++)); do   # 2s, well under the ~7.5s drip
+    kill -0 "$UPLOAD_PID" 2>/dev/null || break
+    UPLOAD_OFF="$( { tr -d '[:space:]' <"$UPLOAD_PROGRESS"; } 2>/dev/null )" || UPLOAD_OFF=""
+    case "$UPLOAD_OFF" in
+        ''|*[!0-9]*) ;;
+        *) [ "$UPLOAD_OFF" -gt 0 ] && break ;;
+    esac
+    UPLOAD_OFF=""
     sleep 0.05
 done
-if [ "$alive" -eq 1 ] && kill -0 "$UPLOAD_PID" 2>/dev/null; then
-    echo "ok 1 - the upload was still in flight immediately before USR1"
+
+case "$UPLOAD_OFF" in ''|*[!0-9]*) UPLOAD_OFF=0 ;; esac
+if [ "$UPLOAD_OFF" -gt 0 ] && [ "$UPLOAD_OFF" -lt "$BODY_LEN" ] \
+   && kill -0 "$UPLOAD_PID" 2>/dev/null; then
+    echo "ok 1 - the upload was still in flight immediately before USR1 ($UPLOAD_OFF of $BODY_LEN body bytes written, connection open)"
 else
-    echo "not ok 1 - the upload was not in flight before USR1; the undisturbed-traffic claim below would be vacuous"
+    echo "not ok 1 - the upload was not in flight before USR1 ($UPLOAD_OFF of $BODY_LEN body bytes written); the undisturbed-traffic claim below would be vacuous"
     echo "# LIFECYCLE-USR1-RED-NOT-INFLIGHT"
     FAILED=$((FAILED + 1))
 fi
