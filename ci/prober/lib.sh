@@ -2705,7 +2705,13 @@ prober_http_body_complete() {
     # `head -1` was wrong for a second reason: conflicting Content-Length
     # headers are invalid framing, not something to resolve by taking the
     # first. They are collected and compared instead.
-    cl_values="$(LC_ALL=C head -c "$hdr_len" "$f" | grep -i '^Content-Length:' | sed 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*$//')" || cl_values=""
+    # A sentinel keeps each header on its own line even when its value is
+    # EMPTY. Without it, `Content-Length: 10` followed by a valueless
+    # `Content-Length:` collapsed to the single line "10" -- command
+    # substitution strips the trailing newline that represented the empty
+    # value, so the duplicate disappeared before it could be rejected and the
+    # response was accepted on the first value alone.
+    cl_values="$(LC_ALL=C head -c "$hdr_len" "$f" | grep -i '^Content-Length:' | sed 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*$//; s/^/=/')" || cl_values=""
     cl_count="$(printf '%s' "$cl_values" | grep -c '')" || cl_count=0
     [ -n "$cl_values" ] || cl_count=0
 
@@ -2718,7 +2724,22 @@ prober_http_body_complete() {
     fi
 
     declared="$(printf '%s\n' "$cl_values" | head -1)"
+    declared="${declared#=}"
     case "$declared" in ''|*[!0-9]*) echo "the response declared no usable Content-Length, so its body length cannot be checked"; return 1 ;; esac
+
+    # An all-digit value can still be too large for the shell's integer range,
+    # and `[ "$body_len" -ne "$declared" ]` then fails with "integer expression
+    # expected" and rc=2 rather than answering the question. As the condition
+    # of an `if`, that error takes the ELSE branch and falls through to the
+    # `return 0` below -- accepting an incomplete response because the length
+    # check errored out. Strip leading zeros and bound the width before any
+    # arithmetic sees the value.
+    declared="$(printf '%s' "$declared" | sed 's/^0*//')"
+    [ -n "$declared" ] || declared=0
+    if [ "${#declared}" -gt 18 ]; then
+        echo "the response declared a Content-Length of $declared, which is out of range for a body-length comparison"
+        return 1
+    fi
 
     total="$(stat -c '%s' "$f" 2>/dev/null || echo 0)"
     case "$total" in ''|*[!0-9]*) total=0 ;; esac
