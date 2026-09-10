@@ -18,6 +18,7 @@ case "${MUT_ROW:-}" in
     *"worker set unchanged"*)   EXPECT='LIFECYCLE-USR1-RED-WORKER-CHANGED' ;;
     *"fd count unchanged"*)     EXPECT='LIFECYCLE-USR1-RED-FD-LEAK' ;;
     *"no spurious exit"*)       EXPECT='LIFECYCLE-USR1-RED-SPURIOUS-EXIT' ;;
+    *"rotated content"*)        EXPECT='LIFECYCLE-USR1-RED-OLD-FILE-CORRUPTED' ;;
     *"worker fd on new inode"*) EXPECT='LIFECYCLE-USR1-RED-WORKER-STALE-FD' ;;
     "")
         EXPECT='LIFECYCLE-USR1-RED-(NOT-INFLIGHT|NO-REOPEN|DISTURBED|WORKER-CHANGED|FD-LEAK|SPURIOUS-EXIT|OLD-FILE-CORRUPTED|WORKER-STALE-FD)' ;;

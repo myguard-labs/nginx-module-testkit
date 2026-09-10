@@ -3534,6 +3534,19 @@ mutate "lifecycle-quit-vs-term-drain: QUIT ordering oracle (comparison inverted,
 # TERM terminal-record row: same disarm idiom, targeting phase B's own
 # signal.
 # shellcheck disable=SC2016
+# The ordering oracle's no-evidence arm. Suppressing the stamp write leaves
+# the oracle with nothing to judge, which must be reported as absent evidence
+# rather than silently passing -- an oracle that greens when its own input is
+# missing would assert nothing at all. Must red assertion 4 on the NO-STAMP
+# marker, not the ORDER one.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT stamp path (stamp write suppressed, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    '            if [ -n "$stamp" ] && [ "$((off + len))" -ge "$BODY_LEN" ]; then' \
+    '            if [ -n "$stamp" ] && [ "$((off + len))" -ge "$BODY_LEN" ] && false; then' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# shellcheck disable=SC2016
 mutate "lifecycle-quit-vs-term-drain: TERM terminal record (signal disarmed, must red)" \
     scenarios/lifecycle-quit-vs-term-drain/driver.sh \
     'kill -TERM "$MASTER_T" 2>/dev/null || true' \
@@ -3610,6 +3623,18 @@ mutate "lifecycle-usr1-reopen: fd count unchanged (comparison inverted, must red
     scenarios/lifecycle-usr1-reopen/driver.sh \
     'if [ -n "$FDS_AFTER" ] && [ "$FDS_AFTER" = "$FDS_BEFORE" ]; then' \
     'if [ -n "$FDS_AFTER" ] && [ "$FDS_AFTER" != "$FDS_BEFORE" ]; then' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# shellcheck disable=SC2016
+# The rotated file's CONTENT guarantee, distinct from its inode. Truncating
+# the renamed file simulates an "in-place reopen" that keeps the inode while
+# destroying the bytes -- exactly what the inode-only form of assertion 7
+# could not distinguish from a correct rename-based rotation. Must red
+# assertion 7 on the content arm specifically.
+mutate "lifecycle-usr1-reopen: rotated content survives (renamed file truncated, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'mv -f "$ELOG" "$ELOG.rotated" 2>/dev/null || true' \
+    'mv -f "$ELOG" "$ELOG.rotated" 2>/dev/null || true; : >"$ELOG.rotated"' \
     scenarios/lifecycle-usr1-reopen/mutate-suite.sh
 
 # shellcheck disable=SC2016

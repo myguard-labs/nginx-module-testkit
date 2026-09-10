@@ -151,7 +151,13 @@ start_upload() {
             fi
         done
 
-        cat <&3 2>/dev/null || true
+        # Bounded, because the failure this driver exists to detect is the
+        # server NOT completing the request. An unbounded read would hang
+        # rather than fail: run-scenario.sh invokes the driver directly and
+        # test-scenarios.sh waits on scenario workers without a timeout, so
+        # nothing upstream would cut it off and the "not ok" below would
+        # never be reached. A timeout turns that hang into the failure it is.
+        timeout 30 cat <&3 2>/dev/null || true
     ) >"$out" 2>/dev/null &
     printf -v "$pidvar" '%s' "$!"
 }
@@ -212,6 +218,13 @@ fi
 # rename ourselves, outside nginx, is exactly what real log rotation is --
 # nginx's USR1 handler never renames anything itself, it only reopens
 # whatever inode currently sits at the configured path.
+# Snapshot the pre-rotation bytes so assertion 7 can check CONTENT survival,
+# not merely inode identity. Taken immediately before the rename, so it is
+# exactly what the rotated file must still begin with.
+PRE_ROTATE_SNAPSHOT="$PROBER_PREFIX/elog-pre-rotate.snapshot"
+cp -- "$ELOG" "$PRE_ROTATE_SNAPSHOT" 2>/dev/null || true
+PRE_ROTATE_BYTES="$(stat -c '%s' "$PRE_ROTATE_SNAPSHOT" 2>/dev/null || echo 0)"
+
 mv -f "$ELOG" "$ELOG.rotated" 2>/dev/null || true
 
 kill -USR1 "$MASTER" 2>/dev/null || true
@@ -321,11 +334,33 @@ fi
 # persisted under its new name rather than being reused or truncated in
 # place, which is what a genuine rename-based rotation guarantees and an
 # in-place-truncate "reopen" would not.
+#
+# The inode alone does not state that claim: a "reopen" that truncated the
+# file in place after the rename keeps the same inode while destroying every
+# byte, and would pass an inode-only check. So the surviving CONTENT is
+# checked too -- the rotated file must still BEGIN with the exact bytes the
+# file held immediately before the rename. A prefix rather than an equality,
+# because the worker may legitimately append a few more lines to its old
+# descriptor in the window between the rename and its handling of USR1;
+# appended bytes are consistent with the guarantee, altered or lost ones are
+# not.
 OLD_INODE_NOW="$(stat -c '%i' "$ELOG.rotated" 2>/dev/null || true)"
-if [ -n "$OLD_INODE_NOW" ] && [ "$OLD_INODE_NOW" = "$INODE_BEFORE" ]; then
-    echo "ok 7 - the pre-rotation log file survived under its renamed path with its original inode ($INODE_BEFORE)"
-else
+ROTATED_PREFIX_OK=0
+if [ "$PRE_ROTATE_BYTES" -gt 0 ] 2>/dev/null &&
+    [ "$(stat -c '%s' "$ELOG.rotated" 2>/dev/null || echo 0)" -ge "$PRE_ROTATE_BYTES" ] &&
+    head -c "$PRE_ROTATE_BYTES" "$ELOG.rotated" 2>/dev/null |
+        cmp -s - "$PRE_ROTATE_SNAPSHOT" 2>/dev/null; then
+    ROTATED_PREFIX_OK=1
+fi
+
+if [ -n "$OLD_INODE_NOW" ] && [ "$OLD_INODE_NOW" = "$INODE_BEFORE" ] && [ "$ROTATED_PREFIX_OK" -eq 1 ]; then
+    echo "ok 7 - the pre-rotation log file survived under its renamed path with its original inode ($INODE_BEFORE) and its $PRE_ROTATE_BYTES pre-rotation bytes intact"
+elif [ "$OLD_INODE_NOW" != "$INODE_BEFORE" ]; then
     echo "not ok 7 - the renamed log file's inode does not match the pre-rotation inode (expected $INODE_BEFORE, got $OLD_INODE_NOW)"
+    echo "# LIFECYCLE-USR1-RED-OLD-FILE-CORRUPTED"
+    FAILED=$((FAILED + 1))
+else
+    echo "not ok 7 - the renamed log file kept inode $INODE_BEFORE but no longer begins with its $PRE_ROTATE_BYTES pre-rotation bytes -- it was truncated or rewritten in place"
     echo "# LIFECYCLE-USR1-RED-OLD-FILE-CORRUPTED"
     FAILED=$((FAILED + 1))
 fi

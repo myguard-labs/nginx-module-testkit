@@ -418,6 +418,25 @@ validate_fault(const backend_fault *f, int have_after, int have_delta,
         if (have_after || have_delta || have_bytes || have_ms) {
             die("%s:%d: action=raw takes only data=<bytes>", file, lineno);
         }
+
+        /*
+         * An EMPTY data= is refused, not accepted as a zero-byte reply. The
+         * close this action promises is driven by close_after_write, which
+         * the event loop only ever consults inside its POLLOUT branch -- and
+         * POLLOUT is requested only while out_len > out_off. A zero-length
+         * reply therefore never arms POLLOUT, never reaches the close, and
+         * leaves the connection open, so whatever the peer sends next lands
+         * in drain_commands and hits the protocol parser: precisely the
+         * outcome the unconditional close exists to prevent. Refusing at
+         * validation makes that state unrepresentable rather than patching
+         * its consequence, and follows the same rule as the parameter checks
+         * above -- an author who writes data= with no bytes is asking for
+         * something this action cannot do.
+         */
+        if (f->raw_len == 0) {
+            die("%s:%d: action=raw requires a non-empty data=<bytes>",
+                file, lineno);
+        }
         break;
 
     case BACKEND_ACT_RST:

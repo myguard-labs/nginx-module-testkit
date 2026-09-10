@@ -17,7 +17,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=41
+PLANNED=42
 tests_run=0
 failures=0
 
@@ -598,6 +598,29 @@ timeout 5 ./fakesrv -script "$WORK/rawms.backend" -listen 127.0.0.1:0 \
          -portfile "$WORK/rawmsport" >/dev/null 2>&1 || rc=$?
 if [ "$rc" -eq 2 ]; then st=0; else st=1; fi
 ok "$st" "action=raw refuses ms= (exit $rc, want 2)"
+
+# An EMPTY data= is refused too, for a reason the ms= case does not cover: the
+# close this action promises rides on close_after_write, and the event loop
+# only consults that flag inside its POLLOUT branch, which is armed only while
+# out_len > out_off. A zero-length reply therefore never arms POLLOUT, never
+# reaches the close, and leaves the connection open -- so the peer's next bytes
+# land in drain_commands and hit the protocol parser, which is exactly what the
+# unconditional close exists to prevent. Refused at validation so the state is
+# unrepresentable rather than merely unreachable.
+#
+# Same positively-identified exit status as above: die() exits 2, and a mutant
+# that drops the refusal boots (0) or is killed by the timeout (124), neither
+# of which may read as a pass.
+cat >"$WORK/rawempty.backend" <<'EOF'
+proto   memcached
+fault   on=get:1  action=raw  data=
+EOF
+
+rc=0
+timeout 5 ./fakesrv -script "$WORK/rawempty.backend" -listen 127.0.0.1:0 \
+         -portfile "$WORK/rawemptyport" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 2 ]; then st=0; else st=1; fi
+ok "$st" "action=raw refuses an empty data= (exit $rc, want 2)"
 
 # ...but ONLY when ms= precedes data=. `data=` is greedy by design: the rest of
 # the line after it is the reply verbatim, spaces and all, so a trailing

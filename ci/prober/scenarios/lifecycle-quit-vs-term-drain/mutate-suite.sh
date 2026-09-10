@@ -16,12 +16,13 @@ case "${MUT_ROW:-}" in
     *"QUIT drains upload"*)       EXPECT='LIFECYCLE-DRAIN-RED-QUIT-NOT-DRAINED' ;;
     *"QUIT terminal record"*)     EXPECT='LIFECYCLE-DRAIN-RED-QUIT-NO-TERMINAL' ;;
     *"QUIT ordering"*)            EXPECT='LIFECYCLE-DRAIN-RED-QUIT-ORDER' ;;
+    *"QUIT stamp path"*)          EXPECT='LIFECYCLE-DRAIN-RED-QUIT-NO-STAMP' ;;
     *"TERM in-flight gate"*)      EXPECT='LIFECYCLE-DRAIN-RED-TERM-NOT-INFLIGHT' ;;
     *"TERM cuts upload"*)         EXPECT='LIFECYCLE-DRAIN-RED-TERM-DID-NOT-CUT' ;;
     *"TERM terminal record"*)     EXPECT='LIFECYCLE-DRAIN-RED-TERM-NO-TERMINAL' ;;
     *"contrast holds"*)           EXPECT='LIFECYCLE-DRAIN-RED-CONTRAST' ;;
     "")
-        EXPECT='LIFECYCLE-DRAIN-RED-(QUIT-NOT-INFLIGHT|QUIT-NOT-DRAINED|QUIT-NO-TERMINAL|QUIT-ORDER|TERM-NOT-INFLIGHT|TERM-DID-NOT-CUT|TERM-NO-TERMINAL|CONTRAST)' ;;
+        EXPECT='LIFECYCLE-DRAIN-RED-(QUIT-NOT-INFLIGHT|QUIT-NOT-DRAINED|QUIT-NO-TERMINAL|QUIT-ORDER|QUIT-NO-STAMP|TERM-NOT-INFLIGHT|TERM-DID-NOT-CUT|TERM-NO-TERMINAL|CONTRAST)' ;;
     *)
         echo "Bail out! scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh does not" \
              "know which assertion row '$MUT_ROW' claims to red; add it to" \
