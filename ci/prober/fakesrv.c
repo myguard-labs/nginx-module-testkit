@@ -462,6 +462,16 @@ apply_fault(conn *c, const backend_fault *f, unsigned char *reply,
             memcpy(copy, f->raw, f->raw_len);
             out_set(c, copy, f->raw_len);
         }
+        /* A raw reply hangs the connection up as soon as its bytes are
+         * flushed -- close_after_write, checked in the write path BEFORE
+         * drain_commands, not a close_at_ms deadline, which the write path
+         * falls through past and which would therefore let the parser run
+         * anyway. See the RAW arm of backend.c's validate_fault for why an
+         * unclosed raw reply is a protocol-error generator rather than a
+         * harmless idle connection: whatever the peer sends next is by
+         * construction not in the configured proto, so the parser is
+         * guaranteed to choke on it. */
+        c->close_after_write = 1;
         return 1;
 
     case BACKEND_ACT_CLOSE_AFTER:

@@ -2625,3 +2625,163 @@ prober_cleanup() {
 
     return "$rc"
 }
+
+# Is $1 a COMPLETE HTTP/1.1 response -- headers, then exactly as many body
+# bytes as its own Content-Length declares?
+#
+# Two greps for a status line and a body string do not establish this. The
+# fixtures in the lifecycle scenarios declare `Content-Length: 9` for a body
+# of "UPLOADED\n", so a response truncated to "UPLOADED" -- eight of the nine
+# declared bytes -- still matches a `grep -q UPLOADED`, and if the peer then
+# closes cleanly the reader exits 0 as well. Measured directly: both greps
+# match and the file is 65 bytes. Every drain and completion assertion built
+# on those greps therefore accepted a truncated response, which is precisely
+# the failure a draining shutdown is supposed to be unable to produce.
+#
+# Returns 0 when the response is complete, 1 otherwise, and prints a short
+# reason to stdout when it is not. Chunked responses are rejected explicitly
+# rather than silently passed: this helper only knows how to measure a
+# Content-Length body, and reporting "complete" for a framing it did not check
+# would reintroduce the same defect one layer up.
+prober_http_body_complete() {
+    local f=$1 hdr_len body_len declared total cl_values cl_count cl_first prev_byte
+
+    [ -s "$f" ] || { echo "the response file is empty"; return 1; }
+
+    # Header/body split at the first CRLFCRLF, as a byte offset -- the body is
+    # binary as far as this check is concerned.
+    #
+    # The terminator is located as the CR-only line that ends the header block,
+    # and both of the more obvious spellings were tried and measured wrong.
+    #
+    #   awk 'BEGIN{RS="\r\n\r\n"} {print length($0)+4}'
+    #     Wrong twice over. POSIX awk uses only the FIRST character of RS and
+    #     leaves a multi-character value unspecified, so the split depends on
+    #     whichever awk the runner supplies and no CI workflow pins one. Worse,
+    #     length($0)+4 is positive even when the terminator is ABSENT: fed a
+    #     header-only file with no CRLFCRLF it returned 40, so the guard below
+    #     that claims to reject a response with no header terminator could
+    #     never fire -- the vacuous-assertion defect this helper exists to
+    #     catch, reproduced inside the helper itself.
+    #
+    #   grep -abo -F "$(printf '\r\n\r\n')"
+    #     Returns rc=1 even on a known-good response, measured. GNU grep is
+    #     line-oriented: it splits input on LF before matching, so a pattern
+    #     CONTAINING newlines can never match, and every response would have
+    #     been reported header-less.
+    #
+    # `^\r$` matches the empty header line and is line-oriented, so grep can
+    # actually match it; -a keeps the binary body from suppressing output and
+    # -b reports the line's byte offset. The header runs to the end of that
+    # line, which is that offset plus its own two bytes (CR, LF). An absent
+    # terminator produces no match and no output, which the sentinel below
+    # turns into a non-positive length -- absence reported as absence.
+    hdr_len="$(LC_ALL=C grep -abm1 "$(printf '^\r$')" "$f" 2>/dev/null | head -1 | cut -d: -f1)"
+    case "$hdr_len" in ''|*[!0-9]*) hdr_len=-2 ;; esac
+    hdr_len=$((hdr_len + 2))
+    [ "$hdr_len" -gt 0 ] || { echo "no header terminator (CRLFCRLF) was received, so the response is incomplete"; return 1; }
+
+    # A CR-only line proves its OWN two bytes, not that the line before it
+    # ended in CRLF -- and the separator this function claims to find is
+    # CRLFCRLF, all four bytes. Measured: `...200 OK\r\nContent-Length: 1\n\r\nX`
+    # matched at offset 35 and was accepted, though the file contains no
+    # CRLFCRLF anywhere. Require the CR of the preceding line's terminator,
+    # unless the CR-only line is the very first thing in the response (offset
+    # 0), where there is no preceding line to have terminated.
+    # Compared as a hex byte, not as a string: command substitution strips
+    # trailing newlines, and a bare CR is one of them, so `"$(dd ...)"` would
+    # collapse to the empty string and match nothing.
+    if [ "$hdr_len" -gt 2 ]; then
+        prev_byte="$(LC_ALL=C dd if="$f" bs=1 skip=$((hdr_len - 4)) count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+        if [ "$prev_byte" != "0d" ]; then
+            echo "no header terminator (CRLFCRLF) was received, so the response is incomplete"
+            return 1
+        fi
+    fi
+
+    # ANY Transfer-Encoding, not only `chunked`: RFC 9112 s6.1 says a message
+    # carrying Transfer-Encoding must have its Content-Length ignored, so the
+    # length comparison below is meaningless for every value. Matching only
+    # `chunked` let `Transfer-Encoding: gzip` plus `Content-Length: 1` reach
+    # that comparison and be reported COMPLETE (measured), crediting framing
+    # this helper cannot actually measure.
+    #
+    # `grep -q` exits at its first match, which can SIGPIPE the feeding `head`
+    # on a large header; under `pipefail` that turns a positive detection into
+    # a failed pipeline and skips the rejection below. Reading to EOF and
+    # discarding the output keeps the exit status meaningful.
+    if LC_ALL=C head -c "$hdr_len" "$f" | grep -i '^Transfer-Encoding:' >/dev/null; then
+        echo "the response carries a Transfer-Encoding, so its Content-Length must be ignored and this check cannot measure the body"
+        return 1
+    fi
+
+    # Every Content-Length in the header block, field name and surrounding
+    # whitespace (including the trailing CR) stripped, one per line.
+    #
+    # The previous spelling ended in `tr -dc '0-9'`, which DELETES non-digits
+    # instead of rejecting them and so laundered a malformed value into a
+    # valid-looking one: measured, `Content-Length: 1x0` became `10`, and a
+    # response with ten body bytes then passed as correctly framed by the very
+    # helper that exists to detect bad framing. It also made the all-digits
+    # guard that followed it unfirable, since `tr` had already guaranteed the
+    # only characters that could reach it -- a vacuous guard of the same class
+    # this file keeps catching elsewhere. The value is now validated whole.
+    #
+    # `head -1` was wrong for a second reason: conflicting Content-Length
+    # headers are invalid framing, not something to resolve by taking the
+    # first. They are collected and compared instead.
+    # A sentinel keeps each header on its own line even when its value is
+    # EMPTY. Without it, `Content-Length: 10` followed by a valueless
+    # `Content-Length:` collapsed to the single line "10" -- command
+    # substitution strips the trailing newline that represented the empty
+    # value, so the duplicate disappeared before it could be rejected and the
+    # response was accepted on the first value alone.
+    cl_values="$(LC_ALL=C head -c "$hdr_len" "$f" | grep -i '^Content-Length:' | sed 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*$//; s/^/=/')" || cl_values=""
+    cl_count="$(printf '%s' "$cl_values" | grep -c '')" || cl_count=0
+    [ -n "$cl_values" ] || cl_count=0
+
+    if [ "${cl_count:-0}" -gt 1 ]; then
+        cl_first="$(printf '%s\n' "$cl_values" | head -1)"
+        # `grep -q` again: it exits at its first match, which SIGPIPEs the
+        # feeding `printf` once the collected headers exceed pipe capacity,
+        # and under `pipefail` the condition then reads FALSE -- letting a
+        # response with conflicting lengths pass on the strength of the first
+        # one. Measured rc=141 on 20000 collected values. Read to EOF and
+        # discard, exactly as the Transfer-Encoding check above does.
+        if printf '%s\n' "$cl_values" | grep -vxF -- "$cl_first" >/dev/null; then
+            # Bounded: a hostile response can carry thousands of these, and
+            # the whole list would land in the driver's log. Four is enough to
+            # show the disagreement; the count says how many there were.
+            echo "the response declared $cl_count conflicting Content-Length values ($(printf '%s\n' "$cl_values" | head -4 | tr '\n' '/')...), which is invalid framing"
+            return 1
+        fi
+    fi
+
+    declared="$(printf '%s\n' "$cl_values" | head -1)"
+    declared="${declared#=}"
+    case "$declared" in ''|*[!0-9]*) echo "the response declared no usable Content-Length, so its body length cannot be checked"; return 1 ;; esac
+
+    # An all-digit value can still be too large for the shell's integer range,
+    # and `[ "$body_len" -ne "$declared" ]` then fails with "integer expression
+    # expected" and rc=2 rather than answering the question. As the condition
+    # of an `if`, that error takes the ELSE branch and falls through to the
+    # `return 0` below -- accepting an incomplete response because the length
+    # check errored out. Strip leading zeros and bound the width before any
+    # arithmetic sees the value.
+    declared="$(printf '%s' "$declared" | sed 's/^0*//')"
+    [ -n "$declared" ] || declared=0
+    if [ "${#declared}" -gt 18 ]; then
+        echo "the response declared a Content-Length of $declared, which is out of range for a body-length comparison"
+        return 1
+    fi
+
+    total="$(stat -c '%s' "$f" 2>/dev/null || echo 0)"
+    case "$total" in ''|*[!0-9]*) total=0 ;; esac
+    body_len=$((total - hdr_len))
+
+    if [ "$body_len" -ne "$declared" ]; then
+        echo "the body is $body_len bytes against a declared Content-Length of $declared"
+        return 1
+    fi
+    return 0
+}

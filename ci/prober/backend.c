@@ -394,6 +394,49 @@ validate_fault(const backend_fault *f, int have_after, int have_delta,
         if (!have_data) {
             die("%s:%d: action=raw needs data=<bytes>", file, lineno);
         }
+        /*
+         * A raw reply hangs the connection up once the canned bytes have been
+         * flushed. That is not a convenience: raw exists precisely because the
+         * reply does not follow the configured proto, so whatever the peer
+         * sends next is not guaranteed to be parseable either. Leaving the
+         * connection open makes the parser choke on it and trips a protocol
+         * error that prober_backend_scrape correctly reports as a failure --
+         * an HTTP upstream driven by proxy_pass is exactly that shape, where
+         * every header line after the request line reaches a memcached parser.
+         *
+         * Because that close is unconditional, raw takes no other parameter.
+         * ms= in particular is REFUSED rather than ignored: it would read as
+         * close_after's linger, and a deadline cannot express this at all --
+         * the write path checks close_after_write before drain_commands but
+         * falls through past close_at_ms, so a lingering raw connection would
+         * parse the very bytes the close exists to avoid. Refusing follows the
+         * same rule as the parameterless actions below: a script author who
+         * writes ms= is asking for something this action cannot do, and
+         * silence there leaves them reading a green scenario that never tested
+         * what they wrote.
+         */
+        if (have_after || have_delta || have_bytes || have_ms) {
+            die("%s:%d: action=raw takes only data=<bytes>", file, lineno);
+        }
+
+        /*
+         * An EMPTY data= is refused, not accepted as a zero-byte reply. The
+         * close this action promises is driven by close_after_write, which
+         * the event loop only ever consults inside its POLLOUT branch -- and
+         * POLLOUT is requested only while out_len > out_off. A zero-length
+         * reply therefore never arms POLLOUT, never reaches the close, and
+         * leaves the connection open, so whatever the peer sends next lands
+         * in drain_commands and hits the protocol parser: precisely the
+         * outcome the unconditional close exists to prevent. Refusing at
+         * validation makes that state unrepresentable rather than patching
+         * its consequence, and follows the same rule as the parameter checks
+         * above -- an author who writes data= with no bytes is asking for
+         * something this action cannot do.
+         */
+        if (f->raw_len == 0) {
+            die("%s:%d: action=raw requires a non-empty data=<bytes>",
+                file, lineno);
+        }
         break;
 
     case BACKEND_ACT_RST:

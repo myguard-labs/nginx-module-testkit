@@ -1,0 +1,8 @@
+# daemon on -- same contract as lifecycle-journal's own env: this driver
+# reboots a fresh master/worker generation between its QUIT and TERM phases
+# (start_phase REBOOT=1), and the daemon-off alternative tracks the master by
+# $! -- reaped the instant the master forks away, useless for retargeting
+# THIS generation's own master a moment later. PROBER_DAEMON_MODE=on's
+# pidfile-based tracking, re-exported by driver.sh before it calls
+# prober_boot a second time, is what makes that second boot reliable.
+PROBER_DAEMON_MODE=on

@@ -17,7 +17,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=35
+PLANNED=42
 tests_run=0
 failures=0
 
@@ -512,6 +512,57 @@ fi
 ok "$st" "close_after on a reply-less command fails loud, not silent (AUD-05)"
 stop_srv
 
+# ---- raw: the canned reply, and the close that must follow it ---------------
+#
+# raw exists so a script can answer with bytes that are NOT in the configured
+# proto. That makes whatever the peer sends next unparseable by construction:
+# an HTTP upstream reached through proxy_pass sends a request line the
+# memcached tokenizer happens to accept, then header lines and a blank line it
+# does not. If the connection stayed open the parser would choke on those and
+# fakesrv would report a protocol error -- which prober_backend_scrape
+# correctly treats as a scenario failure, so a scenario using raw over HTTP
+# could never go green. Hence: raw hangs up once its bytes are flushed.
+#
+# The close is asserted through its OBSERVABLE consequence -- follow-on garbage
+# draws no protocol error -- rather than by reading back a flag, because the
+# flag is what could be wrong.
+cat >"$WORK/raw.backend" <<'EOF'
+proto   memcached
+fault   on=post:1  action=raw  data=HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nHI\n
+EOF
+
+start_srv "$WORK/raw.backend"
+# A whole HTTP request: the request line the tokenizer reads as the `post`
+# command, then the header lines and blank line it cannot read at all.
+got="$(talk "$PORT" 'POST /upload HTTP/1.0\r\nHost: x\r\nContent-Length: 0\r\n\r\n')"
+
+# A full equality check, not a prefix match: "verbatim" is the claim, and a
+# prefix test passes with the headers or the body missing -- which is the
+# vacuous-assertion shape this suite exists to catch. Command substitution
+# strips the trailing newline from both sides, so they stay comparable.
+expected="$(printf 'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nHI\n')"
+if [ "$got" = "$expected" ]; then st=0; else st=1; fi
+ok "$st" "raw puts its literal bytes on the wire verbatim"
+
+if grep -q '"ev":"fault".*"action":"raw","applied":true' "$WORK/journal"; then
+    st=0
+else
+    st=1
+fi
+ok "$st" "an applied raw is journalled applied:true"
+
+# THE REGRESSION THIS FILE EXISTS FOR: the header lines after the request line
+# must never reach the parser. If raw stops closing, they do, and this errfile
+# gains a protocol-error line.
+if [ -s "$WORK/err" ]; then st=1; else st=0; fi
+ok "$st" "raw closes after writing, so unparseable follow-on bytes draw no protocol error"
+
+# ...and the parser must have seen exactly the one command, not the headers.
+n="$(grep -c '"ev":"cmd"' "$WORK/journal")" || n=0
+if [ "${n:-0}" -eq 1 ]; then st=0; else st=1; fi
+ok "$st" "raw's connection is closed before a second command can be parsed (saw ${n:-0})"
+stop_srv
+
 # ---- a bad script must not boot ---------------------------------------------
 
 cat >"$WORK/bad.backend" <<'EOF'
@@ -525,6 +576,71 @@ if ./fakesrv -script "$WORK/bad.backend" -listen 127.0.0.1:0 \
 else
     ok 0 "a script with an unknown action refuses to boot"
 fi
+
+# `ms=` is not a raw parameter: the close is unconditional, so a deadline
+# cannot express anything raw can do. It must be refused rather than ignored,
+# on the same rule as the parameterless actions -- an author who writes it is
+# asking for something the action cannot do, and silence leaves them reading a
+# green scenario that never tested what they wrote.
+cat >"$WORK/rawms.backend" <<'EOF'
+proto   memcached
+fault   on=get:1  action=raw  ms=50  data=AB
+EOF
+
+# Bounded, and the exit status is CHECKED rather than merely being non-zero.
+# A mutant that drops the refusal BOOTS: unbounded it hangs the suite, and
+# under a bare `timeout` it exits 124 -- which a plain `if ... else` reads as
+# "did not boot" and reports as a pass. That is the vacuous shape this suite
+# exists to catch, so the refusal must be identified positively: die() exits
+# 2, and anything else (0 = booted, 124 = booted and was killed) is a failure.
+rc=0
+timeout 5 ./fakesrv -script "$WORK/rawms.backend" -listen 127.0.0.1:0 \
+         -portfile "$WORK/rawmsport" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 2 ]; then st=0; else st=1; fi
+ok "$st" "action=raw refuses ms= (exit $rc, want 2)"
+
+# An EMPTY data= is refused too, for a reason the ms= case does not cover: the
+# close this action promises rides on close_after_write, and the event loop
+# only consults that flag inside its POLLOUT branch, which is armed only while
+# out_len > out_off. A zero-length reply therefore never arms POLLOUT, never
+# reaches the close, and leaves the connection open -- so the peer's next bytes
+# land in drain_commands and hit the protocol parser, which is exactly what the
+# unconditional close exists to prevent. Refused at validation so the state is
+# unrepresentable rather than merely unreachable.
+#
+# Same positively-identified exit status as above: die() exits 2, and a mutant
+# that drops the refusal boots (0) or is killed by the timeout (124), neither
+# of which may read as a pass.
+cat >"$WORK/rawempty.backend" <<'EOF'
+proto   memcached
+fault   on=get:1  action=raw  data=
+EOF
+
+rc=0
+timeout 5 ./fakesrv -script "$WORK/rawempty.backend" -listen 127.0.0.1:0 \
+         -portfile "$WORK/rawemptyport" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 2 ]; then st=0; else st=1; fi
+ok "$st" "action=raw refuses an empty data= (exit $rc, want 2)"
+
+# ...but ONLY when ms= precedes data=. `data=` is greedy by design: the rest of
+# the line after it is the reply verbatim, spaces and all, so a trailing
+# `ms=50` is payload bytes, not a parameter, and no validator can see it. That
+# is a documented consequence of the greedy lexer rather than a bug to fix
+# here -- fixing it would make `data=` unable to carry the literal text
+# "ms=", which is exactly what raw exists to allow. Pinned so the asymmetry is
+# a stated property with a test, not a trap a future author rediscovers by
+# watching their close deadline silently become two extra bytes on the wire.
+cat >"$WORK/rawms2.backend" <<'EOF'
+proto   memcached
+fault   on=get:1  action=raw  data=AB  ms=50
+EOF
+
+start_srv "$WORK/rawms2.backend"
+got="$(talk "$PORT" 'get k\r\n')"
+expected="$(printf 'AB  ms=50')"
+if [ "$got" = "$expected" ]; then st=0; else st=1; fi
+ok "$st" "a trailing ms= is raw payload, not a parameter"
+stop_srv
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
     echo "# ran $tests_run tests but the plan says $PLANNED"

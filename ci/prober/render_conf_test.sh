@@ -159,8 +159,8 @@ else
 fi
 
 # Unlike @PROBE@, an unset PROBER_BACKEND_PORT must render EMPTY rather than
-# bail: every scenario checked in today runs without a backend, so a
-# bail-if-unset rule here would fail all of them. Asserted explicitly because
+# bail: most scenarios ship no `backend` file, so a bail-if-unset rule here
+# would fail every one of them. Asserted explicitly because
 # the two placeholders sit on adjacent lines in the same sed and copying
 # @PROBE@'s guard across is the obvious wrong move.
 UNSET_OUT="$( ( unset PROBER_BACKEND_PORT

@@ -511,9 +511,11 @@ rm -rf "$OWNED_PREFIX"
 # prober_backend_scrape's liveness check asks whether the upstream survived the
 # scenario -- its own message says "exited before teardown". Running it AFTER
 # prober_backend_stop therefore sees the pid the stop just reaped and reports
-# every backend scenario as failed. This asserts the ordering hazard directly,
-# because no scenario in the tree ships a `backend` file yet and the
-# integration path has no other coverage.
+# every backend scenario as failed. This asserts the ordering hazard directly
+# rather than leaning on a scenario to exercise it: a scenario only catches the
+# wrong order when its upstream is still alive at scrape time, so the bug would
+# surface as an unexplained red in whichever backend scenario ran, not as a
+# named failure here.
 
 PROBER_PREFIX="$(mktemp -d "${TMPDIR:-/tmp}/prober-order.XXXXXX")"
 PROBER_PREFIX_OWNED=1

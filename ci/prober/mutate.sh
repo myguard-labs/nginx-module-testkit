@@ -2781,6 +2781,27 @@ mutate "backend: replies are never written" fakesrv.c \
     '                n = (ssize_t) want;' \
     fakesrv_test.sh
 
+# A raw reply is bytes outside the configured proto, so whatever the peer sends
+# next is unparseable by construction. Leaving the connection open feeds those
+# bytes to the parser, which reports a protocol error -- and
+# prober_backend_scrape turns that into a scenario failure, so every scenario
+# reaching an HTTP upstream through raw would be permanently red. Dropping the
+# close must red fakesrv_test.sh's two follow-on-bytes assertions.
+# `ms=` is not a raw parameter -- the close is unconditional, so a deadline
+# cannot express anything raw can do. Dropping the refusal lets a script
+# specifying it boot and silently ignore it, which is the false-green shape the
+# tree refuses parameters to avoid. Must red fakesrv_test.sh's refusal
+# assertion.
+mutate "backend: action=raw silently ignores ms= instead of refusing it" backend.c \
+    '        if (have_after || have_delta || have_bytes || have_ms) {' \
+    '        if (0) {' \
+    fakesrv_test.sh
+
+mutate "backend: a raw reply leaves the connection open" fakesrv.c \
+    '        c->close_after_write = 1;' \
+    '        c->close_after_write = 0;' \
+    fakesrv_test.sh
+
 # The journal's accept count is the one observable that proves keepalive reuse.
 # Stuck at a constant it reports reuse for every run, including the runs that
 # opened a fresh connection every time.
@@ -3467,3 +3488,328 @@ mutate "lifecycle-journal: sequence monotonicity (duplicate seq must red)" \
     '        emit() {   # role pid ev
             :' \
     scenarios/lifecycle-journal/mutate-suite.sh
+
+# --- scenarios/lifecycle-quit-vs-term-drain (L-1 remainder (b): QUIT drains, TERM does not) --
+#
+# Same discipline as lifecycle-journal's own rows above: each mutation
+# disarms or falsifies exactly the mechanism its assertion depends on, pinned
+# via MUTATE_REQUIRE_MARKER in this scenario's own mutate-suite.sh so
+# "the suite exited nonzero" is credited only when the SPECIFIC claimed
+# assertion actually reddened.
+
+# QUIT terminal-record row: same "disarm the signal" idiom as
+# lifecycle-journal's QUIT/TERM rows -- kill -0 is a harmless liveness probe,
+# not termination, so the worker never exits and assertion 3 (terminal
+# record must appear) has nothing to observe.
+# The SERVER-SIDE half of the in-flight precondition (assertions 1 and 5).
+# Freezing the observed fd count at the baseline removes the only evidence
+# that the WORKER accepted the connection -- written client bytes prove only
+# that the kernel buffered them. QUIT runs first, so this reds on
+# QUIT-NOT-INFLIGHT.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT in-flight gate needs server-side accept (fd delta erased, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    '    QFDS_NOW="$(prober_probe_field "$pbody" fds 2>/dev/null || true)"' \
+    '    QFDS_NOW="$QFDS"' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# The in-flight PRECONDITION shared by both legs (assertions 1 and 5).
+# Suppressing the progress stamp leaves both gates with no written-byte
+# evidence: the upload subshell still EXISTS, so the old `kill -0` form
+# passed, but nothing proves the request ever reached the wire. QUIT runs
+# first, so this reds on QUIT-NOT-INFLIGHT.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT in-flight gate needs written bytes (progress stamp suppressed, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    '            if [ -n "$progress" ]; then' \
+    '            if false; then' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT terminal record (signal disarmed, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'kill -QUIT "$MASTER_Q" 2>/dev/null || true' \
+    'kill -0 "$MASTER_Q" 2>/dev/null || true' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# QUIT ordering row (the scenario's own central claim): makes the PASSING
+# branch unreachable, so a genuinely draining QUIT (which stamps "absent")
+# falls through to the "did not drain" arm and reds with the real QUIT-ORDER
+# marker. Written as an unsatisfiable compare rather than a negation: `!=
+# "absent"` would instead make the run take the passing branch on a
+# non-draining QUIT, which is the wrong claim to test. The missing-stamp case
+# is deliberately checked FIRST and separately in the driver so that this
+# mutation cannot be absorbed by it -- an earlier arrangement let both the
+# mutant and the no-evidence case emit NO-STAMP, which MUTATE_REQUIRE_MARKER
+# correctly reported as BROKEN rather than crediting as caught. A stub-to-always-true version of
+# this row was tried first and SURVIVED: assertion 4 always printing "ok"
+# regardless of the underlying data is indistinguishable, from the suite's
+# own perspective, from assertion 4 correctly evaluating true, so nothing
+# catches it -- the inverted comparison below is a real, falsifiable claim
+# instead, and the correctly-ordered records this scenario actually produces
+# make it red.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT ordering oracle (comparison inverted, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'elif [ "$UPLOAD_TERM_SEEN_Q" = "absent" ]; then' \
+    'elif [ "$UPLOAD_TERM_SEEN_Q" = "no-such-value" ]; then' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# TERM terminal-record row: same disarm idiom, targeting phase B's own
+# signal.
+# shellcheck disable=SC2016
+# The ordering oracle's no-evidence arm. Suppressing the stamp write leaves
+# the oracle with nothing to judge, which must be reported as absent evidence
+# rather than silently passing -- an oracle that greens when its own input is
+# missing would assert nothing at all. Must red assertion 4 on the NO-STAMP
+# marker, not the ORDER one.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT stamp path (stamp write suppressed, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    '            if [ -n "$stamp" ] && [ "$((off + len))" -ge "$BODY_LEN" ]; then' \
+    '            if [ -n "$stamp" ] && [ "$((off + len))" -ge "$BODY_LEN" ] && false; then' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM terminal record (signal disarmed, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'kill -TERM "$MASTER_T" 2>/dev/null || true' \
+    'kill -0 "$MASTER_T" 2>/dev/null || true' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# TERM cutoff row: negates the grep condition itself (not just the branch
+# text -- a text-only flip was tried first and SURVIVED, because the real
+# run always takes the ELSE branch regardless of which text sits in which
+# arm, so nothing downstream could tell the arms had been swapped). Negating
+# the condition makes the ELSE branch -- the one a genuinely cut-off upload
+# actually takes -- print "not ok 6" instead, so the row now depends on the
+# real client-visible outcome (the upload IS cut off) rather than on which
+# arm happens to run.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM cuts upload (grep sense negated, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'if grep -q '"'"'^HTTP/1\.1 200'"'"' "$UPLOAD_T_OUT" 2>/dev/null && grep -q '"'"'UPLOADED'"'"' "$UPLOAD_T_OUT" 2>/dev/null; then' \
+    'if ! grep -q '"'"'^HTTP/1\.1 200'"'"' "$UPLOAD_T_OUT" 2>/dev/null || ! grep -q '"'"'UPLOADED'"'"' "$UPLOAD_T_OUT" 2>/dev/null; then' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# The cutoff assertion's NON-CUTOFF arm (assertion 6). Injecting a synthetic
+# response status line into the TERM leg's output file simulates a worker
+# that answered the request -- with a 502, say -- instead of having its
+# connection torn down. Before this arm existed, that outcome satisfied the
+# assertion, because "no clean 200" is not the same claim as "cut off".
+# Must red on DID-NOT-CUT via the status-line arm specifically.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM cutoff is not merely a non-200 (synthetic 502 injected, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
+    'printf '"'"'HTTP/1.1 502 Bad Gateway\r\n\r\n'"'"' >"$UPLOAD_T_OUT"; TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# The DRAIN assertion's FRAMING requirement (assertion 2). Truncating the
+# response by one byte leaves both greps matching and the reader exiting 0 at
+# the orderly close, so only the Content-Length measurement can red. This is
+# the exact case measured in prober_http_body_complete's comment.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT drain requires a complete body (response truncated one byte, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'QUIT_FRAMING="$(prober_http_body_complete' \
+    'truncate -s -1 "$UPLOAD_Q_OUT"; QUIT_FRAMING="$(prober_http_body_complete' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# The DRAIN assertion's completed-read requirement (assertion 2). QUIT is
+# supposed to finish the request and close it, and the reader observes that as
+# an orderly EOF. Suppressing the QUIT leg's status sidecar leaves both greps
+# satisfied -- the 200 and the whole 9-byte UPLOADED body are still on the
+# wire -- so only the recorded-status half of the condition can red. This also
+# closes a three-set gap: the QUIT-NOT-DRAINED marker and its mutate-suite arm
+# both existed with no row behind them.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: QUIT drains upload needs a completed read (status sidecar removed, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'QUIT_READER_RC="$( { tr -d' \
+    'QUIT_READER_RC=""; : "$( { tr -d' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# The cutoff assertion's ABANDONED-UPLOAD arm (assertion 6). Forcing the
+# recorded offset to the full body length is the case where the worker
+# consumed the entire upload and then closed without answering: the response
+# file is still empty, the reader still exits 0, and the terminal record still
+# appears, so every other arm passes and only this one can red.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM cutoff requires an abandoned upload (full offset forced, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'case "$TOFF_FINAL" in' \
+    'TOFF_FINAL=$BODY_LEN; case "$TOFF_FINAL" in' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# The cutoff assertion's NON-EMPTY-RESPONSE arm (assertion 6). Injecting a
+# PARTIAL status line is the counterexample the two grep arms cannot see: it
+# matches neither the complete-200 nor the complete-status-line pattern, and
+# its reader still exits 0 at EOF, so before the byte-count arm existed it
+# reached the success branch and reported "nothing reached the client" over a
+# file holding response bytes. Must red on DID-NOT-CUT.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM cutoff requires an empty response (partial status line injected, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'TERM_BYTES="$(stat -c' \
+    'printf "HTTP/1.1 2" >"$UPLOAD_T_OUT"; TERM_BYTES="$(stat -c' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# The cutoff assertion's TIMEOUT arm (assertion 6). Forcing the recorded
+# reader status to 124 simulates a read that expired with the connection
+# still open and no data -- a worker that neither drained nor died. That
+# produces the same EMPTY response file as a genuine teardown, so before the
+# timeout arm existed this outcome passed as a successful cutoff. Must red on
+# DID-NOT-CUT via the timeout arm.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM cutoff is not a stalled read (reader timeout forced, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    '"$reader_rc" >"$rcfile"' \
+    '124 >"$rcfile"' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# The cutoff assertion's UNRECORDED-STATUS arm (assertion 6). Deleting the
+# sidecar before it is read leaves TERM_READER_RC empty -- the reader's
+# outcome was never observed. The response file is empty exactly as it is on a
+# genuine teardown, so an assertion that only rejects the ONE bad status it
+# thought of (124) reports this as a successful cutoff. Must red on
+# DID-NOT-CUT via the accept-only-rc=0 arm.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: TERM cutoff requires a recorded status (sidecar removed, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
+    'rm -f "$UPLOAD_T_RC"; TERM_BYTES="$(stat -c '"'"'%s'"'"' "$UPLOAD_T_OUT" 2>/dev/null || echo 0)"' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# Contrast row (assertion 8): inverts the required T_DRAINED value, so the
+# oracle now demands TERM drain its upload too -- the opposite of what this
+# scenario actually produces. (A stub-to-always-true version was tried first
+# and SURVIVED for the same reason as the ordering row above: "always ok"
+# cannot be distinguished from "correctly ok" by anything downstream, so
+# nothing catches it.) With the requirement inverted, the genuinely-divergent
+# legs this scenario produces (Q_DRAINED=1, T_DRAINED=0) now fail the
+# mutated check, closing the one gap the QUIT/TERM-specific rows above do
+# not cover -- a driver bug that made both legs behave identically would
+# still pass assertions 2..7 individually in the degenerate case where both
+# drained or both cut off.
+# shellcheck disable=SC2016
+mutate "lifecycle-quit-vs-term-drain: contrast holds (divergence requirement inverted, must red)" \
+    scenarios/lifecycle-quit-vs-term-drain/driver.sh \
+    'if [ "$Q_DRAINED" = "1" ] && [ "$T_DRAINED" = "0" ]; then' \
+    'if [ "$Q_DRAINED" = "1" ] && [ "$T_DRAINED" = "1" ]; then' \
+    scenarios/lifecycle-quit-vs-term-drain/mutate-suite.sh
+
+# --- scenarios/lifecycle-usr1-reopen (L-1 remainder (a): USR1 log-reopen
+# inode/fd neutrality under traffic) --
+#
+# Same discipline as the two blocks above: each row inverts the actual
+# comparison or negates the actual boolean condition an assertion depends on
+# -- never a stub-to-always-true and never a branch-text-only swap, both of
+# which are indistinguishable from a correctly-passing run and reliably
+# SURVIVE (see the lifecycle-quit-vs-term-drain block's own history of this
+# exact mistake, fixed there before shipping). Pinned via
+# MUTATE_REQUIRE_MARKER in this scenario's own mutate-suite.sh.
+
+# Assertion 3 claims the upload completed "not cut, not stalled". Forcing the
+# RECORDED reader status to a timeout -- at the write site, so no later
+# assignment can undo it -- reproduces exactly the stall the wording denies:
+# the response bytes are all present, so the greps still match, and only the
+# status distinguishes a completed read from one that hung to the 30s bound.
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: upload survives needs a completed read (reader timeout forced, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    '"$reader_rc" >"$rcfile.tmp"' \
+    '124 >"$rcfile.tmp"' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# Assertion 3's FRAMING requirement. Same one-byte truncation as the QUIT leg:
+# the greps still match and the read still ends at EOF, so the declared-length
+# measurement is the only thing that can red.
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: upload survives requires a complete body (response truncated one byte, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'UPLOAD_FRAMING="$(prober_http_body_complete' \
+    'truncate -s -1 "$UPLOAD_OUT"; UPLOAD_FRAMING="$(prober_http_body_complete' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# The SERVER-SIDE half of the in-flight precondition (assertion 1). Freezing
+# the observed fd count at the baseline removes the only evidence that the
+# WORKER accepted the connection before USR1 was sent.
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: in-flight gate needs server-side accept (fd delta erased, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    '    ACC_FDS_NOW="$(prober_probe_field' \
+    '    ACC_FDS_NOW="$ACC_FDS" #' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# The in-flight PRECONDITION (assertion 1). Suppressing the progress stamp
+# leaves the gate with no written-byte evidence: the upload subshell still
+# EXISTS, so the old `kill -0` form passed, but nothing proves the request
+# ever reached the wire. Every "undisturbed traffic" claim downstream rests on
+# this precondition, so it must red rather than silently gate on liveness.
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: in-flight gate needs written bytes (progress stamp suppressed, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    '            if [ -n "$progress" ]; then' \
+    '            if false; then' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: inode changes (comparison inverted, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'if [ -n "$INODE_AFTER" ] && [ "$INODE_AFTER" != "$INODE_BEFORE" ]; then' \
+    'if [ -n "$INODE_AFTER" ] && [ "$INODE_AFTER" = "$INODE_BEFORE" ]; then' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: upload survives (grep sense negated, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'if grep -q ' \
+    'if ! grep -q ' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: worker set unchanged (comparison inverted, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'if [ -n "$WPID_AFTER" ] && [ "$WPID_AFTER" = "$WPID_BEFORE" ]; then' \
+    'if [ -n "$WPID_AFTER" ] && [ "$WPID_AFTER" != "$WPID_BEFORE" ]; then' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: fd count unchanged (comparison inverted, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'if [ -n "$FDS_AFTER" ] && [ "$FDS_AFTER" = "$FDS_BEFORE" ]; then' \
+    'if [ -n "$FDS_AFTER" ] && [ "$FDS_AFTER" != "$FDS_BEFORE" ]; then' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# shellcheck disable=SC2016
+# The rotated file's CONTENT guarantee, distinct from its inode. Truncating
+# the renamed file simulates an "in-place reopen" that keeps the inode while
+# destroying the bytes -- exactly what the inode-only form of assertion 7
+# could not distinguish from a correct rename-based rotation. Must red
+# assertion 7 on the content arm specifically.
+mutate "lifecycle-usr1-reopen: rotated content survives (renamed file truncated, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'mv -f "$ELOG" "$ELOG.rotated" 2>/dev/null || true' \
+    'mv -f "$ELOG" "$ELOG.rotated" 2>/dev/null || true; : >"$ELOG.rotated"' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: no spurious exit (grep sense negated, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    'if grep -qE "$WPID_BEFORE#[0-9]+: exiting$" "$ELOG" "$ELOG.rotated" 2>/dev/null; then' \
+    'if ! grep -qE "$WPID_BEFORE#[0-9]+: exiting$" "$ELOG" "$ELOG.rotated" 2>/dev/null; then' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
+
+# The scenario's sharpest claim: USR1 is forwarded to the WORKER, not merely
+# handled by the master. Making the match unsatisfiable simulates exactly the
+# regression the assertion exists to catch -- a worker still holding the
+# rotated-away descriptor while the master's reopen made the path's inode
+# change anyway. Must red assertion 8 specifically; assertions 2, 4, 5 and 7
+# all stay green under it, which is the whole reason the row is here.
+# shellcheck disable=SC2016
+mutate "lifecycle-usr1-reopen: worker fd on new inode (match made unsatisfiable, must red)" \
+    scenarios/lifecycle-usr1-reopen/driver.sh \
+    '    *" $INODE_AFTER "*)' \
+    '    *" no-such-inode "*)' \
+    scenarios/lifecycle-usr1-reopen/mutate-suite.sh
